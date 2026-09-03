@@ -1,0 +1,8 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "CFW3 entry_point imports from client/",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

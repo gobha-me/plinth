@@ -1,0 +1,8 @@
+{
+  "name": "mixedrules",
+  "version": "1.0.0",
+  "description": "RBAC-test fixture — 1 clean PASS + 1 passes-until-poisoned + 1 cap-rule mismatch FAIL",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

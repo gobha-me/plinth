@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plinth</title>
+    <!-- ICD-0.6.2 §4.5 + §5.3 pre-paint resolver. External sync script
+         in <head> (no defer/async) — blocking by default, runs before
+         first paint per CSP `script-src 'self'`. Sets data-theme and
+         documentElement.style.fontSize so tokens.css's `:root[data-theme]`
+         palette + the rem baseline land without a flash. -->
+    <script src="./prepaint.js"></script>
+    <link rel="stylesheet" href="./css/tokens.css" />
+    <!-- ICD-0.6.3 §A.6 / §4.3 — import-map declaring bare specifiers
+         the panel modules and shell consume. Must precede every
+         <script type="module"> on the page. The targets resolve
+         through kernel indirection (`/api/frontend/*`) so panel
+         modules survive shell upgrades without 404'ing on a stale
+         versioned URL — same posture as ICD-0.6.2 `tokens.css`. -->
+    <script type="importmap">
+      {
+        "imports": {
+          "@plinth/frontend/sdk":    "/api/frontend/sdk.js",
+          "@plinth/frontend/tokens": "/api/frontend/tokens.css",
+          "preact":                  "./vendor/preact.module.js",
+          "preact/hooks":            "./vendor/preact-hooks.module.js",
+          "htm":                     "./vendor/htm.module.js"
+        }
+      }
+    </script>
+    <!-- ICD-0.6.3 §6.5 (boundary `error_stack` redaction) and OQ6 —
+         dev builds keep the stack; production flips this flag at
+         deploy time (out of scope for v0.6.3 — see §17 deviation). -->
+    <script>window.__PLINTH_PRODUCTION__ = false;</script>
+    <style>
+      /* ICD-0.6.2 §3 — base typography + html/body styles live in
+         tokens.css. This block holds layout + component styles only.
+         Hex values mechanically rewritten to var() refs per ICD §3.9
+         (token names frozen for the 0.6.x arc); px → rem per
+         §3.8 + §5 (1rem == 13.5 px at 100% scale). */
+      :root { color-scheme: dark; }
+      :root[data-theme="light"] { color-scheme: light; }
+      #root { height: 100%; display: flex; flex-direction: column; }
+      .topbar {
+        display: flex; align-items: center; height: 3.55rem;
+        background: var(--bg-1); border-bottom: 1px solid var(--border);
+        flex: 0 0 auto;
+      }
+      .zone {
+        display: flex; align-items: center; padding: 0 0.89rem;
+        height: 100%; gap: 0.44rem;
+      }
+      .zone-tray { flex: 1; }
+      .zone-app-name { color: var(--text-1); }
+      .zone-app-name .mark {
+        width: 1.04rem; height: 1.04rem; border-radius: 0.30rem;
+        background: var(--accent); flex: 0 0 auto;
+      }
+      .zone-avatar button {
+        background: transparent; border: 0; padding: 0.30rem 0.44rem;
+        display: flex; align-items: center; gap: 0.44rem; cursor: pointer;
+        color: inherit; font-size: inherit;
+      }
+      .zone-avatar button:hover { background: var(--bg-3); border-radius: var(--r-md); }
+      .avatar-circle {
+        width: 1.78rem; height: 1.78rem; border-radius: 50%;
+        background: linear-gradient(135deg, var(--accent), #bc8cff);
+        color: #fff; display: flex; align-items: center;
+        justify-content: center; font-size: 0.81rem; font-weight: 700;
+      }
+      .chev { width: 0.74rem; height: 0.74rem; opacity: 0.6; }
+      main {
+        flex: 1; display: flex; align-items: center;
+        justify-content: center; font-size: 1.33rem; padding: 1.78rem;
+      }
+      .login-card {
+        background: var(--bg-1); border: 1px solid var(--border);
+        border-radius: var(--r-lg);
+        padding: 1.78rem; min-width: 20.74rem; max-width: 26.67rem;
+      }
+      .login-card h1 {
+        margin: 0 0 1.19rem; font-size: 1.33rem; font-weight: 600;
+        color: var(--text-0);
+      }
+      .login-card label {
+        display: block; margin-top: 0.89rem; font-size: 0.89rem;
+        color: var(--text-1);
+      }
+      .login-card input {
+        width: 100%; box-sizing: border-box; margin-top: 0.30rem;
+        padding: 0.59rem;
+        background: var(--bg-0); border: 1px solid var(--border);
+        border-radius: var(--r);
+        color: var(--text-0); font: inherit;
+      }
+      .login-card input:focus { outline: 1px solid var(--focus-ring); }
+      .login-card button {
+        margin-top: 1.19rem; width: 100%; padding: 0.59rem;
+        background: var(--accent);
+        color: var(--bg-0); border: 0; border-radius: var(--r);
+        font-weight: 600; cursor: pointer; font: inherit;
+      }
+      .login-card button:disabled { opacity: 0.5; cursor: not-allowed; }
+      .login-error {
+        margin-top: 0.89rem; color: var(--danger);
+        font-size: 0.89rem; min-height: 1em;
+      }
+      .popover {
+        position: absolute; top: 3.26rem; right: 0.59rem;
+        background: var(--bg-1); border: 1px solid var(--border);
+        border-radius: var(--r-md);
+        min-width: 10.37rem; padding: 0.30rem;
+      }
+      .popover [role="menuitem"] {
+        display: block; width: 100%; text-align: left;
+        background: transparent; border: 0; padding: 0.59rem 0.74rem;
+        color: inherit; font: inherit; cursor: pointer;
+        border-radius: var(--r);
+      }
+      .popover [role="menuitem"]:hover { background: var(--bg-3); }
+      .popover-row {
+        display: flex; align-items: center; justify-content: space-between;
+        gap: 0.74rem; padding: 0.44rem 0.74rem;
+      }
+      .popover-row label {
+        color: var(--text-2); font-size: 0.89rem;
+      }
+      .popover-row select {
+        background: var(--bg-0); color: var(--text-0);
+        border: 1px solid var(--border); border-radius: var(--r);
+        padding: 0.22rem 0.30rem; font: inherit; font-size: 0.89rem;
+        min-width: 5.93rem;
+      }
+      .popover-sep {
+        margin: 0.30rem 0; border: 0; border-top: 1px solid var(--border);
+      }
+      .boundary-fallback { text-align: center; }
+      .boundary-fallback button {
+        margin-top: 0.89rem; padding: 0.44rem 1.04rem;
+        background: var(--accent);
+        color: var(--bg-0); border: 0; border-radius: var(--r);
+        cursor: pointer; font: inherit; font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="shell.js"></script>
+  </body>
+</html>

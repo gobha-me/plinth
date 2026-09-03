@@ -1,0 +1,45 @@
+{
+  "provides": [
+    {
+      "namespace":   "shell",
+      "version":     1,
+      "function":    "preferences.get",
+      "params":      [{"name": "key", "type": "string"}],
+      "returns":     "object",
+      "scope":       "instance",
+      "description": "Read this user's shell preference at `key`. Returns {value: <jsonb>} or {value: undefined} when absent.",
+      "rbac_rule":   "shell.preferences.read"
+    },
+    {
+      "namespace":   "shell",
+      "version":     1,
+      "function":    "preferences.set",
+      "params":      [{"name": "key", "type": "string"}, {"name": "value", "type": "any"}],
+      "returns":     "object",
+      "scope":       "instance",
+      "description": "Write this user's shell preference at `key`. Pass undefined to delete; pass null to UPSERT a JSONB null literal. 64 KiB serialised cap.",
+      "rbac_rule":   "shell.preferences.write"
+    },
+    {
+      "namespace":   "shell",
+      "version":     1,
+      "function":    "preferences.get_all",
+      "params":      [],
+      "returns":     "object",
+      "scope":       "instance",
+      "description": "Return all preference key/value pairs for this user, sorted by key ASC.",
+      "rbac_rule":   "shell.preferences.read"
+    },
+    {
+      "namespace":   "shell",
+      "version":     1,
+      "function":    "audit.emit",
+      "params":      [{"name": "detail", "type": "any"}],
+      "returns":     "object",
+      "scope":       "instance",
+      "description": "Single-purpose audit emit for the top-level Preact boundary. Pins action `ext.shell.frontend.boundary.caught`; ignores client-supplied action override. ICD-0.6.3 §6 / §A.4 — name deviates per validator constraints (see handler header).",
+      "rbac_rule":   "shell.audit.emit"
+    }
+  ],
+  "requires": []
+}

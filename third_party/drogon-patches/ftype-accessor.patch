@@ -1,0 +1,29 @@
+Expose Field::oid() accessor so Drogon callers can read the PG column
+OID without reaching into the private Result API. Result::oid() is
+already a member of drogon::orm::Result; adding a public delegating
+accessor on Field keeps the per-column OID reachable without a
+consumer-side friendship on Row. Used by Plinth's 0.5.3 OID-driven
+PG-type → JS-type mapping.
+
+Upstreamable. Filed against drogonframework/drogon at ship.
+---
+ orm_lib/inc/drogon/orm/Field.h | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/orm_lib/inc/drogon/orm/Field.h b/orm_lib/inc/drogon/orm/Field.h
+--- a/orm_lib/inc/drogon/orm/Field.h
++++ b/orm_lib/inc/drogon/orm/Field.h
+@@ -49,6 +49,13 @@ class DROGON_EXPORT Field
+     /// Column name
+     const char *name() const;
+
++    /// Column type OID (PostgreSQL-specific; 0 for other backends).
++    /// Delegates to Result::oid, which is already friend-accessible.
++    int oid() const noexcept
++    {
++        return result_.oid(column_);
++    }
++
+     /// Is this field's value null?
+     bool isNull() const;
+

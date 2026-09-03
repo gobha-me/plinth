@@ -1,0 +1,16 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "0.4.2 valid-cross-file baseline",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "frontend": {
+    "mount": "/notes",
+    "entry": "index.html"
+  },
+  "runtime": {
+    "memory_limit_mb": 8
+  },
+  "shareable": []
+}

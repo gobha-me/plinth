@@ -1,0 +1,8 @@
+{
+  "name": "smuggle-bad-utf8",
+  "version": "0.1.0",
+  "description": "Fixture: server/handlers/shell.js is generated at test runtime with overlong UTF-8 bytes",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

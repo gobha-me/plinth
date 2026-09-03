@@ -1,0 +1,26 @@
+{
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "plinth",
+    "password": "plinth",
+    "database": "plinth",
+    "pool_size": 32
+  },
+  "migrations_dir": "./migrations",
+  "dev_mode": false,
+  "listen_host": "127.0.0.1",
+  "listen_port": 8080,
+  "registration_enabled": true,
+  "node_id": "node-1",
+  "ws_auth_timeout_s": 5.0,
+  "ws_heartbeat_interval_s": 30.0,
+  "ws_heartbeat_timeout_s": 10.0,
+  "security": {
+    "unicode_scanner": {
+      "enabled": true,
+      "threshold": 50,
+      "log_findings": true
+    }
+  }
+}

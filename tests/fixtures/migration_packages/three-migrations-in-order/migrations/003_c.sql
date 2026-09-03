@@ -1,0 +1,1 @@
+CREATE TABLE ext_{EXT_NAME}.c (id INT);

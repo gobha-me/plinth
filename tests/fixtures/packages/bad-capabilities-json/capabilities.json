@@ -1,0 +1,11 @@
+{
+  "provides": [
+    {
+      "namespace": "x",
+      "version": 1,
+      "returns": "object",
+      "scope": "instance",
+      "description": "missing function field"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "lh1storm",
+  "version": "0.1.0",
+  "description": "Load harness LH-1 driver extension \u2014 exposes lh1storm:1:burst(count, bytes) which fires count parallel pubsub.publish calls on plinth:ext:lh1storm:storm_event to drive the v0.5.0 Layer-3 emit path under sustained storm load. Named lh1storm (not ICD's ext_lh1_storm) because manifest name and channel-extension segment both reject underscores.",
+  "author": "plinth-load-harness",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

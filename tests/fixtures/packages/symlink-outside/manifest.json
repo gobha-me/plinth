@@ -1,0 +1,8 @@
+{
+  "name": "symlink-outside",
+  "version": "0.1.0",
+  "description": "Fixture: symlink generated in test setup",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

@@ -1,0 +1,6 @@
+{
+  "rules": [
+    {"namespace": "notes",                     "description": "Access to notes"},
+    {"namespace": "not-a-capability-namespace","description": "CF1 violation: no matching capability provides this namespace"}
+  ]
+}

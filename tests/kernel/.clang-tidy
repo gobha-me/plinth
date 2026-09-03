@@ -1,0 +1,27 @@
+---
+# Scope override for tests/kernel/** — inherits the root .clang-tidy and
+# disables test-framework-idiomatic checks that would otherwise flood the
+# output with noise from Catch2 macro expansions. Every check that fires on
+# real test code stays enabled; only the following are silenced:
+#
+#   - cppcoreguidelines-avoid-do-while
+#       Catch2 `REQUIRE(...)` / `CHECK(...)` expand to do-while loops.
+#   - cert-err58-cpp
+#       Catch2 `TEST_CASE(...)` constructs static-storage-duration objects
+#       whose constructor can throw — we cannot change Catch2's scaffolding.
+#   - readability-function-cognitive-complexity
+#       Test cases have long, linear Given/When/Then bodies by design.
+#   - bugprone-unchecked-optional-access
+#       Tests frequently assert a condition and then `.value()` an optional;
+#       the assertion is the check, but clang-tidy can't see that.
+#
+# HeaderFilterRegex is widened so test-only headers under tests/kernel/ are
+# also linted when included by test TUs.
+InheritParentConfig: true
+Checks: >
+  -cppcoreguidelines-avoid-do-while,
+  -cert-err58-cpp,
+  -readability-function-cognitive-complexity,
+  -bugprone-unchecked-optional-access
+
+HeaderFilterRegex: '(src|tests)/kernel/.*'

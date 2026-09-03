@@ -1,0 +1,8 @@
+{
+  "name": "minimal",
+  "version": "0.1.0",
+  "description": "Minimal fixture for 0.4.0 validator tests",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

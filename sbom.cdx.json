@@ -1,0 +1,315 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/drogonframework/drogon"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "drogon",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/drogonframework/drogon@89aca8c7993c8194f2c109c1d06a3b45bf363d5d",
+      "type": "library",
+      "version": "1.9.12"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nlohmann/json"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "nlohmann-json",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/nlohmann/json@9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+      "type": "library",
+      "version": "3.11.3"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/gabime/spdlog"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "spdlog",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/gabime/spdlog@6fa36017cfd5731d617e1a934f0e5ea9c4445b13",
+      "type": "library",
+      "version": "1.15.3"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/p-ranav/argparse"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "argparse",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/p-ranav/argparse@68fd0277eea5412aff9b91c0b70efc698359dae0",
+      "type": "library",
+      "version": "3.1"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/catchorg/Catch2"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "BSL-1.0"
+          }
+        }
+      ],
+      "name": "catch2",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/catchorg/Catch2@fa43b77429ba76c462b1898d6cd2f2d7a9416b14",
+      "type": "library",
+      "version": "3.7.1"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/nih-at/libzip"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "name": "libzip",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/nih-at/libzip@6f8a0cdd24a0dc6cce9dac4a7679da784ab124ea",
+      "type": "library",
+      "version": "1.11.4"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/quickjs-ng/quickjs"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "quickjs-ng",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/quickjs-ng/quickjs@3c051980ab7e783dfbfb1c70c014ce5e05ecf24c",
+      "type": "library",
+      "version": "0.14.0"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/google/benchmark"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "name": "google-benchmark",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "fetchcontent"
+        }
+      ],
+      "purl": "pkg:github/google/benchmark@c58e6d0710581e3a08d65c349664128a8d9a2461",
+      "type": "library",
+      "version": "1.9.1"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/preactjs/preact"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "087942b6f43a74de6a3abb2e0c4e287f03b54b4849cfa34d312402f24aa34a30"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "preact",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "vendored"
+        }
+      ],
+      "purl": "pkg:github/preactjs/preact@10.22.0",
+      "type": "library",
+      "version": "10.22.0"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/preactjs/preact"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "0f0ae96b609149ba96ef6b95fa1801a0e94d3d3dc2d52b38c1c3fec19fd0302b"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "preact-hooks",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "vendored"
+        }
+      ],
+      "purl": "pkg:github/preactjs/preact@10.22.0",
+      "type": "library",
+      "version": "10.22.0"
+    },
+    {
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://github.com/developit/htm"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4"
+        }
+      ],
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        }
+      ],
+      "name": "htm",
+      "properties": [
+        {
+          "name": "plinth:dependency-kind",
+          "value": "vendored"
+        }
+      ],
+      "purl": "pkg:github/developit/htm@3.1.1",
+      "type": "library",
+      "version": "3.1.1"
+    }
+  ],
+  "metadata": {
+    "component": {
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "name": "plinth",
+      "type": "application",
+      "version": "0.6.3"
+    }
+  },
+  "serialNumber": "urn:uuid:baaf7e32-6971-5e49-b014-dfe4ad1a99b6",
+  "specVersion": "1.6",
+  "version": 1
+}

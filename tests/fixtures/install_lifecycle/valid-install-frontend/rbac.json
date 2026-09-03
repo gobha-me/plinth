@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"rule": "notesfe.read", "namespace": "notesfe", "description": "Access to notes"}
+  ]
+}

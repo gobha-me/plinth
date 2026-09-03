@@ -1,0 +1,6 @@
+{
+  "rules": [
+    {"rule": "lh1storm.burst", "namespace": "lh1storm", "description": "LH-1 burst capability — invokes pubsub.publish count times"},
+    {"rule": "lh1storm.realtime.subscribe.stormevent", "namespace": "lh1storm", "description": "LH-2 cross-ext subscribe rule — granted to lh2sidecar's caller to subscribe to the storm channel"}
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "CFW1 capability without matching rule",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

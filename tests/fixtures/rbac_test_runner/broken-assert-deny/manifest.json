@@ -1,0 +1,8 @@
+{
+  "name": "brokendeny",
+  "version": "1.0.0",
+  "description": "RBAC-test fixture — installs clean; Slice C poisons everyone→rule to break assert_deny",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

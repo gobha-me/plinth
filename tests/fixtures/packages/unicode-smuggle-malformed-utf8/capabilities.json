@@ -1,0 +1,13 @@
+{
+  "provides": [
+    {
+      "namespace": "smugglebadutf8",
+      "version": 1,
+      "function": "shell",
+      "returns": "string",
+      "scope": "instance",
+      "description": "Smuggle test handler",
+      "rbac_rule": "smugglebadutf8.shell"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "allowside",
+      "version": 1,
+      "function": "edit",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Extension cap — dispatch returns TIER3_NOT_AVAILABLE, which is non-permission-denied → assert_allow PASSES",
+      "rbac_rule": "allowside.edit"
+    }
+  ],
+  "requires": []
+}

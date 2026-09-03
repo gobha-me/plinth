@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"namespace": "full", "description": "Allow reading records"}
+  ]
+}

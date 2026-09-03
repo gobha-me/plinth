@@ -1,0 +1,8 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "RT3 missing requires[] fixture (gated)",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

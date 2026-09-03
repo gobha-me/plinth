@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"namespace": "other", "description": "orphan rule CF1 catches but R-rules do not"}
+  ]
+}

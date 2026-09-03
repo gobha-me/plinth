@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"namespace": "minimal", "description": "Greet access"}
+  ]
+}

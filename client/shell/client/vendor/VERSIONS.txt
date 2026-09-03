@@ -1,0 +1,15 @@
+preact          10.22.0 sha256=087942b6f43a74de6a3abb2e0c4e287f03b54b4849cfa34d312402f24aa34a30 https://unpkg.com/preact@10.22.0/dist/preact.module.js
+htm             3.1.1   sha256=ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4 https://unpkg.com/htm@3.1.1/dist/htm.module.js
+preact/hooks    10.22.0 sha256=0f0ae96b609149ba96ef6b95fa1801a0e94d3d3dc2d52b38c1c3fec19fd0302b https://unpkg.com/preact@10.22.0/hooks/dist/hooks.module.js  (filename: preact-hooks.module.js; on-disk byte differs from upstream by one line — `import{options}from"preact"` rewritten to `import{options}from"./preact.module.js"` so the module resolves alongside `preact.module.js` without an importmap entry; CSP-clean)
+
+Vendored 2026-04-27 for ICD-0.6.0 §4.2 (Preact + htm shipped same-origin
+under `client/shell/client/vendor/`). preact/hooks added 2026-04-29 for
+ICD-0.6.3 §3.3 (`plinth.useData`). All three files verified at vendor
+time to contain no `eval(` or `new Function(` calls — required for CSP
+`script-src 'self'` per ICD-0.6.0 §11.1. Refresh checklist: re-run the
+grep guard, update sha256 fields above, note the date. Fetch URLs are
+informative; the on-disk bytes are the contract.
+
+Preact and Preact Hooks are MIT-licensed. HTM 3.1.1 is Apache-2.0-licensed.
+Version-matched license texts are in `third_party/licenses/` and summarized in
+`THIRD_PARTY_NOTICES.md`.

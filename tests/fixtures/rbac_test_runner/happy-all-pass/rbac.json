@@ -1,0 +1,27 @@
+{
+  "rules": [
+    {
+      "rule": "happypass.read",
+      "namespace": "happypass",
+      "description": "Access to happypass:read",
+      "test": {
+        "assert_deny":  {"call": "happypass:1:read", "expect": "permission_denied"},
+        "assert_allow": {"call": "happypass:1:read", "expect": "success"}
+      }
+    },
+    {
+      "rule": "happypass.edit",
+      "namespace": "happypass",
+      "description": "Access to happypass:edit",
+      "test": {
+        "assert_deny":  {"call": "happypass:1:edit", "expect": "permission_denied"},
+        "assert_allow": {"call": "happypass:1:edit", "expect": "success"}
+      }
+    },
+    {
+      "rule": "happypass.note",
+      "namespace": "happypass",
+      "description": "Access to happypass:note — no test contract; RBAC test skips"
+    }
+  ]
+}

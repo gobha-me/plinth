@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "namespace": "notes",
+      "description": "Namespace matches, but test.call does not",
+      "test": {"call": "notes:99:unknown"}
+    }
+  ]
+}

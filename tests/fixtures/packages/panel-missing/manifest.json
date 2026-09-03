@@ -1,0 +1,8 @@
+{
+  "name": "panel-missing",
+  "version": "0.1.0",
+  "description": "panels.json refs a missing file",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

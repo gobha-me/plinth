@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "slow",
+      "version": 1,
+      "function": "wait",
+      "params": [{"name": "ms", "type": "number"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Sleep for ms milliseconds via db.query(pg_sleep), then return {ok, slept_ms}",
+      "rbac_rule": "slow.alpha"
+    }
+  ],
+  "requires": []
+}

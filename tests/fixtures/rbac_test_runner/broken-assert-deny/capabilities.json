@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "brokendeny",
+      "version": 1,
+      "function": "edit",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Edit",
+      "rbac_rule": "brokendeny.edit"
+    }
+  ],
+  "requires": []
+}

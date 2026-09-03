@@ -1,0 +1,10 @@
+#pragma once
+
+namespace plinth {
+
+constexpr const char* VERSION = "@PLINTH_GIT_VERSION@";
+constexpr int VERSION_MAJOR = @PLINTH_VERSION_MAJOR@;
+constexpr int VERSION_MINOR = @PLINTH_VERSION_MINOR@;
+constexpr int VERSION_PATCH = @PLINTH_VERSION_PATCH@;
+
+} // namespace plinth

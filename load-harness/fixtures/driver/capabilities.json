@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "lh0driver",
+      "version": 1,
+      "function": "noop",
+      "params": [],
+      "returns": "object",
+      "scope": "instance",
+      "description": "No-op placeholder — the LH-0 harness drives load via the kernel lh0:1:chain path, not this capability. Present to exercise capability registration during install.",
+      "rbac_rule": "lh0driver.noop"
+    }
+  ],
+  "requires": []
+}

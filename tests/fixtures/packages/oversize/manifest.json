@@ -1,0 +1,8 @@
+{
+  "name": "oversize",
+  "version": "0.1.0",
+  "description": "Fixture: size-limit test; test overrides max_size_bytes to a small value so the checked-in blob triggers R6",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

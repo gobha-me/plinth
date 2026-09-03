@@ -1,0 +1,8 @@
+{
+  "name": "lh2sidecar",
+  "version": "0.1.0",
+  "description": "Load harness LH-2 sidecar extension — exposes lh2sidecar:1:install_subscription(channel) which calls pubsub.subscribe against a cross-extension Layer-3 channel to exercise the broker's per-bc JS fan-out arm; lh2sidecar:1:read_counters() returns the observed envelope count + lag samples at harness teardown. Named lh2sidecar (not ICD's ext_lh2_sidecar) because manifest name and channel-extension segment both reject underscores; same precedent as lh1storm.",
+  "author": "plinth-load-harness",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

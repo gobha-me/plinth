@@ -1,0 +1,8 @@
+{
+  "name": "dotdot-path",
+  "version": "0.1.0",
+  "description": "Fixture: directory-input stand-in for archive-mode '..' traversal (symlink escaping root, created in test setup)",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

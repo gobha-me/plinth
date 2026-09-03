@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "brokenallow",
+      "version": 1,
+      "function": "edit",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Edit — cap requires brokenallow.other_rule, not brokenallow.edit",
+      "rbac_rule": "brokenallow.other_rule"
+    }
+  ],
+  "requires": []
+}

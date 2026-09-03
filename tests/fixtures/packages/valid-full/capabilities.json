@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "full",
+      "version": 1,
+      "function": "read",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read a record",
+      "rbac_rule": "full.read"
+    }
+  ],
+  "requires": []
+}

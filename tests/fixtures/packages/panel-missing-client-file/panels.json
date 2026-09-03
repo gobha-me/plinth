@@ -1,0 +1,5 @@
+{
+  "panels": [
+    {"id": "ghost", "client_path": "ghost.js"}
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "rules": [
+    {"rule": "slow.alpha", "namespace": "slow", "description": "v2 alpha changed — exercises changed-rule reconciliation"},
+    {"rule": "slow.gamma", "namespace": "slow", "description": "v1 gamma — preserved across upgrade unchanged"},
+    {"rule": "slow.delta", "namespace": "slow", "description": "v2 delta — new rule added in upgrade"}
+  ]
+}

@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "notesfe",
+      "version": 1,
+      "function": "read",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read a note by id",
+      "rbac_rule": "notesfe.read"
+    }
+  ],
+  "requires": []
+}

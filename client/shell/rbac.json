@@ -1,0 +1,24 @@
+{
+  "rules": [
+    {
+      "rule":        "shell.preferences.read",
+      "namespace":   "shell",
+      "description": "Read this user's shell preferences (own scope only)."
+    },
+    {
+      "rule":        "shell.preferences.write",
+      "namespace":   "shell",
+      "description": "Write this user's shell preferences (own scope only)."
+    },
+    {
+      "rule":        "shell.audit.emit",
+      "namespace":   "shell",
+      "description": "Permits `shell.audit.emit` capability dispatch — the single-purpose path the top-level Preact boundary uses to emit `ext.shell.frontend.boundary.caught` audits."
+    }
+  ],
+  "default_grants": [
+    {"group": "everyone", "rule": "shell.preferences.read"},
+    {"group": "everyone", "rule": "shell.preferences.write"},
+    {"group": "everyone", "rule": "shell.audit.emit"}
+  ]
+}

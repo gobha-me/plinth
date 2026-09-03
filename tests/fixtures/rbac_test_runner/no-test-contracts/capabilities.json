@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "notests",
+      "version": 1,
+      "function": "read",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read",
+      "rbac_rule": "notests.read"
+    }
+  ],
+  "requires": []
+}

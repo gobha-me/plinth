@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "rule": "allowside.edit",
+      "namespace": "allowside",
+      "description": "Access to allowside:edit",
+      "test": {
+        "assert_deny":  {"call": "allowside:1:edit", "expect": "permission_denied"},
+        "assert_allow": {"call": "allowside:1:edit", "expect": "success"}
+      }
+    }
+  ]
+}

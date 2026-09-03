@@ -1,0 +1,124 @@
+/*
+ * shell.zip/client/css/tokens.css
+ * Plinth bundled-shell design tokens — ICD-0.6.2 §3.
+ *
+ * Theme switch: set [data-theme="light"] on <html> for the light
+ * palette; bare :root is the dark default. The pre-paint resolver
+ * in client/index.html sets [data-theme] before first paint.
+ *
+ * Scale: documentElement.style.fontSize controls rem; 13.5 px at
+ * 100%; range 80%–175% per ICD-0.6.2 §5.
+ */
+
+:root {
+  /* Surface scale (§3.1) */
+  --bg-0: #0b0f14;
+  --bg-1: #11161d;
+  --bg-2: #171d26;
+  --bg-3: #1f2630;
+  --bg-4: #262e3a;
+
+  /* Text scale (§3.2) */
+  --text-0: #e7edf4;
+  --text-1: #c4cbd4;
+  --text-2: #8a94a0;
+  --text-3: #5f6874;
+
+  /* Border scale (§3.3) */
+  --border:        #252c36;
+  --border-soft:   #1a2029;
+  --border-strong: #323a45;
+
+  /* Accent (§3.4) */
+  --accent:        #5aa9ff;
+  --accent-soft:   rgba(90, 169, 255, 0.14);
+  --accent-softer: rgba(90, 169, 255, 0.08);
+
+  /* Semantic tones (§3.5) */
+  --success:      #3bb77e;
+  --success-soft: rgba(59, 183, 126, 0.14);
+  --warn:         #d6a640;
+  --warn-soft:    rgba(214, 166, 64, 0.14);
+  --danger:       #e26565;
+  --danger-soft:  rgba(226, 101, 101, 0.14);
+
+  /* Geometry (§3.6) */
+  --r:    5px;
+  --r-md: 7px;
+  --r-lg: 10px;
+
+  /* Focus ring (§3.7) */
+  --focus-ring: #5aa9ff;
+}
+
+:root[data-theme="light"] {
+  --bg-0: #f7f7f4;
+  --bg-1: #fcfcfa;
+  --bg-2: #f1f1ed;
+  --bg-3: #e8e8e3;
+  --bg-4: #dedcd5;
+
+  --text-0: #16181c;
+  --text-1: #353841;
+  --text-2: #6a6e78;
+  --text-3: #93969f;
+
+  --border:        #dcdad2;
+  --border-soft:   #e9e7df;
+  --border-strong: #c8c5bc;
+
+  --accent:        #1f6feb;
+  --accent-soft:   rgba(31, 111, 235, 0.10);
+  --accent-softer: rgba(31, 111, 235, 0.05);
+
+  --success:      #1f7a4e;
+  --success-soft: rgba(31, 122, 78, 0.10);
+  --warn:         #9a6a07;
+  --warn-soft:    rgba(154, 106, 7, 0.10);
+  --danger:       #b43b3b;
+  --danger-soft:  rgba(180, 59, 59, 0.10);
+
+  --focus-ring: #1f6feb;
+  /* Geometry tokens are theme-invariant; not redeclared here. */
+}
+
+/* Self-hosted typography per ICD-0.6.0 §6.3 + ICD-0.6.2 §3.8. The
+   shell vendors Inter and JetBrains Mono under client/vendor/ in
+   the bundle; absolute URLs work because the shell extension
+   serves them at /ext/shell/0.6.2/vendor/<file>. The relative
+   `url('../vendor/<file>')` resolves against the tokens.css URL
+   at /ext/shell/0.6.2/css/tokens.css. */
+@font-face {
+  font-family: 'Inter';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('../vendor/inter-variable.woff2') format('woff2-variations');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 400 600;
+  font-display: swap;
+  src: url('../vendor/jetbrains-mono-variable.woff2') format('woff2-variations');
+}
+
+/* Base typography per ICD-0.6.0 §6.3 + ICD-0.6.2 §3.8. */
+:root { font-size: 13.5px; }
+html, body {
+  margin: 0; padding: 0; height: 100%;
+  background: var(--bg-0);
+  color: var(--text-1);
+  font-family: 'Inter', system-ui, sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular,
+               Menlo, Consolas, monospace;
+  font-feature-settings: 'zero' 1, 'ss01' 1;
+}
+* { box-sizing: border-box; }
+:focus-visible { outline: 1px solid var(--focus-ring); }

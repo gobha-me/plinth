@@ -1,0 +1,18 @@
+{
+  "rules": [
+    {
+      "rule": "brokenallow.edit",
+      "namespace": "brokenallow",
+      "description": "Access to brokenallow:edit — MISMATCH: cap actually requires brokenallow.other_rule",
+      "test": {
+        "assert_deny":  {"call": "brokenallow:1:edit", "expect": "permission_denied"},
+        "assert_allow": {"call": "brokenallow:1:edit", "expect": "success"}
+      }
+    },
+    {
+      "rule": "brokenallow.other_rule",
+      "namespace": "brokenallow",
+      "description": "The rule the capability actually requires"
+    }
+  ]
+}

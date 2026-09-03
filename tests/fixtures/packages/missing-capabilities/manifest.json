@@ -1,0 +1,8 @@
+{
+  "name": "missing-capabilities",
+  "version": "0.1.0",
+  "description": "Fixture lacking capabilities.json",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

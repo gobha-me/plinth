@@ -1,0 +1,25 @@
+{
+  "provides": [
+    {
+      "namespace": "notes",
+      "version": 1,
+      "function": "read",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read a note by id",
+      "rbac_rule": "notes.read"
+    },
+    {
+      "namespace": "notes",
+      "version": 1,
+      "function": "comment",
+      "params": [{"name": "id", "type": "string"}, {"name": "body", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Append a comment to a note (NEW in v1.3.0)",
+      "rbac_rule": "notes.comment"
+    }
+  ],
+  "requires": []
+}

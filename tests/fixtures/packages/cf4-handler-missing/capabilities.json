@@ -1,0 +1,12 @@
+{
+  "provides": [
+    {
+      "namespace": "notes",
+      "version": 1,
+      "function": "edit",
+      "returns": "object",
+      "scope": "instance",
+      "description": "Edit a note"
+    }
+  ]
+}

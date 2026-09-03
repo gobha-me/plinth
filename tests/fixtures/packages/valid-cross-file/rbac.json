@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "namespace": "notes",
+      "description": "Note CRUD access",
+      "test": {"call": "notes:1:read"}
+    }
+  ]
+}

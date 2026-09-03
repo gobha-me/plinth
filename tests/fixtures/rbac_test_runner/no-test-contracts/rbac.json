@@ -1,0 +1,7 @@
+{
+  "rules": [
+    {"rule": "notests.read",   "namespace": "notests", "description": "No test"},
+    {"rule": "notests.edit",   "namespace": "notests", "description": "No test"},
+    {"rule": "notests.delete", "namespace": "notests", "description": "No test"}
+  ]
+}

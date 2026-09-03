@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"namespace": "other", "description": "Orphan rule"}
+  ]
+}

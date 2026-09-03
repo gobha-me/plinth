@@ -1,0 +1,13 @@
+{
+  "provides": [
+    {
+      "namespace": "legitemoji",
+      "version": 1,
+      "function": "shell",
+      "returns": "string",
+      "scope": "instance",
+      "description": "Smoke test for legitimate Unicode usage",
+      "rbac_rule": "legitemoji.shell"
+    }
+  ]
+}

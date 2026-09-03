@@ -1,0 +1,10 @@
+{
+  "panels": [
+    {
+      "id":          "demo",
+      "title":       "SDK Demo",
+      "icon":        "edit-3",
+      "client_path": "demo.js"
+    }
+  ]
+}

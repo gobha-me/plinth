@@ -1,0 +1,12 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "CF5 frontend.mount starts with /api/",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "frontend": {
+    "mount": "/api/custom",
+    "entry": "index.html"
+  }
+}

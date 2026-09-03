@@ -1,0 +1,8 @@
+{
+  "name": "handler-missing",
+  "version": "0.1.0",
+  "description": "Capability without server/handlers/*.js",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Boundary render smoke — E.01–E.02 (manual)</title>
+    <style>
+      body { font: 14px/1.5 -apple-system, system-ui, sans-serif;
+             max-width: 760px; margin: 24px auto; padding: 0 16px; }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; margin-top: 24px; }
+      code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+      ol > li { margin: 6px 0; }
+      .case { border-left: 3px solid #ff9b3a; padding: 8px 12px;
+              margin: 12px 0; background: #fffaf0; }
+      .expected { color: #1a7f37; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>Shell error boundary — manual smoke (ICD-0.6.0 §13 E.01–E.02)</h1>
+    <p>The shell exposes a <code>?force-throw=1</code> URL parameter
+       that swaps the rendered route for a deliberate-throw component.
+       The top-level Preact error boundary catches the throw and
+       renders the fallback. <code>console.error</code> emits the
+       structured <code>[shell] boundary caught</code> log.</p>
+
+    <h2>Setup</h2>
+    <ol>
+      <li>Start the kernel: <code>./build/plinth serve --config dev.toml</code>.</li>
+      <li>Open Chromium DevTools (Console panel visible).</li>
+    </ol>
+
+    <h2>Cases</h2>
+
+    <div class="case">
+      <strong>E.01</strong> Boundary catches synchronous render exception
+      and renders fallback + logs to console.
+      <ol>
+        <li>Navigate to <code>http://localhost:8080/app/?force-throw=1</code>.
+            (You can submit a login form first if you want to test the
+             authenticated route; the seam fires regardless of route.)</li>
+        <li>Observe DOM: <code>.boundary-fallback</code> renders with
+            <code>"Something went wrong."</code> text and a
+            <code>Reload</code> button.</li>
+        <li>Observe Console: a single
+            <code>[shell] boundary caught</code> entry with a
+            structured payload <code>{ error, info, route }</code>.</li>
+        <li class="expected">Expected: fallback DOM visible; console
+            entry present; <code>route</code> field is the string
+            <code>"force-throw"</code>.</li>
+      </ol>
+    </div>
+
+    <div class="case">
+      <strong>E.02</strong> Reload button triggers a full page reload.
+      <ol>
+        <li>From the E.01 fallback view, hold the Network panel open
+            and check "Preserve log".</li>
+        <li>Click the <code>Reload</code> button.</li>
+        <li>Observe Network: a fresh <code>GET /app/</code> document
+            request fires (the page navigates from scratch — not an SPA
+            re-render).</li>
+        <li class="expected">Expected: new document request lands;
+            <code>?force-throw=1</code> may persist if the URL hadn't
+            changed (the reload is unconditional, not URL-cleaning —
+            user's browser history dictates the post-reload URL). To
+            recover the live shell, drop the query param and refresh.</li>
+      </ol>
+    </div>
+
+    <h2>Ship gate</h2>
+    <p>Both cases must hold for 0.6.0 release. Headless coverage lands
+       in the 0.6.0.N browser-test harness per OQ2 deferral.</p>
+  </body>
+</html>

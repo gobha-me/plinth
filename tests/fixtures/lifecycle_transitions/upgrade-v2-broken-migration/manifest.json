@@ -1,0 +1,8 @@
+{
+  "name": "notes",
+  "version": "1.4.0",
+  "description": "Upgrade fixture v1.4.0 — X.06 broken-migration variant; bumps notes from 1.2.3 to 1.4.0 with a deliberately-broken 002_*.sql to trigger MIGRATING-stage failure on upgrade",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

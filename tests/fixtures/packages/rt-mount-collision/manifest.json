@@ -1,0 +1,12 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "RT2 frontend.mount collision fixture (gated)",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "frontend": {
+    "mount": "/custom",
+    "entry": "index.html"
+  }
+}

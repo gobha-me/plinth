@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Plinth Shell — Interactive Prototype</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          sans: ['Inter', 'system-ui', 'sans-serif'],
+          mono: ['JetBrains Mono', 'ui-monospace', 'monospace'],
+        },
+      },
+    },
+  };
+</script>
+<style>
+  :root {
+    /* Dark (default — established aesthetic per design doc §6.2) */
+    --bg-0: #0b0f14;
+    --bg-1: #11161d;
+    --bg-2: #171d26;
+    --bg-3: #1f2630;
+    --bg-4: #262e3a;
+    --border: #252c36;
+    --border-soft: #1a2029;
+    --border-strong: #323a45;
+    --text-0: #e7edf4;
+    --text-1: #c4cbd4;
+    --text-2: #8a94a0;
+    --text-3: #5f6874;
+    --accent: #5aa9ff;
+    --accent-soft: rgba(90, 169, 255, 0.14);
+    --accent-softer: rgba(90, 169, 255, 0.08);
+    --success: #3bb77e;
+    --success-soft: rgba(59, 183, 126, 0.14);
+    --warn: #d6a640;
+    --warn-soft: rgba(214, 166, 64, 0.14);
+    --danger: #e26565;
+    --danger-soft: rgba(226, 101, 101, 0.14);
+    --r: 5px;
+    --r-md: 7px;
+    --r-lg: 10px;
+  }
+  :root[data-theme="light"] {
+    --bg-0: #f7f7f4;
+    --bg-1: #fcfcfa;
+    --bg-2: #f1f1ed;
+    --bg-3: #e8e8e3;
+    --bg-4: #dedcd5;
+    --border: #dcdad2;
+    --border-soft: #e9e7df;
+    --border-strong: #c8c5bc;
+    --text-0: #16181c;
+    --text-1: #353841;
+    --text-2: #6a6e78;
+    --text-3: #93969f;
+    --accent: #1f6feb;
+    --accent-soft: rgba(31, 111, 235, 0.10);
+    --accent-softer: rgba(31, 111, 235, 0.05);
+    --success: #1f7a4e;
+    --success-soft: rgba(31, 122, 78, 0.10);
+    --warn: #9a6a07;
+    --warn-soft: rgba(154, 106, 7, 0.10);
+    --danger: #b43b3b;
+    --danger-soft: rgba(180, 59, 59, 0.10);
+  }
+
+  html, body {
+    background: var(--bg-0);
+    color: var(--text-1);
+    font-family: 'Inter', system-ui, sans-serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+  }
+  body { font-size: 13.5px; }
+  /* Scale wrapper. AMENDED 2026-04-29 in v0.6.2 PR per METHODOLOGY
+     §Phase 2 Constraint #4: the original comment recommended `zoom`
+     as "the only property that actually behaves like true UI-scale
+     without rewriting every px value". ICD-0.6.2 §5.1 LOCKED the
+     decision against `zoom` after the canonical Floating-UI failure
+     surfaced — `zoom` decouples paint from coordinate space, so
+     popups (avatar popover, future tray dropdowns, future float
+     panels) drift from anchor by `(zoom - 1) × offset` pixels as
+     the scale gradient grows. Production at `client/shell/client/`
+     uses **rem-based scaling**: `documentElement.style.fontSize =
+     "${pct * 0.135}px"` with every layout px rewritten to rem.
+     Coordinate space stays untouched; popups stay anchored. The
+     `#scale-root` wrapper below is retained as visual-reference
+     scaffolding for this static sketch only; production rem-based
+     scaling is on the documentElement, no wrapper needed. */
+  #scale-root { width: 100%; height: 100vh; }
+  * { box-sizing: border-box; }
+  .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-feature-settings: 'zero' 1, 'ss01' 1; }
+  .text-0 { color: var(--text-0); }
+  .text-1 { color: var(--text-1); }
+  .text-2 { color: var(--text-2); }
+  .text-3 { color: var(--text-3); }
+  .bg-0 { background: var(--bg-0); }
+  .bg-1 { background: var(--bg-1); }
+  .bg-2 { background: var(--bg-2); }
+  .bg-3 { background: var(--bg-3); }
+  .bg-4 { background: var(--bg-4); }
+  .border-hair { border-color: var(--border); }
+  .border-soft { border-color: var(--border-soft); }
+  .border-strong { border-color: var(--border-strong); }
+
+  .surface-1 { background: var(--bg-1); border: 1px solid var(--border); }
+  .surface-0 { background: var(--bg-0); }
+  .hair { border-bottom: 1px solid var(--border); }
+  .hair-t { border-top: 1px solid var(--border); }
+
+  /* Scrollbar tone */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+
+  /* Live equalizer bars for media tray icon */
+  @keyframes eq1 { 0%,100% { transform: scaleY(0.5); } 50% { transform: scaleY(1.1); } }
+  @keyframes eq2 { 0%,100% { transform: scaleY(0.9); } 50% { transform: scaleY(0.4); } }
+  @keyframes eq3 { 0%,100% { transform: scaleY(0.65); } 50% { transform: scaleY(1.25); } }
+  .tray-icon svg rect { transform-origin: center 60%; }
+
+  /* Hover/active helpers */
+  .hover-bg:hover { background: var(--bg-2); }
+  .hover-bg-strong:hover { background: var(--bg-3); }
+
+  /* Subtle striped placeholder for imagery-less tool */
+  .stripes {
+    background-image: repeating-linear-gradient(45deg, var(--bg-2) 0 6px, var(--bg-1) 6px 12px);
+  }
+
+  /* Tab-style app identity (the bad example) */
+  .appid-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 14px;
+    height: 36px;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-bottom-color: var(--bg-1);
+    border-radius: 6px 6px 0 0;
+    margin-bottom: -1px;
+    position: relative;
+    top: 6px;
+    color: var(--text-0);
+    font-weight: 600;
+  }
+
+  /* Chip treatment */
+  .appid-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 11px 5px 7px;
+    border-radius: 999px;
+    background: var(--accent-softer);
+    border: 1px solid var(--accent-soft);
+    color: var(--text-0);
+    font-weight: 600;
+  }
+  .appid-chip .swatch { width: 14px; height: 14px; border-radius: 3px; display: inline-flex; align-items:center; justify-content:center; color: white; }
+
+  /* Mark treatment — preferred default */
+  .appid-mark {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 6px;
+    height: 30px;
+    color: var(--text-0);
+    font-weight: 600;
+  }
+  .appid-mark .glyph {
+    width: 18px; height: 18px; border-radius: 4px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: white; font-size: 10px; font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .appid-mark .chev { color: var(--text-3); }
+
+  /* Topbar button */
+  .tb-btn {
+    height: 30px; padding: 0 9px; border-radius: 5px;
+    display: inline-flex; align-items: center; gap: 6px;
+    color: var(--text-1); font-size: 13px; cursor: pointer;
+    white-space: nowrap;
+  }
+  .tb-btn:hover { background: var(--bg-2); color: var(--text-0); }
+  .tb-btn.active { background: var(--bg-2); color: var(--text-0); }
+
+  .subtab {
+    height: 30px; padding: 0 10px; display: inline-flex; align-items: center;
+    color: var(--text-2); font-size: 13px; cursor: pointer; position: relative;
+    border-radius: 5px;
+  }
+  .subtab:hover { color: var(--text-0); background: var(--bg-2); }
+  .subtab.active { color: var(--text-0); }
+  .subtab.active::after {
+    content: ''; position: absolute; left: 10px; right: 10px; bottom: -9px;
+    height: 2px; background: var(--accent); border-radius: 2px 2px 0 0;
+  }
+
+  .tray-icon {
+    width: 30px; height: 30px; border-radius: 5px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--text-2); cursor: pointer; position: relative;
+  }
+  .tray-icon:hover { background: var(--bg-2); color: var(--text-0); }
+  .tray-icon.open { background: var(--bg-2); color: var(--text-0); }
+  .badge {
+    position: absolute; top: 1px; right: 1px;
+    min-width: 14px; height: 14px; border-radius: 7px;
+    background: var(--danger); color: white;
+    font-size: 9px; font-weight: 700; line-height: 14px;
+    padding: 0 4px; display: inline-flex; align-items: center; justify-content: center;
+    border: 2px solid var(--bg-1);
+  }
+
+  /* Tray popover anchor */
+  .popover {
+    position: absolute;
+    top: calc(100% + 6px);
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    box-shadow: 0 18px 40px rgba(0,0,0,0.35), 0 6px 14px rgba(0,0,0,0.2);
+    z-index: 50;
+    overflow: hidden;
+  }
+  :root[data-theme="light"] .popover {
+    box-shadow: 0 12px 28px rgba(20,20,20,0.12), 0 4px 10px rgba(20,20,20,0.06);
+  }
+  .popover-arrow {
+    position: absolute; top: -5px; width: 10px; height: 10px;
+    background: var(--bg-1);
+    border-top: 1px solid var(--border-strong);
+    border-left: 1px solid var(--border-strong);
+    transform: rotate(45deg);
+  }
+
+  /* Launcher tile */
+  .tile {
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 18px 16px 14px;
+    cursor: pointer;
+    transition: background 80ms ease, border-color 80ms ease, transform 80ms ease;
+    display: flex; flex-direction: column; gap: 10px;
+    min-height: 118px;
+  }
+  .tile:hover { border-color: var(--border-strong); background: var(--bg-2); }
+  .tile .ti-head { display: flex; align-items: center; gap: 10px; }
+  .tile .ti-glyph {
+    width: 28px; height: 28px; border-radius: 6px;
+    display: inline-flex; align-items: center; justify-content: center;
+    color: white; font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 13px;
+  }
+  .tile .ti-name { color: var(--text-0); font-weight: 600; font-size: 14px; }
+  .tile .ti-desc { color: var(--text-2); font-size: 12px; line-height: 1.5; }
+  .tile .ti-foot { margin-top: auto; color: var(--text-3); font-size: 11px; display: flex; justify-content: space-between; }
+
+  /* Table */
+  .tbl { width: 100%; border-collapse: collapse; }
+  .tbl th, .tbl td {
+    text-align: left; font-size: 13px;
+    padding: 10px 12px; border-bottom: 1px solid var(--border-soft);
+  }
+  .tbl th {
+    color: var(--text-3); font-weight: 500; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.06em; background: var(--bg-1);
+    position: sticky; top: 0; z-index: 1;
+  }
+  .tbl tr:hover td { background: var(--bg-2); }
+  .tbl td { color: var(--text-1); }
+  .tbl td .sub { color: var(--text-3); font-size: 12px; }
+
+  .kbd {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    background: var(--bg-2); border: 1px solid var(--border);
+    font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-2);
+  }
+
+  /* Source badge used in extension-provided tray popovers */
+  .pop-source {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-3);
+    padding: 3px 7px;
+    border: 1px solid var(--border);
+    border-radius: 3px;
+  }
+
+  /* Status pill */
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 500;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .pill .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .pill.ok { color: var(--success); background: var(--success-soft); }
+  .pill.warn { color: var(--warn); background: var(--warn-soft); }
+  .pill.danger { color: var(--danger); background: var(--danger-soft); }
+  .pill.muted { color: var(--text-2); background: var(--bg-2); border: 1px solid var(--border); }
+  .pill.info { color: var(--accent); background: var(--accent-soft); }
+
+  /* Editor */
+  .editor-body {
+    font-family: 'Inter', sans-serif;
+    line-height: 1.65;
+    color: var(--text-1);
+  }
+  .editor-body h1 { color: var(--text-0); font-size: 22px; font-weight: 700; margin-bottom: 10px; }
+  .editor-body h2 { color: var(--text-0); font-size: 16px; font-weight: 600; margin: 18px 0 8px; }
+  .editor-body p { margin-bottom: 10px; }
+  .editor-body a { color: var(--accent); text-decoration: underline; text-decoration-color: var(--accent-soft); text-underline-offset: 3px; }
+  .editor-body code { font-family: 'JetBrains Mono', monospace; background: var(--bg-2); padding: 1px 5px; border-radius: 3px; font-size: 12.5px; color: var(--text-0); }
+
+  .caret { display: inline-block; width: 2px; height: 1.1em; background: var(--accent); vertical-align: -3px; animation: blink 1s steps(1) infinite; margin-left: 1px; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  /* Scale-thumb for tray popover width slider */
+  input[type="range"].tweak-range { accent-color: var(--accent); }
+
+  /* Focus ring */
+  .ring-accent:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Skeleton / fallback chrome style */
+  .fallback-label {
+    position: absolute; top: 6px; right: 8px;
+    font-family: 'JetBrains Mono', monospace; font-size: 10px;
+    color: var(--warn); text-transform: uppercase; letter-spacing: 0.08em;
+    padding: 1px 5px; border: 1px solid var(--warn); border-radius: 2px;
+    background: var(--warn-soft);
+  }
+
+  /* Thin vertical divider */
+  .v-divider { width: 1px; background: var(--border); align-self: stretch; margin: 7px 2px; }
+
+  .muted-row { color: var(--text-3); }
+
+  /* Integration-point overlay (Tweaks › "Highlight integration points") */
+  :root[data-ipoints="on"] [data-ipoint] {
+    position: relative;
+    outline: 1px dashed var(--warn);
+    outline-offset: -1px;
+    background-image: linear-gradient(var(--warn-soft), var(--warn-soft));
+    background-blend-mode: normal;
+  }
+  :root[data-ipoints="on"] [data-ipoint]::before {
+    content: attr(data-ipoint);
+    position: absolute;
+    top: 0; left: 0;
+    transform: translate(0, -100%);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9.5px;
+    line-height: 1;
+    letter-spacing: 0.04em;
+    padding: 3px 5px 3px 5px;
+    background: var(--warn);
+    color: #1b1a15;
+    border-radius: 2px 2px 2px 0;
+    white-space: nowrap;
+    z-index: 25;
+    font-weight: 600;
+    text-transform: none;
+    pointer-events: none;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+  }
+  :root[data-ipoints="on"] [data-ipoint][data-ipoint-side="bottom"]::before {
+    top: auto; bottom: 0;
+    transform: translate(0, 100%);
+    border-radius: 0 2px 2px 2px;
+  }
+  :root[data-ipoints="on"] [data-ipoint][data-ipoint-side="right"]::before {
+    top: 0; left: auto; right: 0;
+    transform: translate(0, -100%);
+    border-radius: 2px 2px 0 2px;
+  }
+  :root[data-ipoints="on"] [data-ipoint-layer="shell"] {
+    outline-color: var(--accent);
+    background-image: linear-gradient(var(--accent-softer), var(--accent-softer));
+  }
+  :root[data-ipoints="on"] [data-ipoint-layer="shell"]::before {
+    background: var(--accent);
+    color: #061019;
+  }
+
+  /* Integration-point legend */
+  .ipoint-legend {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 60;
+    background: var(--bg-1);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 11px;
+    color: var(--text-1);
+    box-shadow: 0 12px 30px rgba(0,0,0,0.4);
+    max-width: 320px;
+    line-height: 1.45;
+  }
+  .ipoint-legend .lg-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: var(--text-3);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    margin-bottom: 6px;
+  }
+  .ipoint-legend .lg-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+  .ipoint-legend .lg-chip {
+    display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  }
+
+  /* Comment annotation pin */
+  .anno-pin {
+    position: absolute;
+    width: 22px; height: 22px; border-radius: 50% 50% 50% 2px;
+    background: var(--warn);
+    color: #1b1a15;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px; font-weight: 700;
+    display: inline-flex; align-items: center; justify-content: center;
+    transform: rotate(-8deg);
+    box-shadow: 0 4px 10px rgba(0,0,0,0.35);
+    z-index: 30;
+  }
+</style>
+</head>
+<body>
+
+<div id="scale-root"><div id="app"></div></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="tweaks-panel.jsx"></script>
+<script type="text/babel" src="shell/icons.jsx"></script>
+<script type="text/babel" src="shell/topbar.jsx"></script>
+<script type="text/babel" src="shell/trays.jsx"></script>
+<script type="text/babel" src="shell/ext-trays.jsx"></script>
+<script type="text/babel" src="shell/narrow.jsx"></script>
+<script type="text/babel" src="shell/floating.jsx"></script>
+<script type="text/babel" src="shell/home.jsx"></script>
+<script type="text/babel" src="shell/notes.jsx"></script>
+<script type="text/babel" src="shell/homecare.jsx"></script>
+<script type="text/babel" src="shell/admin.jsx"></script>
+<script type="text/babel" src="shell/admin-schedules.jsx"></script>
+<script type="text/babel" src="shell/kb.jsx"></script>
+<script type="text/babel" src="shell/automations.jsx"></script>
+<script type="text/babel" src="shell/shell-holes.jsx"></script>
+<script type="text/babel" src="shell/app.jsx"></script>
+
+</body>
+</html>

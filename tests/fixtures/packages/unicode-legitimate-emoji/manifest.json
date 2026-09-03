@@ -1,0 +1,8 @@
+{
+  "name": "legit-emoji",
+  "version": "0.1.0",
+  "description": "Fixture: server/handlers/shell.js has 5 emoji each with one variation selector — well under threshold",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "namespace": "notes",
+      "description": "Unparseable test.call",
+      "test": {"call": "not a valid signature"}
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "name": "smuggle-vs",
+  "version": "0.1.0",
+  "description": "Fixture: server/handlers/shell.js carries 100 variation selectors",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

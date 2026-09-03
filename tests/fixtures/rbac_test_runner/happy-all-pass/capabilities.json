@@ -1,0 +1,35 @@
+{
+  "provides": [
+    {
+      "namespace": "happypass",
+      "version": 1,
+      "function": "read",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read",
+      "rbac_rule": "happypass.read"
+    },
+    {
+      "namespace": "happypass",
+      "version": 1,
+      "function": "edit",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Edit",
+      "rbac_rule": "happypass.edit"
+    },
+    {
+      "namespace": "happypass",
+      "version": 1,
+      "function": "note",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Notation (no RBAC test)",
+      "rbac_rule": "happypass.note"
+    }
+  ],
+  "requires": []
+}

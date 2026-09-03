@@ -1,0 +1,8 @@
+{
+  "name": "notes",
+  "version": "1.2.3",
+  "description": "Valid install fixture — I.01 base + shared by I.04/I.13/I.14/I.18/I.19/I.20",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

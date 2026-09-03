@@ -1,0 +1,13 @@
+{
+  "provides": [
+    {
+      "namespace": "smugglevs",
+      "version": 1,
+      "function": "shell",
+      "returns": "string",
+      "scope": "instance",
+      "description": "Smuggle test handler",
+      "rbac_rule": "smugglevs.shell"
+    }
+  ]
+}

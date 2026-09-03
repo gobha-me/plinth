@@ -1,0 +1,36 @@
+{
+  "rules": [
+    {
+      "rule": "mixedrules.ok",
+      "namespace": "mixedrules",
+      "description": "Clean rule — PASS on install",
+      "test": {
+        "assert_deny":  {"call": "mixedrules:1:ok", "expect": "permission_denied"},
+        "assert_allow": {"call": "mixedrules:1:ok", "expect": "success"}
+      }
+    },
+    {
+      "rule": "mixedrules.leaky",
+      "namespace": "mixedrules",
+      "description": "Passes at install; Slice C grants everyone → assert_deny FAILS",
+      "test": {
+        "assert_deny":  {"call": "mixedrules:1:leaky", "expect": "permission_denied"},
+        "assert_allow": {"call": "mixedrules:1:leaky", "expect": "success"}
+      }
+    },
+    {
+      "rule": "mixedrules.locked",
+      "namespace": "mixedrules",
+      "description": "Rule mismatch — cap actually requires mixedrules.other; assert_allow FAILS",
+      "test": {
+        "assert_deny":  {"call": "mixedrules:1:locked", "expect": "permission_denied"},
+        "assert_allow": {"call": "mixedrules:1:locked", "expect": "success"}
+      }
+    },
+    {
+      "rule": "mixedrules.other",
+      "namespace": "mixedrules",
+      "description": "The rule the locked capability actually requires"
+    }
+  ]
+}

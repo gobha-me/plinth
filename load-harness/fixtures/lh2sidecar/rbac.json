@@ -1,0 +1,6 @@
+{
+  "rules": [
+    {"rule": "lh2sidecar.install", "namespace": "lh2sidecar", "description": "LH-2 sidecar: install pubsub.subscribe handler on a storm channel"},
+    {"rule": "lh2sidecar.read",    "namespace": "lh2sidecar", "description": "LH-2 sidecar: read accumulated observed-envelope counters at teardown"}
+  ]
+}

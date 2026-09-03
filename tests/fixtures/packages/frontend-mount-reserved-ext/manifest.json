@@ -1,0 +1,12 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "CF5 frontend.mount exactly /ext",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "frontend": {
+    "mount": "/metrics",
+    "entry": "index.html"
+  }
+}

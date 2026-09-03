@@ -1,0 +1,8 @@
+{
+  "name": "kernel",
+  "version": "1.0.0",
+  "description": "CF6 reserved name fixture",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

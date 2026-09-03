@@ -1,0 +1,8 @@
+{
+  "name": "lh0driver",
+  "version": "0.1.0",
+  "description": "Load harness LH-0 driver extension — exercises install lifecycle under sustained POST /api/packages load.",
+  "author": "plinth-load-harness",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

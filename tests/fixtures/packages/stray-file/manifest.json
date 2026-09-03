@@ -1,0 +1,8 @@
+{
+  "name": "stray-file",
+  "version": "0.1.0",
+  "description": "Fixture with a forbidden top-level .js",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

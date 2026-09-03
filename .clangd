@@ -1,0 +1,18 @@
+# clangd config for Plinth's C++23 code.
+# The build is the source of truth: `cmake -B build` exports compile_commands.json
+# carrying the real compiler, standard, warnings and include paths. Do not pin a
+# compiler here: the template respects $CXX, and consumers own their toolchain.
+# These flags are only a fallback for files absent from the database.
+CompileFlags:
+  Add: [-std=c++23, -I, src]
+Index:
+  StandardLibrary: Yes
+
+# clangd reads the repository's .clang-tidy directly. Keep editor-only behavior
+# here instead of maintaining a second, divergent check policy. The strict fast
+# filter preserves responsive Vim/Neovim feedback; tools/lint.sh runs the full
+# configured policy in CI.
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    FastCheckFilter: Strict

@@ -1,0 +1,13 @@
+{
+  "provides": [
+    {
+      "namespace": "minimal",
+      "version": 1,
+      "function": "greet",
+      "returns": "string",
+      "scope": "instance",
+      "description": "Say hello",
+      "rbac_rule": "minimal.greet"
+    }
+  ]
+}

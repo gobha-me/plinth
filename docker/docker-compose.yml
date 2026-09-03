@@ -1,0 +1,64 @@
+# Two ways to use this compose file:
+#
+# 1. Full-stack (default profile): builds + runs the plinth binary
+#    against an attached postgres. Equivalent to the pre-0.3.3
+#    behavior.
+#
+#       docker compose -f docker/docker-compose.yml up -d
+#
+# 2. PG-only (postgres service, default profile too — plinth depends
+#    on it). Spin up just the database for running PG-backed Catch2
+#    tests against the host build:
+#
+#       docker compose -f docker/docker-compose.yml up -d postgres
+#       PLINTH_PG_TESTS=ON ./build/plinth_tests
+#       docker compose -f docker/docker-compose.yml down
+#
+# pgvector image is pinned to 0.8.2 on PostgreSQL 18 (trixie base) per
+# project_rag_intent.md — Plinth treats pgvector as a kernel-bundled
+# capability for future RAG extensions. Bumped from pg16 in 0.3.3.
+
+services:
+  plinth:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      PLINTH_PG_HOST: postgres
+      PLINTH_PG_PORT: 5432
+      PLINTH_PG_USER: plinth
+      PLINTH_PG_PASSWORD: plinth
+      PLINTH_PG_DATABASE: plinth
+      # Loopback-only host publication above makes this suitable for the
+      # documented first-admin bootstrap. Disable it after registration.
+      PLINTH_REGISTRATION_ENABLED: "true"
+    volumes:
+      - plinth_data:/opt/plinth/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:0.8.2-pg18-trixie@sha256:b7337db8fe39d12fe8ecb0003c72680f24479813a744b43154eee6f2eab5a5f3
+    environment:
+      POSTGRES_USER: plinth
+      POSTGRES_PASSWORD: plinth
+      POSTGRES_DB: plinth
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # PG 18 mount convention: parent dir (`/var/lib/postgresql`) so
+      # the image can lay out major-version-specific subdirectories.
+      # See pgvector image startup notes / docker-library/postgres#37.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plinth"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  plinth_data:
+  pgdata:

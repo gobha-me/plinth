@@ -1,0 +1,9 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "CFW2 shareable non-empty fixture",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "shareable": ["public-surface"]
+}

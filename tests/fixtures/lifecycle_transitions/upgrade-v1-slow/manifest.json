@@ -1,0 +1,8 @@
+{
+  "name": "slow",
+  "version": "1.0.0",
+  "description": "Upgrade fixture v1 — controllable-delay slow handler + 3-rule RBAC base for ICD-0.4.5 X.07 (missing/changed) and X.08/X.09 (drain window)",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

@@ -1,0 +1,27 @@
+{
+  "provides": [
+    {
+      "namespace": "lh2sidecar",
+      "version": 1,
+      "function": "install_subscription",
+      "params": [
+        {"name": "channel", "type": "string"}
+      ],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Subscribe the sidecar to `channel`; route each envelope into a globalThis-backed observed counter + lag array. Returns {ok,channel}.",
+      "rbac_rule": "lh2sidecar.install"
+    },
+    {
+      "namespace": "lh2sidecar",
+      "version": 1,
+      "function": "read_counters",
+      "params": [],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Return the sidecar's accumulated observation state: {observed, lags, channel}. Called by the harness at teardown.",
+      "rbac_rule": "lh2sidecar.read"
+    }
+  ],
+  "requires": []
+}

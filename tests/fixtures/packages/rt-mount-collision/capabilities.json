@@ -1,0 +1,12 @@
+{
+  "provides": [
+    {
+      "namespace": "notes",
+      "version": 1,
+      "function": "read",
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read"
+    }
+  ]
+}

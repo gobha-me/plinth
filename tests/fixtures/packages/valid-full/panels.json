@@ -1,0 +1,5 @@
+{
+  "panels": [
+    {"id": "main", "client_path": "main.js"}
+  ]
+}

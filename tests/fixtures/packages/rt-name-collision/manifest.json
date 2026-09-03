@@ -1,0 +1,8 @@
+{
+  "name": "existing-pkg",
+  "version": "1.0.0",
+  "description": "RT1 name collision fixture (gated on PLINTH_KERNEL_TESTS)",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

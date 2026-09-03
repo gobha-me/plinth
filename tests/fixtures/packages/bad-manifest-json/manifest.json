@@ -1,0 +1,8 @@
+{
+  "name": "bad",
+  "version": "0.1.0",
+  "description": "d",
+  "author": "a",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+}

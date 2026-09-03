@@ -1,0 +1,18 @@
+{
+  "provides": [
+    {
+      "namespace": "lh1storm",
+      "version": 1,
+      "function": "burst",
+      "params": [
+        {"name": "count", "type": "number"},
+        {"name": "bytes", "type": "number"}
+      ],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Fire `count` parallel pubsub.publish calls on plinth:ext:lh1storm:storm_event with per-notify payload `{seq, data, emit_started_at}`. Returns {emitted: count}. Rejects if bytes > 7800.",
+      "rbac_rule": "lh1storm.burst"
+    }
+  ],
+  "requires": []
+}

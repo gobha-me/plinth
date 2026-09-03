@@ -1,0 +1,5 @@
+{
+  "panels": [
+    {"id": "editor", "client_path": "editor.js"}
+  ]
+}

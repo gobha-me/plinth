@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Plinth Shell — Topbar Reference Sketch</title>
+<style>
+  :root {
+    --bg-0: #0d1117;
+    --bg-1: #161b22;
+    --bg-2: #21262d;
+    --bg-3: #30363d;
+    --border: #30363d;
+    --border-soft: #21262d;
+    --text-0: #e6edf3;
+    --text-1: #c9d1d9;
+    --text-2: #8b949e;
+    --text-3: #6e7681;
+    --accent: #58a6ff;
+    --accent-soft: rgba(88,166,255,0.15);
+    --success: #3fb950;
+    --warn: #d29922;
+    --danger: #f85149;
+    --r: 6px;
+    --r-lg: 10px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{background:#050709;color:var(--text-1);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;font-size:14px;line-height:1.5;padding:32px 24px;}
+  .stage{max-width:1280px;margin:0 auto;}
+  h1{color:var(--text-0);font-size:18px;font-weight:600;margin-bottom:4px;}
+  .subtitle{color:var(--text-3);font-size:13px;margin-bottom:40px;}
+  .label{color:var(--text-3);font-size:11px;text-transform:uppercase;letter-spacing:0.08em;font-weight:600;margin-bottom:10px;margin-top:48px;}
+  .label:first-of-type{margin-top:0;}
+  .caption{color:var(--text-3);font-size:12px;margin-top:10px;max-width:1100px;line-height:1.7;}
+  .caption strong{color:var(--text-2);}
+
+  /* ===== Topbar ===== */
+  .topbar{background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r);display:flex;align-items:stretch;height:48px;overflow:visible;position:relative;z-index:10;}
+  .zone{display:flex;align-items:center;gap:2px;padding:0 8px;}
+  .zone-fill{flex:1;min-width:0;padding:0 8px;gap:2px;}
+  .home-btn{width:36px;height:36px;border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--text-1);cursor:pointer;}
+  .home-btn:hover,.home-btn.active{background:var(--bg-2);}
+
+  /* App name */
+  .app-name{display:flex;align-items:center;gap:8px;padding:0 12px;height:36px;border-radius:var(--r);color:var(--text-0);cursor:pointer;font-size:14px;font-weight:600;white-space:nowrap;}
+  .app-name:hover{background:var(--bg-2);}
+  .app-name svg{flex-shrink:0;}
+  .app-name .chev{color:var(--text-3);margin-left:2px;}
+  .app-divider{width:1px;height:20px;background:var(--border-soft);margin:0 4px;flex-shrink:0;}
+
+  /* Sub-tabs */
+  .subtab{display:flex;align-items:center;padding:0 10px;height:32px;border-radius:var(--r);color:var(--text-2);cursor:pointer;font-size:13px;font-weight:500;white-space:nowrap;}
+  .subtab:hover{background:var(--bg-2);color:var(--text-1);}
+  .subtab.active{color:var(--text-0);border-bottom:2px solid var(--accent);border-radius:var(--r) var(--r) 0 0;}
+
+  /* ===== Tray ===== */
+  .tray{display:flex;align-items:center;gap:2px;padding:0 6px;flex-shrink:0;}
+  .tray-icon{width:34px;height:34px;border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--text-2);cursor:pointer;position:relative;}
+  .tray-icon:hover{background:var(--bg-2);color:var(--text-1);}
+  .tray-icon.open{background:var(--bg-2);color:var(--text-0);}
+  .tray-icon .badge{position:absolute;top:3px;right:3px;min-width:14px;height:14px;border-radius:7px;background:var(--danger);color:#fff;font-size:9px;font-weight:700;display:flex;align-items:center;justify-content:center;padding:0 3px;border:2px solid var(--bg-1);}
+  .tray-icon .dot{position:absolute;top:5px;right:5px;width:6px;height:6px;border-radius:50%;border:2px solid var(--bg-1);}
+  .tray-sep{width:1px;height:18px;background:var(--border);margin:0 3px;flex-shrink:0;}
+  .avatar-btn{display:flex;align-items:center;gap:6px;padding:0 8px;height:34px;border-radius:var(--r);cursor:pointer;color:var(--text-2);}
+  .avatar-btn:hover,.avatar-btn.open{background:var(--bg-2);color:var(--text-1);}
+  .avatar-circle{width:22px;height:22px;border-radius:50%;background:linear-gradient(135deg,#58a6ff,#bc8cff);display:flex;align-items:center;justify-content:center;color:#fff;font-size:10px;font-weight:700;flex-shrink:0;}
+
+  @keyframes eq1{0%,100%{height:4px}50%{height:11px}}
+  @keyframes eq2{0%,100%{height:7px}50%{height:3px}}
+  @keyframes eq3{0%,100%{height:5px}50%{height:13px}}
+
+  /* ===== Content area ===== */
+  .content{background:var(--bg-1);border:1px solid var(--border);border-top:none;border-radius:0 0 var(--r) var(--r);display:flex;flex-direction:column;align-items:center;justify-content:center;color:var(--text-3);font-size:12px;}
+
+  /* ===== Popover ===== */
+  .popover-wrap{position:relative;}
+  .popover{position:absolute;top:56px;right:0;width:300px;background:var(--bg-1);border:1px solid var(--border);border-radius:var(--r-lg);box-shadow:0 12px 32px rgba(0,0,0,0.5);overflow:hidden;z-index:20;}
+  .popover-wide{width:380px;}
+  .popover::before{content:'';position:absolute;top:-6px;right:16px;width:10px;height:10px;background:var(--bg-1);border-top:1px solid var(--border);border-left:1px solid var(--border);transform:rotate(45deg);}
+  .pop-identity{padding:16px;border-bottom:1px solid var(--border-soft);display:flex;gap:12px;align-items:center;}
+  .pop-avatar{width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#58a6ff,#bc8cff);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:700;flex-shrink:0;}
+  .pop-name{color:var(--text-0);font-size:14px;font-weight:600;}
+  .pop-user{color:var(--text-3);font-size:12px;}
+  .pop-section{padding:8px;}
+  .pop-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:var(--r);color:var(--text-1);font-size:13px;cursor:pointer;}
+  .pop-row:hover{background:var(--bg-2);}
+  .pop-row svg{color:var(--text-3);flex-shrink:0;}
+  .pop-row-label{flex:1;}
+  .pop-row-value{color:var(--text-3);font-size:12px;}
+  .pop-divider{height:1px;background:var(--border-soft);margin:0 8px;}
+  .pop-row.danger{color:var(--danger);}
+  .pop-row.danger svg{color:var(--danger);}
+
+  /* Theme toggle */
+  .theme-toggle{display:flex;background:var(--bg-0);border-radius:var(--r);padding:2px;gap:2px;}
+  .theme-opt{padding:4px 10px;border-radius:4px;font-size:11px;font-weight:500;color:var(--text-3);cursor:pointer;}
+  .theme-opt.active{background:var(--bg-2);color:var(--text-0);}
+
+  /* Scale slider */
+  .scale-row{display:flex;align-items:center;gap:8px;padding:8px 10px;}
+  .scale-label{color:var(--text-3);font-size:11px;font-weight:600;width:44px;flex-shrink:0;}
+  .scale-track{flex:1;height:4px;background:var(--bg-3);border-radius:2px;position:relative;}
+  .scale-fill{height:100%;width:50%;background:var(--accent);border-radius:2px;}
+  .scale-thumb{position:absolute;top:-5px;left:50%;width:14px;height:14px;border-radius:50%;background:var(--text-0);border:2px solid var(--accent);transform:translateX(-50%);}
+  .scale-val{color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums;width:36px;text-align:right;}
+
+  /* Music popover */
+  .track{display:flex;gap:12px;margin-bottom:14px;}
+  .track-art{width:56px;height:56px;border-radius:var(--r);background:linear-gradient(135deg,#2b3140,#3a4256,#4c5570);flex-shrink:0;display:flex;align-items:center;justify-content:center;color:var(--text-2);}
+  .track-info{flex:1;min-width:0;padding-top:2px;}
+  .track-title{color:var(--text-0);font-size:14px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:2px;}
+  .track-artist{color:var(--text-2);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .progress{height:3px;background:var(--bg-3);border-radius:2px;overflow:hidden;margin-bottom:8px;}
+  .progress-fill{height:100%;width:38%;background:var(--accent);}
+  .progress-time{display:flex;justify-content:space-between;color:var(--text-3);font-size:11px;font-variant-numeric:tabular-nums;margin-bottom:14px;}
+  .controls{display:flex;align-items:center;justify-content:center;gap:8px;}
+  .ctrl{width:36px;height:36px;border-radius:50%;background:transparent;border:none;color:var(--text-1);display:flex;align-items:center;justify-content:center;cursor:pointer;}
+  .ctrl:hover{background:var(--bg-2);}
+  .ctrl.primary{width:44px;height:44px;background:var(--accent);color:#0d1117;}
+  .ctrl.primary:hover{background:#79b8ff;}
+  .pop-header{padding:14px 16px 10px;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;justify-content:space-between;}
+  .pop-header h3{font-size:13px;color:var(--text-0);font-weight:600;}
+  .pop-source{font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--text-3);padding:3px 7px;border:1px solid var(--border);border-radius:3px;}
+  .pop-body{padding:14px 16px;}
+
+  /* ===== Home launcher ===== */
+  .launcher{background:var(--bg-1);border:1px solid var(--border);border-top:none;border-radius:0 0 var(--r) var(--r);padding:24px;}
+  .launcher-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:12px;}
+  .launcher-item{display:flex;flex-direction:column;align-items:center;gap:8px;padding:16px 8px;border-radius:var(--r);cursor:pointer;color:var(--text-2);font-size:12px;font-weight:500;}
+  .launcher-item:hover{background:var(--bg-2);color:var(--text-1);}
+  .launcher-icon{width:44px;height:44px;border-radius:var(--r-lg);display:flex;align-items:center;justify-content:center;}
+  .launcher-item.current{color:var(--accent);}
+  .launcher-item.current .launcher-icon{background:var(--accent-soft);color:var(--accent);}
+
+  /* ===== Narrow viewport ===== */
+  .narrow-frame{max-width:400px;border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;background:var(--bg-0);}
+  .narrow-topbar{background:var(--bg-1);display:flex;align-items:stretch;height:48px;}
+  .narrow-content{height:200px;display:flex;align-items:center;justify-content:center;color:var(--text-3);font-size:11px;padding:16px;text-align:center;}
+  .bottom-sheet{background:var(--bg-1);border-top:1px solid var(--border);padding:16px;border-radius:var(--r-lg) var(--r-lg) 0 0;}
+  .bottom-handle{width:32px;height:4px;background:var(--bg-3);border-radius:2px;margin:0 auto 16px;}
+</style>
+</head>
+<body>
+<div class="stage">
+
+<h1>Plinth Shell — Topbar Reference</h1>
+<div class="subtitle">Visual reference for code sessions. Structure and behavior defined in DESIGN-shell-v06x.md.</div>
+
+<!-- ===== STATE 1: App active with sub-tabs ===== -->
+<div class="label">Active app with sub-tabs — Knowledge Base (7 tabs, stress case)</div>
+
+<div class="topbar">
+  <div class="zone">
+    <div class="home-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+  </div>
+  <div class="zone zone-fill">
+    <div class="app-name">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg>
+      Knowledge Base
+      <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+    <div class="app-divider"></div>
+    <div class="subtab active">Search</div>
+    <div class="subtab">Chat</div>
+    <div class="subtab">Sources</div>
+    <div class="subtab">Sync Log</div>
+    <div class="subtab">Health</div>
+    <div class="subtab">Analytics</div>
+    <div class="subtab">Settings</div>
+  </div>
+  <div class="zone tray">
+    <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 12 6 12 8 8 11 16 13 10 16 14 18 12 21 12"/></svg><span class="dot" style="background:var(--success)"></span></div>
+    <div class="tray-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <g transform="translate(3,3)"><rect x="1" y="11" width="3" height="4" fill="currentColor" rx="0.5" style="animation:eq1 .8s ease-in-out infinite"/><rect x="6" y="7" width="3" height="8" fill="currentColor" rx="0.5" style="animation:eq2 .8s ease-in-out infinite .1s"/><rect x="11" y="9" width="3" height="6" fill="currentColor" rx="0.5" style="animation:eq3 .8s ease-in-out infinite .2s"/></g>
+      </svg>
+    </div>
+    <div class="tray-sep"></div>
+    <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="badge">3</span></div>
+    <div class="avatar-btn"><div class="avatar-circle">J</div><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+  </div>
+</div>
+<div class="content" style="height:120px;">
+  <span>extension content area — single row of chrome</span>
+  <span style="margin-top:4px;font-size:11px;">topbar is the active app's chrome; extension switching via Home or app-name dropdown</span>
+</div>
+
+<!-- ===== STATE 2: Simple app, no sub-tabs ===== -->
+<div class="label">Active app without sub-tabs — Terminal</div>
+
+<div class="topbar">
+  <div class="zone">
+    <div class="home-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+  </div>
+  <div class="zone zone-fill">
+    <div class="app-name">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      Terminal
+      <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+    </div>
+  </div>
+  <div class="zone tray">
+    <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 12 6 12 8 8 11 16 13 10 16 14 18 12 21 12"/></svg><span class="dot" style="background:var(--success)"></span></div>
+    <div class="tray-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <g transform="translate(3,3)"><rect x="1" y="11" width="3" height="4" fill="currentColor" rx="0.5" style="animation:eq1 .8s ease-in-out infinite"/><rect x="6" y="7" width="3" height="8" fill="currentColor" rx="0.5" style="animation:eq2 .8s ease-in-out infinite .1s"/><rect x="11" y="9" width="3" height="6" fill="currentColor" rx="0.5" style="animation:eq3 .8s ease-in-out infinite .2s"/></g>
+      </svg>
+    </div>
+    <div class="tray-sep"></div>
+    <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></div>
+    <div class="avatar-btn"><div class="avatar-circle">J</div><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+  </div>
+</div>
+<div class="content" style="height:80px;">
+  <span>clean topbar — app name fills the quiet; no visual noise when tabs aren't needed</span>
+</div>
+
+<!-- ===== STATE 3: Avatar popover ===== -->
+<div class="label">Avatar tray popover — user menu</div>
+
+<div class="popover-wrap">
+  <div class="topbar">
+    <div class="zone">
+      <div class="home-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+    </div>
+    <div class="zone zone-fill">
+      <div class="app-name">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        Notes
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+      <div class="app-divider"></div>
+      <div class="subtab active">Editor</div>
+      <div class="subtab">Preview</div>
+      <div class="subtab">Graph</div>
+    </div>
+    <div class="zone tray">
+      <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 12 6 12 8 8 11 16 13 10 16 14 18 12 21 12"/></svg><span class="dot" style="background:var(--success)"></span></div>
+      <div class="tray-sep"></div>
+      <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></div>
+      <div class="avatar-btn open"><div class="avatar-circle">J</div><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+    </div>
+  </div>
+
+  <!-- Avatar popover -->
+  <div class="popover" style="right:8px;">
+    <div class="pop-identity">
+      <div class="pop-avatar">J</div>
+      <div>
+        <div class="pop-name">the maintainer</div>
+        <div class="pop-user">@maintainer · admin</div>
+      </div>
+    </div>
+    <div class="pop-section">
+      <div class="pop-row">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2m-8-10H4m16 0h2m-2.93-7.07l-1.41 1.41M7.34 16.66l-1.41 1.41m0-12.73l1.41 1.41m9.32 9.32l1.41 1.41"/></svg>
+        <span class="pop-row-label">Theme</span>
+        <div class="theme-toggle">
+          <span class="theme-opt">Light</span>
+          <span class="theme-opt active">Dark</span>
+          <span class="theme-opt">Auto</span>
+        </div>
+      </div>
+    </div>
+    <div class="scale-row">
+      <span class="scale-label">Scale</span>
+      <div class="scale-track">
+        <div class="scale-fill"></div>
+        <div class="scale-thumb"></div>
+      </div>
+      <span class="scale-val">100%</span>
+    </div>
+    <div class="pop-divider"></div>
+    <div class="pop-section">
+      <div class="pop-row">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span class="pop-row-label">User Settings</span>
+      </div>
+    </div>
+    <div class="pop-divider"></div>
+    <div class="pop-section">
+      <div class="pop-row danger">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4m7 14l5-5-5-5m5 5H9"/></svg>
+        <span class="pop-row-label">Sign Out</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="caption" style="margin-top: 320px;">
+  <strong>Identity block</strong> — who you are, at a glance. <strong>Theme + scale</strong> — the two settings changed often enough to live outside full settings. <strong>User Settings</strong> — navigates to the shell's settings panel for everything else. <strong>Sign Out</strong> — always last, separated, colored as a destructive action. Five items total; if a sixth is proposed, push it into User Settings instead.
+</div>
+
+<!-- ===== STATE 4: Music tray popover ===== -->
+<div class="label">Extension tray popover — media player</div>
+
+<div class="popover-wrap">
+  <div class="topbar">
+    <div class="zone">
+      <div class="home-btn"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+    </div>
+    <div class="zone zone-fill">
+      <div class="app-name">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        Files
+        <svg class="chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      </div>
+    </div>
+    <div class="zone tray">
+      <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 12 6 12 8 8 11 16 13 10 16 14 18 12 21 12"/></svg><span class="dot" style="background:var(--success)"></span></div>
+      <div class="tray-icon open">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <g transform="translate(3,3)"><rect x="1" y="11" width="3" height="4" fill="currentColor" rx="0.5" style="animation:eq1 .8s ease-in-out infinite"/><rect x="6" y="7" width="3" height="8" fill="currentColor" rx="0.5" style="animation:eq2 .8s ease-in-out infinite .1s"/><rect x="11" y="9" width="3" height="6" fill="currentColor" rx="0.5" style="animation:eq3 .8s ease-in-out infinite .2s"/></g>
+        </svg>
+      </div>
+      <div class="tray-sep"></div>
+      <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg></div>
+      <div class="avatar-btn"><div class="avatar-circle">J</div><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+    </div>
+  </div>
+
+  <div class="popover popover-wide" style="right:70px;">
+    <div class="pop-header">
+      <h3>Now Playing</h3>
+      <div class="pop-source">media-player</div>
+    </div>
+    <div class="pop-body">
+      <div class="track">
+        <div class="track-art">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        </div>
+        <div class="track-info">
+          <div class="track-title">Midnight Geometry</div>
+          <div class="track-artist">Parallel Fields · Inner Atlas</div>
+        </div>
+      </div>
+      <div class="progress"><div class="progress-fill"></div></div>
+      <div class="progress-time"><span>1:24</span><span>3:42</span></div>
+      <div class="controls">
+        <button class="ctrl"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg></button>
+        <button class="ctrl"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="19 20 9 12 19 4" fill="currentColor"/><line x1="5" y1="19" x2="5" y2="5"/></svg></button>
+        <button class="ctrl primary"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="5" width="4" height="14" rx="1"/><rect x="14" y="5" width="4" height="14" rx="1"/></svg></button>
+        <button class="ctrl"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="5 4 15 12 5 20" fill="currentColor"/><line x1="19" y1="5" x2="19" y2="19"/></svg></button>
+        <button class="ctrl"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="caption" style="margin-top: 340px;">
+  Extension-provided tray popover. Source badge in header identifies the extension. Same Preact component tree and panel SDK as any other panel type — just a different container (anchored popover vs. content area vs. float window). The EQ bars in the topbar keep animating whether the popover is open or not — the tray icon is a live status surface.
+</div>
+
+<!-- ===== STATE 5: Home launcher ===== -->
+<div class="label">Home — app launcher</div>
+
+<div class="topbar">
+  <div class="zone">
+    <div class="home-btn active"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+  </div>
+  <div class="zone zone-fill">
+    <div class="app-name" style="color:var(--text-2);">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg>
+      Home
+    </div>
+  </div>
+  <div class="zone tray">
+    <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 12 6 12 8 8 11 16 13 10 16 14 18 12 21 12"/></svg><span class="dot" style="background:var(--success)"></span></div>
+    <div class="tray-icon">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <g transform="translate(3,3)"><rect x="1" y="11" width="3" height="4" fill="currentColor" rx="0.5" style="animation:eq1 .8s ease-in-out infinite"/><rect x="6" y="7" width="3" height="8" fill="currentColor" rx="0.5" style="animation:eq2 .8s ease-in-out infinite .1s"/><rect x="11" y="9" width="3" height="6" fill="currentColor" rx="0.5" style="animation:eq3 .8s ease-in-out infinite .2s"/></g>
+      </svg>
+    </div>
+    <div class="tray-sep"></div>
+    <div class="tray-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg><span class="badge">3</span></div>
+    <div class="avatar-btn"><div class="avatar-circle">J</div><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div>
+  </div>
+</div>
+<div class="launcher">
+  <div class="launcher-grid">
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(88,166,255,0.12);color:var(--accent);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg></div>
+      Notes
+    </div>
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(63,185,80,0.12);color:var(--success);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></div>
+      Files
+    </div>
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(210,153,34,0.12);color:var(--warn);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg></div>
+      Gallery
+    </div>
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(139,148,158,0.12);color:var(--text-2);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg></div>
+      Terminal
+    </div>
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(188,140,255,0.12);color:#bc8cff;"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+      Chat
+    </div>
+    <div class="launcher-item current">
+      <div class="launcher-icon"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/></svg></div>
+      Knowledge Base
+    </div>
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(248,81,73,0.12);color:var(--danger);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></div>
+      Workspace
+    </div>
+    <div class="launcher-item">
+      <div class="launcher-icon" style="background:rgba(139,148,158,0.08);color:var(--text-3);"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
+      Admin
+    </div>
+  </div>
+</div>
+
+<div class="caption" style="margin-top:10px;">
+  RBAC-gated — only extensions the user can access appear. Last-active highlighted. This surface is where extension count scales: 8, 15, 30 extensions all have room. Additive slots for future enhancement: search bar, recent activity, pinned favorites, extension grouping. None needed at launch; the grid is the MVP.
+</div>
+
+<!-- ===== STATE 6: Narrow / mobile ===== -->
+<div class="label">Narrow viewport — mobile treatment</div>
+
+<div style="display:flex;gap:24px;flex-wrap:wrap;">
+  <div>
+    <div style="color:var(--text-3);font-size:11px;margin-bottom:8px;font-weight:600;">Active app (narrow)</div>
+    <div class="narrow-frame">
+      <div class="narrow-topbar">
+        <div class="zone" style="padding:0 4px;">
+          <div class="home-btn" style="width:32px;height:32px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+        </div>
+        <div class="zone zone-fill">
+          <div class="app-name" style="font-size:13px;padding:0 8px;">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            Notes
+            <svg class="chev" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+        </div>
+        <div class="zone tray" style="padding:0 4px;">
+          <div class="tray-icon" style="width:30px;height:30px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/></svg></div>
+          <div class="tray-icon" style="width:30px;height:30px;"><div class="avatar-circle" style="width:20px;height:20px;font-size:9px;">J</div></div>
+        </div>
+      </div>
+      <div class="narrow-content">
+        <div>
+          <div style="color:var(--text-2);font-size:12px;margin-bottom:8px;">Sub-tabs become horizontal scroll</div>
+          <div style="display:flex;gap:4px;overflow-x:auto;padding:4px 0;">
+            <div class="subtab active" style="font-size:11px;padding:0 8px;height:28px;flex-shrink:0;">Editor</div>
+            <div class="subtab" style="font-size:11px;padding:0 8px;height:28px;flex-shrink:0;">Preview</div>
+            <div class="subtab" style="font-size:11px;padding:0 8px;height:28px;flex-shrink:0;">Graph</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div style="color:var(--text-3);font-size:11px;margin-bottom:8px;font-weight:600;">Tray popover → bottom sheet</div>
+    <div class="narrow-frame">
+      <div class="narrow-topbar" style="opacity:0.4;">
+        <div class="zone" style="padding:0 4px;">
+          <div class="home-btn" style="width:32px;height:32px;"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9"/><path d="M5 10v10h14V10"/></svg></div>
+        </div>
+        <div class="zone zone-fill">
+          <div class="app-name" style="font-size:13px;padding:0 8px;">Notes</div>
+        </div>
+      </div>
+      <div class="narrow-content" style="height:60px;opacity:0.3;">
+        <span>dimmed content</span>
+      </div>
+      <div class="bottom-sheet">
+        <div class="bottom-handle"></div>
+        <div class="pop-identity" style="padding:0 0 12px;border:none;">
+          <div class="pop-avatar">J</div>
+          <div><div class="pop-name">the maintainer</div><div class="pop-user">@maintainer · admin</div></div>
+        </div>
+        <div class="pop-row" style="padding:6px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2m-8-10H4m16 0h2"/></svg>
+          <span class="pop-row-label">Theme</span>
+          <div class="theme-toggle"><span class="theme-opt">Light</span><span class="theme-opt active">Dark</span><span class="theme-opt">Auto</span></div>
+        </div>
+        <div class="pop-divider" style="margin:8px 0;"></div>
+        <div class="pop-row" style="padding:6px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06"/></svg>
+          <span class="pop-row-label">User Settings</span>
+        </div>
+        <div class="pop-divider" style="margin:8px 0;"></div>
+        <div class="pop-row danger" style="padding:6px 0;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4m7 14l5-5-5-5m5 5H9"/></svg>
+          <span class="pop-row-label">Sign Out</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="caption" style="margin-top:16px;">
+  Narrow viewports: topbar collapses tray to essentials (bell + avatar). Sub-tabs move below content area or become horizontal scroll within the extension's content zone. Tray popovers become bottom sheets. Float panels become full-screen modals with back button (same as current shell doc §3.5). The panel component doesn't know the viewport — the shell adapts the container.
+</div>
+
+</div>
+</body>
+</html>

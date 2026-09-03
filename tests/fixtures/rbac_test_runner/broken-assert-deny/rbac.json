@@ -1,0 +1,13 @@
+{
+  "rules": [
+    {
+      "rule": "brokendeny.edit",
+      "namespace": "brokendeny",
+      "description": "Access to brokendeny:edit",
+      "test": {
+        "assert_deny":  {"call": "brokendeny:1:edit", "expect": "permission_denied"},
+        "assert_allow": {"call": "brokendeny:1:edit", "expect": "success"}
+      }
+    }
+  ]
+}

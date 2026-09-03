@@ -1,0 +1,107 @@
+{
+  "schema": 1,
+  "components": [
+    {
+      "name": "drogon",
+      "version": "1.9.12",
+      "source": "https://github.com/drogonframework/drogon",
+      "commit": "89aca8c7993c8194f2c109c1d06a3b45bf363d5d",
+      "license": "MIT",
+      "license_path": "third_party/licenses/drogon-MIT.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "nlohmann-json",
+      "version": "3.11.3",
+      "source": "https://github.com/nlohmann/json",
+      "commit": "9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+      "license": "MIT",
+      "license_path": "third_party/licenses/nlohmann-json-MIT.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "spdlog",
+      "version": "1.15.3",
+      "source": "https://github.com/gabime/spdlog",
+      "commit": "6fa36017cfd5731d617e1a934f0e5ea9c4445b13",
+      "license": "MIT",
+      "license_path": "third_party/licenses/spdlog-MIT.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "argparse",
+      "version": "3.1",
+      "source": "https://github.com/p-ranav/argparse",
+      "commit": "68fd0277eea5412aff9b91c0b70efc698359dae0",
+      "license": "MIT",
+      "license_path": "third_party/licenses/argparse-MIT.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "catch2",
+      "version": "3.7.1",
+      "source": "https://github.com/catchorg/Catch2",
+      "commit": "fa43b77429ba76c462b1898d6cd2f2d7a9416b14",
+      "license": "BSL-1.0",
+      "license_path": "third_party/licenses/catch2-BSL-1.0.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "libzip",
+      "version": "1.11.4",
+      "source": "https://github.com/nih-at/libzip",
+      "commit": "6f8a0cdd24a0dc6cce9dac4a7679da784ab124ea",
+      "license": "BSD-3-Clause",
+      "license_path": "third_party/licenses/libzip-BSD-3-Clause.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "quickjs-ng",
+      "version": "0.14.0",
+      "source": "https://github.com/quickjs-ng/quickjs",
+      "commit": "3c051980ab7e783dfbfb1c70c014ce5e05ecf24c",
+      "license": "MIT",
+      "license_path": "third_party/licenses/quickjs-ng-MIT.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "google-benchmark",
+      "version": "1.9.1",
+      "source": "https://github.com/google/benchmark",
+      "commit": "c58e6d0710581e3a08d65c349664128a8d9a2461",
+      "license": "Apache-2.0",
+      "license_path": "third_party/licenses/google-benchmark-Apache-2.0.txt",
+      "kind": "fetchcontent"
+    },
+    {
+      "name": "preact",
+      "version": "10.22.0",
+      "source": "https://github.com/preactjs/preact",
+      "license": "MIT",
+      "license_path": "third_party/licenses/preact-MIT.txt",
+      "kind": "vendored",
+      "path": "client/shell/client/vendor/preact.module.js",
+      "sha256": "087942b6f43a74de6a3abb2e0c4e287f03b54b4849cfa34d312402f24aa34a30"
+    },
+    {
+      "name": "preact-hooks",
+      "version": "10.22.0",
+      "source": "https://github.com/preactjs/preact",
+      "license": "MIT",
+      "license_path": "third_party/licenses/preact-MIT.txt",
+      "kind": "vendored",
+      "path": "client/shell/client/vendor/preact-hooks.module.js",
+      "sha256": "0f0ae96b609149ba96ef6b95fa1801a0e94d3d3dc2d52b38c1c3fec19fd0302b"
+    },
+    {
+      "name": "htm",
+      "version": "3.1.1",
+      "source": "https://github.com/developit/htm",
+      "license": "Apache-2.0",
+      "license_path": "third_party/licenses/htm-Apache-2.0.txt",
+      "kind": "vendored",
+      "path": "client/shell/client/vendor/htm.module.js",
+      "sha256": "ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4"
+    }
+  ]
+}

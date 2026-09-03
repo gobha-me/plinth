@@ -1,0 +1,11 @@
+{
+  "name": "notes",
+  "version": "1.0.0",
+  "description": "CFW4 memory_limit_mb over kernel max",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "runtime": {
+    "memory_limit_mb": 4096
+  }
+}

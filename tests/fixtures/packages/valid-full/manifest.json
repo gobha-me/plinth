@@ -1,0 +1,16 @@
+{
+  "name": "full",
+  "version": "1.2.3",
+  "description": "All-optional-files fixture",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js",
+  "frontend": {
+    "mount": "/full",
+    "entry": "index.html"
+  },
+  "runtime": {
+    "memory_limit_mb": 8
+  },
+  "shareable": []
+}

@@ -1,0 +1,8 @@
+{
+  "name": "oversize-tunable",
+  "version": "0.1.0",
+  "description": "Same content as oversize/ — test passes --max-size large enough to fit",
+  "author": "plinth-tests",
+  "license": "MIT",
+  "entry_point": "server/main.js"
+}

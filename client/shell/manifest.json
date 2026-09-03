@@ -1,0 +1,12 @@
+{
+  "name": "shell",
+  "version": "0.6.3",
+  "description": "Plinth bundled reference frontend. 0.6.3 lands the Panel SDK (plinth.panel.* — 5 live + 6 stub methods), the Client SDK (plinth.call/subscribe/useData) served via /api/frontend/sdk.js indirection, and the ext.shell.frontend.boundary.caught audit family promoted from console-only. Inherits ICD-0.6.2 tokens/theme/scaling verbatim.",
+  "author": "plinth",
+  "license": "MIT",
+  "entry_point": "server/main.js",
+  "frontend": {
+    "mount": "/app",
+    "entry": "index.html"
+  }
+}

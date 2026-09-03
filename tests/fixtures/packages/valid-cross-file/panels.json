@@ -1,0 +1,5 @@
+{
+  "panels": [
+    {"id": "list", "client_path": "list.js", "title": "Notes"}
+  ]
+}

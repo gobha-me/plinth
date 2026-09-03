@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: formatting and static analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies and LLVM 20
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          set -euo pipefail
+          .github/scripts/install-llvm.sh "$CLANG_VERSION"
+          sudo apt-get install -y \
+            build-essential cmake pkg-config git ca-certificates \
+            libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
+            libargon2-dev nodejs \
+            "clang-format-$CLANG_VERSION" "clang-tidy-$CLANG_VERSION" \
+            "clang-tools-$CLANG_VERSION"
+
+      - name: Check formatting
+        run: tools/format.sh --check
+
+      - name: Check licenses, dependency pins, and SBOM
+        run: tools/public_readiness.py
+
+      - name: Scan repository and history for secrets
+        run: .github/scripts/run-gitleaks.sh
+
+      - name: Scan dependencies for known vulnerabilities
+        run: .github/scripts/run-osv.sh
+
+      - name: Check suppression policy and run clang-tidy
+        env:
+          PROJECT_TIDY_JOBS: "2"
+        run: tools/lint.sh
+
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: gcc / tests
+            cc: gcc
+            cxx: g++
+            install_llvm: false
+          - name: clang-20 / tests
+            cc: clang-20
+            cxx: clang++-20
+            install_llvm: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+        env:
+          POSTGRES_USER: plinth
+          POSTGRES_PASSWORD: plinth
+          POSTGRES_DB: plinth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U plinth -d plinth_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install LLVM 20
+        if: ${{ matrix.install_llvm }}
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          set -euo pipefail
+          .github/scripts/install-llvm.sh "$CLANG_VERSION"
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config git ca-certificates \
+            libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
+            libargon2-dev nodejs
+
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+        run: ctest --test-dir build --output-on-failure --parallel 1
+
+      - name: Check version command
+        run: ./build/plinth --version
+
+  asan-ubsan:
+    name: clang-20 / ASan+UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+        env:
+          POSTGRES_USER: plinth
+          POSTGRES_PASSWORD: plinth
+          POSTGRES_DB: plinth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U plinth -d plinth_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies and LLVM 20
+        env:
+          CLANG_VERSION: "20"
+        run: |
+          set -euo pipefail
+          .github/scripts/install-llvm.sh "$CLANG_VERSION"
+          sudo apt-get install -y \
+            build-essential cmake pkg-config git ca-certificates \
+            libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
+            libargon2-dev nodejs libclang-rt-20-dev
+
+      - name: Configure
+        env:
+          CC: clang-20
+          CXX: clang++-20
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DPLINTH_SANITIZERS=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2
+
+      - name: Test
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure --parallel 1

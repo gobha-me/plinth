@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Topbar render smoke — T.01–T.05 (manual)</title>
+    <style>
+      body { font: 14px/1.5 -apple-system, system-ui, sans-serif;
+             max-width: 760px; margin: 24px auto; padding: 0 16px; }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; margin-top: 24px; }
+      code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+      ol > li { margin: 6px 0; }
+      .case { border-left: 3px solid #5aa9ff; padding: 8px 12px;
+              margin: 12px 0; background: #fafbfc; }
+      .expected { color: #1a7f37; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>Shell topbar render — manual smoke (ICD-0.6.0 §13 T.01–T.05)</h1>
+    <p>Run after a successful manual login (see
+       <a href="login_walkthrough_test.html">login_walkthrough_test.html</a>).
+       Each step's <span class="expected">expected outcome</span> must hold
+       in the DOM or DevTools panel.</p>
+
+    <h2>Setup</h2>
+    <ol>
+      <li>Start the kernel: <code>./build/plinth serve --config dev.toml</code>.</li>
+      <li>Seed admin user if needed (see
+          <a href="README.md">README.md</a>).</li>
+      <li>Open Chromium DevTools (Elements + Console).</li>
+      <li>Navigate to <code>http://localhost:8080/</code>.</li>
+      <li>Log in with seeded admin credentials.</li>
+    </ol>
+
+    <h2>Cases</h2>
+
+    <div class="case">
+      <strong>T.01</strong> Four <code>.zone</code> elements in DOM in order
+      <code>home → app-name → tray → avatar</code>.
+      <ol>
+        <li>In DevTools Elements, expand <code>&lt;header class="topbar"&gt;</code>.</li>
+        <li>Verify four child <code>&lt;div class="zone …"&gt;</code> in
+            this order: <code>zone-home</code>, <code>zone-app-name</code>,
+            <code>zone-tray</code>, <code>zone-avatar</code>.</li>
+        <li class="expected">Expected: exactly 4 <code>.zone</code> children;
+            classes match; no extra children.</li>
+      </ol>
+    </div>
+
+    <div class="case">
+      <strong>T.02</strong> Avatar zone shows username's first character (uppercased).
+      <ol>
+        <li>Inspect <code>.zone-avatar .avatar-circle</code>.</li>
+        <li>For seeded user <code>admin</code>, text content should be
+            <code>A</code>.</li>
+        <li class="expected">Expected: <code>textContent === 'A'</code>.</li>
+      </ol>
+    </div>
+
+    <div class="case">
+      <strong>T.03</strong> Click avatar → popover renders Sign Out menu item.
+      <ol>
+        <li>Click anywhere inside <code>.zone-avatar button</code>.</li>
+        <li>A <code>.popover</code> appears; inspect its children.</li>
+        <li>Verify exactly one <code>[role="menuitem"]</code> with
+            <code>textContent === 'Sign Out'</code>.</li>
+        <li class="expected">Expected: 1 menuitem visible; text matches.</li>
+        <li>Click outside the popover; verify it closes (popover unmounts).</li>
+      </ol>
+    </div>
+
+    <div class="case">
+      <strong>T.04</strong> Content area renders <code>Hello, {username}</code>.
+      <ol>
+        <li>Inspect the <code>&lt;main&gt;</code> element under
+            <code>#root</code>.</li>
+        <li>Verify <code>main.textContent.trim() === 'Hello, admin'</code>
+            (substituting the seeded username).</li>
+        <li class="expected">Expected: exact match including comma and space.</li>
+      </ol>
+    </div>
+
+    <div class="case">
+      <strong>T.05</strong> Tray zone is empty.
+      <ol>
+        <li>Inspect <code>.zone-tray</code>.</li>
+        <li>Verify <code>childElementCount === 0</code> (no
+            children).</li>
+        <li class="expected">Expected: zero element children. Whitespace
+            text nodes are acceptable.</li>
+      </ol>
+    </div>
+
+    <h2>Ship gate</h2>
+    <p>All five cases must hold for 0.6.0 release. Document any deviation
+       in the CHANGELOG entry's "Implementation deviation" subsection
+       per METHODOLOGY §Phase 2 Constraint #4.</p>
+  </body>
+</html>

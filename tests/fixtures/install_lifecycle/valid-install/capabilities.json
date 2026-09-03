@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "notes",
+      "version": 1,
+      "function": "read",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Read a note by id",
+      "rbac_rule": "notes.read"
+    }
+  ],
+  "requires": []
+}

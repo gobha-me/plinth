@@ -1,0 +1,8 @@
+{
+  "name": "sdk-demo",
+  "version": "0.1.0",
+  "description": "ICD-0.6.3 §D.1 — test-only fixture exercising the Panel SDK + Client SDK end-to-end. Not bundled. Loads via `loadPanel('sdk-demo','0.1.0','demo', container)` from the manual FE smoke gate.",
+  "author": "plinth",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

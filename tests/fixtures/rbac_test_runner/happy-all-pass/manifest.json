@@ -1,0 +1,8 @@
+{
+  "name": "happypass",
+  "version": "1.0.0",
+  "description": "RBAC-test fixture — 2 rules with test_contract + 1 skipped; all PASS",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

@@ -1,0 +1,37 @@
+# Build
+build/
+build-*/
+cmake-build-*/
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies (fetched by CMake)
+_deps/
+third_party/build/
+
+# Runtime
+*.log
+*.pid
+data/
+
+# Docker
+docker-compose.override.yml
+
+# Environment
+.env
+.env.local
+
+# Workspace-local scratch (Claude Code plugin state, ctest output, session notes)
+.claude/
+Testing/
+/Descusion*.md

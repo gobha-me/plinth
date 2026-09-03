@@ -1,0 +1,7 @@
+{
+  "schema": {
+    "max_note_length": 4096,
+    "autosave_enabled": true,
+    "display_name": "Notes"
+  }
+}

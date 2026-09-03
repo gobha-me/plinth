@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"rule": "lh0driver.noop", "namespace": "lh0driver", "description": "LH-0 driver noop rule (placeholder)"}
+  ]
+}

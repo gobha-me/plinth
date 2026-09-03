@@ -1,0 +1,8 @@
+{
+  "name": "brokenallow",
+  "version": "1.0.0",
+  "description": "RBAC-test fixture — cap rbac_rule mismatch; assert_allow FAILS at install",
+  "author": "plinth-tests",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

@@ -1,0 +1,35 @@
+{
+  "provides": [
+    {
+      "namespace": "mixedrules",
+      "version": 1,
+      "function": "ok",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Clean pass",
+      "rbac_rule": "mixedrules.ok"
+    },
+    {
+      "namespace": "mixedrules",
+      "version": 1,
+      "function": "leaky",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Clean at install — poisoned by Slice C via everyone-grant",
+      "rbac_rule": "mixedrules.leaky"
+    },
+    {
+      "namespace": "mixedrules",
+      "version": 1,
+      "function": "locked",
+      "params": [{"name": "id", "type": "string"}],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Cap requires mixedrules.other; declared test rule mismatches — assert_allow FAILS",
+      "rbac_rule": "mixedrules.other"
+    }
+  ],
+  "requires": []
+}

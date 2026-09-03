@@ -1,0 +1,7 @@
+{
+  "rules": [
+    {"rule": "slow.alpha", "namespace": "slow", "description": "v1 alpha — gates the wait capability"},
+    {"rule": "slow.beta",  "namespace": "slow", "description": "v1 beta — dropped in v2 (orphaned_at exercise)"},
+    {"rule": "slow.gamma", "namespace": "slow", "description": "v1 gamma — preserved across upgrade unchanged"}
+  ]
+}

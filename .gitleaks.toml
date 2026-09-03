@@ -1,0 +1,26 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "LLVM signing-key checksum, not a credential"
+condition = "AND"
+paths = ['''^\.github/scripts/install-llvm\.sh$''']
+regexes = ['''8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d''']
+
+[[allowlists]]
+description = "RFC 6455 example WebSocket nonce"
+condition = "AND"
+paths = ['''^tests/kernel/lifecycle/process_shutdown_test\.cpp$''']
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']
+
+[[allowlists]]
+description = "Nonfunctional PAT shown in the protocol documentation"
+condition = "AND"
+paths = ['''^docs/icd/ICD-0\.1\.3-pats\.md$''']
+regexes = ['''plinth_aBcDeFgH1234567890abcdef\.\.\.''']
+
+[[allowlists]]
+description = "ICD dependency label misclassified as a credential"
+condition = "AND"
+paths = ['''^docs/icd/ICD-0\.1\.4-groups-rbac\.md$''']
+regexes = ['''ICD-0\.1\.3-pats''']

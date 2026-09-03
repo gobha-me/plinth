@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Login walkthrough — I.01–I.02 + L.01–L.06 (manual)</title>
+    <style>
+      body { font: 14px/1.5 -apple-system, system-ui, sans-serif;
+             max-width: 760px; margin: 24px auto; padding: 0 16px; }
+      h1 { font-size: 18px; }
+      h2 { font-size: 15px; margin-top: 24px; }
+      code { background: #f4f4f4; padding: 1px 4px; border-radius: 3px; }
+      ol > li { margin: 6px 0; }
+      .case { border-left: 3px solid #5aa9ff; padding: 8px 12px;
+              margin: 12px 0; background: #fafbfc; }
+      .case.l { border-left-color: #bc8cff; background: #fbf8ff; }
+      .expected { color: #1a7f37; font-weight: 600; }
+      .deferred { color: #957500; font-weight: 600; }
+    </style>
+  </head>
+  <body>
+    <h1>Shell login walkthrough — manual smoke
+        (ICD-0.6.0 §13 I.01–I.02 + L.01–L.06)</h1>
+    <p>End-to-end: redirect, login form, authenticated frame, sign-out.
+       L.\* wire-contract cases are <span class="deferred">deferred to
+       0.6.0.N</span> per architect sign-off; they remain documented
+       here as the manual checklist a human can run pre-0.6.0.N harness.</p>
+
+    <h2>Setup</h2>
+    <ol>
+      <li>Start the kernel: <code>./build/plinth serve --config dev.toml</code>.</li>
+      <li>Seed an admin user: <code>./build/plinth seed-admin --username admin --password &lt;pw&gt;</code>
+          (or use an existing user).</li>
+      <li>Open Chromium DevTools (Elements, Network, Console panels).</li>
+      <li>Open <code>chrome://settings/cookies</code> in another tab if
+          you need to clear <code>plinth_session</code> between cases.</li>
+    </ol>
+
+    <h2>Integration cases</h2>
+
+    <div class="case">
+      <strong>I.01</strong> Navigate to <code>/</code> → redirected to
+      <code>/app/</code> → see login form → submit valid creds → see
+      authenticated frame.
+      <ol>
+        <li>Navigate to <code>http://localhost:8080/</code>.</li>
+        <li>Observe Network: a 302 response with
+            <code>Location: /app/</code>.</li>
+        <li>Browser follows; final URL is <code>/app/</code>.</li>
+        <li>Observe DOM: <code>&lt;form class="login-card"&gt;</code> renders.</li>
+        <li>Submit valid admin credentials.</li>
+        <li>Observe Network: <code>POST /api/auth/login</code> →
+            <code>200</code> with <code>Set-Cookie:
+            plinth_session=…; HttpOnly; SameSite=Strict</code> (Secure
+            in production builds; absent in dev_mode).</li>
+        <li>Observe DOM: four <code>.zone</code> divs in the topbar +
+            <code>main</code> with <code>Hello, admin</code>.</li>
+        <li class="expected">Expected: every step transitions in order;
+            no Console errors; no CSP violations.</li>
+      </ol>
+    </div>
+
+    <div class="case">
+      <strong>I.02</strong> Sign Out from authenticated frame returns
+      to login form; cookie cleared.
+      <ol>
+        <li>From the I.01 authenticated state, click avatar → Sign Out.</li>
+        <li>Observe Network: <code>POST /api/auth/logout</code> →
+            <code>200</code> with <code>Set-Cookie: plinth_session=;
+            Max-Age=0</code>.</li>
+        <li>Observe Application → Cookies: no <code>plinth_session</code>
+            cookie remains for the origin.</li>
+        <li>Observe DOM: login form renders again under <code>#root</code>.</li>
+        <li class="expected">Expected: cookie gone; login form re-renders;
+            no Console errors.</li>
+      </ol>
+    </div>
+
+    <h2>Login wire-contract cases (deferred to 0.6.0.N)</h2>
+
+    <div class="case l">
+      <strong>L.01</strong> Submit valid credentials → 200 + cookie +
+      <code>GET /api/auth/session</code> returns user object.
+      <ol>
+        <li>From login form, submit valid admin creds.</li>
+        <li>Network: <code>POST /api/auth/login</code> 200; check
+            <code>Set-Cookie</code> attributes (<code>HttpOnly</code>,
+            <code>SameSite=Strict</code>, <code>Secure</code> when not
+            dev_mode, <code>Path=/</code>, <code>Max-Age</code> non-zero).</li>
+        <li>Follow with <code>GET /api/auth/session</code>; expect 200
+            + JSON body with user fields (username, id, etc).</li>
+        <li class="expected">Expected: cookie attributes match;
+            session endpoint returns user.</li>
+      </ol>
+    </div>
+
+    <div class="case l">
+      <strong>L.02</strong> Wrong password → 401 + <code>body.error ==
+      "invalid_credentials"</code>; cookie not set.
+      <ol>
+        <li>Submit valid username + intentionally wrong password.</li>
+        <li>Network: 401 with JSON body containing
+            <code>error: "invalid_credentials"</code>.</li>
+        <li>Application → Cookies: no <code>plinth_session</code>
+            cookie set.</li>
+        <li>DOM: login error region shows
+            <code>"Username or password is incorrect."</code>.</li>
+        <li>Password input cleared; username preserved.</li>
+        <li class="expected">Expected: cookie absent; error string matches.</li>
+      </ol>
+    </div>
+
+    <div class="case l">
+      <strong>L.03</strong> Empty username → 400 +
+      <code>body.error == "missing_username"</code>.
+      <ol>
+        <li>Browser HTML5 validation usually catches this; bypass by
+            removing the <code>required</code> attribute via DevTools
+            Elements panel before clicking Sign In.</li>
+        <li>Or use <code>curl</code>:
+            <code>curl -X POST http://localhost:8080/api/auth/login -H
+            'Content-Type: application/json' -d
+            '{"username":"","password":"x"}'</code>.</li>
+        <li class="expected">Expected: 400 + body
+            <code>{ "error": "missing_username" }</code>.</li>
+      </ol>
+    </div>
+
+    <div class="case l">
+      <strong>L.04</strong> Empty password → 400 +
+      <code>body.error == "missing_password"</code>.
+      <ol>
+        <li>Similar bypass to L.03.
+            <code>curl -X POST … -d
+            '{"username":"admin","password":""}'</code>.</li>
+        <li class="expected">Expected: 400 + body
+            <code>{ "error": "missing_password" }</code>.</li>
+      </ol>
+    </div>
+
+    <div class="case l">
+      <strong>L.05</strong> 6th rapid failed attempt → 429 + body
+      contains <code>retry_after</code>.
+      <ol>
+        <li>Submit wrong password 5 times in a row from one IP.</li>
+        <li>6th attempt: Network response is 429 with body
+            <code>{ "error": "rate_limited", "retry_after": &lt;seconds&gt; }</code>.</li>
+        <li>DOM: form's submit button disables; countdown starts
+            (<code>"Try again in {N} seconds"</code>) per OQ3 resolution.</li>
+        <li class="expected">Expected: 429; <code>retry_after</code> in body;
+            UI countdown ticks down.</li>
+      </ol>
+    </div>
+
+    <div class="case l">
+      <strong>L.06</strong> Sign Out clears cookie + subsequent
+      <code>GET /api/auth/session</code> returns 401.
+      <ol>
+        <li>From authenticated state, click Sign Out.</li>
+        <li>Network: <code>POST /api/auth/logout</code> 200 with
+            <code>Set-Cookie: plinth_session=; Max-Age=0</code>.</li>
+        <li>In Console run <code>fetch('/api/auth/session', {
+            credentials: 'include' }).then(r =&gt; r.status)</code>;
+            expect <code>401</code>.</li>
+        <li class="expected">Expected: 401; no
+            <code>plinth_session</code> cookie returned with the request.</li>
+      </ol>
+    </div>
+
+    <h2>Ship gate</h2>
+    <p>I.01 + I.02 must hold for 0.6.0 release.
+       L.01–L.06 are <span class="deferred">deferred to 0.6.0.N</span>
+       and not on the 0.6.0 ship gate, but the manual checklist above
+       must run clean before claiming the wire-contract is intact.</p>
+  </body>
+</html>

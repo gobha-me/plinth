@@ -1,0 +1,6 @@
+{
+  "rules": [
+    {"rule": "notes.read", "namespace": "notes", "description": "Access to notes"},
+    {"rule": "notes.comment", "namespace": "notes", "description": "Comment on notes (NEW in v1.3.0)"}
+  ]
+}
