@@ -11,9 +11,10 @@ tag list (`git tag -l`).
 
 ---
 
-## 2026-09-03 — public-readiness hardening (unreleased)
+## v0.6.3 — 2026-09-03 — initial public release
 
-Prepared the private repository for a separately approved public cutover:
+Prepared Plinth for public collaboration and published a deliberately clean
+Git history:
 
 - made the default listener loopback-only and registration disabled, while
   requiring an explicitly requested configuration file to exist and parse;
@@ -26,11 +27,14 @@ Prepared the private repository for a separately approved public cutover:
 - removed private forge workflows and internal-session material from the
   publishable tree, and sanitized the retained design archive; and
 - added deterministic public-readiness, vulnerability, formatting, tidy,
-  build, test, sanitizer, and public-only CodeQL gates. GitHub container
-  publishing remains deliberately deferred.
+  build, test, sanitizer, and public-only CodeQL gates, including explicit
+  installation of the selected Clang compiler.
 
-No visibility, archive-authority, tag, or release change is part of this
-unreleased readiness entry.
+The complete pre-public history remains in a private, read-only archive. The
+public repository begins from one reviewed source-tree snapshot, protects
+`main` with the required CI and CodeQL checks, and uses GitHub's public security
+features. GitHub container builds and registry publication remain deliberately
+deferred.
 
 ---
 
