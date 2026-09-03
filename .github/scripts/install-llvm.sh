@@ -16,3 +16,4 @@ printf '%s\n' \
   "deb [signed-by=/etc/apt/keyrings/apt.llvm.org.asc] https://apt.llvm.org/noble/ llvm-toolchain-noble-${llvm_version} main" \
   | sudo tee /etc/apt/sources.list.d/llvm.list >/dev/null
 sudo apt-get update
+sudo apt-get install -y "clang-${llvm_version}"
