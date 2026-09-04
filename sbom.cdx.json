@@ -306,10 +306,10 @@
       ],
       "name": "plinth",
       "type": "application",
-      "version": "0.6.3"
+      "version": "0.6.4"
     }
   },
-  "serialNumber": "urn:uuid:baaf7e32-6971-5e49-b014-dfe4ad1a99b6",
+  "serialNumber": "urn:uuid:0c09802a-5d40-5676-9d42-916cfc440f0e",
   "specVersion": "1.6",
   "version": 1
 }
