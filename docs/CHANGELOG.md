@@ -11,6 +11,17 @@ tag list (`git tag -l`).
 
 ---
 
+## v0.6.4 — 2026-09-04 — load-harness dependency maintenance
+
+- Updated the Go load harness from `github.com/lib/pq` 1.10.9 to 1.12.3.
+- Added a SHA-pinned Go setup action and exact Go 1.22.12 module verification,
+  package compilation/tests, and vetting to the required quality gate.
+
+This release does not change Plinth server APIs, runtime behavior, database
+schemas, or container publication.
+
+---
+
 ## v0.6.3 — 2026-09-03 — initial public release
 
 Prepared Plinth for public collaboration and published a deliberately clean
