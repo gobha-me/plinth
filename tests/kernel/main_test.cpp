@@ -122,8 +122,13 @@ TEST_CASE("Version string is not empty", "[kernel]") {
   REQUIRE_FALSE(std::string(plinth::VERSION).empty());
 }
 
-TEST_CASE("Version components are non-negative", "[kernel]") {
-  REQUIRE(plinth::VERSION_MAJOR == 0);
-  REQUIRE(plinth::VERSION_MINOR == 6);
-  REQUIRE(plinth::VERSION_PATCH == 3);
+TEST_CASE("Version components match the version string", "[kernel]") {
+  REQUIRE(plinth::VERSION_MAJOR >= 0);
+  REQUIRE(plinth::VERSION_MINOR >= 0);
+  REQUIRE(plinth::VERSION_PATCH >= 0);
+
+  const auto expected = std::to_string(plinth::VERSION_MAJOR) + "." +
+                        std::to_string(plinth::VERSION_MINOR) + "." +
+                        std::to_string(plinth::VERSION_PATCH);
+  REQUIRE(std::string(plinth::VERSION) == expected);
 }
