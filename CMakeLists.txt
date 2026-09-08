@@ -744,12 +744,22 @@ add_test(NAME plinth_tests_pure
 set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
 
 add_test(NAME plinth_tests_js
-  COMMAND plinth_tests "[js]"
+  COMMAND plinth_tests "[js] ~[batch-transaction]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_js
   PROPERTIES RESOURCE_LOCK plinth_pg_schema
              LABELS "needs_pg"
              TIMEOUT 300)
+
+# A single connection exposes accidental transactions opened by batch queries.
+add_test(NAME plinth_tests_batch_transaction
+  COMMAND plinth_tests "[batch-transaction]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_batch_transaction
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1"
+             TIMEOUT 60)
 
 add_test(NAME plinth_tests_pg
   COMMAND plinth_tests "[integration] ~[ws] ~[js]"

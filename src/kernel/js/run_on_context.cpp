@@ -724,6 +724,9 @@ auto finalize_batch(BridgeContext& bc, AsyncOp::Type type, AsyncOp op,
           std::size_t ops = bc.batch_state.ops_in_batch;
           plinth::js::clear_batch_timer(scope_id);
           bc.batch_state = BridgeContext::BatchState{};
+          // COMMIT completed. Return the pinned connection before the
+          // coalescer requests a pool connection for its notification flush.
+          tx.reset();
           plinth::js::unregister_in_flight_batch(scope_id);
           plinth::realtime::CoalescerRegistry::instance().flush_batch_scope(
               scope_id);
@@ -811,7 +814,7 @@ auto handle_db_batch_commit(BridgeContext& bc, AsyncOp op,
     }
     co_await tx->execSqlCoro("COMMIT");
     finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
-                   tx, std::nullopt);
+                   std::move(tx), std::nullopt);
   } catch (const drogon::orm::DrogonDbException& e) {
     finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
                    nullptr, pg_exception_to_rejection(e));
