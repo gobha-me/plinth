@@ -6,28 +6,28 @@ if (($# != 0)); then
   exit 2
 fi
 
-tidy=${CLANG_TIDY:-clang-tidy-20}
-runner=${RUN_CLANG_TIDY:-run-clang-tidy-20}
-compiler=${CLANGXX:-clang++-20}
+tidy=${CLANG_TIDY:-clang-tidy-21}
+runner=${RUN_CLANG_TIDY:-run-clang-tidy-21}
+compiler=${CLANGXX:-clang++-21}
 build_dir=${PROJECT_TIDY_BUILD_DIR:-build-tidy}
 jobs=${PROJECT_TIDY_JOBS:-2}
 
 for tool in "$tidy" "$runner" "$compiler"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "error: $tool was not found; install Clang/clang-tidy 20.x" >&2
+    echo "error: $tool was not found; install Clang/clang-tidy 21.x" >&2
     exit 1
   fi
 done
 
 tidy_version=$($tidy --version)
-if [[ ! "$tidy_version" =~ version[[:space:]]20\. ]]; then
-  echo "error: linting requires clang-tidy 20.x; found: $tidy_version" >&2
+if [[ ! "$tidy_version" =~ version[[:space:]]21\. ]]; then
+  echo "error: linting requires clang-tidy 21.x; found: $tidy_version" >&2
   exit 1
 fi
 
 compiler_version=$($compiler --version)
-if [[ ! "$compiler_version" =~ version[[:space:]]20\. ]]; then
-  echo "error: linting requires Clang 20.x; found: $compiler_version" >&2
+if [[ ! "$compiler_version" =~ version[[:space:]]21\. ]]; then
+  echo "error: linting requires Clang 21.x; found: $compiler_version" >&2
   exit 1
 fi
 

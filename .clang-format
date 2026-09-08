@@ -2,7 +2,7 @@
 Language: Cpp
 BasedOnStyle: LLVM
 
-# The repository pins clang-format 20.x in tools/format.sh. Latest selects the
+# The repository pins clang-format 21.x in tools/format.sh. Latest selects the
 # newest C++ grammar understood by that formatter without pretending it is the
 # project's language-standard setting (CMake owns that).
 Standard: Latest

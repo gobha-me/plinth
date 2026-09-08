@@ -13,10 +13,10 @@
 
 ## C++ tooling
 
-- Plinth uses C++23 and LLVM/Clang-derived formatting, pinned to Clang 20.
+- Plinth uses C++23 and LLVM/Clang-derived formatting, pinned to Clang 21.
 - Run `tools/format.sh --check`; use `tools/format.sh --fix` for mechanical
   normalization.
-- Run `tools/lint.sh`. It uses Clang/clang-tidy 20 and defaults to two jobs.
+- Run `tools/lint.sh`. It uses Clang/clang-tidy 21 and defaults to two jobs.
 - `NOLINT`, `NOLINTNEXTLINE`, `NOLINTBEGIN`, and `NOLINTEND` are exceptional.
   They must name exact checks and include an inline ASCII `-- justification`.
   Bare, wildcard, unexplained, nested, mismatched, or unclosed suppressions are

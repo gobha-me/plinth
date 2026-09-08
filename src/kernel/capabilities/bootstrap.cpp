@@ -60,7 +60,9 @@ constexpr std::array KERNEL_CAPS = {
 // can emit rbac.rule_registered exactly once across restarts.
 auto insert_rule_if_absent(PGconn* conn, const KernelCap& cap) -> bool {
   std::array<const char*, 4> values = {
-      cap.rbac_rule, cap.nspace, cap.description,
+      cap.rbac_rule,
+      cap.nspace,
+      cap.description,
       "kernel", // extension_name for kernel-owned rules
   };
   std::unique_ptr<PGresult, decltype(&PQclear)> res(

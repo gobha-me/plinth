@@ -965,31 +965,34 @@ endif()
 # sources dominated CI wall-clock prior to 0.2.1.1a. Fall back to a
 # serial clang-tidy invocation when run-clang-tidy is unavailable so
 # local devs without clang-tools still get coverage.
-find_program(RUN_CLANG_TIDY_EXE NAMES run-clang-tidy-20 run-clang-tidy)
-find_program(CLANG_TIDY_EXE NAMES clang-tidy-20 clang-tidy)
+# Match tools/lint.sh; an unversioned executable could select another major.
+# Versioned cache keys avoid retaining tools from a previous major on upgrade.
+find_program(RUN_CLANG_TIDY_21_EXE NAMES run-clang-tidy-21)
+find_program(CLANG_TIDY_21_EXE NAMES clang-tidy-21)
 file(GLOB_RECURSE KERNEL_SOURCES
   ${CMAKE_SOURCE_DIR}/src/kernel/*.cpp
   ${CMAKE_SOURCE_DIR}/src/kernel/*.hpp
   ${CMAKE_SOURCE_DIR}/tests/kernel/*.cpp
   ${CMAKE_SOURCE_DIR}/tests/kernel/*.hpp
 )
-if(RUN_CLANG_TIDY_EXE)
+if(RUN_CLANG_TIDY_21_EXE AND CLANG_TIDY_21_EXE)
   # clang-tidy has a large per-translation-unit working set. Keep the default
   # within the repository's 16 GiB development/CI memory envelope.
   set(TIDY_JOBS 2 CACHE STRING "Parallel clang-tidy jobs")
   add_custom_target(tidy
-    COMMAND ${RUN_CLANG_TIDY_EXE}
+    COMMAND ${RUN_CLANG_TIDY_21_EXE}
       -p ${CMAKE_BINARY_DIR}
       -j ${TIDY_JOBS}
+      -clang-tidy-binary ${CLANG_TIDY_21_EXE}
       -quiet
       ${KERNEL_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
     COMMENT "Running clang-tidy (run-clang-tidy -j${TIDY_JOBS}) on kernel sources"
     VERBATIM
   )
-elseif(CLANG_TIDY_EXE)
+elseif(CLANG_TIDY_21_EXE)
   add_custom_target(tidy
-    COMMAND ${CLANG_TIDY_EXE}
+    COMMAND ${CLANG_TIDY_21_EXE}
       -p ${CMAKE_BINARY_DIR}
       ${KERNEL_SOURCES}
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
@@ -997,5 +1000,5 @@ elseif(CLANG_TIDY_EXE)
     VERBATIM
   )
 else()
-  message(STATUS "clang-tidy not found — 'tidy' target disabled")
+  message(STATUS "clang-tidy 21 not found — 'tidy' target disabled")
 endif()

@@ -16,7 +16,7 @@ license in this repository. No contributor license agreement is required.
 
 ## Local checks
 
-Use Clang 20 for formatting and clang-tidy. The scripts fail if another major
+Use Clang 21 for formatting and clang-tidy. The scripts fail if another major
 version is selected.
 
 ```bash
@@ -32,6 +32,13 @@ PostgreSQL and WebSocket coverage uses a disposable database configured with
 `PLINTH_PG_*`; the GitHub workflow is the canonical example. Lifecycle changes
 also require normal return, SIGINT, SIGTERM, active-work, and partial-startup
 coverage plus ASan/UBSan and feasible TSan runs.
+
+`docker/ci.Dockerfile` provides the Ubuntu 26.04 builder with explicitly
+versioned LLVM 21 tools. The **CI image** workflow builds it locally and runs
+the complete project build, PostgreSQL/WebSocket tests, formatting, and lint
+inside the image on toolchain or dependency changes. It never publishes an
+image. The regular CI also retains Clang 20 tests and ASan/UBSan alongside
+Clang 21 during the transition.
 
 Do not add unexplained or wildcard `NOLINT` suppressions. Follow the exact
 suppression syntax documented in `AGENTS.md`.
