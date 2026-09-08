@@ -61,6 +61,9 @@ def main():
             child_env["PLINTH_DEV_MODE"] = "false"
             child_env["PLINTH_MIGRATIONS_DIR"] = str(repo / "migrations")
             child_env["PLINTH_BASE_URL"] = f"http://127.0.0.1:{port}"
+            browser_tmp = root / "browser-tmp"
+            browser_tmp.mkdir()
+            child_env["TMPDIR"] = str(browser_tmp)
             output_path = root / "kernel.log"
             with output_path.open("w") as output:
                 child = subprocess.Popen(

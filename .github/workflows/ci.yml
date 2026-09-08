@@ -156,6 +156,7 @@ jobs:
           sudo apt-get install -y postgresql-client
           npm ci --prefix tests/browser
           (cd tests/browser && npx playwright install --with-deps chromium)
+          python3 tests/browser/process_cleanup_test.py
           python3 tests/browser/run-production.py --binary build/plinth
 
   asan-ubsan:

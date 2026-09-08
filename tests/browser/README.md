@@ -40,3 +40,19 @@ inclusion with an explicit development configuration.
 `PLINTH_BROWSER` selects an existing Chromium-compatible executable. When
 required by a container that cannot run the Chromium sandbox,
 `PLINTH_BROWSER_NO_SANDBOX=1` explicitly disables it.
+
+
+The production launcher requires Linux with `prctl(PR_SET_CHILD_SUBREAPER)`
+and procfs child enumeration (the Ubuntu CI environment provides both). A
+separate supervisor owns only the browser command and adopts orphaned Node
+or Chromium descendants, including Playwright's detached browser sessions.
+On success, failure, or timeout it terminates and reaps that tree before the
+launcher proceeds. Browser temporary files use the launcher's disposable
+`TMPDIR`; forced termination cannot leave those profiles outside its cleanup.
+Direct `npm test` remains usable on Playwright-supported platforms; the owned
+production launcher fails before starting a browser on unsupported platforms.
+
+Run `python3 tests/browser/process_cleanup_test.py` after installing the browser
+to verify same-group, detached-child, abandoned-child, and actual Playwright
+timeout cleanup. The real-browser probe disables Playwright's signal handlers
+so its detached Chromium process must be cleaned by the external supervisor.
