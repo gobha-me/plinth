@@ -26,7 +26,11 @@ async function fixture() {
         open() { this.readyState = 1; this.emit('open'); }
         receive(value) { this.emit('message', { data: JSON.stringify(value) }); }
         send(value) { assert.equal(this.readyState, 1); this.frames.push(JSON.parse(value)); }
-        close(code = 1000) { this.readyState = 3; this.emit('close', { code, reason: '' }); }
+        close(code = 1000) {
+            this.readyState = this.deferClose ? 2 : 3;
+            if (!this.deferClose) this.emit('close', { code, reason: '' });
+        }
+        finishClose() { this.readyState = 3; this.emit('close', { code: 1000, reason: '' }); }
     }
     const context = vm.createContext({
         window: { location: { protocol: 'https:', host: 'plinth.test' } },
@@ -155,4 +159,33 @@ test('auth failure and displacement are terminal until explicit reconnect', asyn
     assert.equal(timers.size, 0);
     remove();
     removeSecond();
+});
+
+
+test('explicit reconnect and resubscribe wait for previous socket to close', async () => {
+    const { sdk, sockets } = await fixture();
+    const remove = sdk.subscribe('a', () => {});
+    const first = sockets[0];
+    first.open();
+    first.receive({ type: 'connected' });
+    first.receive({ type: 'subscribed', channels: ['a'] });
+    first.deferClose = true;
+    sdk.reconnectRealtime();
+    sdk.reconnectRealtime();
+    assert.equal(sockets.length, 1);
+    first.receive({ type: 'connected' });
+    assert.equal(first.frames.length, 1);
+    first.finishClose();
+    assert.equal(sockets.length, 2);
+    const second = sockets[1];
+    second.deferClose = true;
+    remove();
+    const keep = sdk.subscribe('new', () => {});
+    assert.equal(sockets.length, 2);
+    second.finishClose();
+    assert.equal(sockets.length, 3);
+    sockets[2].open();
+    sockets[2].receive({ type: 'connected' });
+    assert.deepEqual(sockets[2].frames, [{ type: 'subscribe', channels: ['new'] }]);
+    keep();
 });

@@ -152,14 +152,19 @@ function reportError(error, channel) {
     }
 }
 
-function closeSocket() {
+function closeSocket(restart = false) {
     if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
     }
     const previous = socket;
-    socket = null; // Late close/error/message callbacks no longer own anything.
-    previous?.ws.close();
+    if (previous) {
+        // Retain ownership until the close event. Starting a replacement before
+        // that event would briefly create two live sockets for one session.
+        previous.closing = true;
+        previous.restart ||= restart;
+        previous.ws.close();
+    }
 }
 
 function failRealtime(error) {
@@ -174,13 +179,13 @@ function failRealtime(error) {
 export function reconnectRealtime() {
     terminalError = null;
     backoffMs = 1000;
-    closeSocket();
     setRealtimeState('idle');
+    closeSocket(true);
     ensureWs();
 }
 
 function reconcile(owner) {
-    if (socket !== owner || !owner.authenticated || owner.pending ||
+    if (socket !== owner || owner.closing || !owner.authenticated || owner.pending ||
         owner.ws.readyState !== WebSocket.OPEN) return;
     const removed = [...owner.granted].filter(channel => !subscriptions.has(channel));
     const added = [...subscriptions.keys()].filter(channel =>
@@ -217,7 +222,7 @@ function acceptAcknowledgement(owner, frame) {
 }
 
 function receiveFrame(owner, event) {
-    if (socket !== owner) return;
+    if (socket !== owner || owner.closing) return;
     let frame;
     try { frame = JSON.parse(event.data); } catch { return; }
     if (!frame || typeof frame !== 'object') return;
@@ -250,11 +255,16 @@ function receiveFrame(owner, event) {
 }
 
 function ensureWs() {
-    if (socket || reconnectTimer !== null || terminalError || !subscriptions.size) return;
+    if (terminalError || !subscriptions.size) return;
+    if (socket) {
+        if (socket.closing) socket.restart = true;
+        return;
+    }
+    if (reconnectTimer !== null) return;
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${window.location.host}/ws/events`);
     const owner = { ws, authenticated: false, granted: new Set(),
-        denied: new Set(), pending: null };
+        denied: new Set(), pending: null, closing: false, restart: false };
     socket = owner;
     ws.addEventListener('message', event => receiveFrame(owner, event));
     // A browser WebSocket error is always followed by close. Only close owns
@@ -262,6 +272,10 @@ function ensureWs() {
     ws.addEventListener('close', event => {
         if (socket !== owner) return;
         socket = null;
+        if (owner.closing) {
+            if (owner.restart) ensureWs();
+            return;
+        }
         if ([4001, 4002, 4003].includes(event.code)) {
             const codes = { 4001: 'auth_timeout', 4002: 'auth_failed', 4003: 'already_connected' };
             failRealtime(new RealtimeError(codes[event.code], event.reason || codes[event.code]));
