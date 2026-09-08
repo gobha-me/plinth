@@ -6,8 +6,18 @@ Run `npm test --prefix tests/browser` to package the actual shell ZIP, extract
 it unchanged, and serve its files under the production CSP. Set
 `PLINTH_SHELL_ZIP=/absolute/path/to/shell.zip` to test an existing build artifact.
 
-For the production gate, start a task-owned kernel with a disposable database
-and a fresh shell installation, then run:
+For the production gate, the launcher creates a unique disposable database,
+starts the real kernel from its staged shell bundle, runs the smoke, and checks
+bounded clean shutdown before dropping only its database:
+
+```sh
+python3 tests/browser/run-production.py --binary build/plinth
+```
+
+Set `PLINTH_PG_HOST`, `PLINTH_PG_PORT`, `PLINTH_PG_USER`,
+`PLINTH_PG_PASSWORD`, and `PLINTH_PG_DATABASE` for the PostgreSQL service.
+The test role needs permission to create a database. To use an already
+running task-owned kernel with a fresh shell installation, run:
 
 ```sh
 PLINTH_BASE_URL=http://127.0.0.1:8080 npm test --prefix tests/browser
