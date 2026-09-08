@@ -2878,8 +2878,8 @@ auto insert_upgrade_row(PGconn* admin, std::string& new_id,
            "AND plinth.packages.supersedes_id=EXCLUDED.supersedes_id";
   }
   sql += " RETURNING id::text";
-  PgResultPtr res(plinth::db::exec_params(admin, sql.c_str(), 11, nullptr, values.data(),
-                               nullptr, nullptr, 0),
+  PgResultPtr res(plinth::db::exec_params(admin, sql.c_str(), 11, nullptr,
+                                          values.data(), nullptr, nullptr, 0),
                   PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
 

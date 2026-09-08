@@ -854,9 +854,10 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
       offset += parsed->length;
     }
     auto res = make_result(
-        manage_transaction ? plinth::db::exec(&conn, file.contents.c_str())
-                           : plinth::db::exec_params(&conn, statement.c_str(), 0, nullptr,
-                                          nullptr, nullptr, nullptr, 0));
+        manage_transaction
+            ? plinth::db::exec(&conn, file.contents.c_str())
+            : plinth::db::exec_params(&conn, statement.c_str(), 0, nullptr,
+                                      nullptr, nullptr, nullptr, 0));
 
     auto status = PQresultStatus(res.get());
     if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK &&

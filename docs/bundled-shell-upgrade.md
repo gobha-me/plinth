@@ -52,6 +52,10 @@ directories for inspection. If a failed COMMIT cannot restore the pointer, the
 command reports `upgrade-recovery-required` and retains the new files. A lost
 connection during COMMIT also requires checking the committed database outcome
 before deciding which version to restore.
+Signal cancellation during COMMIT follows the same conservative recovery
+contract and exits unsuccessfully; it is never reported as a clean startup
+cancellation. `shell status` owns bounded, cancellable connection/query
+operations and exits unsuccessfully if inspection is interrupted.
 
 This workflow upgrades shell extension migrations only. The separate kernel
 schema migration policy remains the milestone 0.7 gate; it does not make a

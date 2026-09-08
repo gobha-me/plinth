@@ -441,11 +441,15 @@ auto main(int argc, char* argv[]) -> int {
         std::cerr << shell_cmd;
         return 1;
       }
+      block_shutdown_signals();
+      ShutdownSignalOwner signals;
+      plinth::db::OperationScope database_operations{signals.token()};
       auto cfg = shell_status_cmd.is_used("--config")
                      ? plinth::load_config(
                            shell_status_cmd.get<std::string>("--config"))
                      : plinth::load_config();
       const auto status = plinth::shell::bundled_shell_status(cfg);
+      database_operations.checkpoint();
       if (!status) {
         std::cerr << "shell status failed: " << status.error() << '\n';
         return 1;
@@ -720,7 +724,11 @@ auto main(int argc, char* argv[]) -> int {
                 cfg, bootstrap_ctx,
                 serve_cmd.get<bool>("--upgrade-bundled-shell"));
             !fb.has_value()) {
-          database_operations.checkpoint();
+          // A cancelled COMMIT may have committed remotely. Never turn its
+          // recovery requirement into the clean exit used for startup cancel.
+          if (!fb.error().recovery_required) {
+            database_operations.checkpoint();
+          }
           spdlog::critical(
               "shell::firstboot: aborting boot — kind={} message={}",
               fb.error().kind_string(), fb.error().message);
@@ -784,7 +792,6 @@ auto main(int argc, char* argv[]) -> int {
         database_operations.checkpoint();
         throw;
       }
-
     }
 
     // ── validate ────────────────────────────────────────

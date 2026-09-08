@@ -113,13 +113,13 @@ struct DetectResult {
 
 auto detect_active_bundled_frontend(PGconn* conn)
     -> std::expected<DetectResult, std::string> {
-  PgResult res{plinth::db::exec(conn,
-                      "SELECT name, provenance, state, id::text, version "
-                      "FROM plinth.packages "
-                      "WHERE name = 'shell' "
-                      "   OR (provenance = 'bundled' "
-                      "       AND frontend_mount IS NOT NULL "
-                      "       AND state IN ('ACTIVE','ACTIVE_FLAGGED'))")};
+  PgResult res{plinth::db::exec(
+      conn, "SELECT name, provenance, state, id::text, version "
+            "FROM plinth.packages "
+            "WHERE name = 'shell' "
+            "   OR (provenance = 'bundled' "
+            "       AND frontend_mount IS NOT NULL "
+            "       AND state IN ('ACTIVE','ACTIVE_FLAGGED'))")};
 
   if (PQresultStatus(res.res) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.res)});
@@ -322,8 +322,8 @@ auto bundled_shell_status(const Config& cfg)
     return std::unexpected("cannot connect to inspect installed shell");
   }
   BundledShellStatus status{.available_version = bundle->version};
-  PgResult exists{
-      plinth::db::exec(pg.conn, "SELECT to_regclass('plinth.packages') IS NOT NULL")};
+  PgResult exists{plinth::db::exec(
+      pg.conn, "SELECT to_regclass('plinth.packages') IS NOT NULL")};
   if (PQresultStatus(exists.res) != PGRES_TUPLES_OK ||
       PQntuples(exists.res) != 1) {
     return std::unexpected("cannot inspect package schema");
@@ -417,7 +417,8 @@ auto ensure_bundled_shell_installed(
       return std::unexpected(FirstBootFailure{
           .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
           .message = "bundled frontend active symlink disagrees with installed "
-                     "version; operator recovery required"});
+                     "version; operator recovery required",
+          .recovery_required = true});
     }
     if (upgrade_requested) {
       if (detect->name != "shell") {
@@ -450,10 +451,12 @@ auto ensure_bundled_shell_installed(
           packages::upgrade_package(bundle->bytes, detect->id, bootstrap_ctx,
                                     packages::Provenance::BUNDLED);
       if (!upgraded) {
-        return std::unexpected(
-            FirstBootFailure{.kind = FirstBootError::BUNDLE_INSTALL_FAILED,
-                             .message = "bundled-shell upgrade failed: " +
-                                        upgraded.error().message});
+        return std::unexpected(FirstBootFailure{
+            .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
+            .message =
+                "bundled-shell upgrade failed: " + upgraded.error().message,
+            .recovery_required = upgraded.error().report.value("kind", "") ==
+                                 "upgrade-recovery-required"});
       }
       spdlog::info("shell: explicitly upgraded bundled shell {} to {}",
                    detect->version, upgraded->new_record.version);

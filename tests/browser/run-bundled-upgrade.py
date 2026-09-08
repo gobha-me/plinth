@@ -80,7 +80,7 @@ def main():
             children = []
             browser = None
 
-            def launch(upgrade=False, fails=""):
+            def launch(upgrade=False, fails="", cancel_commit=None):
                 output_path = root / f"kernel-{len(children)}.log"
                 with output_path.open("w") as output:
                     child = subprocess.Popen([str(binary), "serve", "--config", str(config)] +
@@ -88,6 +88,22 @@ def main():
                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
                 children.append(child)
                 try:
+                    if cancel_commit is not None:
+                        deadline = time.monotonic() + 15
+                        while child.poll() is None and time.monotonic() < deadline:
+                            # The deferred trigger runs only inside the final
+                            # COMMIT, after the candidate pointer was swapped.
+                            if sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+                                   "AND query='COMMIT' AND state='active' AND wait_event='PgSleep'") == "1":
+                                break
+                            time.sleep(0.05)
+                        else:
+                            raise RuntimeError("upgrade never reached the blocked COMMIT")
+                        child.send_signal(cancel_commit)
+                        child.wait(timeout=15)
+                        assert child.returncode == 2, "COMMIT cancellation lost its recovery failure"
+                        assert "database commit outcome is unknown" in output_path.read_text()
+                        return None
                     if fails:
                         child.wait(timeout=45)
                         assert child.returncode != 0, "invalid upgrade unexpectedly succeeded"
@@ -214,6 +230,30 @@ def main():
                 launch(upgrade=True, fails="incoming version directory already exists")
                 unchanged()
                 assert (collision / "sentinel").read_text() == "retain unrelated files"
+                # A signal while COMMIT is in flight must retain both versions
+                # and remain a recovery failure, even after backend cancellation.
+                sql("CREATE FUNCTION plinth.pause_bundled_commit() RETURNS trigger LANGUAGE plpgsql "
+                    "AS $$ BEGIN IF NEW.name='shell' AND NEW.state='ACTIVE' "
+                    "AND NEW.version IN ('901.0.8','901.0.9') THEN PERFORM pg_sleep(60); "
+                    "END IF; RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER pause_bundled_commit "
+                    "AFTER UPDATE ON plinth.packages DEFERRABLE INITIALLY DEFERRED "
+                    "FOR EACH ROW EXECUTE FUNCTION plinth.pause_bundled_commit();")
+                for interrupted_version, shutdown_signal in (("901.0.8", signal.SIGINT),
+                                                               ("901.0.9", signal.SIGTERM)):
+                    candidate(interrupted_version, [first_migration])
+                    launch(upgrade=True, cancel_commit=shutdown_signal)
+                    unchanged()
+                    retained = root / "data/extensions/shell" / interrupted_version
+                    assert retained.is_dir(), "uncertain COMMIT discarded the candidate files"
+                    assert sql("SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+                               "AND query='COMMIT' AND state='active'") == "0"
+                    # Simulate operator recovery only after independently
+                    # confirming the committed old database state and pointer.
+                    sql("UPDATE plinth.packages SET state='INSTALL_FAILED' WHERE name='shell' "
+                        f"AND version='{interrupted_version}' AND state='UPLOADING'")
+                    shutil.rmtree(retained)
+                sql("DROP TRIGGER pause_bundled_commit ON plinth.packages; "
+                    "DROP FUNCTION plinth.pause_bundled_commit();")
                 candidate("901.0.2", [("002_upgrade_probe.sql",
                     "ALTER TABLE ext_shell.user_preferences ADD COLUMN upgrade_probe TEXT;")])
                 transition.legacy.clear()

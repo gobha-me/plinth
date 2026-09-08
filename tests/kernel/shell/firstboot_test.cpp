@@ -380,6 +380,8 @@ TEST_CASE("bundled shell upgrade cannot be invoked as a user package",
   auto inconsistent =
       plinth::shell::ensure_bundled_shell_installed(s.cfg, s.ctx);
   REQUIRE_FALSE(inconsistent);
+  REQUIRE(inconsistent.error().recovery_required);
+  REQUIRE(inconsistent.error().exit_code() == 2);
   REQUIRE(inconsistent.error().message.find("operator recovery required") !=
           std::string::npos);
 }

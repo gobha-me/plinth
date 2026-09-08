@@ -51,6 +51,9 @@ enum class FirstBootError : std::uint8_t {
 struct FirstBootFailure {
   FirstBootError kind;
   std::string message;
+  // An uncertain commit or mismatched active pointer remains an operator
+  // failure even when the caller simultaneously receives a shutdown signal.
+  bool recovery_required = false;
 
   [[nodiscard]] auto exit_code() const noexcept -> int;
   [[nodiscard]] auto kind_string() const noexcept -> std::string_view;

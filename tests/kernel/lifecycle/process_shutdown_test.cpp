@@ -1232,3 +1232,25 @@ TEST_CASE(
     }
   }
 }
+
+TEST_CASE("shell status cancels a stalled PostgreSQL handshake",
+          "[integration][lifecycle][subprocess][startup][shell-status]") {
+  for (int signal : {SIGINT, SIGTERM}) {
+    CAPTURE(signal);
+    StalledPostgres endpoint;
+    TempTree tree;
+    const auto config = write_startup_config(tree);
+    const auto log = tree.path / "status.log";
+    ChildProcess child{{PLINTH_BINARY_PATH, "shell", "status", "--config",
+                        config.string(), "--json"},
+                       log,
+                       &endpoint.database};
+    auto peer = endpoint.accept_handshake();
+    child.send_signal(signal);
+    auto status = child.wait_for_exit(10s);
+    REQUIRE(status.has_value());
+    REQUIRE(WIFEXITED(*status));
+    REQUIRE(WEXITSTATUS(*status) == 1);
+    REQUIRE(read_text(log).contains("PostgreSQL startup operation cancelled"));
+  }
+}
