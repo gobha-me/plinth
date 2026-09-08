@@ -1,5 +1,6 @@
 #include "kernel/groups/handlers.hpp"
 #include "kernel/auth/middleware.hpp"
+#include "kernel/db/connection_info.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/rbac/enforcement.hpp"
 
@@ -10,7 +11,6 @@
 #include <memory>
 #include <mutex>
 #include <spdlog/spdlog.h>
-#include <sstream>
 
 namespace plinth::groups {
 
@@ -820,14 +820,6 @@ auto handle_revoke_rule(const drogon::HttpRequestPtr& req, Callback&& callback,
 
 // ── Bootstrap helpers (libpq, synchronous) ──────────────────────────
 
-auto build_conninfo(const Config::Database& db_cfg) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db_cfg.host << " port=" << db_cfg.port
-     << " dbname=" << db_cfg.database << " user=" << db_cfg.user
-     << " password=" << db_cfg.password;
-  return ss.str();
-}
-
 auto pg_exec(PGconn* conn, const std::string& sql) -> void {
   std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(conn, sql.c_str()),
                                                     PQclear);
@@ -843,7 +835,7 @@ auto pg_exec(PGconn* conn, const std::string& sql) -> void {
 // ── Public API ───────────────────────────────────────────────────────
 
 auto bootstrap_groups(const Config::Database& db_cfg) -> void {
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);

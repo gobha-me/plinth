@@ -1,5 +1,6 @@
 #include "kernel/audit/handlers.hpp"
 #include "kernel/auth/middleware.hpp"
+#include "kernel/db/connection_info.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/rbac/enforcement.hpp"
 
@@ -14,7 +15,6 @@
 #include <memory>
 #include <mutex>
 #include <spdlog/spdlog.h>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -265,14 +265,6 @@ auto handle_list_audit(const drogon::HttpRequestPtr& req, Callback&& callback)
 
 // ── Retention ───────────────────────────────────────────────────────
 
-auto build_conninfo(const Config::Database& db_cfg) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db_cfg.host << " port=" << db_cfg.port
-     << " dbname=" << db_cfg.database << " user=" << db_cfg.user
-     << " password=" << db_cfg.password;
-  return ss.str();
-}
-
 } // namespace
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -315,7 +307,7 @@ auto purge_older_than(const Config::Database& db, int retention_days)
     return 0;
   }
 
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);

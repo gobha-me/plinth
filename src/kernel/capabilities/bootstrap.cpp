@@ -1,4 +1,5 @@
 #include "kernel/capabilities/bootstrap.hpp"
+#include "kernel/db/connection_info.hpp"
 #include "kernel/logging.hpp"
 
 #include <array>
@@ -6,7 +7,6 @@
 #include <libpq-fe.h>
 #include <memory>
 #include <spdlog/spdlog.h>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -52,13 +52,6 @@ constexpr std::array KERNEL_CAPS = {
               .rbac_rule = "kernel.config.get",
               .description = "Read kernel configuration values"},
 };
-
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
 
 // Returns true if this is the first time the given rule is being
 // registered in this DB (i.e. the INSERT affected one row). Mirrors
@@ -123,7 +116,7 @@ auto insert_capability_if_absent(PGconn* conn, const KernelCap& cap,
 } // namespace
 
 auto bootstrap_kernel_capabilities(const Config::Database& db_cfg) -> void {
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);

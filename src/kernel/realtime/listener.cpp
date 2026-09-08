@@ -1,4 +1,5 @@
 #include "kernel/realtime/listener.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/realtime/channel.hpp"
 
@@ -14,7 +15,6 @@
 #include <optional>
 #include <poll.h>
 #include <spdlog/spdlog.h>
-#include <sstream>
 #include <string>
 #include <sys/eventfd.h>
 #include <thread>
@@ -76,13 +76,6 @@ std::mutex handlers_mutex;
 std::vector<EventHandler> handlers;
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
 
 using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
@@ -159,7 +152,7 @@ auto dispatch(const DispatchedEvent& ev) -> bool {
 // ── Thread body (connect + LISTEN + poll + dispatch loop) ──────────
 
 auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("realtime listener: connect failed: {}",

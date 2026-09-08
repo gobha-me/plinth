@@ -1,4 +1,5 @@
 #include "kernel/shell/active_frontend.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -15,7 +16,6 @@
 #include <optional>
 #include <ranges>
 #include <shared_mutex>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -264,13 +264,6 @@ auto handle_app_request(
   std::move(cb)(serve_file(*resolved, mime, CACHE_MOUNT));
 }
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 // `<mount>` may or may not have a trailing slash in the manifest. The
 // route registrar normalises to "no trailing slash + (.*)" so the
 // captured remainder skips the leading "/" (matches existing 0.6.0
@@ -287,7 +280,7 @@ auto trim_trailing_slash(std::string_view s) -> std::string {
 auto resolve_active_frontend(const Config::Database& db,
                              const std::filesystem::path& data_dir)
     -> std::optional<ActiveFrontend> {
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("shell::resolve_active_frontend: PG connect failed: {}",
