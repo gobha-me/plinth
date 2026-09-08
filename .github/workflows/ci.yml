@@ -159,6 +159,7 @@ jobs:
           python3 tests/browser/process_cleanup_test.py
           python3 tests/browser/run-production.py --binary build/plinth
           python3 tests/browser/run-production.py --binary build/plinth --upgrade-cache
+          python3 tests/browser/run-bundled-upgrade.py --binary build/plinth
 
   asan-ubsan:
     name: clang-20 / ASan+UBSan
