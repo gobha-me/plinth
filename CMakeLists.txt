@@ -762,9 +762,20 @@ set_tests_properties(plinth_tests_batch_transaction
              TIMEOUT 60)
 
 add_test(NAME plinth_tests_pg
-  COMMAND plinth_tests "[integration] ~[ws] ~[js]"
+  COMMAND plinth_tests "[integration] ~[ws] ~[js] ~[subprocess]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pg
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             TIMEOUT 300)
+
+# Repeated production boots need their own aggregate budget under sanitizers.
+# Keep the per-process lifecycle bounds unchanged and serialize both groups
+# against the shared PostgreSQL fixture, including when CTest runs in parallel.
+add_test(NAME plinth_tests_subprocess
+  COMMAND plinth_tests "[integration] [subprocess] ~[ws] ~[js]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_subprocess
   PROPERTIES RESOURCE_LOCK plinth_pg_schema
              LABELS "needs_pg"
              TIMEOUT 300)
