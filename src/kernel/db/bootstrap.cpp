@@ -1,4 +1,5 @@
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include <fstream>
 #include <libpq-fe.h>
@@ -136,14 +137,6 @@ auto reset_development_schemas(const PgConnection& pg) -> void {
   }
 }
 
-auto build_conninfo(const Config::Database& db_cfg) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db_cfg.host << " port=" << db_cfg.port
-     << " dbname=" << db_cfg.database << " user=" << db_cfg.user
-     << " password=" << db_cfg.password;
-  return ss.str();
-}
-
 } // namespace
 
 auto load_schema_sql(const std::string& migrations_dir) -> std::string {
@@ -168,7 +161,7 @@ auto bootstrap_schema(const Config::Database& db_cfg,
                       const std::string& migrations_dir, bool dev_mode)
     -> void {
   auto schema_sql = load_schema_sql(migrations_dir);
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
 
   spdlog::info("connecting to {}:{}/{}", db_cfg.host, db_cfg.port,
                db_cfg.database);

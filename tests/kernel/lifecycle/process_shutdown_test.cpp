@@ -4,6 +4,9 @@
 #include "kernel/config.hpp"
 #include <catch2/catch_test_macros.hpp>
 
+#include "kernel/config.hpp"
+#include "kernel/db/connection_info.hpp"
+
 #include <nlohmann/json.hpp>
 
 #include <arpa/inet.h>
@@ -21,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <spawn.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
@@ -267,6 +271,90 @@ auto required_env(const char* name) -> std::optional<std::string> {
   }
   return std::string{value};
 }
+
+// Owns only uniquely named credentials and a database on the disposable
+// PostgreSQL instance selected by the integration-test environment.
+class CredentialDatabase {
+ public:
+  CredentialDatabase() {
+    db.host = required_env("PLINTH_PG_HOST").value();
+    db.port = static_cast<std::uint16_t>(
+        std::stoi(required_env("PLINTH_PG_PORT").value()));
+    db.user = required_env("PLINTH_PG_USER").value();
+    db.password = required_env("PLINTH_PG_PASSWORD").value();
+    db.database = required_env("PLINTH_PG_DATABASE").value();
+    auto conninfo = plinth::db::connection_info(db) +
+                    " connect_timeout=5 options='-c statement_timeout=5000'";
+    admin.reset(PQconnectdb(conninfo.c_str()));
+    REQUIRE(admin != nullptr);
+    REQUIRE(PQstatus(admin.get()) == CONNECTION_OK);
+    auto suffix =
+        std::to_string(::getpid()) + "_" + std::to_string(sequence++) + "'\\";
+    db.user = "plinth credential role " + suffix;
+    db.database = "plinth credential db " + suffix;
+  }
+
+  ~CredentialDatabase() {
+    if (database_created) {
+      CHECK(
+          exec("DROP DATABASE " + quote(db.database, false) + " WITH (FORCE)"));
+    }
+    if (role_created) {
+      CHECK(exec("DROP ROLE " + quote(db.user, false)));
+    }
+  }
+
+  CredentialDatabase(const CredentialDatabase&) = delete;
+  auto operator=(const CredentialDatabase&) -> CredentialDatabase& = delete;
+
+  auto create(std::string password) -> void {
+    db.password = std::move(password);
+    REQUIRE(exec("CREATE ROLE " + quote(db.user, false) +
+                 " LOGIN SUPERUSER PASSWORD " + quote(db.password, true)));
+    role_created = true;
+    REQUIRE(exec("CREATE DATABASE " + quote(db.database, false) + " OWNER " +
+                 quote(db.user, false)));
+    database_created = true;
+
+    using Connection = std::unique_ptr<PGconn, decltype(&PQfinish)>;
+    auto conninfo = plinth::db::connection_info(db) + " connect_timeout=5";
+    Connection authenticated{PQconnectdb(conninfo.c_str()), PQfinish};
+    REQUIRE(authenticated != nullptr);
+    REQUIRE(PQstatus(authenticated.get()) == CONNECTION_OK);
+    // Trust authentication would hide password corruption, so it is not a
+    // valid environment for this test. CI's PostgreSQL service uses SCRAM.
+    REQUIRE(PQconnectionUsedPassword(authenticated.get()) == 1);
+    auto incorrect = db;
+    incorrect.password = "deliberately-incorrect-test-password";
+    conninfo = plinth::db::connection_info(incorrect) + " connect_timeout=5";
+    Connection rejected{PQconnectdb(conninfo.c_str()), PQfinish};
+    REQUIRE(rejected != nullptr);
+    REQUIRE(PQstatus(rejected.get()) == CONNECTION_BAD);
+  }
+
+  plinth::Config::Database db;
+
+ private:
+  auto quote(const std::string& value, bool literal) const -> std::string {
+    std::unique_ptr<char, decltype(&PQfreemem)> result{
+        literal ? PQescapeLiteral(admin.get(), value.data(), value.size())
+                : PQescapeIdentifier(admin.get(), value.data(), value.size()),
+        PQfreemem};
+    REQUIRE(result != nullptr);
+    return result.get();
+  }
+
+  auto exec(const std::string& sql) const -> bool {
+    std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexec(admin.get(), sql.c_str()), PQclear};
+    return PQresultStatus(result.get()) == PGRES_COMMAND_OK;
+  }
+
+  static inline unsigned int sequence = 0;
+  std::unique_ptr<PGconn, decltype(&PQfinish)> admin{nullptr, PQfinish};
+  bool role_created = false;
+  bool database_created = false;
+};
 
 auto emit_realtime_burst() -> void {
   auto host = required_env("PLINTH_PG_HOST");
@@ -673,6 +761,86 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
                  {EVENT_CHANNEL, std::to_string(control_seq)}) == 1);
 }
 
+auto request_http(std::uint16_t port, std::string_view request) -> std::string {
+  auto socket = connect_to(port);
+  if (socket.fd < 0 || !send_all(socket.fd, request)) {
+    throw std::runtime_error("failed to send subprocess HTTP request");
+  }
+  std::array<char, 4096> buffer{};
+  std::string response;
+  for (;;) {
+    ssize_t received = ::recv(socket.fd, buffer.data(), buffer.size(), 0);
+    if (received < 0) {
+      throw std::runtime_error("failed to receive subprocess HTTP response");
+    }
+    if (received == 0) {
+      return response;
+    }
+    response.append(buffer.data(), static_cast<std::size_t>(received));
+    REQUIRE(response.size() <= 65536);
+  }
+}
+
+auto require_authenticated_runtime_queries(std::uint16_t port) -> void {
+  auto frontend = request_http(
+      port, "GET /api/frontend/tokens.css HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Connection: close\r\n\r\n");
+  REQUIRE(frontend.contains(" 302 "));
+  REQUIRE(frontend.contains("/ext/shell/"));
+
+  // The missing-user response requires a successful query on Drogon's pool.
+  // A broken pool connection would instead time out or return a server error.
+  constexpr std::string_view BODY =
+      R"({"username":"credential-test-missing","password":"fake-password"})";
+  auto login = request_http(
+      port, "POST /api/auth/login HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+            "Connection: close\r\nContent-Type: application/json\r\n"
+            "Content-Length: " +
+                std::to_string(BODY.size()) + "\r\n\r\n" + std::string{BODY});
+  REQUIRE(login.contains(" 401 "));
+  REQUIRE(login.contains("invalid_credentials"));
+}
+
+auto require_authenticated_listener(const plinth::Config::Database& db,
+                                    int boot) -> void {
+  using Connection = std::unique_ptr<PGconn, decltype(&PQfinish)>;
+  auto conninfo = plinth::db::connection_info(db) +
+                  " connect_timeout=5 options='-c statement_timeout=5000'";
+  Connection connection{PQconnectdb(conninfo.c_str()), PQfinish};
+  REQUIRE(connection != nullptr);
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  auto marker = std::to_string(boot);
+  auto payload = nlohmann::json{
+      {"layer", "system"},
+      {"channel", "plinth:system:credential.test"},
+      {"marker",
+       marker}}.dump();
+  const std::array<const char*, 1> payload_params{payload.c_str()};
+  const std::array<const char*, 1> marker_params{marker.c_str()};
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
+    Result sent{PQexecParams(
+                    connection.get(), "SELECT pg_notify('plinth:realtime', $1)",
+                    1, nullptr, payload_params.data(), nullptr, nullptr, 0),
+                PQclear};
+    REQUIRE(PQresultStatus(sent.get()) == PGRES_TUPLES_OK);
+    Result found{
+        PQexecParams(connection.get(),
+                     "SELECT 1 FROM plinth.events WHERE channel = "
+                     "'plinth:system:credential.test' AND payload->>'marker' "
+                     "= $1 LIMIT 1",
+                     1, nullptr, marker_params.data(), nullptr, nullptr, 0),
+        PQclear};
+    REQUIRE(PQresultStatus(found.get()) == PGRES_TUPLES_OK);
+    if (PQntuples(found.get()) > 0) {
+      return;
+    }
+    std::this_thread::sleep_for(25ms);
+  }
+  FAIL("production listener did not persist the credential-test notification");
+}
+
 auto require_clean_signal_shutdown(int signal) -> void {
   TempTree tree;
   auto port = test_port();
@@ -783,4 +951,50 @@ TEST_CASE("partial startup uses bounded coordinator teardown",
   REQUIRE(status.has_value());
   REQUIRE(WIFEXITED(*status));
   REQUIRE(WEXITSTATUS(*status) == 1);
+}
+
+TEST_CASE("production preserves PostgreSQL credentials across boot and restart",
+          "[integration][lifecycle][subprocess][conninfo]") {
+  if (!required_env("PLINTH_PG_HOST").has_value()) {
+    SKIP("PostgreSQL environment is not configured");
+  }
+
+  // The last value has whitespace but no ordinary space, exercising Drogon's
+  // pool quoting separately from Plinth's direct libpq connection strings.
+  const std::array<std::string, 3> passwords{"fake space password",
+                                             "fake\\backslash'quote",
+                                             "fake\twhite\nspace\r\f\v"};
+  for (std::size_t variant = 0; variant < passwords.size(); ++variant) {
+    CAPTURE(variant);
+    CredentialDatabase database;
+    database.create(passwords[variant]);
+    TempTree tree;
+    auto port = test_port();
+    auto config_path = write_config(tree, port, true);
+    auto config = nlohmann::json::parse(read_text(config_path));
+    config["dev_mode"] = false;
+    {
+      std::ofstream stream(config_path);
+      REQUIRE(stream.good());
+      stream << config.dump(2);
+      REQUIRE(stream.good());
+    }
+    for (int boot = 0; boot < 2; ++boot) {
+      CAPTURE(boot);
+      auto log_path = tree.path / ("boot-" + std::to_string(boot) + ".log");
+      ChildProcess child{
+          {PLINTH_BINARY_PATH, "serve", "--config", config_path.string()},
+          log_path,
+          &database.db};
+      REQUIRE(wait_for_health(port, 30s));
+      require_authenticated_runtime_queries(port);
+      require_authenticated_listener(database.db, boot);
+      child.send_signal(SIGTERM);
+      auto status = child.wait_for_exit(15s);
+      REQUIRE(status.has_value());
+      REQUIRE(WIFEXITED(*status));
+      REQUIRE(WEXITSTATUS(*status) == 0);
+      REQUIRE_FALSE(read_text(log_path).contains(database.db.password));
+    }
+  }
 }

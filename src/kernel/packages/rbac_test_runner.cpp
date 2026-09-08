@@ -1,4 +1,5 @@
 #include "kernel/packages/rbac_test_runner.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/capabilities/parser.hpp"
 #include "kernel/capabilities/resolution.hpp"
@@ -173,9 +174,7 @@ auto format_iso(std::chrono::system_clock::time_point tp) -> std::string {
 }
 
 auto conninfo_of(const plinth::Config::Database& db) -> std::string {
-  return "host=" + db.host + " port=" + std::to_string(db.port) +
-         " dbname=" + db.database + " user=" + db.user +
-         " password=" + db.password + " connect_timeout=5";
+  return plinth::db::connection_info(db) + " connect_timeout=5";
 }
 
 struct PgGuard {

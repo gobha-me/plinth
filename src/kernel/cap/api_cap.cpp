@@ -1,4 +1,5 @@
 #include "kernel/cap/api_cap.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/auth/middleware.hpp"
 #include "kernel/capabilities/resolution.hpp"
@@ -16,7 +17,6 @@
 #include <spdlog/spdlog.h>
 
 #include <memory>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -26,13 +26,6 @@ namespace plinth::cap {
 
 namespace {
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 // Mirrors the SELECT in rbac/enforcement.cpp:261-264. Sync libpq because
 // the cap-dispatch handler is already off-loop (Drogon dispatched it via
 // the registered handler with the SessionFilter chain) and the resolver
@@ -41,7 +34,7 @@ auto load_effective_rules(const Config::Database& db_cfg,
                           std::string_view user_id)
     -> std::vector<std::string> {
   std::vector<std::string> rules;
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("cap::api_cap: PG connect failed: {}", PQerrorMessage(conn));

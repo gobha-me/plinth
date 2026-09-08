@@ -1,4 +1,5 @@
 #include "kernel/frontend/api_frontend.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -9,7 +10,6 @@
 
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <string>
 #include <utility>
 
@@ -34,20 +34,13 @@ struct ResolveResult {
   std::string version;
 };
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 // Resolve the single ACTIVE frontend row from `plinth.packages`. Mirrors
 // the LIMIT 2 detection in `shell::resolve_active_frontend` but reports
 // the n==0 vs n>1 distinction so the handler can return the right 503
 // diagnostic body per ICD §6.4. The column subset is narrower (name +
 // version only) — this handler builds a redirect URL, not an asset path.
 auto resolve_active(const Config::Database& db) -> ResolveResult {
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("frontend::api_frontend: PG connect failed: {}",

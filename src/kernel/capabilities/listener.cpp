@@ -1,5 +1,6 @@
 #include "kernel/capabilities/listener.hpp"
 #include "kernel/capabilities/resolution.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include <array>
 #include <chrono>
@@ -13,7 +14,6 @@
 #include <optional>
 #include <poll.h>
 #include <spdlog/spdlog.h>
-#include <sstream>
 #include <string>
 #include <sys/eventfd.h>
 #include <thread>
@@ -46,16 +46,6 @@ std::condition_variable listener_exit_cv;
 bool listener_exited = true;
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-auto build_conninfo(const Config::Database& db) -> std::string {
-  // Duplicated in registration.cpp and resolution.cpp — not lifted
-  // into a shared header because the producer/consumer paths are
-  // intentionally independent (see listener.hpp threading note).
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
 
 struct ParsedNotification {
   std::string action;    // "register" | "deregister" | "disable" | "enable"
@@ -117,7 +107,7 @@ using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 // register→disable race lands on the correct state.
 auto fetch_row(const Config::Database& db_cfg, std::string_view signature,
                std::string_view scope) -> std::optional<CachedCapability> {
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("listener: fetch_row connect failed: {}",
@@ -220,7 +210,7 @@ auto apply(const Config::Database& db_cfg, const ParsedNotification& n)
 // ── Listener thread body ─────────────────────────────────────────────
 
 auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("listener: connect failed: {}", PQerrorMessage(conn));

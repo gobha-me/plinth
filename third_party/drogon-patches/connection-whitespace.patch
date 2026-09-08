@@ -1,0 +1,13 @@
+diff --git a/orm_lib/src/DbClientManager.cc b/orm_lib/src/DbClientManager.cc
+--- a/orm_lib/src/DbClientManager.cc
++++ b/orm_lib/src/DbClientManager.cc
+@@ -24,7 +24,8 @@ using namespace drogon;
+ 
+ inline std::string escapeConnString(const std::string &str)
+ {
+-    bool beQuoted = str.empty() || (str.find(' ') != std::string::npos);
++    bool beQuoted = str.empty() ||
++                    (str.find_first_of(" \t\n\r\f\v") != std::string::npos);
+ 
+     std::string escaped;
+     escaped.reserve(str.size());
