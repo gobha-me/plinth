@@ -229,7 +229,7 @@ auto inspect_bundle(const fs::path& path, std::size_t max_bytes)
     }
     if (std::string_view{info.name} == "manifest.json") {
       if (manifest_index || (info.valid & ZIP_STAT_SIZE) == 0 ||
-          info.size == 0 || info.size > 256 * 1024) {
+          info.size == 0 || info.size > zip_uint64_t{256} * 1024) {
         return std::unexpected(
             "bundled ZIP requires one bounded root manifest");
       }
