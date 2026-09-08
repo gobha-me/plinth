@@ -31,7 +31,12 @@ try {
     });
     for (const version of ['901.0.1', '901.0.2']) {
         responses.length = 0;
+        const sessionResponse = page.waitForResponse(response =>
+            new URL(response.url()).pathname === '/api/auth/session');
         await page.goto(baseURL + '/app/');
+        // The sign-in heading can render before the session lookup finishes.
+        // Finish that owned request before later navigating away from the page.
+        assert.equal(await (await sessionResponse).finished(), null);
         try {
             await page.getByRole('heading', { name: 'Sign in to Plinth', exact: true }).waitFor();
         } catch (cause) {
