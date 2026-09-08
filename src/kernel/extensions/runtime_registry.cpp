@@ -6,6 +6,7 @@
 
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/js/async_op.hpp"
 #include "kernel/js/bridge_context.hpp"
@@ -724,7 +725,7 @@ auto invoke_handler(plinth::js::BridgeContext& bc,
 auto connect_and_list_active_extensions(const Config::Database& db_cfg,
                                         std::vector<std::string>& out) -> bool {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);
@@ -732,8 +733,9 @@ auto connect_and_list_active_extensions(const Config::Database& db_cfg,
     return false;
   }
   std::unique_ptr<PGconn, decltype(&PQfinish)> guard(conn, PQfinish);
-  PGresult* res = PQexec(conn, "SELECT name FROM plinth.packages "
-                               "WHERE state IN ('ACTIVE', 'ACTIVE_FLAGGED')");
+  PGresult* res =
+      plinth::db::exec(conn, "SELECT name FROM plinth.packages "
+                             "WHERE state IN ('ACTIVE', 'ACTIVE_FLAGGED')");
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     spdlog::error("extensions::init_registry: SELECT failed: {}",
                   PQresultErrorMessage(res));
@@ -768,6 +770,7 @@ auto init_registry(const Config& cfg) -> void {
   }
   std::size_t created = 0;
   for (const auto& name : active_names) {
+    plinth::db::OperationScope::checkpoint_current();
     if (create_pool(name)) {
       ++created;
     }

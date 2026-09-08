@@ -1,4 +1,5 @@
 #include "kernel/rbac/rule_validator.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/capabilities/parser.hpp"
 #include "kernel/capabilities/types.hpp"
@@ -182,7 +183,7 @@ auto check_rule_a5(const RbacRule& r, std::size_t idx,
   std::string rule_s{r.rule};
   std::array<const char*, 1> values = {rule_s.c_str()};
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           &conn, "SELECT extension_name FROM plinth.rbac_rules WHERE rule = $1",
           1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);

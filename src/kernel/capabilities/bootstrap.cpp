@@ -1,5 +1,6 @@
 #include "kernel/capabilities/bootstrap.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/logging.hpp"
 
 #include <array>
@@ -63,12 +64,12 @@ auto insert_rule_if_absent(PGconn* conn, const KernelCap& cap) -> bool {
       "kernel", // extension_name for kernel-owned rules
   };
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexecParams(conn,
-                   "INSERT INTO plinth.rbac_rules "
-                   "(rule, namespace, description, extension_name) "
-                   "VALUES ($1, $2, $3, $4) "
-                   "ON CONFLICT (rule) DO NOTHING",
-                   4, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(conn,
+                              "INSERT INTO plinth.rbac_rules "
+                              "(rule, namespace, description, extension_name) "
+                              "VALUES ($1, $2, $3, $4) "
+                              "ON CONFLICT (rule) DO NOTHING",
+                              4, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     throw std::runtime_error(
@@ -95,7 +96,7 @@ auto insert_capability_if_absent(PGconn* conn, const KernelCap& cap,
       cap.rbac_rule,
   };
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexecParams(
+      plinth::db::exec_params(
           conn,
           "INSERT INTO plinth.capabilities "
           "(namespace, version, function, signature, provider_type, "
@@ -117,7 +118,7 @@ auto insert_capability_if_absent(PGconn* conn, const KernelCap& cap,
 
 auto bootstrap_kernel_capabilities(const Config::Database& db_cfg) -> void {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);

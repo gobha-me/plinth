@@ -2,6 +2,7 @@
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/parser.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/logging.hpp"
 
@@ -200,7 +201,7 @@ using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 // if a full refresh is required; this function only inserts.
 auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);
@@ -209,12 +210,13 @@ auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
   }
   std::unique_ptr<PGconn, decltype(&PQfinish)> guard(conn, PQfinish);
 
-  PgResultPtr res{PQexec(conn, "SELECT signature, provider_type, "
-                               "       COALESCE(extension_name, ''), scope, "
-                               "       rbac_rule "
-                               "FROM plinth.capabilities "
-                               "WHERE enabled = true"),
-                  PQclear};
+  PgResultPtr res{
+      plinth::db::exec(conn, "SELECT signature, provider_type, "
+                             "       COALESCE(extension_name, ''), scope, "
+                             "       rbac_rule "
+                             "FROM plinth.capabilities "
+                             "WHERE enabled = true"),
+      PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("tier2 load: SELECT failed: {}",
                   PQresultErrorMessage(res.get()));

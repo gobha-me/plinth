@@ -1,5 +1,6 @@
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -328,7 +329,7 @@ auto cancel_all_registrations() noexcept -> void {
 auto restore_routes(const Config::Database& db,
                     const std::filesystem::path& data_dir) -> void {
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("asset_server::restore_routes: PG connect failed: {}",
                  PQerrorMessage(conn));
@@ -339,9 +340,9 @@ auto restore_routes(const Config::Database& db,
   std::unique_ptr<PGconn, decltype(cleanup)> guard(conn, cleanup);
 
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexec(conn, "SELECT name, version, manifest_checksum "
-                   "FROM plinth.packages "
-                   "WHERE state IN ('ACTIVE', 'ACTIVE_FLAGGED')"),
+      plinth::db::exec(conn, "SELECT name, version, manifest_checksum "
+                             "FROM plinth.packages "
+                             "WHERE state IN ('ACTIVE', 'ACTIVE_FLAGGED')"),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::warn("asset_server::restore_routes: SELECT failed: {}",

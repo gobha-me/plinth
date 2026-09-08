@@ -1,6 +1,7 @@
 #include "kernel/groups/handlers.hpp"
 #include "kernel/auth/middleware.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/rbac/enforcement.hpp"
 
@@ -821,8 +822,8 @@ auto handle_revoke_rule(const drogon::HttpRequestPtr& req, Callback&& callback,
 // ── Bootstrap helpers (libpq, synchronous) ──────────────────────────
 
 auto pg_exec(PGconn* conn, const std::string& sql) -> void {
-  std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(conn, sql.c_str()),
-                                                    PQclear);
+  std::unique_ptr<PGresult, decltype(&PQclear)> res(
+      plinth::db::exec(conn, sql.c_str()), PQclear);
   auto status = PQresultStatus(res.get());
   if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
     throw std::runtime_error(std::string("bootstrap_groups SQL failed: ") +
@@ -836,7 +837,7 @@ auto pg_exec(PGconn* conn, const std::string& sql) -> void {
 
 auto bootstrap_groups(const Config::Database& db_cfg) -> void {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);
@@ -875,9 +876,9 @@ auto bootstrap_groups(const Config::Database& db_cfg) -> void {
   //    rule, guarded to stay idempotent across restarts. Per ICD-0.1.7
   //    §Audit Event Catalog, every RBAC rule registration must be audited.
   std::unique_ptr<PGresult, decltype(&PQclear)> audit_check(
-      PQexec(conn, "SELECT 1 FROM plinth.audit_log "
-                   "WHERE action = 'rbac.rule_registered' "
-                   "  AND detail->>'rule' = 'kernel.admin' LIMIT 1"),
+      plinth::db::exec(conn, "SELECT 1 FROM plinth.audit_log "
+                             "WHERE action = 'rbac.rule_registered' "
+                             "  AND detail->>'rule' = 'kernel.admin' LIMIT 1"),
       PQclear);
   if (PQresultStatus(audit_check.get()) == PGRES_TUPLES_OK &&
       PQntuples(audit_check.get()) == 0) {
@@ -914,7 +915,7 @@ auto bootstrap_groups(const Config::Database& db_cfg) -> void {
                                   "  AND detail->>'rule' = '") +
                       rule + "' LIMIT 1";
     std::unique_ptr<PGresult, decltype(&PQclear)> check(
-        PQexec(conn, sql.c_str()), PQclear);
+        plinth::db::exec(conn, sql.c_str()), PQclear);
     if (PQresultStatus(check.get()) == PGRES_TUPLES_OK &&
         PQntuples(check.get()) == 0) {
       Json::Value detail;

@@ -1,4 +1,5 @@
 #include "kernel/packages/panels.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <libpq-fe.h>
 
@@ -43,11 +44,12 @@ auto register_panel(PGconn& conn, const PanelRegistration& reg)
   };
 
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexecParams(&conn,
-                   "INSERT INTO plinth.panels "
-                   "(package_id, panel_id, panel_type, slot_type, declaration) "
-                   "VALUES ($1::uuid, $2, $3, $4, $5::jsonb)",
-                   5, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          &conn,
+          "INSERT INTO plinth.panels "
+          "(package_id, panel_id, panel_type, slot_type, declaration) "
+          "VALUES ($1::uuid, $2, $3, $4, $5::jsonb)",
+          5, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});

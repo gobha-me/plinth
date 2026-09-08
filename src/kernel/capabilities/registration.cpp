@@ -1,6 +1,7 @@
 #include "kernel/capabilities/registration.hpp"
 #include "kernel/capabilities/validation.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <array>
 #include <cstring>
@@ -26,7 +27,7 @@ struct PgConn {
   PGconn* conn = nullptr;
 
   explicit PgConn(const Config::Database& db) {
-    conn = PQconnectdb(plinth::db::connection_info(db).c_str());
+    conn = plinth::db::connect(plinth::db::connection_info(db).c_str());
   }
   ~PgConn() {
     if (conn != nullptr) {
@@ -76,8 +77,9 @@ auto send_notify(PGconn* conn, std::string_view action,
   auto payload_str = json_write(payload);
 
   std::array<const char*, 2> values = {CHANGE_CHANNEL, payload_str.c_str()};
-  PgResultPtr res{PQexecParams(conn, "SELECT pg_notify($1, $2)", 2, nullptr,
-                               values.data(), nullptr, nullptr, 0),
+  PgResultPtr res{plinth::db::exec_params(conn, "SELECT pg_notify($1, $2)", 2,
+                                          nullptr, values.data(), nullptr,
+                                          nullptr, 0),
                   PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("NOTIFY {} failed: {}", CHANGE_CHANNEL,
@@ -87,10 +89,10 @@ auto send_notify(PGconn* conn, std::string_view action,
 
 auto rbac_rule_exists(PGconn* conn, const std::string& rule) -> bool {
   std::array<const char*, 1> values = {rule.c_str()};
-  PgResultPtr res{
-      PQexecParams(conn, "SELECT 1 FROM plinth.rbac_rules WHERE rule = $1", 1,
-                   nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear};
+  PgResultPtr res{plinth::db::exec_params(
+                      conn, "SELECT 1 FROM plinth.rbac_rules WHERE rule = $1",
+                      1, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("rbac_rule_exists probe failed: {}",
                   PQresultErrorMessage(res.get()));
@@ -133,12 +135,13 @@ auto insert_and_notify(PGconn* conn, const CapabilityRegistration& reg,
       reg.rbac_rule.c_str(),
   };
   PgResultPtr res{
-      PQexecParams(conn,
-                   "INSERT INTO plinth.capabilities "
-                   "(namespace, version, function, signature, provider_type, "
-                   " extension_name, scope, description, rbac_rule) "
-                   "VALUES ($1, $2::int, $3, $4, $5, $6, $7, $8, $9)",
-                   9, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn,
+          "INSERT INTO plinth.capabilities "
+          "(namespace, version, function, signature, provider_type, "
+          " extension_name, scope, description, rbac_rule) "
+          "VALUES ($1, $2::int, $3, $4, $5, $6, $7, $8, $9)",
+          9, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear};
 
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
@@ -216,7 +219,7 @@ auto unregister_capability(std::string_view ns, int version,
   // RETURNING captures scope per deleted row so NOTIFY fires precisely
   // for each Tier 2 cache entry that needs eviction.
   PgResultPtr res{
-      PQexecParams(
+      plinth::db::exec_params(
           &conn,
           "DELETE FROM plinth.capabilities "
           "WHERE namespace = $1 AND version = $2::int AND function = $3 "
@@ -256,10 +259,11 @@ auto deregister_capability(const Config::Database& db_cfg,
   std::string scope_str{scope};
   std::array<const char*, 2> values = {signature_str.c_str(),
                                        scope_str.c_str()};
-  PgResultPtr res{PQexecParams(pg.conn,
-                               "DELETE FROM plinth.capabilities "
-                               "WHERE signature = $1 AND scope = $2",
-                               2, nullptr, values.data(), nullptr, nullptr, 0),
+  PgResultPtr res{plinth::db::exec_params(pg.conn,
+                                          "DELETE FROM plinth.capabilities "
+                                          "WHERE signature = $1 AND scope = $2",
+                                          2, nullptr, values.data(), nullptr,
+                                          nullptr, 0),
                   PQclear};
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     spdlog::error("deregister_capability DELETE failed: {}",
@@ -307,11 +311,12 @@ auto set_enabled_by_extension(const Config::Database& db_cfg,
   std::string enabled_str = target_enabled ? "true" : "false";
   std::string ext_str{extension_name};
   std::array<const char*, 2> values = {enabled_str.c_str(), ext_str.c_str()};
-  PgResultPtr res{PQexecParams(pg.conn,
-                               "UPDATE plinth.capabilities "
-                               "SET enabled = $1::boolean "
-                               "WHERE extension_name = $2",
-                               2, nullptr, values.data(), nullptr, nullptr, 0),
+  PgResultPtr res{plinth::db::exec_params(pg.conn,
+                                          "UPDATE plinth.capabilities "
+                                          "SET enabled = $1::boolean "
+                                          "WHERE extension_name = $2",
+                                          2, nullptr, values.data(), nullptr,
+                                          nullptr, 0),
                   PQclear};
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     spdlog::error("set_enabled_by_extension UPDATE failed: {}",

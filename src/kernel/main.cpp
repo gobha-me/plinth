@@ -11,6 +11,7 @@
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/frontend/api_frontend.hpp"
 #include "kernel/groups/handlers.hpp"
@@ -45,6 +46,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
+#include <fcntl.h>
 #include <filesystem>
 #include <iostream>
 #include <mutex>
@@ -140,58 +142,92 @@ auto block_shutdown_signals() -> void {
 }
 
 [[noreturn]] auto emergency_shutdown_exit(std::string_view reason) -> void {
-  plinth::log::shutdown();
-  spdlog::critical("shutdown failed closed: {}", reason);
-  if (auto logger = spdlog::default_logger(); logger != nullptr) {
-    logger->flush();
+  sigset_t blocked;
+  sigemptyset(&blocked);
+  sigaddset(&blocked, SIGPIPE);
+  (void)pthread_sigmask(SIG_BLOCK, &blocked, nullptr);
+  int flags = ::fcntl(STDERR_FILENO, F_GETFL);
+  if (flags >= 0 && ::fcntl(STDERR_FILENO, F_SETFL, flags | O_NONBLOCK) == 0) {
+    constexpr std::string_view prefix = "shutdown failed closed: ";
+    (void)::write(STDERR_FILENO, prefix.data(), prefix.size());
+    (void)::write(STDERR_FILENO, reason.data(), reason.size());
+    (void)::write(STDERR_FILENO, "\n", 1);
   }
-  spdlog::shutdown();
   std::_Exit(2);
 }
 
-class ShutdownDeadlineGuard {
+// Construct before the first subsystem starts. This single owner consumes
+// signals throughout startup and keeps the first shutdown deadline through
+// coordinator teardown, the Drogon join, and logging destruction.
+class ShutdownSignalOwner {
  public:
-  explicit ShutdownDeadlineGuard(std::chrono::milliseconds timeout)
-      : watchdog([this, timeout] {
-          std::unique_lock lock(mu);
-          if (cv.wait_for(lock, timeout, [this] { return finished; })) {
-            return;
+  ShutdownSignalOwner()
+      : watcher([this](std::stop_token stop) {
+          auto signals = shutdown_signals();
+          while (!stop.stop_requested()) {
+            timespec wait{.tv_sec = 0, .tv_nsec = 50'000'000};
+            int received = sigtimedwait(&signals, nullptr, &wait);
+            if (received == SIGINT || received == SIGTERM) {
+              begin_shutdown();
+              cancellation.request_stop();
+            } else if (received < 0 && errno != EAGAIN && errno != EINTR) {
+              emergency_shutdown_exit("sigtimedwait failed");
+            }
+            std::lock_guard lock(mu);
+            if (deadline && std::chrono::steady_clock::now() >= *deadline) {
+              emergency_shutdown_exit("shutdown hard deadline exceeded");
+            }
           }
-          lock.unlock();
-          constexpr std::string_view message =
-              "shutdown hard deadline exceeded; exiting fail-closed\n";
-          (void)::write(STDERR_FILENO, message.data(), message.size());
-          std::_Exit(2);
         }) {}
 
-  ~ShutdownDeadlineGuard() {
-    {
-      std::lock_guard lock(mu);
-      finished = true;
+  ShutdownSignalOwner(const ShutdownSignalOwner&) = delete;
+  auto operator=(const ShutdownSignalOwner&) -> ShutdownSignalOwner& = delete;
+
+  auto begin_shutdown() -> void {
+    std::lock_guard lock(mu);
+    if (!deadline) {
+      deadline = std::chrono::steady_clock::now() + std::chrono::seconds{50};
     }
-    cv.notify_all();
   }
 
-  ShutdownDeadlineGuard(const ShutdownDeadlineGuard&) = delete;
-  auto operator=(const ShutdownDeadlineGuard&)
-      -> ShutdownDeadlineGuard& = delete;
+  [[nodiscard]] auto stop_requested() const noexcept -> bool {
+    return cancellation.stop_requested();
+  }
+  [[nodiscard]] auto token() const noexcept -> std::stop_token {
+    return cancellation.get_token();
+  }
 
  private:
   std::mutex mu;
-  std::condition_variable cv;
-  bool finished = false;
-  std::jthread watchdog;
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  std::stop_source cancellation;
+  std::jthread watcher;
 };
 
-auto bounded_quiesce(plinth::lifecycle::ShutdownCoordinator& coordinator)
+auto bounded_quiesce(plinth::lifecycle::ShutdownCoordinator& coordinator,
+                     ShutdownSignalOwner& signals)
     -> plinth::lifecycle::ShutdownResult {
-  ShutdownDeadlineGuard hard_deadline{std::chrono::seconds{50}};
-  return coordinator.quiesce();
+  signals.begin_shutdown();
+  // Startup cancellation stops new work, not the accepted writes drained by
+  // the coordinator. This nested owner keeps cooperative ten-second database
+  // bounds without inheriting the already-requested startup token. The signal
+  // owner retains the same absolute process deadline throughout this drain.
+  plinth::db::OperationScope shutdown_database_operations{std::stop_token{}};
+  auto result = coordinator.quiesce();
+  try {
+    shutdown_database_operations.checkpoint();
+  } catch (const std::exception&) {
+    if (result.clean) {
+      result.clean = false;
+      result.failed_step = "shutdown_database_operations";
+    }
+  }
+  return result;
 }
 
 auto run_drogon_until_shutdown(
-    plinth::lifecycle::ShutdownCoordinator& coordinator)
-    -> plinth::lifecycle::ShutdownResult {
+    plinth::lifecycle::ShutdownCoordinator& coordinator,
+    ShutdownSignalOwner& signals) -> plinth::lifecycle::ShutdownResult {
   struct AppState {
     std::mutex mu;
     std::condition_variable cv;
@@ -213,7 +249,6 @@ auto run_drogon_until_shutdown(
     state.cv.notify_all();
   });
 
-  auto signals = shutdown_signals();
   std::optional<plinth::lifecycle::ShutdownResult> shutdown_result;
   for (;;) {
     {
@@ -223,9 +258,7 @@ auto run_drogon_until_shutdown(
       }
     }
 
-    timespec wait{.tv_sec = 0, .tv_nsec = 100'000'000};
-    int received = sigtimedwait(&signals, nullptr, &wait);
-    if (received == SIGINT || received == SIGTERM) {
+    if (signals.stop_requested()) {
       auto startup_deadline =
           std::chrono::steady_clock::now() + std::chrono::seconds{10};
       std::unique_lock lock(state.mu);
@@ -238,19 +271,19 @@ auto run_drogon_until_shutdown(
       if (!can_stop) {
         emergency_shutdown_exit("Drogon did not finish startup");
       }
-      shutdown_result = bounded_quiesce(coordinator);
+      shutdown_result = bounded_quiesce(coordinator, signals);
       if (!shutdown_result->clean) {
         emergency_shutdown_exit(shutdown_result->failed_step);
       }
       break;
     }
-    if (received < 0 && errno != EAGAIN && errno != EINTR) {
-      emergency_shutdown_exit("sigtimedwait failed");
-    }
+    std::unique_lock lock(state.mu);
+    state.cv.wait_for(lock, std::chrono::milliseconds{50},
+                      [&state] { return state.done; });
   }
 
   if (!shutdown_result.has_value()) {
-    shutdown_result = bounded_quiesce(coordinator);
+    shutdown_result = bounded_quiesce(coordinator, signals);
     if (!shutdown_result->clean) {
       emergency_shutdown_exit(shutdown_result->failed_step);
     }
@@ -273,13 +306,13 @@ auto run_drogon_until_shutdown(
 class ServeShutdownGuard {
  public:
   explicit ServeShutdownGuard(
-      plinth::lifecycle::ShutdownCoordinator& coordinator_in)
-      : coordinator(coordinator_in) {}
+      plinth::lifecycle::ShutdownCoordinator& coordinator_in,
+      ShutdownSignalOwner& signals_in)
+      : coordinator(coordinator_in), signals(signals_in) {}
 
   ~ServeShutdownGuard() {
     if (!dismissed) {
-      ShutdownDeadlineGuard hard_deadline{std::chrono::seconds{50}};
-      auto result = coordinator.quiesce();
+      auto result = bounded_quiesce(coordinator, signals);
       if (!result.clean) {
         emergency_shutdown_exit(result.failed_step);
       }
@@ -294,6 +327,7 @@ class ServeShutdownGuard {
 
  private:
   plinth::lifecycle::ShutdownCoordinator& coordinator;
+  ShutdownSignalOwner& signals;
   bool dismissed = false;
 };
 
@@ -413,245 +447,279 @@ auto main(int argc, char* argv[]) -> int {
       // owner below consumes these signals synchronously and invokes the
       // coordinator outside signal context.
       block_shutdown_signals();
+      ShutdownSignalOwner signals;
       plinth::lifecycle::ShutdownCoordinator shutdown;
-      ServeShutdownGuard shutdown_guard{shutdown};
+      plinth::db::OperationScope database_operations{signals.token()};
+      ServeShutdownGuard shutdown_guard{shutdown, signals};
 
-      plinth::log::init(cfg);
-      plinth::log::set_node_id(cfg.node_id);
+      try {
 
-      // ICD-0.4.1 — wire the scanner policy from loaded Config and
-      // emit the one-shot `security.unicode_scanner_disabled`
-      // audit if an operator turned the gate off.
-      plinth::js::set_unicode_scanner_policy(
-          cfg.security_unicode_scanner_enabled,
-          cfg.security_unicode_scanner_threshold,
-          cfg.security_unicode_scanner_log_findings);
-      if (!cfg.security_unicode_scanner_enabled) {
-        Json::Value detail{Json::objectValue};
-        detail["config_origin"] =
-            has_config ? "explicit_file" : "defaults+environment";
-        plinth::log::audit("security.unicode_scanner_disabled", detail,
-                           plinth::log::AuditCtx{});
+        database_operations.checkpoint();
+        plinth::log::init(cfg);
+        plinth::log::set_node_id(cfg.node_id);
+
+        // ICD-0.4.1 — wire the scanner policy from loaded Config and
+        // emit the one-shot `security.unicode_scanner_disabled`
+        // audit if an operator turned the gate off.
+        plinth::js::set_unicode_scanner_policy(
+            cfg.security_unicode_scanner_enabled,
+            cfg.security_unicode_scanner_threshold,
+            cfg.security_unicode_scanner_log_findings);
+        if (!cfg.security_unicode_scanner_enabled) {
+          Json::Value detail{Json::objectValue};
+          detail["config_origin"] =
+              has_config ? "explicit_file" : "defaults+environment";
+          plinth::log::audit("security.unicode_scanner_disabled", detail,
+                             plinth::log::AuditCtx{});
+        }
+
+        spdlog::info("plinth {} starting...", plinth::VERSION);
+        spdlog::info("config={} host={}:{} dev_mode={}", config_path,
+                     cfg.listen_host, cfg.listen_port, cfg.dev_mode);
+
+        // Database bootstrap
+        database_operations.checkpoint();
+        plinth::db::bootstrap_schema(cfg.db, cfg.migrations_dir, cfg.dev_mode);
+        database_operations.checkpoint();
+        plinth::groups::bootstrap_groups(cfg.db);
+
+        // Register Drogon PG connection pool for runtime queries
+        database_operations.checkpoint();
+        drogon::app().createDbClient("postgresql", cfg.db.host, cfg.db.port,
+                                     cfg.db.database, cfg.db.user,
+                                     cfg.db.password, cfg.db.pool_size);
+
+        // Seed kernel RBAC rules + capabilities (per ICD-0.2.0 §Bootstrap).
+        database_operations.checkpoint();
+        plinth::capabilities::bootstrap_kernel_capabilities(cfg.db);
+
+        // Load the Tier 2 cache and register Tier 1 stub handlers
+        // (per ICD-0.2.2 §Resolution Algorithm).
+        database_operations.checkpoint();
+        plinth::capabilities::init_resolver(cfg.db);
+
+        // ICD-0.5.0.3 §Lifecycle — spin up one RuntimePool per
+        // installed-ACTIVE extension. Must run AFTER init_resolver
+        // so the Tier 2 cache is coherent with the `plinth.packages`
+        // scan this init performs, and BEFORE route registration
+        // so dispatched extension calls land on a live pool from
+        // first request.
+        database_operations.checkpoint();
+        plinth::extensions::init_registry(cfg);
+
+        // LH-0.1 — process-lifetime RuntimePool for the
+        // lh0:1:js_stress diagnostic dispatch. See
+        // docs/icd/ICD-LH-0.1-async-bridge-stress.md §5.
+        database_operations.checkpoint();
+        plinth::ws::init_js_stress_pool(cfg);
+
+        // Start the LISTEN/NOTIFY subscriber so registry mutations
+        // on any node reach our Tier 2 cache (ICD-0.2.3). Stopped
+        // below after app().run() returns.
+        database_operations.checkpoint();
+        plinth::capabilities::start_notify_listener(cfg.db);
+
+        // ICD-0.5.0 §Deterministic Teardown + §Startup placement
+        // — per-node LISTEN subscriber for the realtime event bus.
+        // Runs as a sibling to the 0.2.3 capability listener; see
+        // ICD §Relationship to the 0.2.3 Capability Listener.
+        database_operations.checkpoint();
+        plinth::realtime::start_listener(cfg.db, cfg.realtime.listener);
+
+        // ICD-0.5.1 §Startup + shutdown wiring — spin up the PG
+        // auto-event coalescer after the listener. The coalescer's
+        // dedicated event-loop thread hosts the window timers; the shutdown
+        // coordinator reverses the dependency order.
+        database_operations.checkpoint();
+        plinth::realtime::CoalescerRegistry::instance().start(
+            cfg.realtime.coalescer);
+
+        // ICD-0.5.2 §Broker Subsystem → Lifecycle integration. As
+        // of ICD-0.5.5 §5 the broker is no longer a peer listener
+        // handler; `broker::start` only flips `broker_enabled` and
+        // pulls config so the writer-downstream `broker::dispatch`
+        // call from `events_writer::insert_envelope` knows it is
+        // safe to fan out. Order is still listener → coalescer →
+        // broker → events_writer (so the writer's call into the
+        // broker sees `broker_enabled=true` from the start).
+        database_operations.checkpoint();
+        plinth::realtime::broker::start(cfg.realtime.broker);
+
+        // ICD-0.5.5 §5 §Topology pin — the events writer is the
+        // sole listener handler. Inside `insert_envelope` it
+        // INSERTs, stamps `ev.envelope["seq"]` from the RETURNING
+        // result, calls `broker::dispatch` (which fans to WS + JS
+        // subscribers and populates `ev.delivered_to_users`), then
+        // advances the per-user cursor. The shutdown coordinator drains this
+        // database-backed work before destroying Drogon.
+        database_operations.checkpoint();
+        plinth::realtime::events_writer::start(cfg.realtime.events);
+
+        // ICD-0.5.3 §OID-Driven PG-Type → JS-Type Mapping §Feature
+        // flag — propagate `db.oid_mapping.enabled` into the kernel
+        // JS-result converter so db.query / db.exec honor the
+        // setting on the first query after startup.
+        plinth::js::db::set_oid_mapping_enabled(
+            cfg.db_bindings.oid_mapping.enabled);
+
+        // ICD-0.5.3 §silent Flag §Rate-limited `db.silent.used`
+        // audit — propagate the aggregation window so silent-exec
+        // bursts coalesce under the expected config window.
+        plinth::js::set_silent_audit_window_ms(
+            cfg.db_bindings.silent.audit_window_ms);
+
+        // ICD-0.5.3 §Per-Op SET search_path Isolation §Config
+        // override. Propagate the enforce flag so db.exec /
+        // db.query from extension-scope bcs wrap in BEGIN; SET
+        // LOCAL search_path ...; user_sql; COMMIT.
+        plinth::js::db::set_search_path_enforce(
+            cfg.db_bindings.search_path.enforce);
+
+        // ICD-0.5.3 §`db.batch()` §Config Surface — propagate
+        // the audit aggregation window, the per-batch op quota,
+        // and the §B.06 wall-clock deadline so both observability
+        // and the synchronous reject paths match the operator's
+        // config.
+        plinth::js::set_batch_audit_window_ms(
+            cfg.db_bindings.batch.audit_window_ms);
+        plinth::js::set_batch_max_ops_per_batch(
+            cfg.db_bindings.batch.max_ops_per_batch);
+        plinth::js::set_batch_timeout_ms(cfg.db_bindings.batch.timeout_ms);
+
+        // TODO: scheduler init
+        // TODO: QuickJS runtime pool init
+
+        register_healthz();
+        plinth::auth::register_auth_routes(cfg.dev_mode,
+                                           cfg.registration_enabled);
+        plinth::auth::register_pat_routes();
+        plinth::groups::register_group_routes();
+        plinth::audit::register_audit_routes();
+        plinth::ws::register_ws_routes(cfg);
+
+        // ICD-0.4.4: package install lifecycle + asset serving.
+        // The asset-server wildcard route is registered once; per-
+        // (name, version) entries live in an in-memory route map
+        // populated by restore_routes() for already-ACTIVE rows
+        // and by install_package() for new installs.
+        plinth::packages::asset_server::register_drogon_handler();
+        plinth::packages::PackageRoutesConfig pkgs_cfg{
+            .db = cfg.db,
+            .data_dir = cfg.packages_data_dir,
+            .staging_dir = cfg.packages_staging_dir,
+            .max_package_size_bytes =
+                cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
+            .upgrade_drain_timeout_ms = cfg.packages_upgrade_drain_timeout_ms,
+        };
+        plinth::packages::register_package_routes(pkgs_cfg);
+        // Bootstrap install path (ICD-0.4.4 slice B + ICD-0.6.1 §3.6):
+        //   1) reconcile_in_flight_installs — recover rows left in
+        //      any mid-install state by a previous crash.
+        //   2) shell::ensure_bundled_shell_installed — first-boot the
+        //      bundled shell from on-disk `<bundle_path>/shell.zip`
+        //      when no ACTIVE bundled frontend exists. Failure here
+        //      aborts bootstrap with an exit code per ICD-0.6.1 §3.5.
+        //   3) asset_server::restore_routes — rebuild the in-memory
+        //      (name,version) → on-disk-tree route map from every
+        //      ACTIVE/ACTIVE_FLAGGED row (the shell just installed
+        //      counts; register_asset_routes was called inside its
+        //      ACTIVATING stage but restore_routes is idempotent).
+        plinth::packages::InstallerContext bootstrap_ctx{
+            .db = cfg.db,
+            .caller_user_id = "",
+            .data_dir = cfg.packages_data_dir,
+            .staging_dir = cfg.packages_staging_dir,
+            .max_package_size_bytes =
+                cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
+            .upgrade_drain_timeout_ms =
+                std::chrono::milliseconds{
+                    cfg.packages_upgrade_drain_timeout_ms},
+        };
+        if (!plinth::packages::rbac_test::start_async_workers()) {
+          throw std::runtime_error(
+              "RBAC worker registry still draining from a prior lifecycle");
+        }
+        // ICD-0.4.5 §Security Constraint 4 — bootstrap refuses to
+        // start if {data_dir} and {staging_dir} are on different
+        // mountpoints. Atomic-swap rename(2) relies on the single-
+        // filesystem guarantee.
+        if (auto mp = plinth::packages::check_single_mountpoint(
+                cfg.packages_data_dir, cfg.packages_staging_dir);
+            !mp.has_value()) {
+          database_operations.checkpoint();
+          spdlog::critical("bootstrap: mountpoint check failed: {}",
+                           mp.error());
+          return 1;
+        }
+        database_operations.checkpoint();
+        plinth::packages::reconcile_in_flight_installs(bootstrap_ctx);
+        if (auto fb = plinth::shell::ensure_bundled_shell_installed(
+                cfg, bootstrap_ctx);
+            !fb.has_value()) {
+          database_operations.checkpoint();
+          spdlog::critical(
+              "shell::firstboot: aborting boot — kind={} message={}",
+              fb.error().kind_string(), fb.error().message);
+          return fb.error().exit_code();
+        }
+        database_operations.checkpoint();
+        plinth::packages::asset_server::restore_routes(cfg.db,
+                                                       cfg.packages_data_dir);
+
+        // ICD-0.6.3 §5 — `POST /api/cap/{capability}` HTTP cap-
+        // dispatch route. Browser-side `plinth.call(cap, args)`
+        // posts here; the handler resolves auth via SessionFilter,
+        // synthesises the resolver signature triple from the URL
+        // parameter, populates effective_rules from plinth.group_rules
+        // (mirroring RbacFilter's SQL), and co_awaits the resolver
+        // path. Slots in alongside the other kernel `/api/*` routes
+        // BEFORE the catch-all so it does not get shadowed.
+        plinth::cap::register_cap_routes(cfg.db);
+
+        // ICD-0.6.2 §6 — `/api/frontend/tokens.css` indirection.
+        // 302 → `/ext/{active-frontend}/{version}/css/tokens.css`
+        // when a single ACTIVE frontend exists; 503 with JSON
+        // diagnostic otherwise. Slot is AFTER kernel `/api/*` and
+        // `/ext/*` registrations (so the asset server resolves the
+        // 302 target) and BEFORE the active-frontend catch-all
+        // (so the catch-all does not shadow `/api/frontend/*`).
+        plinth::frontend::register_api_frontend_routes(cfg.db);
+
+        // ICD-0.6.1 §4.4 / §4.6 — register the active frontend's
+        // `/` redirect + `<mount>(.*)` SPA-fallback handler AFTER
+        // all `/api/*`, `/ext/*`, `/ws`, `/healthz` registrations
+        // so the catch-all glob does not shadow kernel API surfaces.
+        // Reads `plinth.packages` to resolve the active frontend's
+        // mount + entry + installed `client/` directory. Replaces
+        // ICD-0.6.0 §8.1's hardcoded `/app/*` static handler.
+        database_operations.checkpoint();
+        plinth::shell::register_routes_for_active_frontend(
+            cfg.shell, cfg.db, cfg.packages_data_dir);
+
+        shutdown.install_ingress_gate();
+        drogon::app()
+            .setLogPath("") // Drogon logging disabled — spdlog handles it
+            .setLogLevel(trantor::Logger::kWarn)
+            .addListener(cfg.listen_host, cfg.listen_port)
+            .setThreadNum(std::thread::hardware_concurrency())
+            .disableSigtermHandling();
+
+        database_operations.checkpoint();
+        auto shutdown_result = run_drogon_until_shutdown(shutdown, signals);
+        if (!shutdown_result.clean) {
+          emergency_shutdown_exit(shutdown_result.failed_step);
+        }
+        shutdown.finish_after_drogon();
+        shutdown_guard.dismiss();
+        return 0;
+      } catch (...) {
+        if (signals.stop_requested() &&
+            !database_operations.cancellation_failed()) {
+          return 0;
+        }
+        database_operations.checkpoint();
+        throw;
       }
-
-      spdlog::info("plinth {} starting...", plinth::VERSION);
-      spdlog::info("config={} host={}:{} dev_mode={}", config_path,
-                   cfg.listen_host, cfg.listen_port, cfg.dev_mode);
-
-      // Database bootstrap
-      plinth::db::bootstrap_schema(cfg.db, cfg.migrations_dir, cfg.dev_mode);
-      plinth::groups::bootstrap_groups(cfg.db);
-
-      // Register Drogon PG connection pool for runtime queries
-      drogon::app().createDbClient("postgresql", cfg.db.host, cfg.db.port,
-                                   cfg.db.database, cfg.db.user,
-                                   cfg.db.password, cfg.db.pool_size);
-
-      // Seed kernel RBAC rules + capabilities (per ICD-0.2.0 §Bootstrap).
-      plinth::capabilities::bootstrap_kernel_capabilities(cfg.db);
-
-      // Load the Tier 2 cache and register Tier 1 stub handlers
-      // (per ICD-0.2.2 §Resolution Algorithm).
-      plinth::capabilities::init_resolver(cfg.db);
-
-      // ICD-0.5.0.3 §Lifecycle — spin up one RuntimePool per
-      // installed-ACTIVE extension. Must run AFTER init_resolver
-      // so the Tier 2 cache is coherent with the `plinth.packages`
-      // scan this init performs, and BEFORE route registration
-      // so dispatched extension calls land on a live pool from
-      // first request.
-      plinth::extensions::init_registry(cfg);
-
-      // LH-0.1 — process-lifetime RuntimePool for the
-      // lh0:1:js_stress diagnostic dispatch. See
-      // docs/icd/ICD-LH-0.1-async-bridge-stress.md §5.
-      plinth::ws::init_js_stress_pool(cfg);
-
-      // Start the LISTEN/NOTIFY subscriber so registry mutations
-      // on any node reach our Tier 2 cache (ICD-0.2.3). Stopped
-      // below after app().run() returns.
-      plinth::capabilities::start_notify_listener(cfg.db);
-
-      // ICD-0.5.0 §Deterministic Teardown + §Startup placement
-      // — per-node LISTEN subscriber for the realtime event bus.
-      // Runs as a sibling to the 0.2.3 capability listener; see
-      // ICD §Relationship to the 0.2.3 Capability Listener.
-      plinth::realtime::start_listener(cfg.db, cfg.realtime.listener);
-
-      // ICD-0.5.1 §Startup + shutdown wiring — spin up the PG
-      // auto-event coalescer after the listener. The coalescer's
-      // dedicated event-loop thread hosts the window timers; the shutdown
-      // coordinator reverses the dependency order.
-      plinth::realtime::CoalescerRegistry::instance().start(
-          cfg.realtime.coalescer);
-
-      // ICD-0.5.2 §Broker Subsystem → Lifecycle integration. As
-      // of ICD-0.5.5 §5 the broker is no longer a peer listener
-      // handler; `broker::start` only flips `broker_enabled` and
-      // pulls config so the writer-downstream `broker::dispatch`
-      // call from `events_writer::insert_envelope` knows it is
-      // safe to fan out. Order is still listener → coalescer →
-      // broker → events_writer (so the writer's call into the
-      // broker sees `broker_enabled=true` from the start).
-      plinth::realtime::broker::start(cfg.realtime.broker);
-
-      // ICD-0.5.5 §5 §Topology pin — the events writer is the
-      // sole listener handler. Inside `insert_envelope` it
-      // INSERTs, stamps `ev.envelope["seq"]` from the RETURNING
-      // result, calls `broker::dispatch` (which fans to WS + JS
-      // subscribers and populates `ev.delivered_to_users`), then
-      // advances the per-user cursor. The shutdown coordinator drains this
-      // database-backed work before destroying Drogon.
-      plinth::realtime::events_writer::start(cfg.realtime.events);
-
-      // ICD-0.5.3 §OID-Driven PG-Type → JS-Type Mapping §Feature
-      // flag — propagate `db.oid_mapping.enabled` into the kernel
-      // JS-result converter so db.query / db.exec honor the
-      // setting on the first query after startup.
-      plinth::js::db::set_oid_mapping_enabled(
-          cfg.db_bindings.oid_mapping.enabled);
-
-      // ICD-0.5.3 §silent Flag §Rate-limited `db.silent.used`
-      // audit — propagate the aggregation window so silent-exec
-      // bursts coalesce under the expected config window.
-      plinth::js::set_silent_audit_window_ms(
-          cfg.db_bindings.silent.audit_window_ms);
-
-      // ICD-0.5.3 §Per-Op SET search_path Isolation §Config
-      // override. Propagate the enforce flag so db.exec /
-      // db.query from extension-scope bcs wrap in BEGIN; SET
-      // LOCAL search_path ...; user_sql; COMMIT.
-      plinth::js::db::set_search_path_enforce(
-          cfg.db_bindings.search_path.enforce);
-
-      // ICD-0.5.3 §`db.batch()` §Config Surface — propagate
-      // the audit aggregation window, the per-batch op quota,
-      // and the §B.06 wall-clock deadline so both observability
-      // and the synchronous reject paths match the operator's
-      // config.
-      plinth::js::set_batch_audit_window_ms(
-          cfg.db_bindings.batch.audit_window_ms);
-      plinth::js::set_batch_max_ops_per_batch(
-          cfg.db_bindings.batch.max_ops_per_batch);
-      plinth::js::set_batch_timeout_ms(cfg.db_bindings.batch.timeout_ms);
-
-      // TODO: scheduler init
-      // TODO: QuickJS runtime pool init
-
-      register_healthz();
-      plinth::auth::register_auth_routes(cfg.dev_mode,
-                                         cfg.registration_enabled);
-      plinth::auth::register_pat_routes();
-      plinth::groups::register_group_routes();
-      plinth::audit::register_audit_routes();
-      plinth::ws::register_ws_routes(cfg);
-
-      // ICD-0.4.4: package install lifecycle + asset serving.
-      // The asset-server wildcard route is registered once; per-
-      // (name, version) entries live in an in-memory route map
-      // populated by restore_routes() for already-ACTIVE rows
-      // and by install_package() for new installs.
-      plinth::packages::asset_server::register_drogon_handler();
-      plinth::packages::PackageRoutesConfig pkgs_cfg{
-          .db = cfg.db,
-          .data_dir = cfg.packages_data_dir,
-          .staging_dir = cfg.packages_staging_dir,
-          .max_package_size_bytes =
-              cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
-          .upgrade_drain_timeout_ms = cfg.packages_upgrade_drain_timeout_ms,
-      };
-      plinth::packages::register_package_routes(pkgs_cfg);
-      // Bootstrap install path (ICD-0.4.4 slice B + ICD-0.6.1 §3.6):
-      //   1) reconcile_in_flight_installs — recover rows left in
-      //      any mid-install state by a previous crash.
-      //   2) shell::ensure_bundled_shell_installed — first-boot the
-      //      bundled shell from on-disk `<bundle_path>/shell.zip`
-      //      when no ACTIVE bundled frontend exists. Failure here
-      //      aborts bootstrap with an exit code per ICD-0.6.1 §3.5.
-      //   3) asset_server::restore_routes — rebuild the in-memory
-      //      (name,version) → on-disk-tree route map from every
-      //      ACTIVE/ACTIVE_FLAGGED row (the shell just installed
-      //      counts; register_asset_routes was called inside its
-      //      ACTIVATING stage but restore_routes is idempotent).
-      plinth::packages::InstallerContext bootstrap_ctx{
-          .db = cfg.db,
-          .caller_user_id = "",
-          .data_dir = cfg.packages_data_dir,
-          .staging_dir = cfg.packages_staging_dir,
-          .max_package_size_bytes =
-              cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
-          .upgrade_drain_timeout_ms =
-              std::chrono::milliseconds{cfg.packages_upgrade_drain_timeout_ms},
-      };
-      if (!plinth::packages::rbac_test::start_async_workers()) {
-        throw std::runtime_error(
-            "RBAC worker registry still draining from a prior lifecycle");
-      }
-      // ICD-0.4.5 §Security Constraint 4 — bootstrap refuses to
-      // start if {data_dir} and {staging_dir} are on different
-      // mountpoints. Atomic-swap rename(2) relies on the single-
-      // filesystem guarantee.
-      if (auto mp = plinth::packages::check_single_mountpoint(
-              cfg.packages_data_dir, cfg.packages_staging_dir);
-          !mp.has_value()) {
-        spdlog::critical("bootstrap: mountpoint check failed: {}", mp.error());
-        return 1;
-      }
-      plinth::packages::reconcile_in_flight_installs(bootstrap_ctx);
-      if (auto fb =
-              plinth::shell::ensure_bundled_shell_installed(cfg, bootstrap_ctx);
-          !fb.has_value()) {
-        spdlog::critical("shell::firstboot: aborting boot — kind={} message={}",
-                         fb.error().kind_string(), fb.error().message);
-        return fb.error().exit_code();
-      }
-      plinth::packages::asset_server::restore_routes(cfg.db,
-                                                     cfg.packages_data_dir);
-
-      // ICD-0.6.3 §5 — `POST /api/cap/{capability}` HTTP cap-
-      // dispatch route. Browser-side `plinth.call(cap, args)`
-      // posts here; the handler resolves auth via SessionFilter,
-      // synthesises the resolver signature triple from the URL
-      // parameter, populates effective_rules from plinth.group_rules
-      // (mirroring RbacFilter's SQL), and co_awaits the resolver
-      // path. Slots in alongside the other kernel `/api/*` routes
-      // BEFORE the catch-all so it does not get shadowed.
-      plinth::cap::register_cap_routes(cfg.db);
-
-      // ICD-0.6.2 §6 — `/api/frontend/tokens.css` indirection.
-      // 302 → `/ext/{active-frontend}/{version}/css/tokens.css`
-      // when a single ACTIVE frontend exists; 503 with JSON
-      // diagnostic otherwise. Slot is AFTER kernel `/api/*` and
-      // `/ext/*` registrations (so the asset server resolves the
-      // 302 target) and BEFORE the active-frontend catch-all
-      // (so the catch-all does not shadow `/api/frontend/*`).
-      plinth::frontend::register_api_frontend_routes(cfg.db);
-
-      // ICD-0.6.1 §4.4 / §4.6 — register the active frontend's
-      // `/` redirect + `<mount>(.*)` SPA-fallback handler AFTER
-      // all `/api/*`, `/ext/*`, `/ws`, `/healthz` registrations
-      // so the catch-all glob does not shadow kernel API surfaces.
-      // Reads `plinth.packages` to resolve the active frontend's
-      // mount + entry + installed `client/` directory. Replaces
-      // ICD-0.6.0 §8.1's hardcoded `/app/*` static handler.
-      plinth::shell::register_routes_for_active_frontend(cfg.shell, cfg.db,
-                                                         cfg.packages_data_dir);
-
-      shutdown.install_ingress_gate();
-      drogon::app()
-          .setLogPath("") // Drogon logging disabled — spdlog handles it
-          .setLogLevel(trantor::Logger::kWarn)
-          .addListener(cfg.listen_host, cfg.listen_port)
-          .setThreadNum(std::thread::hardware_concurrency())
-          .disableSigtermHandling();
-
-      auto shutdown_result = run_drogon_until_shutdown(shutdown);
-      if (!shutdown_result.clean) {
-        emergency_shutdown_exit(shutdown_result.failed_step);
-      }
-      shutdown.finish_after_drogon();
-      shutdown_guard.dismiss();
-      return 0;
     }
 
     // ── validate ────────────────────────────────────────

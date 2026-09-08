@@ -1,5 +1,6 @@
 #include "kernel/realtime/listener.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/realtime/channel.hpp"
 
@@ -50,6 +51,7 @@ int wakeup_fd = -1;
 std::mutex listener_exit_mutex;
 std::condition_variable listener_exit_cv;
 bool listener_exited = true;
+bool listener_clean = true;
 
 enum class DrainState : unsigned char { IDLE, REQUESTED, COMPLETE, FAILED };
 std::mutex drain_mutex;
@@ -153,7 +155,7 @@ auto dispatch(const DispatchedEvent& ev) -> bool {
 
 auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("realtime listener: connect failed: {}",
                   PQerrorMessage(conn));
@@ -161,8 +163,9 @@ auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
     return nullptr;
   }
   PgResultPtr res{
-      PQexec(conn,
-             R"(LISTEN "plinth:realtime"; LISTEN "plinth:realtime:shutdown")"),
+      plinth::db::exec(
+          conn,
+          R"(LISTEN "plinth:realtime"; LISTEN "plinth:realtime:shutdown")"),
       PQclear};
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     spdlog::error("realtime listener: LISTEN failed: {}",
@@ -286,7 +289,8 @@ auto wait_for_reconnect(int wake_fd, int backoff_ms) -> void {
 }
 
 auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
-                  int wake_fd, int backoff_ms) -> void {
+                  int wake_fd, int backoff_ms) -> bool {
+  plinth::db::OperationScope database_operations{tok, std::chrono::seconds{5}};
   PGconn* conn = nullptr;
   bool connected_once = false;
   bool delivery_lost = false;
@@ -297,8 +301,9 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
       requested = drain_state;
     }
     if (requested == DrainState::REQUESTED) {
-      const bool clean = !delivery_lost && conn != nullptr &&
-                         PQstatus(conn) == CONNECTION_OK &&
+      const bool clean = !delivery_lost &&
+                         !database_operations.cancellation_failed() &&
+                         conn != nullptr && PQstatus(conn) == CONNECTION_OK &&
                          acknowledge_drain(conn, tok, wake_fd);
       complete_drain(clean);
       continue;
@@ -309,6 +314,9 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
       wait_for_reconnect(wake_fd, POLL_TIMEOUT_MS);
       continue;
     }
+    // Reconnect timeouts can retry, but the drain state and an unconfirmed
+    // backend cancellation remain sticky and cannot certify delivery.
+    database_operations.retry();
     if (conn == nullptr || PQstatus(conn) != CONNECTION_OK) {
       delivery_lost = delivery_lost || connected_once;
       if (conn != nullptr) {
@@ -357,6 +365,7 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
   }
   ::close(wake_fd);
   spdlog::info("realtime listener: stopped");
+  return !database_operations.cancellation_failed();
 }
 
 } // namespace
@@ -398,12 +407,14 @@ auto start_listener(const Config::Database& db_cfg,
   {
     std::lock_guard exit_lock(listener_exit_mutex);
     listener_exited = false;
+    listener_clean = true;
   }
   listener_thread.emplace([db_cfg, fd, backoff_ms](const std::stop_token& tok) {
-    run_listener(tok, db_cfg, fd, backoff_ms);
+    bool clean = run_listener(tok, db_cfg, fd, backoff_ms);
     {
       std::lock_guard exit_lock(listener_exit_mutex);
       listener_exited = true;
+      listener_clean = clean;
     }
     listener_exit_cv.notify_all();
   });
@@ -434,7 +445,7 @@ auto drain_listener(std::chrono::milliseconds timeout) -> bool {
 auto stop_listener(std::chrono::milliseconds timeout) -> bool {
   std::lock_guard lock(lifecycle_mutex);
   if (!listener_thread.has_value()) {
-    return true;
+    return listener_clean;
   }
   listener_thread->request_stop();
   if (wakeup_fd >= 0) {
@@ -450,7 +461,7 @@ auto stop_listener(std::chrono::milliseconds timeout) -> bool {
   }
   listener_thread.reset(); // completion barrier makes this join immediate
   wakeup_fd = -1;
-  return true;
+  return listener_clean;
 }
 
 auto apply_notification_for_test(std::string_view channel,

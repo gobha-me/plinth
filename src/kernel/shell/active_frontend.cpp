@@ -1,5 +1,6 @@
 #include "kernel/shell/active_frontend.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -281,7 +282,7 @@ auto resolve_active_frontend(const Config::Database& db,
                              const std::filesystem::path& data_dir)
     -> std::optional<ActiveFrontend> {
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("shell::resolve_active_frontend: PG connect failed: {}",
                  PQerrorMessage(conn));
@@ -292,12 +293,13 @@ auto resolve_active_frontend(const Config::Database& db,
   std::unique_ptr<PGconn, decltype(cleanup)> guard(conn, cleanup);
 
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexec(conn,
-             "SELECT id::text, name, version, frontend_mount, frontend_entry "
-             "FROM plinth.packages "
-             "WHERE frontend_mount IS NOT NULL "
-             "  AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
-             "LIMIT 2"), // LIMIT 2 to detect singleton-violation
+      plinth::db::exec(
+          conn,
+          "SELECT id::text, name, version, frontend_mount, frontend_entry "
+          "FROM plinth.packages "
+          "WHERE frontend_mount IS NOT NULL "
+          "  AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
+          "LIMIT 2"), // LIMIT 2 to detect singleton-violation
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::warn("shell::resolve_active_frontend: SELECT failed: {}",

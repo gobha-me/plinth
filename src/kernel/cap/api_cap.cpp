@@ -1,5 +1,6 @@
 #include "kernel/cap/api_cap.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/auth/middleware.hpp"
 #include "kernel/capabilities/resolution.hpp"
@@ -35,7 +36,7 @@ auto load_effective_rules(const Config::Database& db_cfg,
     -> std::vector<std::string> {
   std::vector<std::string> rules;
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("cap::api_cap: PG connect failed: {}", PQerrorMessage(conn));
     PQfinish(conn);
@@ -47,12 +48,13 @@ auto load_effective_rules(const Config::Database& db_cfg,
   std::string user_id_str{user_id};
   std::array<const char*, 1> params{user_id_str.c_str()};
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexecParams(conn,
-                   "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
-                   "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
-                   "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
-                   "WHERE gm.user_id = $1::uuid",
-                   1, nullptr, params.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn,
+          "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
+          "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
+          "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
+          "WHERE gm.user_id = $1::uuid",
+          1, nullptr, params.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::warn("cap::api_cap: rules SELECT failed: {}",
