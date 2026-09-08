@@ -10,6 +10,7 @@
 
 #include <drogon/drogon.h>
 #include <memory>
+#include <utility>
 
 namespace plinth::ws {
 
@@ -59,6 +60,10 @@ auto close_displaced(const drogon::WebSocketConnectionPtr& displaced) -> void {
 // Handle the failure path: audit + error frame + close.
 auto on_auth_failure(const drogon::WebSocketConnectionPtr& conn,
                      const std::string& reason) -> void {
+  auto* state = conn->getContext<ConnState>().get();
+  if (state != nullptr) {
+    state->auth_failed = true;
+  }
   Json::Value detail;
   detail["reason"] = reason;
   plinth::log::audit(
@@ -75,7 +80,8 @@ auto finish_auth(const drogon::WebSocketConnectionPtr& conn, bool is_admin,
                  const std::string& node_id) -> void {
   auto state_ptr = conn->getContext<ConnState>();
   auto* state = state_ptr.get();
-  if (state == nullptr || state->authenticated) {
+  if (state == nullptr || state->authenticated || state->auth_failed ||
+      !conn->connected()) {
     return;
   }
 
@@ -150,7 +156,7 @@ auto resolve_rbac_and_finish(const drogon::WebSocketConnectionPtr& conn,
                 return;
               }
               auto* st = strong->getContext<ConnState>().get();
-              if (st == nullptr) {
+              if (st == nullptr || st->auth_failed || st->authenticated) {
                 return;
               }
               st->effective_rules = std::move(rules);
@@ -189,9 +195,10 @@ auto start_auth_timer(const drogon::WebSocketConnectionPtr& conn,
       return;
     }
     auto* st = strong->getContext<ConnState>().get();
-    if (st == nullptr || st->authenticated) {
+    if (st == nullptr || st->authenticated || st->auth_failed) {
       return;
     }
+    st->auth_failed = true;
     plinth::log::audit(
         "ws.auth_timeout", Json::Value{Json::objectValue},
         {.user_id = "", .session_id = "", .ip_address = peer_ip(strong)});
@@ -201,54 +208,84 @@ auto start_auth_timer(const drogon::WebSocketConnectionPtr& conn,
   state->auth_timer_id = timer_id;
 }
 
-auto on_auth_message(const drogon::WebSocketConnectionPtr& conn,
-                     const Json::Value& msg, const std::string& node_id)
-    -> void {
-  auto* state = conn->getContext<ConnState>().get();
-  if (state == nullptr || state->authenticated) {
-    return; // No state (impossible) or auth replay — ignore.
-  }
+namespace {
 
-  auto token = msg["token"].asString();
+auto authenticate_token(const drogon::WebSocketConnectionPtr& conn,
+                        const std::string& token, const std::string& node_id,
+                        bool session_only) -> void {
+  auto* state = conn->getContext<ConnState>().get();
+  if (state == nullptr || state->auth_started || state->auth_failed ||
+      state->authenticated || state->loop == nullptr) {
+    return;
+  }
+  state->auth_started = true;
   if (token.empty()) {
     on_auth_failure(conn, "missing_token");
     return;
   }
 
   std::weak_ptr<drogon::WebSocketConnection> weak{conn};
-  plinth::auth::validate_token(
-      token,
-      [weak, node_id](const plinth::auth::TokenValidationResult& result) {
-        auto strong = weak.lock();
-        if (!strong || !strong->connected()) {
-          return;
-        }
-        auto* st = strong->getContext<ConnState>().get();
-        if (st == nullptr || st->loop == nullptr) {
-          return;
-        }
-        // Hop back to the connection's owning loop so per-conn state
-        // mutations stay loop-local.
-        st->loop->queueInLoop([weak, node_id, result]() {
-          auto conn_strong = weak.lock();
-          if (!conn_strong || !conn_strong->connected()) {
+  auto* loop = state->loop;
+  auto validated =
+      [weak, loop, node_id](const plinth::auth::TokenValidationResult& result) {
+        // Database callbacks never read or mutate connection context off-loop.
+        loop->queueInLoop([weak, node_id, result]() {
+          auto strong = weak.lock();
+          if (!strong || !strong->connected()) {
             return;
           }
-          auto* ctx_st = conn_strong->getContext<ConnState>().get();
-          if (ctx_st == nullptr || ctx_st->authenticated) {
+          auto* st = strong->getContext<ConnState>().get();
+          if (st == nullptr || st->authenticated || st->auth_failed) {
             return;
           }
           if (!result.ok) {
-            on_auth_failure(conn_strong, result.error_code);
+            on_auth_failure(strong, result.error_code);
             return;
           }
-          // Record the auth context on the connection, then load
-          // the full effective rule set. Finalization happens in
-          // finish_auth().
-          ctx_st->auth = result.context;
-          resolve_rbac_and_finish(conn_strong, node_id);
+          st->auth = result.context;
+          resolve_rbac_and_finish(strong, node_id);
         });
-      });
+      };
+  if (session_only) {
+    plinth::auth::validate_session_token(token, std::move(validated));
+  } else {
+    plinth::auth::validate_token(token, std::move(validated));
+  }
+}
+
+} // namespace
+
+auto on_session_upgrade(const drogon::HttpRequestPtr& req,
+                        const drogon::WebSocketConnectionPtr& conn,
+                        const std::string& node_id,
+                        const std::string& browser_origin) -> void {
+  const auto& cookie = req->getCookie("plinth_session");
+  const auto& origin = req->getHeader("origin");
+  if (cookie.empty() && origin.empty()) {
+    return; // Native clients authenticate explicitly with a token frame.
+  }
+  const auto& host = req->getHeader("host");
+  const std::string scheme =
+      req->isOnSecureConnection() ? "https://" : "http://";
+  // The configured origin is validated at config loading. A proxy must
+  // preserve Host; neither Forwarded nor X-Forwarded-* conveys authority.
+  const auto expected = browser_origin.empty() ? scheme + host : browser_origin;
+  const auto separator = expected.find("://");
+  const bool host_matches =
+      separator != std::string::npos && expected.substr(separator + 3) == host;
+  if (host.empty() || !host_matches || origin != expected) {
+    on_auth_failure(conn, "origin_mismatch");
+    return;
+  }
+  authenticate_token(conn, cookie, node_id, /*session_only=*/true);
+}
+
+auto on_auth_message(const drogon::WebSocketConnectionPtr& conn,
+                     const Json::Value& msg, const std::string& node_id)
+    -> void {
+  const auto& token = msg["token"];
+  authenticate_token(conn, token.isString() ? token.asString() : "", node_id,
+                     /*session_only=*/false);
 }
 
 } // namespace plinth::ws

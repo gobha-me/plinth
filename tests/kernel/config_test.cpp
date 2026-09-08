@@ -538,3 +538,31 @@ TEST_CASE("Shell.root_redirect invalid pattern falls back to /app/",
     REQUIRE(cfg.shell.root_redirect == "/app/");
   }
 }
+
+TEST_CASE(
+    "Browser WebSocket origin accepts only explicit absolute http origins",
+    "[config][unit][browser-origin]") {
+  EnvGuard guard;
+  for (const auto* origin :
+       {"", "http://localhost:8080", "https://plinth.example",
+        "https://plinth.example:8443", "http://[::1]:8080"}) {
+    INFO(origin);
+    auto path = write_temp_config({{"ws_browser_origin", origin}});
+    auto cfg = plinth::load_config(path);
+    remove_file(path);
+    REQUIRE(cfg.ws_browser_origin == origin);
+  }
+  for (const auto* origin :
+       {"null", "//plinth.example", "ftp://plinth.example",
+        "https://user@plinth.example", "https://plinth.example/",
+        "https://plinth.example/path", "https://plinth.example?x=1",
+        "https://plinth.example#fragment", "https://plinth.example:0",
+        "https://plinth.example:65536", "http://[:::1]", "https://a..example",
+        "https://plinth.example,https://evil.example"}) {
+    INFO(origin);
+    auto path = write_temp_config({{"ws_browser_origin", origin}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.ws_browser_origin_invalid");
+    remove_file(path);
+  }
+}

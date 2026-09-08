@@ -2,6 +2,12 @@
   "name": "plinth-browser-smoke",
   "private": true,
   "type": "module",
-  "scripts": { "test": "node shell-smoke.mjs" },
-  "devDependencies": { "playwright": "1.63.0" }
+  "scripts": {
+    "test": "node shell-smoke.mjs",
+    "test:transport": "node --experimental-vm-modules --test sdk-transport.test.mjs",
+    "test:realtime": "node realtime-smoke.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.63.0"
+  }
 }

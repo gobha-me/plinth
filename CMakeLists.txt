@@ -787,12 +787,22 @@ set_tests_properties(plinth_tests_subprocess
              TIMEOUT 300)
 
 add_test(NAME plinth_tests_ws
-  COMMAND plinth_tests "[ws]"
+  COMMAND plinth_tests "[ws] ~[browser-proxy]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_ws
   PROPERTIES RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
              LABELS "needs_pg"
              TIMEOUT 180)
+
+# Proxy-origin registration is immutable for a process, like the real kernel.
+add_test(NAME plinth_tests_ws_browser_proxy
+  COMMAND plinth_tests "[browser-proxy]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_ws_browser_proxy
+  PROPERTIES RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
+             LABELS "needs_pg"
+             ENVIRONMENT "PLINTH_TEST_WS_BROWSER_ORIGIN=https://127.0.0.1:28099"
+             TIMEOUT 30)
 
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s
 # main loop, so `[js][async]` tests now share `plinth_tests_js`'s

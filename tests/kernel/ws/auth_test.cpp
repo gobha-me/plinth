@@ -143,3 +143,143 @@ TEST_CASE("WS second connection displaces first with same session",
   REQUIRE((*evicted)["error"].asString() == "already_connected");
   REQUIRE(c1.wait_for_close(2s));
 }
+
+TEST_CASE(
+    "WS browser authenticates HttpOnly upgrade cookie before token frames",
+    "[ws][integration][auth][browser-auth]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+  auto cfg = plinth::ws_test::test_config();
+  plinth::ws_test::reset_schema(cfg.db);
+  plinth::ws_test::TestPg pg(cfg.db);
+  auto browser_user =
+      plinth::ws_test::insert_user(pg, "browser", "password-123");
+  auto native_user = plinth::ws_test::insert_user(pg, "native", "password-123");
+  auto cookie = plinth::auth::generate_token();
+  auto other = plinth::auth::generate_token();
+  auto session = plinth::ws_test::insert_session(pg, browser_user, cookie);
+  plinth::ws_test::insert_session(pg, native_user, other);
+  const auto origin =
+      "http://127.0.0.1:" + std::to_string(plinth::ws_test::test_server_port());
+
+  WsTestClient client;
+  REQUIRE(client.connect(
+      2s, {{"Origin", origin}, {"Cookie", "plinth_session=" + cookie}}));
+  // A second identity must not race either validation or the RBAC lookup.
+  client.send_json(auth_msg(other));
+  auto connected = client.receive_json(3s);
+  REQUIRE(connected.has_value());
+  REQUIRE((*connected)["type"].asString() == "connected");
+  REQUIRE((*connected)["user"]["id"].asString() == browser_user);
+  REQUIRE((*connected)["session_id"].asString() == session);
+  client.send_json(auth_msg(other));
+  auto next = client.receive_json(3s);
+  REQUIRE(next.has_value());
+  REQUIRE((*next)["type"].asString() == "ping");
+}
+
+TEST_CASE(
+    "WS browser cookie requires an exact actual Origin and a valid session",
+    "[ws][integration][auth][browser-auth]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+  auto cfg = plinth::ws_test::test_config();
+  plinth::ws_test::reset_schema(cfg.db);
+  plinth::ws_test::TestPg pg(cfg.db);
+  auto user =
+      plinth::ws_test::insert_user(pg, "browser-denied", "password-123");
+  auto cookie = plinth::auth::generate_token();
+  plinth::ws_test::insert_session(pg, user, cookie);
+  const auto host =
+      "127.0.0.1:" + std::to_string(plinth::ws_test::test_server_port());
+  std::string origin = "http://" + host;
+  SECTION("cross-origin host") {
+    origin = "http://example.invalid";
+  }
+  SECTION("scheme mismatch ignores forwarded proto") {
+    origin = "https://" + host;
+  }
+  SECTION("opaque origin") {
+    origin = "null";
+  }
+  SECTION("missing origin") {
+    origin = "";
+  }
+  SECTION("invalid cookie") {
+    cookie = "invalid-test-cookie";
+  }
+  SECTION("missing cookie") {
+    cookie = "";
+  }
+  SECTION("expired session") {
+    auto result = pg.exec(
+        "UPDATE plinth.sessions SET expires_at = NOW() - INTERVAL '1 second'");
+    REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+  }
+  SECTION("revoked session") {
+    auto result = pg.exec("UPDATE plinth.sessions SET revoked_at = NOW()");
+    REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+  }
+  WsTestClient client;
+  REQUIRE(client.connect(2s, {{"Origin", origin},
+                              {"X-Forwarded-Proto", "https"},
+                              {"X-Forwarded-Host", host},
+                              {"Cookie", "plinth_session=" + cookie}}));
+  auto error = client.receive_json(3s);
+  REQUIRE(error.has_value());
+  REQUIRE((*error)["type"].asString() == "error");
+  REQUIRE((*error)["error"].asString() == "auth_failed");
+  REQUIRE(client.wait_for_close(2s));
+}
+
+TEST_CASE(
+    "WS proxy cookie auth uses configured HTTPS origin and preserved Host",
+    "[ws][integration][auth][browser-proxy]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+  auto cfg = plinth::ws_test::test_config();
+  if (cfg.ws_browser_origin.empty()) {
+    SKIP("Run the isolated plinth_tests_ws_browser_proxy CTest process");
+  }
+  plinth::ws_test::reset_schema(cfg.db);
+  plinth::ws_test::TestPg pg(cfg.db);
+  auto user = plinth::ws_test::insert_user(pg, "browser-proxy", "password-123");
+  auto cookie = plinth::auth::generate_token();
+  plinth::ws_test::insert_session(pg, user, cookie);
+  std::string origin = cfg.ws_browser_origin;
+  auto host = origin.substr(origin.find("://") + 3);
+  bool accepted = true;
+  bool mismatched_host = false;
+  SECTION("HTTPS public origin over HTTP proxy upstream") {
+  }
+  SECTION("cross-origin rejected") {
+    origin = "https://evil.example";
+    accepted = false;
+  }
+  SECTION("actual HTTP origin cannot override configured HTTPS origin") {
+    origin = "http://" + host;
+    accepted = false;
+  }
+  SECTION("forwarded host cannot repair mismatched actual Host") {
+    mismatched_host = true;
+    accepted = false;
+  }
+  WsTestClient client(mismatched_host ? "localhost" : "127.0.0.1");
+  REQUIRE(client.connect(2s, {{"Origin", origin},
+                              {"X-Forwarded-Host", "127.0.0.1:28099"},
+                              {"X-Forwarded-Proto", "https"},
+                              {"Cookie", "plinth_session=" + cookie}}));
+  auto message = client.receive_json(3s);
+  REQUIRE(message.has_value());
+  if (accepted) {
+    REQUIRE((*message)["type"].asString() == "connected");
+    REQUIRE((*message)["user"]["id"].asString() == user);
+  } else {
+    REQUIRE((*message)["type"].asString() == "error");
+    REQUIRE((*message)["error"].asString() == "auth_failed");
+    REQUIRE(client.wait_for_close(2s));
+  }
+}

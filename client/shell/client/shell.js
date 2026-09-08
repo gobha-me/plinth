@@ -5,7 +5,7 @@
 
 import { h, render, Component } from 'preact';
 import htm from 'htm';
-import { call as plinthCall } from '@plinth/frontend/sdk';
+import { call as plinthCall, reconnectRealtime } from '@plinth/frontend/sdk';
 const html = htm.bind(h);
 
 // ICD-0.6.3 §6.5 — sanitize boundary detail before audit emission.
@@ -244,6 +244,7 @@ class LoginForm extends Component {
         const session = await plinthFetch('/api/auth/session');
         if (session.status === 200) {
           const sessionBody = await session.json();
+          reconnectRealtime();
           setState({ route: 'authenticated',
                      user: sessionBody.user ?? sessionBody,
                      errorCode: null });

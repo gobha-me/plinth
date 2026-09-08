@@ -13,6 +13,7 @@
   "listen_port": 8080,
   "registration_enabled": true,
   "node_id": "node-1",
+  "ws_browser_origin": "",
   "ws_auth_timeout_s": 5.0,
   "ws_heartbeat_interval_s": 30.0,
   "ws_heartbeat_timeout_s": 10.0,

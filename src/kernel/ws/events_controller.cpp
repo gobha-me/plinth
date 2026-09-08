@@ -45,14 +45,16 @@ auto parse_json(std::string_view text) -> Json::Value {
 EventsController::EventsController(double auth_timeout_s,
                                    double heartbeat_interval_s,
                                    double heartbeat_timeout_s,
-                                   std::string node_id)
+                                   std::string node_id,
+                                   std::string browser_origin)
     : auth_timeout_s(auth_timeout_s),
       heartbeat_interval_s(heartbeat_interval_s),
-      heartbeat_timeout_s(heartbeat_timeout_s), node_id(std::move(node_id)) {
+      heartbeat_timeout_s(heartbeat_timeout_s), node_id(std::move(node_id)),
+      browser_origin(std::move(browser_origin)) {
 }
 
 auto EventsController::handleNewConnection(
-    const drogon::HttpRequestPtr& /*req*/,
+    const drogon::HttpRequestPtr& req,
     const drogon::WebSocketConnectionPtr& conn) -> void {
   // Suppress Drogon's protocol-level ping; ICD-0.1.6 specifies
   // application-level JSON ping/pong so the JS SDK can observe it.
@@ -64,6 +66,7 @@ auto EventsController::handleNewConnection(
   state->heartbeat_timeout_s = heartbeat_timeout_s;
   conn->setContext(state);
   start_auth_timer(conn, auth_timeout_s);
+  on_session_upgrade(req, conn, node_id, browser_origin);
 
   spdlog::debug("ws: new connection from {}", peer_ip(conn));
 }

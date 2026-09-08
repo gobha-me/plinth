@@ -90,6 +90,9 @@ auto test_config() -> plinth::Config {
   cfg.listen_port = TEST_PORT;
   cfg.node_id = "test-node";
   // Short timeouts so tests don't wait 30+ seconds.
+  if (const auto* origin = std::getenv("PLINTH_TEST_WS_BROWSER_ORIGIN")) {
+    cfg.ws_browser_origin = origin;
+  }
   cfg.ws_auth_timeout_s = 1.0;
   cfg.ws_heartbeat_interval_s = 0.5;
   cfg.ws_heartbeat_timeout_s = 0.5;
@@ -334,9 +337,9 @@ auto test_server_port() -> uint16_t {
 
 // ── WsTestClient ────────────────────────────────────────────────
 
-WsTestClient::WsTestClient() {
+WsTestClient::WsTestClient(const std::string& server_name) {
   auto port = test_server_port();
-  auto host = "ws://127.0.0.1:" + std::to_string(port);
+  auto host = "ws://" + server_name + ":" + std::to_string(port);
   client = drogon::WebSocketClient::newWebSocketClient(host);
 
   client->setMessageHandler([this](std::string&& message,
@@ -406,11 +409,16 @@ WsTestClient::~WsTestClient() {
   done_fut.wait();
 }
 
-auto WsTestClient::connect(std::chrono::milliseconds timeout) -> bool {
+auto WsTestClient::connect(
+    std::chrono::milliseconds timeout,
+    const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
   std::promise<bool> p;
   auto f = p.get_future();
   auto req = drogon::HttpRequest::newHttpRequest();
   req->setPath("/ws/events");
+  for (const auto& [name, value] : headers) {
+    req->addHeader(name, value);
+  }
   client->connectToServer(req,
                           [this, &p](drogon::ReqResult r,
                                      const drogon::HttpResponsePtr& /*resp*/,

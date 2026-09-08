@@ -16,7 +16,8 @@ class EventsController
                                          /*AutoCreation=*/false> {
  public:
   EventsController(double auth_timeout_s, double heartbeat_interval_s,
-                   double heartbeat_timeout_s, std::string node_id);
+                   double heartbeat_timeout_s, std::string node_id,
+                   std::string browser_origin = {});
 
   auto handleNewConnection(const drogon::HttpRequestPtr& req,
                            const drogon::WebSocketConnectionPtr& conn)
@@ -39,6 +40,7 @@ class EventsController
   double heartbeat_interval_s;
   double heartbeat_timeout_s;
   std::string node_id;
+  std::string browser_origin;
 };
 
 } // namespace plinth::ws
