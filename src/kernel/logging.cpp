@@ -1,5 +1,6 @@
 #include "kernel/logging.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/auth/middleware.hpp"
 #include "kernel/config.hpp"
@@ -146,7 +147,7 @@ auto audit(std::string_view action, const Json::Value& detail,
 auto audit_sync(const Config::Database& db, std::string_view action,
                 const Json::Value& detail) -> void {
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("audit_sync: PG connect failed: {}", PQerrorMessage(conn));
     PQfinish(conn);
@@ -162,10 +163,11 @@ auto audit_sync(const Config::Database& db, std::string_view action,
       g_node_id.c_str(),
   };
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexecParams(conn,
-                   "INSERT INTO plinth.audit_log (action, detail, node_id) "
-                   "VALUES ($1, $2::jsonb, $3)",
-                   3, nullptr, params.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn,
+          "INSERT INTO plinth.audit_log (action, detail, node_id) "
+          "VALUES ($1, $2::jsonb, $3)",
+          3, nullptr, params.data(), nullptr, nullptr, 0),
       PQclear);
 
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {

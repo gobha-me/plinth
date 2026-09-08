@@ -1,5 +1,6 @@
 #include "kernel/frontend/api_frontend.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -41,7 +42,7 @@ struct ResolveResult {
 // version only) — this handler builds a redirect URL, not an asset path.
 auto resolve_active(const Config::Database& db) -> ResolveResult {
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("frontend::api_frontend: PG connect failed: {}",
                  PQerrorMessage(conn));
@@ -52,11 +53,11 @@ auto resolve_active(const Config::Database& db) -> ResolveResult {
   std::unique_ptr<PGconn, decltype(cleanup)> guard(conn, cleanup);
 
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexec(conn, "SELECT name, version "
-                   "FROM plinth.packages "
-                   "WHERE frontend_mount IS NOT NULL "
-                   "  AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
-                   "LIMIT 2"),
+      plinth::db::exec(conn, "SELECT name, version "
+                             "FROM plinth.packages "
+                             "WHERE frontend_mount IS NOT NULL "
+                             "  AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
+                             "LIMIT 2"),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::warn("frontend::api_frontend: SELECT failed: {}",

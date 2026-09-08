@@ -1,6 +1,7 @@
 #include "kernel/capabilities/listener.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <array>
 #include <chrono>
@@ -44,6 +45,7 @@ int wakeup_fd = -1;
 std::mutex listener_exit_mutex;
 std::condition_variable listener_exit_cv;
 bool listener_exited = true;
+bool listener_clean = true;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -108,7 +110,7 @@ using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 auto fetch_row(const Config::Database& db_cfg, std::string_view signature,
                std::string_view scope) -> std::optional<CachedCapability> {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("listener: fetch_row connect failed: {}",
                   PQerrorMessage(conn));
@@ -120,14 +122,15 @@ auto fetch_row(const Config::Database& db_cfg, std::string_view signature,
   std::string sig_str{signature};
   std::string scope_str{scope};
   std::array<const char*, 2> values = {sig_str.c_str(), scope_str.c_str()};
-  PgResultPtr res{PQexecParams(conn,
-                               "SELECT signature, provider_type, "
-                               "       COALESCE(extension_name, ''), scope, "
-                               "       rbac_rule, enabled "
-                               "FROM plinth.capabilities "
-                               "WHERE signature = $1 AND scope = $2",
-                               2, nullptr, values.data(), nullptr, nullptr, 0),
-                  PQclear};
+  PgResultPtr res{
+      plinth::db::exec_params(conn,
+                              "SELECT signature, provider_type, "
+                              "       COALESCE(extension_name, ''), scope, "
+                              "       rbac_rule, enabled "
+                              "FROM plinth.capabilities "
+                              "WHERE signature = $1 AND scope = $2",
+                              2, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("listener: fetch_row SELECT failed: {}",
                   PQresultErrorMessage(res.get()));
@@ -211,13 +214,14 @@ auto apply(const Config::Database& db_cfg, const ParsedNotification& n)
 
 auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("listener: connect failed: {}", PQerrorMessage(conn));
     PQfinish(conn);
     return nullptr;
   }
-  PgResultPtr res{PQexec(conn, "LISTEN plinth_capability_changed"), PQclear};
+  PgResultPtr res{plinth::db::exec(conn, "LISTEN plinth_capability_changed"),
+                  PQclear};
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     spdlog::error("listener: LISTEN failed: {}",
                   PQresultErrorMessage(res.get()));
@@ -243,9 +247,11 @@ auto drain_notifications(PGconn* conn, const Config::Database& db_cfg) -> void {
 }
 
 auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
-                  int wake_fd) -> void {
+                  int wake_fd) -> bool {
+  plinth::db::OperationScope database_operations{tok, std::chrono::seconds{5}};
   PGconn* conn = nullptr;
   while (!tok.stop_requested()) {
+    database_operations.retry();
     if (conn == nullptr || PQstatus(conn) != CONNECTION_OK) {
       if (conn != nullptr) {
         PQfinish(conn);
@@ -253,7 +259,12 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
       }
       conn = open_listen_conn(db_cfg);
       if (conn == nullptr) {
-        std::this_thread::sleep_for(RECONNECT_BACKOFF);
+        pollfd wake{.fd = wake_fd, .events = POLLIN, .revents = 0};
+        (void)::poll(&wake, 1,
+                     static_cast<int>(
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             RECONNECT_BACKOFF)
+                             .count()));
         continue;
       }
       // Full resync after every successful LISTEN open (initial
@@ -292,6 +303,7 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
   // the descriptor is reclaimed immediately on exit.
   ::close(wake_fd);
   spdlog::info("listener: stopped");
+  return !database_operations.cancellation_failed();
 }
 
 } // namespace
@@ -312,12 +324,14 @@ auto start_notify_listener(const Config::Database& db_cfg) -> void {
   {
     std::lock_guard exit_lock(listener_exit_mutex);
     listener_exited = false;
+    listener_clean = true;
   }
   listener_thread.emplace([db_cfg, fd](const std::stop_token& tok) {
-    run_listener(tok, db_cfg, fd);
+    bool clean = run_listener(tok, db_cfg, fd);
     {
       std::lock_guard exit_lock(listener_exit_mutex);
       listener_exited = true;
+      listener_clean = clean;
     }
     listener_exit_cv.notify_all();
   });
@@ -326,7 +340,7 @@ auto start_notify_listener(const Config::Database& db_cfg) -> void {
 auto stop_notify_listener(std::chrono::milliseconds timeout) -> bool {
   std::lock_guard lock(lifecycle_mutex);
   if (!listener_thread.has_value()) {
-    return true;
+    return listener_clean;
   }
   listener_thread->request_stop();
   if (wakeup_fd >= 0) {
@@ -343,7 +357,7 @@ auto stop_notify_listener(std::chrono::milliseconds timeout) -> bool {
   // The completion barrier above makes the jthread reset an immediate join.
   listener_thread.reset();
   wakeup_fd = -1; // ownership handed to the thread, which has closed it
-  return true;
+  return listener_clean;
 }
 
 auto apply_notification_for_test(const Config::Database& db_cfg,

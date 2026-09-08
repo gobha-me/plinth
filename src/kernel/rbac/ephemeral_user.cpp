@@ -1,4 +1,5 @@
 #include "kernel/rbac/ephemeral_user.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <libpq-fe.h>
 
@@ -47,13 +48,13 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
   // denied user
   {
     std::array<const char*, 2> values = {denied_user.c_str(), PLACEHOLDER_HASH};
-    PgResultPtr res(PQexecParams(&conn,
-                                 "INSERT INTO plinth.users "
-                                 "(username, password_hash, is_test_user) "
-                                 "VALUES ($1, $2, true) RETURNING id",
-                                 2, nullptr, values.data(), nullptr, nullptr,
-                                 0),
-                    PQclear);
+    PgResultPtr res(
+        plinth::db::exec_params(&conn,
+                                "INSERT INTO plinth.users "
+                                "(username, password_hash, is_test_user) "
+                                "VALUES ($1, $2, true) RETURNING id",
+                                2, nullptr, values.data(), nullptr, nullptr, 0),
+        PQclear);
     if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
@@ -62,13 +63,13 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
   {
     std::array<const char*, 2> values = {allowed_user.c_str(),
                                          PLACEHOLDER_HASH};
-    PgResultPtr res(PQexecParams(&conn,
-                                 "INSERT INTO plinth.users "
-                                 "(username, password_hash, is_test_user) "
-                                 "VALUES ($1, $2, true) RETURNING id",
-                                 2, nullptr, values.data(), nullptr, nullptr,
-                                 0),
-                    PQclear);
+    PgResultPtr res(
+        plinth::db::exec_params(&conn,
+                                "INSERT INTO plinth.users "
+                                "(username, password_hash, is_test_user) "
+                                "VALUES ($1, $2, true) RETURNING id",
+                                2, nullptr, values.data(), nullptr, nullptr, 0),
+        PQclear);
     if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
@@ -76,14 +77,14 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
   // synthetic group
   {
     std::array<const char*, 1> values = {group_name.c_str()};
-    PgResultPtr res(
-        PQexecParams(&conn,
-                     "INSERT INTO plinth.groups "
-                     "(name, description, built_in) "
-                     "VALUES ($1, 'RBAC test group; auto-cleaned', false) "
-                     "RETURNING id",
-                     1, nullptr, values.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr res(plinth::db::exec_params(
+                        &conn,
+                        "INSERT INTO plinth.groups "
+                        "(name, description, built_in) "
+                        "VALUES ($1, 'RBAC test group; auto-cleaned', false) "
+                        "RETURNING id",
+                        1, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
@@ -92,15 +93,15 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
   {
     std::array<const char*, 2> values = {denied_user.c_str(),
                                          allowed_user.c_str()};
-    PgResultPtr res(
-        PQexecParams(&conn,
-                     "INSERT INTO plinth.group_members (group_id, user_id) "
-                     "SELECT g.id, u.id "
-                     "FROM plinth.groups g, plinth.users u "
-                     "WHERE g.name = 'everyone' "
-                     "  AND u.username IN ($1, $2)",
-                     2, nullptr, values.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr res(plinth::db::exec_params(
+                        &conn,
+                        "INSERT INTO plinth.group_members (group_id, user_id) "
+                        "SELECT g.id, u.id "
+                        "FROM plinth.groups g, plinth.users u "
+                        "WHERE g.name = 'everyone' "
+                        "  AND u.username IN ($1, $2)",
+                        2, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
@@ -109,15 +110,15 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
   {
     std::array<const char*, 2> values = {group_name.c_str(),
                                          allowed_user.c_str()};
-    PgResultPtr res(
-        PQexecParams(&conn,
-                     "INSERT INTO plinth.group_members (group_id, user_id) "
-                     "SELECT g.id, u.id "
-                     "FROM plinth.groups g, plinth.users u "
-                     "WHERE g.name     = $1 "
-                     "  AND u.username = $2",
-                     2, nullptr, values.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr res(plinth::db::exec_params(
+                        &conn,
+                        "INSERT INTO plinth.group_members (group_id, user_id) "
+                        "SELECT g.id, u.id "
+                        "FROM plinth.groups g, plinth.users u "
+                        "WHERE g.name     = $1 "
+                        "  AND u.username = $2",
+                        2, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
@@ -133,7 +134,7 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
   std::array<const char*, 3> values = {
       denied_user.c_str(), allowed_user.c_str(), group_name.c_str()};
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           &conn,
           "SELECT "
           "  (SELECT id::text FROM plinth.users  WHERE username = $1) AS du, "
@@ -156,15 +157,15 @@ auto grant_rule_to_run_group(std::string_view run_id, std::string_view rule,
   std::string group_name = "__rbac_test_" + std::string{run_id};
   std::string rule_s{rule};
   std::array<const char*, 2> values = {group_name.c_str(), rule_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(&conn,
-                   "INSERT INTO plinth.group_rules (group_id, rule_id) "
-                   "SELECT g.id, r.id "
-                   "FROM plinth.groups g, plinth.rbac_rules r "
-                   "WHERE g.name = $1 AND r.rule = $2 "
-                   "ON CONFLICT (group_id, rule_id) DO NOTHING",
-                   2, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      &conn,
+                      "INSERT INTO plinth.group_rules (group_id, rule_id) "
+                      "SELECT g.id, r.id "
+                      "FROM plinth.groups g, plinth.rbac_rules r "
+                      "WHERE g.name = $1 AND r.rule = $2 "
+                      "ON CONFLICT (group_id, rule_id) DO NOTHING",
+                      2, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
@@ -178,7 +179,7 @@ auto revoke_rule_from_run_group(std::string_view run_id, std::string_view rule,
   std::string rule_s{rule};
   std::array<const char*, 2> values = {group_name.c_str(), rule_s.c_str()};
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           &conn,
           "DELETE FROM plinth.group_rules "
           "WHERE group_id = (SELECT id FROM plinth.groups WHERE name = $1) "
@@ -203,7 +204,7 @@ auto destroy_run_users(std::string_view run_id, PGconn& conn)
   {
     std::array<const char*, 1> values = {group_name.c_str()};
     PgResultPtr res(
-        PQexecParams(
+        plinth::db::exec_params(
             &conn,
             "DELETE FROM plinth.group_rules "
             "WHERE group_id = (SELECT id FROM plinth.groups WHERE name = $1)",
@@ -217,7 +218,7 @@ auto destroy_run_users(std::string_view run_id, PGconn& conn)
     std::array<const char*, 3> values = {
         denied_user.c_str(), allowed_user.c_str(), group_name.c_str()};
     PgResultPtr res(
-        PQexecParams(
+        plinth::db::exec_params(
             &conn,
             "DELETE FROM plinth.group_members "
             "WHERE user_id IN (SELECT id FROM plinth.users "
@@ -232,20 +233,20 @@ auto destroy_run_users(std::string_view run_id, PGconn& conn)
   {
     std::array<const char*, 2> values = {denied_user.c_str(),
                                          allowed_user.c_str()};
-    PgResultPtr res(
-        PQexecParams(&conn,
-                     "DELETE FROM plinth.users WHERE username IN ($1, $2)", 2,
-                     nullptr, values.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr res(plinth::db::exec_params(
+                        &conn,
+                        "DELETE FROM plinth.users WHERE username IN ($1, $2)",
+                        2, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
   }
   {
     std::array<const char*, 1> values = {group_name.c_str()};
-    PgResultPtr res(PQexecParams(&conn,
-                                 "DELETE FROM plinth.groups WHERE name = $1", 1,
-                                 nullptr, values.data(), nullptr, nullptr, 0),
+    PgResultPtr res(plinth::db::exec_params(
+                        &conn, "DELETE FROM plinth.groups WHERE name = $1", 1,
+                        nullptr, values.data(), nullptr, nullptr, 0),
                     PQclear);
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
@@ -270,15 +271,15 @@ auto cleanup_orphaned_test_users(
 
   // 1) group_rules for test groups older than cutoff
   {
-    PgResultPtr res(PQexecParams(&conn,
-                                 "DELETE FROM plinth.group_rules "
-                                 "WHERE group_id IN ( "
-                                 "  SELECT id FROM plinth.groups "
-                                 "  WHERE starts_with(name, '__rbac_test_') "
-                                 "    AND created_at < $1::timestamptz)",
-                                 1, nullptr, values.data(), nullptr, nullptr,
-                                 0),
-                    PQclear);
+    PgResultPtr res(
+        plinth::db::exec_params(&conn,
+                                "DELETE FROM plinth.group_rules "
+                                "WHERE group_id IN ( "
+                                "  SELECT id FROM plinth.groups "
+                                "  WHERE starts_with(name, '__rbac_test_') "
+                                "    AND created_at < $1::timestamptz)",
+                                1, nullptr, values.data(), nullptr, nullptr, 0),
+        PQclear);
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
@@ -286,7 +287,7 @@ auto cleanup_orphaned_test_users(
   // 2) group_members for test users OR test groups older than cutoff
   {
     PgResultPtr res(
-        PQexecParams(
+        plinth::db::exec_params(
             &conn,
             "DELETE FROM plinth.group_members "
             "WHERE user_id IN ( "
@@ -305,7 +306,7 @@ auto cleanup_orphaned_test_users(
   // 3) test users older than cutoff
   {
     PgResultPtr res(
-        PQexecParams(
+        plinth::db::exec_params(
             &conn,
             "DELETE FROM plinth.users "
             "WHERE is_test_user = true AND created_at < $1::timestamptz",
@@ -316,12 +317,13 @@ auto cleanup_orphaned_test_users(
     }
   }
   // 4) test groups older than cutoff — count these for the return.
-  PgResultPtr res(PQexecParams(&conn,
-                               "DELETE FROM plinth.groups "
-                               "WHERE starts_with(name, '__rbac_test_') "
-                               "  AND created_at < $1::timestamptz",
-                               1, nullptr, values.data(), nullptr, nullptr, 0),
-                  PQclear);
+  PgResultPtr res(
+      plinth::db::exec_params(&conn,
+                              "DELETE FROM plinth.groups "
+                              "WHERE starts_with(name, '__rbac_test_') "
+                              "  AND created_at < $1::timestamptz",
+                              1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear);
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }

@@ -1,5 +1,6 @@
 #include "kernel/shell/firstboot.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/config.hpp"
 #include "kernel/logging.hpp"
@@ -54,7 +55,7 @@ auto emit_failed(const Config::Database& db, std::string_view failure_kind,
 struct PgGuard {
   PGconn* conn = nullptr;
   explicit PgGuard(const Config::Database& db) {
-    conn = PQconnectdb(plinth::db::connection_info(db).c_str());
+    conn = plinth::db::connect(plinth::db::connection_info(db).c_str());
   }
   ~PgGuard() {
     if (conn != nullptr) {
@@ -101,13 +102,13 @@ struct DetectResult {
 
 auto detect_active_bundled_frontend(PGconn* conn)
     -> std::expected<DetectResult, std::string> {
-  PgResult res{PQexec(conn,
-                      "SELECT name, provenance, state "
-                      "FROM plinth.packages "
-                      "WHERE name = 'shell' "
-                      "   OR (provenance = 'bundled' "
-                      "       AND frontend_mount IS NOT NULL "
-                      "       AND state IN ('ACTIVE','ACTIVE_FLAGGED'))")};
+  PgResult res{plinth::db::exec(
+      conn, "SELECT name, provenance, state "
+            "FROM plinth.packages "
+            "WHERE name = 'shell' "
+            "   OR (provenance = 'bundled' "
+            "       AND frontend_mount IS NOT NULL "
+            "       AND state IN ('ACTIVE','ACTIVE_FLAGGED'))")};
   if (PQresultStatus(res.res) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.res)});
   }

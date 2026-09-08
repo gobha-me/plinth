@@ -1,6 +1,7 @@
 #include "kernel/audit/handlers.hpp"
 #include "kernel/auth/middleware.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/rbac/enforcement.hpp"
 
@@ -308,7 +309,7 @@ auto purge_older_than(const Config::Database& db, int retention_days)
   }
 
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);
@@ -319,10 +320,10 @@ auto purge_older_than(const Config::Database& db, int retention_days)
   auto interval = std::to_string(retention_days) + " days";
   std::array<const char*, 1> params = {interval.c_str()};
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      PQexecParams(conn,
-                   "DELETE FROM plinth.audit_log "
-                   "WHERE timestamp < NOW() - $1::interval",
-                   1, nullptr, params.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(conn,
+                              "DELETE FROM plinth.audit_log "
+                              "WHERE timestamp < NOW() - $1::interval",
+                              1, nullptr, params.data(), nullptr, nullptr, 0),
       PQclear);
 
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {

@@ -1,5 +1,6 @@
 #include "kernel/packages/handlers.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/rbac/enforcement.hpp"
@@ -292,7 +293,7 @@ auto handle_get_packages(
   bool include_failed = !req->getParameter("include_failed").empty();
 
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   auto conn_guard =
       std::unique_ptr<PGconn, decltype(&PQfinish)>(conn, PQfinish);
   if (PQstatus(conn) != CONNECTION_OK) {
@@ -312,8 +313,8 @@ auto handle_get_packages(
                     where +
                     " ORDER BY installed_at DESC LIMIT $1::int OFFSET $2::int";
   std::array<const char*, 2> values = {limit_str.c_str(), offset_str.c_str()};
-  PgResultPtr res(PQexecParams(conn, sql.c_str(), 2, nullptr, values.data(),
-                               nullptr, nullptr, 0),
+  PgResultPtr res(plinth::db::exec_params(conn, sql.c_str(), 2, nullptr,
+                                          values.data(), nullptr, nullptr, 0),
                   PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     cb(json_resp(drogon::k500InternalServerError,
@@ -354,7 +355,7 @@ auto handle_get_package_by_id(
     std::function<void(const drogon::HttpResponsePtr&)>&& cb,
     const Config::Database& db, const std::string& id) -> void {
   auto conninfo = plinth::db::connection_info(db);
-  PGconn* conn = PQconnectdb(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   auto conn_guard =
       std::unique_ptr<PGconn, decltype(&PQfinish)>(conn, PQfinish);
   if (PQstatus(conn) != CONNECTION_OK) {
@@ -364,15 +365,15 @@ auto handle_get_package_by_id(
   }
 
   std::array<const char*, 1> values = {id.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn,
-                   "SELECT id::text, name, version, state, provenance, "
-                   "       frontend_mount, frontend_entry, entry_point, "
-                   "       manifest_checksum, manifest_json::text, "
-                   "       last_install_report::text, installed_at "
-                   "FROM plinth.packages WHERE id = $1::uuid",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT id::text, name, version, state, provenance, "
+                      "       frontend_mount, frontend_entry, entry_point, "
+                      "       manifest_checksum, manifest_json::text, "
+                      "       last_install_report::text, installed_at "
+                      "FROM plinth.packages WHERE id = $1::uuid",
+                      1, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     cb(json_resp(drogon::k500InternalServerError,
                  error_body("db-error", PQresultErrorMessage(res.get()))));

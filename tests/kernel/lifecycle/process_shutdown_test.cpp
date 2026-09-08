@@ -5,7 +5,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "kernel/config.hpp"
+#include "kernel/db/bootstrap.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -23,6 +25,7 @@
 #include <libpq-fe.h>
 #include <memory>
 #include <optional>
+#include <poll.h>
 #include <spawn.h>
 #include <stdexcept>
 #include <string>
@@ -761,6 +764,133 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
                  {EVENT_CHANNEL, std::to_string(control_seq)}) == 1);
 }
 
+class StalledPostgres {
+ public:
+  StalledPostgres()
+      : listener(::socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0)) {
+    if (listener.fd < 0) {
+      throw std::runtime_error("cannot create fake PostgreSQL socket");
+    }
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (::bind(listener.fd, reinterpret_cast<sockaddr*>(&address),
+               sizeof(address)) != 0 ||
+        ::listen(listener.fd, 1) != 0) {
+      throw std::runtime_error("cannot listen on fake PostgreSQL socket");
+    }
+    socklen_t size = sizeof(address);
+    if (::getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address),
+                      &size) != 0) {
+      throw std::runtime_error("cannot discover fake PostgreSQL port");
+    }
+    database.host = "127.0.0.1";
+    database.port = ntohs(address.sin_port);
+    database.user = "startup-test";
+    database.password = "fake-startup-password";
+    database.database = "startup-test";
+  }
+
+  auto accept_handshake() const -> Socket {
+    pollfd pending{.fd = listener.fd, .events = POLLIN, .revents = 0};
+    if (::poll(&pending, 1, 5000) <= 0) {
+      throw std::runtime_error("production did not connect to fake PostgreSQL");
+    }
+    Socket peer{
+        ::accept4(listener.fd, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK)};
+    if (peer.fd < 0) {
+      throw std::runtime_error("cannot accept fake PostgreSQL connection");
+    }
+    pending.fd = peer.fd;
+    if (::poll(&pending, 1, 5000) <= 0) {
+      throw std::runtime_error("production did not begin PostgreSQL handshake");
+    }
+    std::array<char, 64> bytes{};
+    if (::recv(peer.fd, bytes.data(), bytes.size(), MSG_DONTWAIT) <= 0) {
+      throw std::runtime_error("production closed before PostgreSQL handshake");
+    }
+    return peer;
+  }
+
+  plinth::Config::Database database;
+
+ private:
+  Socket listener;
+};
+
+auto write_startup_config(const TempTree& tree) -> std::filesystem::path {
+  nlohmann::json config{
+      {"migrations_dir", std::string{CMAKE_SOURCE_DIR} + "/migrations"},
+      {"listen_host", "127.0.0.1"},
+      {"listen_port", test_port()},
+      {"dev_mode", false},
+      {"packages",
+       {{"data_dir", (tree.path / "data").string()},
+        {"staging_dir", (tree.path / "staging").string()}}},
+      {"shell",
+       {{"enabled", false},
+        {"bundle_path",
+         std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled"}}}};
+  auto path = tree.path / "startup.json";
+  std::ofstream output(path);
+  REQUIRE(output.good());
+  output << config.dump(2);
+  REQUIRE(output.good());
+  return path;
+}
+
+auto require_clean_startup_signal(ChildProcess& child, int signal,
+                                  const std::filesystem::path& log) -> void {
+  child.send_signal(signal);
+  auto status = child.wait_for_exit(10s);
+  REQUIRE(status.has_value());
+  REQUIRE(WIFEXITED(*status));
+  REQUIRE(WEXITSTATUS(*status) == 0);
+  REQUIRE_FALSE(read_text(log).contains("shutdown failed closed"));
+}
+
+auto wait_for_blocked_backend(PGconn* observer, std::string_view pattern)
+    -> std::string {
+  auto text = std::string{pattern};
+  const char* parameter = text.c_str();
+  auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexecParams(observer,
+                     "SELECT pid::text FROM pg_stat_activity WHERE datname = "
+                     "current_database() AND pid <> pg_backend_pid() AND "
+                     "wait_event_type = 'Lock' AND query ILIKE $1",
+                     1, nullptr, &parameter, nullptr, nullptr, 0),
+        PQclear};
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    if (PQntuples(result.get()) == 1) {
+      return PQgetvalue(result.get(), 0, 0);
+    }
+    std::this_thread::sleep_for(25ms);
+  }
+  throw std::runtime_error(
+      "production did not reach the startup database lock");
+}
+
+auto require_backend_gone(PGconn* observer, const std::string& backend)
+    -> void {
+  const char* parameter = backend.c_str();
+  auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexecParams(observer,
+                     "SELECT 1 FROM pg_stat_activity WHERE pid = $1::int", 1,
+                     nullptr, &parameter, nullptr, nullptr, 0),
+        PQclear};
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    if (PQntuples(result.get()) == 0) {
+      return;
+    }
+    std::this_thread::sleep_for(25ms);
+  }
+  FAIL("cancelled startup left a PostgreSQL backend running behind the lock");
+}
+
 auto request_http(std::uint16_t port, std::string_view request) -> std::string {
   auto socket = connect_to(port);
   if (socket.fd < 0 || !send_all(socket.fd, request)) {
@@ -996,6 +1126,109 @@ TEST_CASE("production preserves PostgreSQL credentials across boot and restart",
       REQUIRE(WIFEXITED(*status));
       REQUIRE(WEXITSTATUS(*status) == 0);
       REQUIRE_FALSE(read_text(log_path).contains(database.db.password));
+    }
+  }
+}
+
+TEST_CASE("startup connection deadlines also stop error-path reconnections",
+          "[db][startup][unit]") {
+  StalledPostgres endpoint;
+  plinth::db::OperationScope operations{std::stop_token{}, 100ms};
+  auto conninfo = plinth::db::connection_info(endpoint.database);
+  const auto started = std::chrono::steady_clock::now();
+  std::unique_ptr<PGconn, decltype(&PQfinish)> connection{
+      plinth::db::connect(conninfo.c_str()), PQfinish};
+  REQUIRE(connection == nullptr);
+  REQUIRE(std::chrono::steady_clock::now() - started < 2s);
+  REQUIRE_THROWS_AS(operations.checkpoint(), std::runtime_error);
+  const auto retry_started = std::chrono::steady_clock::now();
+  connection.reset(plinth::db::connect(conninfo.c_str()));
+  REQUIRE(connection == nullptr);
+  REQUIRE(std::chrono::steady_clock::now() - retry_started < 100ms);
+}
+
+TEST_CASE(
+    "production cancels an incomplete PostgreSQL handshake on either signal",
+    "[integration][lifecycle][subprocess][startup]") {
+  for (int signal : {SIGINT, SIGTERM}) {
+    CAPTURE(signal);
+    StalledPostgres endpoint;
+    TempTree tree;
+    auto config = write_startup_config(tree);
+    auto log = tree.path / "process.log";
+    ChildProcess child{
+        {PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+        log,
+        &endpoint.database};
+    auto peer = endpoint.accept_handshake();
+    require_clean_startup_signal(child, signal, log);
+  }
+}
+
+TEST_CASE(
+    "production cancels bootstrap and reconciliation locks on either signal",
+    "[integration][lifecycle][subprocess][startup]") {
+  if (!required_env("PLINTH_PG_HOST").has_value()) {
+    SKIP("PostgreSQL environment is not configured");
+  }
+  for (bool reconciliation : {false, true}) {
+    for (int signal : {SIGINT, SIGTERM}) {
+      CAPTURE(reconciliation, signal);
+      CredentialDatabase database;
+      database.create("fake-startup-lock-password");
+      plinth::db::bootstrap_schema(
+          database.db, std::string{CMAKE_SOURCE_DIR} + "/migrations", false);
+      using Connection = std::unique_ptr<PGconn, decltype(&PQfinish)>;
+      auto conninfo = plinth::db::connection_info(database.db) +
+                      " connect_timeout=5 options='-c statement_timeout=5000'";
+      Connection blocker{PQconnectdb(conninfo.c_str()), PQfinish};
+      Connection observer{PQconnectdb(conninfo.c_str()), PQfinish};
+      REQUIRE(PQstatus(blocker.get()) == CONNECTION_OK);
+      REQUIRE(PQstatus(observer.get()) == CONNECTION_OK);
+      auto exec = [&blocker](const char* sql) {
+        std::unique_ptr<PGresult, decltype(&PQclear)> result{
+            PQexec(blocker.get(), sql), PQclear};
+        auto status = PQresultStatus(result.get());
+        REQUIRE((status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK));
+      };
+      if (reconciliation) {
+        exec("INSERT INTO plinth.packages "
+             "(name, version, state, provenance, manifest_json, entry_point, "
+             "manifest_checksum) VALUES ('startup-cancel', '1.0.0', "
+             "'UPLOADING', 'user', '{}', 'server/main.js', 'fake-checksum')");
+        exec("BEGIN; SELECT id FROM plinth.packages "
+             "WHERE name = 'startup-cancel' FOR UPDATE");
+      } else {
+        exec("BEGIN; LOCK TABLE plinth.groups IN ACCESS EXCLUSIVE MODE");
+      }
+      TempTree tree;
+      auto config = write_startup_config(tree);
+      auto log = tree.path / "process.log";
+      ChildProcess child{
+          {PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+          log,
+          &database.db};
+      auto backend = wait_for_blocked_backend(
+          observer.get(), reconciliation ? "%UPDATE%plinth.packages%"
+                                         : "%INSERT%plinth.groups%");
+      require_clean_startup_signal(child, signal, log);
+      // Keep the conflicting transaction open until the cancelled backend is
+      // gone. Closing only its client socket does not establish cancellation.
+      require_backend_gone(observer.get(), backend);
+      exec("ROLLBACK");
+      // Restart the same partial installation after releasing the blocker.
+      // This proves cancellation did not strand a lock or corrupt startup
+      // state that prevents the next process from reaching normal service.
+      auto restart_log = tree.path / "restart.log";
+      ChildProcess restarted{
+          {PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+          restart_log,
+          &database.db};
+      const auto port = nlohmann::json::parse(read_text(config))
+                            .at("listen_port")
+                            .get<std::uint16_t>();
+      REQUIRE(wait_for_health(port, 30s));
+      require_clean_startup_signal(restarted, signal, restart_log);
     }
   }
 }

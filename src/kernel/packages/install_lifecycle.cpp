@@ -1,5 +1,6 @@
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/registration.hpp"
@@ -85,7 +86,7 @@ using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 struct PgGuard {
   PGconn* conn = nullptr;
   explicit PgGuard(const Config::Database& db) {
-    conn = PQconnectdb(plinth::db::connection_info(db).c_str());
+    conn = plinth::db::connect(plinth::db::connection_info(db).c_str());
   }
   ~PgGuard() {
     if (conn != nullptr) {
@@ -139,7 +140,7 @@ auto sha256_hex(std::string_view bytes) -> std::string {
 
 auto pg_exec(PGconn* conn, const char* sql)
     -> std::expected<void, std::string> {
-  PgResultPtr res(PQexec(conn, sql), PQclear);
+  PgResultPtr res(plinth::db::exec(conn, sql), PQclear);
   auto status = PQresultStatus(res.get());
   if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
@@ -171,10 +172,11 @@ auto try_acquire_name_lock(PGconn* conn, std::string_view name)
     -> std::expected<void, std::string> {
   std::string seed = advisory_lock_key(name);
   std::array<const char*, 1> values = {seed.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn, "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", 1,
+                      nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
@@ -191,10 +193,11 @@ auto try_acquire_name_lock(PGconn* conn, std::string_view name)
 auto release_name_lock(PGconn* conn, std::string_view name) -> void {
   std::string seed = advisory_lock_key(name);
   std::array<const char*, 1> values = {seed.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn, "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT pg_advisory_unlock(hashtextextended($1, 0))", 1,
+                      nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   (void)res; // best-effort; backend cleanup covers us on connection drop
 }
 
@@ -498,7 +501,7 @@ auto insert_packages_row(PGconn* conn, std::string_view id,
       caller_user_id.c_str(),
   };
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           conn,
           "INSERT INTO plinth.packages "
           "(id, name, version, state, provenance, manifest_json, "
@@ -521,9 +524,9 @@ auto update_packages_state(PGconn* conn, std::string_view id,
   std::string state_s{new_state};
   std::array<const char*, 2> values = {state_s.c_str(), id_s.c_str()};
   PgResultPtr res(
-      PQexecParams(conn,
-                   "UPDATE plinth.packages SET state = $1 WHERE id = $2::uuid",
-                   2, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn, "UPDATE plinth.packages SET state = $1 WHERE id = $2::uuid", 2,
+          nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
@@ -536,12 +539,12 @@ auto update_packages_report(PGconn* conn, std::string_view id,
   std::string id_s{id};
   std::string report_s = report.dump();
   std::array<const char*, 2> values = {report_s.c_str(), id_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn,
-                   "UPDATE plinth.packages "
-                   "SET last_install_report = $1::jsonb WHERE id = $2::uuid",
-                   2, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "UPDATE plinth.packages "
+                      "SET last_install_report = $1::jsonb WHERE id = $2::uuid",
+                      2, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   (void)res; // best-effort record of failure detail
 }
 
@@ -549,13 +552,13 @@ auto name_already_installed(PGconn* conn, std::string_view name)
     -> std::expected<bool, std::string> {
   std::string name_s{name};
   std::array<const char*, 1> values = {name_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn,
-                   "SELECT 1 FROM plinth.packages "
-                   "WHERE name = $1 "
-                   "  AND state IN ('ACTIVE','ACTIVE_FLAGGED','DISABLED')",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT 1 FROM plinth.packages "
+                      "WHERE name = $1 "
+                      "  AND state IN ('ACTIVE','ACTIVE_FLAGGED','DISABLED')",
+                      1, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
@@ -592,15 +595,15 @@ auto classify_uploading_collision(PGconn* conn, std::string_view name,
     -> std::expected<CollisionInfo, std::string> {
   std::string name_s{name};
   std::array<const char*, 1> values = {name_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn,
-                   "SELECT id::text, version, state FROM plinth.packages "
-                   "WHERE name = $1 "
-                   "  AND state IN ('ACTIVE','ACTIVE_FLAGGED','DISABLED') "
-                   "  AND uninstalling_at IS NULL "
-                   "LIMIT 1",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT id::text, version, state FROM plinth.packages "
+                      "WHERE name = $1 "
+                      "  AND state IN ('ACTIVE','ACTIVE_FLAGGED','DISABLED') "
+                      "  AND uninstalling_at IS NULL "
+                      "LIMIT 1",
+                      1, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
@@ -699,15 +702,15 @@ auto register_extension_rbac_rules(PGconn* admin, const fs::path& package_root,
   // because it's PG state, not manifest state).
   for (const auto& g : rm->default_grants) {
     std::array<const char*, 2> values = {g.group.c_str(), g.rule.c_str()};
-    PgResultPtr res(
-        PQexecParams(admin,
-                     "INSERT INTO plinth.group_rules (group_id, rule_id) "
-                     "SELECT gp.id, rl.id "
-                     "FROM plinth.groups gp, plinth.rbac_rules rl "
-                     "WHERE gp.name = $1 AND rl.rule = $2 "
-                     "ON CONFLICT (group_id, rule_id) DO NOTHING",
-                     2, nullptr, values.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr res(plinth::db::exec_params(
+                        admin,
+                        "INSERT INTO plinth.group_rules (group_id, rule_id) "
+                        "SELECT gp.id, rl.id "
+                        "FROM plinth.groups gp, plinth.rbac_rules rl "
+                        "WHERE gp.name = $1 AND rl.rule = $2 "
+                        "ON CONFLICT (group_id, rule_id) DO NOTHING",
+                        2, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       spdlog::warn("rbac default_grant '{}' → '{}' INSERT failed: {} "
                    "(continuing — install does not abort on grant gap)",
@@ -768,7 +771,7 @@ auto reconcile_rbac_on_upgrade(
   std::string name_s{extension_name};
   std::array<const char*, 1> name_v = {name_s.c_str()};
   PgResultPtr v1_res(
-      PQexecParams(
+      plinth::db::exec_params(
           admin, "SELECT rule FROM plinth.rbac_rules WHERE extension_name = $1",
           1, nullptr, name_v.data(), nullptr, nullptr, 0),
       PQclear);
@@ -819,13 +822,13 @@ auto reconcile_rbac_on_upgrade(
     for (const auto& rule : to_orphan) {
       std::string rule_s{rule};
       std::array<const char*, 2> uv = {name_s.c_str(), rule_s.c_str()};
-      PgResultPtr u(
-          PQexecParams(admin,
-                       "UPDATE plinth.rbac_rules SET orphaned_at = NOW() "
-                       "WHERE extension_name = $1 AND rule = $2 "
-                       "  AND orphaned_at IS NULL",
-                       2, nullptr, uv.data(), nullptr, nullptr, 0),
-          PQclear);
+      PgResultPtr u(plinth::db::exec_params(
+                        admin,
+                        "UPDATE plinth.rbac_rules SET orphaned_at = NOW() "
+                        "WHERE extension_name = $1 AND rule = $2 "
+                        "  AND orphaned_at IS NULL",
+                        2, nullptr, uv.data(), nullptr, nullptr, 0),
+                    PQclear);
       if (PQresultStatus(u.get()) != PGRES_COMMAND_OK) {
         return std::unexpected(std::string{PQresultErrorMessage(u.get())});
       }
@@ -872,9 +875,9 @@ auto run_stage_registering_upgrade(PGconn* admin, std::string_view new_id,
   std::string ext_s{name};
   std::array<const char*, 1> name_v = {ext_s.c_str()};
   PgResultPtr del_caps(
-      PQexecParams(admin,
-                   "DELETE FROM plinth.capabilities WHERE extension_name = $1",
-                   1, nullptr, name_v.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          admin, "DELETE FROM plinth.capabilities WHERE extension_name = $1", 1,
+          nullptr, name_v.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(del_caps.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(del_caps.get())});
@@ -1084,7 +1087,7 @@ auto load_package_row(PGconn* conn, std::string_view package_id)
   std::string id_s{package_id};
   std::array<const char*, 1> values = {id_s.c_str()};
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           conn,
           "SELECT name, version, state, manifest_checksum, frontend_mount, "
           "       frontend_entry "
@@ -1148,12 +1151,13 @@ auto unregister_all_capabilities_for(PGconn* conn,
     -> std::expected<void, std::string> {
   std::string ext_s{extension_name};
   std::array<const char*, 1> values = {ext_s.c_str()};
-  PgResultPtr res(PQexecParams(conn,
-                               "SELECT DISTINCT namespace, version, function "
-                               "FROM plinth.capabilities "
-                               "WHERE extension_name = $1",
-                               1, nullptr, values.data(), nullptr, nullptr, 0),
-                  PQclear);
+  PgResultPtr res(
+      plinth::db::exec_params(conn,
+                              "SELECT DISTINCT namespace, version, function "
+                              "FROM plinth.capabilities "
+                              "WHERE extension_name = $1",
+                              1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
@@ -1237,7 +1241,7 @@ auto run_uninstall_cleanup(PGconn* admin, const LoadedPackage& lp,
 
   // 5a: strip group grants referencing this extension's rules.
   PgResultPtr del_gr(
-      PQexecParams(
+      plinth::db::exec_params(
           admin,
           "DELETE FROM plinth.group_rules WHERE rule_id IN ("
           "  SELECT id FROM plinth.rbac_rules WHERE extension_name = $1)",
@@ -1256,9 +1260,9 @@ auto run_uninstall_cleanup(PGconn* admin, const LoadedPackage& lp,
   }
   // 5c: panels.
   PgResultPtr del_panels(
-      PQexecParams(admin,
-                   "DELETE FROM plinth.panels WHERE package_id = $1::uuid", 1,
-                   nullptr, id_v.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          admin, "DELETE FROM plinth.panels WHERE package_id = $1::uuid", 1,
+          nullptr, id_v.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(del_panels.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(
@@ -1308,8 +1312,9 @@ auto run_uninstall_cleanup(PGconn* admin, const LoadedPackage& lp,
   // Step 8: delete the packages row (last; FK cascade unnecessary
   // after explicit 5c).
   PgResultPtr del_row(
-      PQexecParams(admin, "DELETE FROM plinth.packages WHERE id = $1::uuid", 1,
-                   nullptr, id_v.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(admin,
+                              "DELETE FROM plinth.packages WHERE id = $1::uuid",
+                              1, nullptr, id_v.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(del_row.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(
@@ -1826,7 +1831,7 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
   std::string id_s{package_id};
   std::array<const char*, 1> id_v = {id_s.c_str()};
   PgResultPtr recheck(
-      PQexecParams(
+      plinth::db::exec_params(
           pg.conn,
           "SELECT state FROM plinth.packages WHERE id = $1::uuid FOR UPDATE", 1,
           nullptr, id_v.data(), nullptr, nullptr, 0),
@@ -1861,12 +1866,13 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
   }
 
   // §DISABLED step 2 (state + disabled_at).
-  PgResultPtr upd(PQexecParams(pg.conn,
-                               "UPDATE plinth.packages "
-                               "SET state = 'DISABLED', disabled_at = NOW() "
-                               "WHERE id = $1::uuid",
-                               1, nullptr, id_v.data(), nullptr, nullptr, 0),
-                  PQclear);
+  PgResultPtr upd(
+      plinth::db::exec_params(pg.conn,
+                              "UPDATE plinth.packages "
+                              "SET state = 'DISABLED', disabled_at = NOW() "
+                              "WHERE id = $1::uuid",
+                              1, nullptr, id_v.data(), nullptr, nullptr, 0),
+      PQclear);
   if (PQresultStatus(upd.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(transition_failure(TransitionKind::DISABLE,
                                               package_id, "db-error",
@@ -2020,7 +2026,7 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
   std::string id_s{package_id};
   std::array<const char*, 1> id_v = {id_s.c_str()};
   PgResultPtr recheck(
-      PQexecParams(
+      plinth::db::exec_params(
           pg.conn,
           "SELECT state FROM plinth.packages WHERE id = $1::uuid FOR UPDATE", 1,
           nullptr, id_v.data(), nullptr, nullptr, 0),
@@ -2093,12 +2099,13 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
   }
 
   // §ACTIVE-from-DISABLED step 7 (state + disabled_at NULL).
-  PgResultPtr upd(PQexecParams(pg.conn,
-                               "UPDATE plinth.packages "
-                               "SET state = 'ACTIVE', disabled_at = NULL "
-                               "WHERE id = $1::uuid",
-                               1, nullptr, id_v.data(), nullptr, nullptr, 0),
-                  PQclear);
+  PgResultPtr upd(
+      plinth::db::exec_params(pg.conn,
+                              "UPDATE plinth.packages "
+                              "SET state = 'ACTIVE', disabled_at = NULL "
+                              "WHERE id = $1::uuid",
+                              1, nullptr, id_v.data(), nullptr, nullptr, 0),
+      PQclear);
   if (PQresultStatus(upd.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(transition_failure(TransitionKind::ENABLE,
                                               package_id, "db-error",
@@ -2236,7 +2243,7 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
     std::string id_s{package_id};
     std::array<const char*, 1> id_v = {id_s.c_str()};
     PgResultPtr recheck(
-        PQexecParams(
+        plinth::db::exec_params(
             pg.conn,
             "SELECT state FROM plinth.packages WHERE id = $1::uuid FOR UPDATE",
             1, nullptr, id_v.data(), nullptr, nullptr, 0),
@@ -2254,13 +2261,13 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
           "state raced to UNINSTALLING before uninstall tx opened"));
     }
 
-    PgResultPtr upd(
-        PQexecParams(pg.conn,
-                     "UPDATE plinth.packages "
-                     "SET state = 'UNINSTALLING', uninstalling_at = NOW() "
-                     "WHERE id = $1::uuid",
-                     1, nullptr, id_v.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr upd(plinth::db::exec_params(
+                        pg.conn,
+                        "UPDATE plinth.packages "
+                        "SET state = 'UNINSTALLING', uninstalling_at = NOW() "
+                        "WHERE id = $1::uuid",
+                        1, nullptr, id_v.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(upd.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(
           transition_failure(TransitionKind::UNINSTALL, package_id, "db-error",
@@ -2318,15 +2325,16 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
     return;
   }
 
-  PgResultPtr res(
-      PQexec(pg.conn, "SELECT id::text, name, version, state, "
+  PgResultPtr res(plinth::db::exec(
+                      pg.conn,
+                      "SELECT id::text, name, version, state, "
                       "       supersedes_id::text "
                       "FROM plinth.packages "
                       "WHERE state IN ('UPLOADING','VALIDATING','MIGRATING',"
                       "                'REGISTERING','EXTRACTING','ACTIVATING',"
                       "                'UNINSTALLING','SUPERSEDED') "
                       "ORDER BY installed_at ASC"),
-      PQclear);
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("reconcile_in_flight_installs: SELECT failed: {}",
                   PQresultErrorMessage(res.get()));
@@ -2393,11 +2401,12 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
                                       std::string_view supersedes_id) -> void {
     std::string sup_s{supersedes_id};
     std::array<const char*, 1> sup_v = {sup_s.c_str()};
-    PgResultPtr row(PQexecParams(pg.conn,
-                                 "SELECT state, version FROM plinth.packages "
-                                 "WHERE id = $1::uuid",
-                                 1, nullptr, sup_v.data(), nullptr, nullptr, 0),
-                    PQclear);
+    PgResultPtr row(
+        plinth::db::exec_params(pg.conn,
+                                "SELECT state, version FROM plinth.packages "
+                                "WHERE id = $1::uuid",
+                                1, nullptr, sup_v.data(), nullptr, nullptr, 0),
+        PQclear);
     if (PQresultStatus(row.get()) != PGRES_TUPLES_OK ||
         PQntuples(row.get()) == 0) {
       // Predecessor row gone (deleted, perhaps by a separate
@@ -2474,6 +2483,7 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
   };
 
   for (int i = 0; i < row_count; ++i) {
+    plinth::db::OperationScope::checkpoint_current();
     std::string id = PQgetvalue(res.get(), i, 0);
     std::string name = PQgetvalue(res.get(), i, 1);
     std::string version = PQgetvalue(res.get(), i, 2);
@@ -2541,7 +2551,7 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
       std::string name_s = name;
       std::array<const char*, 1> name_v = {name_s.c_str()};
       PgResultPtr active_row(
-          PQexecParams(
+          plinth::db::exec_params(
               pg.conn,
               "SELECT 1 FROM plinth.packages "
               "WHERE name = $1 AND state IN ('ACTIVE','ACTIVE_FLAGGED')",
@@ -2611,14 +2621,16 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
   // post-install trigger window. 1 h ceiling bounds replays; older
   // rows are treated as administratively complete.
   PgResultPtr rbac_test_rows(
-      PQexec(pg.conn, "SELECT id::text FROM plinth.packages "
-                      "WHERE state IN ('ACTIVE','ACTIVE_FLAGGED') "
-                      "  AND last_rbac_test_run_at IS NULL "
-                      "  AND installed_at > NOW() - interval '1 hour'"),
+      plinth::db::exec(pg.conn,
+                       "SELECT id::text FROM plinth.packages "
+                       "WHERE state IN ('ACTIVE','ACTIVE_FLAGGED') "
+                       "  AND last_rbac_test_run_at IS NULL "
+                       "  AND installed_at > NOW() - interval '1 hour'"),
       PQclear);
   if (PQresultStatus(rbac_test_rows.get()) == PGRES_TUPLES_OK) {
     int rbac_test_count = PQntuples(rbac_test_rows.get());
     for (int i = 0; i < rbac_test_count; ++i) {
+      plinth::db::OperationScope::checkpoint_current();
       std::string rbac_test_id = PQgetvalue(rbac_test_rows.get(), i, 0);
       rbac_test::schedule_rbac_test(rbac_test_id, ctx, "reconcile");
     }
@@ -2709,10 +2721,10 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
   }
 
   PgResultPtr rows(
-      PQexec(pg.conn,
-             "SELECT id, name, version, retired_at FROM plinth.packages "
-             "WHERE state = 'SUPERSEDED' AND retired_at IS NOT NULL "
-             "ORDER BY retired_at ASC"),
+      plinth::db::exec(
+          pg.conn, "SELECT id, name, version, retired_at FROM plinth.packages "
+                   "WHERE state = 'SUPERSEDED' AND retired_at IS NOT NULL "
+                   "ORDER BY retired_at ASC"),
       PQclear);
   if (PQresultStatus(rows.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(GcFailure{
@@ -2726,6 +2738,7 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
   auto now = std::chrono::system_clock::now();
   int ntuples = PQntuples(rows.get());
   for (int i = 0; i < ntuples; ++i) {
+    plinth::db::OperationScope::checkpoint_current();
     std::string id = PQgetvalue(rows.get(), i, 0);
     std::string name = PQgetvalue(rows.get(), i, 1);
     std::string version = PQgetvalue(rows.get(), i, 2);
@@ -2757,10 +2770,11 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
     }
 
     std::array<const char*, 1> idv = {id.c_str()};
-    PgResultPtr del(
-        PQexecParams(pg.conn, "DELETE FROM plinth.packages WHERE id = $1::uuid",
-                     1, nullptr, idv.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr del(plinth::db::exec_params(
+                        pg.conn,
+                        "DELETE FROM plinth.packages WHERE id = $1::uuid", 1,
+                        nullptr, idv.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(del.get()) != PGRES_COMMAND_OK) {
       report.warnings.push_back("gc: DELETE failed for id=" + id + ": " +
                                 PQresultErrorMessage(del.get()));
@@ -2843,7 +2857,7 @@ auto insert_upgrade_row(PGconn* admin, std::string_view new_id,
       "user",          // $11 provenance — upgrades always admin POST
   };
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           admin,
           "INSERT INTO plinth.packages "
           "(id, name, version, state, provenance, supersedes_id, "
@@ -2877,12 +2891,12 @@ auto compute_v1_only_capabilities(PGconn* admin, std::string_view name,
   std::vector<std::tuple<std::string, int, std::string>> out;
   std::string name_s{name};
   std::array<const char*, 1> name_v = {name_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(admin,
-                   "SELECT DISTINCT namespace, version, function "
-                   "FROM plinth.capabilities WHERE extension_name = $1",
-                   1, nullptr, name_v.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      admin,
+                      "SELECT DISTINCT namespace, version, function "
+                      "FROM plinth.capabilities WHERE extension_name = $1",
+                      1, nullptr, name_v.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return out;
   }
@@ -3221,31 +3235,32 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     RollbackGuard rg{swap_rollback};
     std::string old_id_s = existing.id;
     std::array<const char*, 1> old_v = {old_id_s.c_str()};
-    PgResultPtr r1(
-        PQexecParams(pg.conn,
-                     "UPDATE plinth.packages SET state='SUPERSEDED', "
-                     "retired_at=NOW() WHERE id=$1::uuid",
-                     1, nullptr, old_v.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr r1(plinth::db::exec_params(
+                       pg.conn,
+                       "UPDATE plinth.packages SET state='SUPERSEDED', "
+                       "retired_at=NOW() WHERE id=$1::uuid",
+                       1, nullptr, old_v.data(), nullptr, nullptr, 0),
+                   PQclear);
     if (PQresultStatus(r1.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(
           fail_and_mark("upgrade-swap-failed", PQresultErrorMessage(r1.get())));
     }
     std::array<const char*, 1> new_v = {new_id.c_str()};
-    PgResultPtr r2(PQexecParams(pg.conn,
+    PgResultPtr r2(
+        plinth::db::exec_params(pg.conn,
                                 "UPDATE plinth.packages SET state='ACTIVE' "
                                 "WHERE id=$1::uuid",
                                 1, nullptr, new_v.data(), nullptr, nullptr, 0),
-                   PQclear);
+        PQclear);
     if (PQresultStatus(r2.get()) != PGRES_COMMAND_OK) {
       return std::unexpected(
           fail_and_mark("upgrade-swap-failed", PQresultErrorMessage(r2.get())));
     }
     // Read retired_at back for the report.
     PgResultPtr rt(
-        PQexecParams(pg.conn,
-                     "SELECT retired_at FROM plinth.packages WHERE id=$1::uuid",
-                     1, nullptr, old_v.data(), nullptr, nullptr, 0),
+        plinth::db::exec_params(
+            pg.conn, "SELECT retired_at FROM plinth.packages WHERE id=$1::uuid",
+            1, nullptr, old_v.data(), nullptr, nullptr, 0),
         PQclear);
     std::string retired_at_s;
     if (PQresultStatus(rt.get()) == PGRES_TUPLES_OK &&

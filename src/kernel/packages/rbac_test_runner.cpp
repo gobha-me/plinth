@@ -1,5 +1,6 @@
 #include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/capabilities/parser.hpp"
 #include "kernel/capabilities/resolution.hpp"
@@ -58,6 +59,7 @@ class WorkerRegistry {
       return false;
     }
     accepting = true;
+    cancellation_clean = true;
     return true;
   }
 
@@ -74,6 +76,7 @@ class WorkerRegistry {
     try {
       workers.back().thread = std::jthread(
           [this, state, task = std::move(task)](std::stop_token stop) mutable {
+            plinth::db::OperationScope database_operations{stop};
             try {
               task(stop);
             } catch (const std::exception& e) {
@@ -81,7 +84,7 @@ class WorkerRegistry {
             } catch (...) {
               spdlog::error("rbac_test worker: unknown exception");
             }
-            finish(state);
+            finish(state, !database_operations.cancellation_failed());
           });
     } catch (...) {
       --active;
@@ -102,7 +105,7 @@ class WorkerRegistry {
     if (drained) {
       reap_finished_locked();
     }
-    return drained;
+    return drained && cancellation_clean;
   }
 
   [[nodiscard]] auto active_count() const -> std::size_t {
@@ -111,10 +114,11 @@ class WorkerRegistry {
   }
 
  private:
-  auto finish(const std::shared_ptr<WorkerState>& state) -> void {
+  auto finish(const std::shared_ptr<WorkerState>& state, bool clean) -> void {
     {
       std::lock_guard lock(mu);
       state->finished = true;
+      cancellation_clean = cancellation_clean && clean;
       --active;
     }
     drained_cv.notify_all();
@@ -134,6 +138,7 @@ class WorkerRegistry {
   mutable std::mutex mu;
   std::condition_variable drained_cv;
   bool accepting = true;
+  bool cancellation_clean = true;
   std::size_t active = 0;
   std::vector<Worker> workers;
 };
@@ -180,7 +185,7 @@ auto conninfo_of(const plinth::Config::Database& db) -> std::string {
 struct PgGuard {
   PGconn* conn = nullptr;
   explicit PgGuard(const plinth::Config::Database& db) {
-    conn = PQconnectdb(conninfo_of(db).c_str());
+    conn = plinth::db::connect(conninfo_of(db).c_str());
   }
   ~PgGuard() {
     if (conn != nullptr) {
@@ -208,12 +213,13 @@ auto effective_rules_for(PGconn* conn, std::string_view user_id)
   std::string id_s{user_id};
   std::array<const char*, 1> values = {id_s.c_str()};
   PgResultPtr res(
-      PQexecParams(conn,
-                   "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
-                   "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
-                   "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
-                   "WHERE gm.user_id = $1::uuid",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn,
+          "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
+          "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
+          "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
+          "WHERE gm.user_id = $1::uuid",
+          1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   std::vector<std::string> out;
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
@@ -230,10 +236,11 @@ auto effective_rules_for(PGconn* conn, std::string_view user_id)
 auto try_acquire_name_lock(PGconn* conn, std::string_view name) -> bool {
   std::string seed = "plinth.packages." + std::string{name};
   std::array<const char*, 1> values = {seed.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn, "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", 1,
+                      nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK ||
       PQntuples(res.get()) == 0) {
     return false;
@@ -245,10 +252,11 @@ auto try_acquire_name_lock(PGconn* conn, std::string_view name) -> bool {
 auto release_name_lock(PGconn* conn, std::string_view name) -> void {
   std::string seed = "plinth.packages." + std::string{name};
   std::array<const char*, 1> values = {seed.c_str()};
-  PgResultPtr res(
-      PQexecParams(conn, "SELECT pg_advisory_unlock(hashtextextended($1, 0))",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT pg_advisory_unlock(hashtextextended($1, 0))", 1,
+                      nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   (void)res;
 }
 
@@ -265,11 +273,12 @@ auto load_package(PGconn* conn, std::string_view package_id)
     -> std::expected<PackageLookup, RbacTestFailure> {
   std::string id_s{package_id};
   std::array<const char*, 1> values = {id_s.c_str()};
-  PgResultPtr res(PQexecParams(conn,
-                               "SELECT id::text, name, version, state "
-                               "FROM plinth.packages WHERE id = $1::uuid",
-                               1, nullptr, values.data(), nullptr, nullptr, 0),
-                  PQclear);
+  PgResultPtr res(
+      plinth::db::exec_params(conn,
+                              "SELECT id::text, name, version, state "
+                              "FROM plinth.packages WHERE id = $1::uuid",
+                              1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(RbacTestFailure{
         .kind = "db_error", .message = PQresultErrorMessage(res.get())});
@@ -488,26 +497,27 @@ auto write_result_update_state_and_release_lock(
   std::array<const char*, 4> values = {id_s.c_str(), payload.c_str(),
                                        flag.c_str(), lock_seed.c_str()};
   PgResultPtr res(
-      PQexecParams(conn,
-                   "WITH updated AS ("
-                   "  UPDATE plinth.packages "
-                   "     SET last_rbac_test_run_at = NOW(), "
-                   "         last_rbac_test_result = $2::jsonb, "
-                   "         state = CASE "
-                   "                   WHEN $3::bool THEN "
-                   "                     CASE state "
-                   "                       WHEN 'ACTIVE_FLAGGED' THEN 'ACTIVE' "
-                   "                       ELSE state "
-                   "                     END "
-                   "                   ELSE 'ACTIVE_FLAGGED' "
-                   "                 END "
-                   "   WHERE id = $1::uuid "
-                   "     AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
-                   "   RETURNING 1"
-                   ") "
-                   "SELECT pg_advisory_unlock(hashtextextended($4, 0)), "
-                   "       (SELECT COUNT(*) FROM updated)",
-                   4, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn,
+          "WITH updated AS ("
+          "  UPDATE plinth.packages "
+          "     SET last_rbac_test_run_at = NOW(), "
+          "         last_rbac_test_result = $2::jsonb, "
+          "         state = CASE "
+          "                   WHEN $3::bool THEN "
+          "                     CASE state "
+          "                       WHEN 'ACTIVE_FLAGGED' THEN 'ACTIVE' "
+          "                       ELSE state "
+          "                     END "
+          "                   ELSE 'ACTIVE_FLAGGED' "
+          "                 END "
+          "   WHERE id = $1::uuid "
+          "     AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
+          "   RETURNING 1"
+          ") "
+          "SELECT pg_advisory_unlock(hashtextextended($4, 0)), "
+          "       (SELECT COUNT(*) FROM updated)",
+          4, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK ||
       PQntuples(res.get()) != 1 ||
@@ -874,10 +884,11 @@ auto lookup_package_by_name(PGconn* conn, std::string_view name)
   std::string name_s{name};
   std::array<const char*, 1> values = {name_s.c_str()};
   PgResultPtr res(
-      PQexecParams(conn,
-                   "SELECT id::text FROM plinth.packages "
-                   "WHERE name = $1 AND state IN ('ACTIVE', 'ACTIVE_FLAGGED')",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(
+          conn,
+          "SELECT id::text FROM plinth.packages "
+          "WHERE name = $1 AND state IN ('ACTIVE', 'ACTIVE_FLAGGED')",
+          1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(RbacTestFailure{
@@ -888,12 +899,12 @@ auto lookup_package_by_name(PGconn* conn, std::string_view name)
     // Disambiguate: does a row exist for this name at all? If yes,
     // it's in a non-active state; otherwise the extension name is
     // unknown to the kernel.
-    PgResultPtr any(
-        PQexecParams(conn,
-                     "SELECT state FROM plinth.packages WHERE name = $1 "
-                     "ORDER BY installed_at DESC LIMIT 1",
-                     1, nullptr, values.data(), nullptr, nullptr, 0),
-        PQclear);
+    PgResultPtr any(plinth::db::exec_params(
+                        conn,
+                        "SELECT state FROM plinth.packages WHERE name = $1 "
+                        "ORDER BY installed_at DESC LIMIT 1",
+                        1, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear);
     if (PQresultStatus(any.get()) == PGRES_TUPLES_OK &&
         PQntuples(any.get()) > 0) {
       return std::unexpected(RbacTestFailure{

@@ -1,4 +1,5 @@
 #include "kernel/rbac/rule_registrar.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
@@ -24,9 +25,9 @@ auto exec_rule_mutation(PGconn& conn, const char* sql,
     -> std::expected<std::size_t, std::string> {
   std::string ext_s{extension_name};
   std::array<const char*, 1> values = {ext_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(&conn, sql, 1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(&conn, sql, 1, nullptr, values.data(),
+                                          nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
@@ -58,7 +59,7 @@ auto upsert_extension_rule(PGconn& conn, std::string_view rule,
       rule_s.c_str(), ns_s.c_str(), desc_s.c_str(), ext_s.c_str(), tc_ptr,
   };
   PgResultPtr res(
-      PQexecParams(
+      plinth::db::exec_params(
           &conn,
           "INSERT INTO plinth.rbac_rules "
           "(rule, namespace, description, extension_name, test_contract) "
@@ -107,14 +108,14 @@ auto fetch_extension_rules_for_rbac_test(std::string_view extension_name,
     -> std::expected<std::vector<RbacTestRule>, std::string> {
   std::string ext_s{extension_name};
   std::array<const char*, 1> values = {ext_s.c_str()};
-  PgResultPtr res(
-      PQexecParams(&conn,
-                   "SELECT rule, namespace, extension_name, test_contract "
-                   "FROM plinth.rbac_rules "
-                   "WHERE extension_name = $1 "
-                   "ORDER BY id ASC",
-                   1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      &conn,
+                      "SELECT rule, namespace, extension_name, test_contract "
+                      "FROM plinth.rbac_rules "
+                      "WHERE extension_name = $1 "
+                      "ORDER BY id ASC",
+                      1, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }

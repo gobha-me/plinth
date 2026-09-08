@@ -1,5 +1,6 @@
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 
 #include <fstream>
 #include <libpq-fe.h>
@@ -19,7 +20,7 @@ struct PgConnection {
   PGconn* conn = nullptr;
 
   explicit PgConnection(const std::string& conninfo)
-      : conn(PQconnectdb(conninfo.c_str())) {
+      : conn(plinth::db::connect(conninfo.c_str())) {
     if (PQstatus(conn) != CONNECTION_OK) {
       std::string err = PQerrorMessage(conn);
       PQfinish(conn);
@@ -41,8 +42,8 @@ struct PgConnection {
 
   auto exec(const std::string& sql) const -> void {
     // PQexec returns a non-null PGresult even on error
-    std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(conn, sql.c_str()),
-                                                      PQclear);
+    std::unique_ptr<PGresult, decltype(&PQclear)> res(
+        plinth::db::exec(conn, sql.c_str()), PQclear);
 
     auto status = PQresultStatus(res.get());
     if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK) {
@@ -53,8 +54,8 @@ struct PgConnection {
 
   // Execute a query and return true if it returns at least one row
   [[nodiscard]] auto has_rows(const std::string& sql) const -> bool {
-    std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(conn, sql.c_str()),
-                                                      PQclear);
+    std::unique_ptr<PGresult, decltype(&PQclear)> res(
+        plinth::db::exec(conn, sql.c_str()), PQclear);
 
     if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
       throw std::runtime_error(std::string("PG query failed: ") +
@@ -65,8 +66,8 @@ struct PgConnection {
 
   [[nodiscard]] auto query_strings(const std::string& sql) const
       -> std::vector<std::string> {
-    std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(conn, sql.c_str()),
-                                                      PQclear);
+    std::unique_ptr<PGresult, decltype(&PQclear)> res(
+        plinth::db::exec(conn, sql.c_str()), PQclear);
     if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
       throw std::runtime_error(std::string("PG query failed: ") +
                                PQresultErrorMessage(res.get()));

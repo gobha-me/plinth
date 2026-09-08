@@ -1,4 +1,5 @@
 #include "kernel/realtime/emit.hpp"
+#include "kernel/db/operations.hpp"
 
 #include "kernel/realtime/channel.hpp"
 
@@ -98,8 +99,8 @@ auto emit_notify(PGconn& conn, const Json::Value& envelope)
   // per ICD §Security Constraint 2.
   std::array<const char*, 2> values = {WIRE_CHANNEL, serialized->c_str()};
   std::unique_ptr<PGresult, decltype(&PQclear)> res{
-      PQexecParams(&conn, "SELECT pg_notify($1, $2)", 2, nullptr, values.data(),
-                   nullptr, nullptr, 0),
+      plinth::db::exec_params(&conn, "SELECT pg_notify($1, $2)", 2, nullptr,
+                              values.data(), nullptr, nullptr, 0),
       PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("realtime emit: pg_notify failed: {}",

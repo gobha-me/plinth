@@ -1,4 +1,5 @@
 #include "kernel/packages/migrations.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/packages/migrations_internal.hpp"
 
 #include <libpq-fe.h>
@@ -520,7 +521,7 @@ auto get_sqlstate(PGresult* res) -> std::optional<std::string> {
 
 auto exec_ok(PGconn& conn, const std::string& sql)
     -> std::optional<std::string> {
-  auto res = make_result(PQexec(&conn, sql.c_str()));
+  auto res = make_result(plinth::db::exec(&conn, sql.c_str()));
   auto status = PQresultStatus(res.get());
   if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
     return std::nullopt;
@@ -540,8 +541,9 @@ auto exec_with_params(PGconn& conn, const char* sql,
   for (const auto& p : params) {
     values.push_back(p.c_str());
   }
-  return make_result(PQexecParams(&conn, sql, static_cast<int>(params.size()),
-                                  nullptr, values.data(), nullptr, nullptr, 0));
+  return make_result(
+      plinth::db::exec_params(&conn, sql, static_cast<int>(params.size()),
+                              nullptr, values.data(), nullptr, nullptr, 0));
 }
 
 auto schema_exists(PGconn& conn, std::string_view name)
@@ -574,7 +576,7 @@ auto try_advisory_lock(PGconn& conn, std::string_view name)
       "SELECT pg_try_advisory_lock(hashtextextended(" +
       pq_escape(conn, std::string{"plinth.migrations."} + std::string{name}) +
       ", 0))";
-  auto res = make_result(PQexec(&conn, sql.c_str()));
+  auto res = make_result(plinth::db::exec(&conn, sql.c_str()));
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK ||
       PQntuples(res.get()) < 1) {
     const char* msg = PQresultErrorMessage(res.get());
@@ -589,7 +591,7 @@ auto advisory_unlock(PGconn& conn, std::string_view name) -> void {
       "SELECT pg_advisory_unlock(hashtextextended(" +
       pq_escape(conn, std::string{"plinth.migrations."} + std::string{name}) +
       ", 0))";
-  auto res = make_result(PQexec(&conn, sql.c_str()));
+  auto res = make_result(plinth::db::exec(&conn, sql.c_str()));
   (void)res;
 }
 
@@ -632,7 +634,7 @@ auto ensure_schema_and_role(PGconn& conn, std::string_view name)
   sql << "  GRANT SELECT ON plinth.users TO " << role << ";\n";
   sql << "COMMIT;";
 
-  auto res = make_result(PQexec(&conn, sql.str().c_str()));
+  auto res = make_result(plinth::db::exec(&conn, sql.str().c_str()));
   auto status = PQresultStatus(res.get());
   if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
     return std::nullopt;
@@ -692,7 +694,7 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
   }
 
   {
-    auto res = make_result(PQexec(&conn, file.contents.c_str()));
+    auto res = make_result(plinth::db::exec(&conn, file.contents.c_str()));
     auto status = PQresultStatus(res.get());
     if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK &&
         status != PGRES_EMPTY_QUERY) {
@@ -827,6 +829,7 @@ auto run_migrations(std::string_view extension_name,
   }
 
   for (const auto& file : discovery->migrations) {
+    plinth::db::OperationScope::checkpoint_current();
     auto stored =
         already_applied_checksum(admin_conn, extension_name, file.filename);
     if (!stored.has_value()) {
@@ -899,7 +902,7 @@ auto drop_schema_and_migrations(std::string_view extension_name,
       << pq_escape(admin_conn, std::string{extension_name}) << ";\n";
   sql << "COMMIT;";
 
-  auto res = make_result(PQexec(&admin_conn, sql.str().c_str()));
+  auto res = make_result(plinth::db::exec(&admin_conn, sql.str().c_str()));
   auto status = PQresultStatus(res.get());
   if (status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK) {
     return {};
