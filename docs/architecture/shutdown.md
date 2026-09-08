@@ -53,6 +53,9 @@ The coordinator executes these nodes in order:
    - Prevent any later audit call from entering Drogon's database manager.
      The spdlog sinks remain open.
 10. `stop_drogon`
+   - Release registry-owned WebSocket connections and state on their original
+     IO loops, and wait for each release acknowledgment before stopping loops.
+     Timeout retains pending owners and prevents Drogon teardown.
    - Stop listeners and event loops, destroy Drogon's database manager, and
      join the thread running `app().run()`.
 11. `close_log_sinks`
@@ -63,7 +66,8 @@ The first seven nodes establish this dependency relation:
 ```text
 ingress -> capability listener -> owned workers -> runtime leases
   -> coalescer flush -> realtime delivery acknowledgment -> durable writer drain
-  -> realtime listener/broker stop -> Drogon database/event loops -> logging sinks
+  -> realtime listener/broker stop -> WS owner release on IO loops
+  -> Drogon database/event loops -> logging sinks
 ```
 
 ## Bounds and failure policy

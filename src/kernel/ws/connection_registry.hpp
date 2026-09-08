@@ -9,10 +9,12 @@
 #include <chrono>
 #include <drogon/WebSocketConnection.h>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace plinth::ws {
 
@@ -39,6 +41,7 @@ struct RegistryKeyHash {
 struct RegistryEntry {
   drogon::WebSocketConnectionPtr conn;
   std::shared_ptr<ConnState> state;
+  trantor::EventLoop* loop{nullptr}; // Immutable after publication.
 };
 
 class ConnectionRegistry {
@@ -74,17 +77,16 @@ class ConnectionRegistry {
   // For tests.
   [[nodiscard]] auto size() const -> std::size_t;
 
-  // Mark the registry as shutting down. After this returns, all
-  // subsequent register_/unregister_/for_each/size calls no-op.
-  // The process coordinator invokes this before `drogon::app().quit()` so
-  // that any late `handleConnectionClosed` dispatched by an IO loop during
-  // the drain can't mutate the registry. The coordinator then joins the
-  // application thread before static destruction, making the singleton's
-  // ordinary static lifetime safe. See `project_ws_flaky_segfault.md` for
-  // history.
-  //
-  // Static — the flag lives in zero-initialized file-scope storage.
+  // Seal singleton admission under the registry lock and gate late callbacks.
+  // Owning references still require release_connections() before loops stop.
   static auto initiate_shutdown() noexcept -> void;
+
+  // Seal admission, release every registered owner on its original IO loop,
+  // and wait for acknowledgments within one shared deadline. Pending releases
+  // survive timeout and repeated calls wait for the same acknowledgments.
+  // Call from the coordinator after producers drain, while all IO loops live.
+  [[nodiscard]] auto release_connections(std::chrono::milliseconds timeout)
+      -> bool;
 
   // Cancel every live connection's auth + heartbeat timers on their
   // owning event loops, synchronously. All connections share one deadline;
@@ -122,6 +124,8 @@ class ConnectionRegistry {
 
  private:
   mutable std::mutex mu;
+  bool sealed{false};
+  std::vector<std::shared_future<void>> releases;
   std::unordered_map<RegistryKey, RegistryEntry, RegistryKeyHash> conns;
 };
 

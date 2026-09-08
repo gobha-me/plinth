@@ -104,7 +104,11 @@ auto production_shutdown_hooks() -> ShutdownHooks {
             return true;
           },
       .stop_drogon =
-          [](std::chrono::milliseconds) {
+          [](std::chrono::milliseconds timeout) {
+            if (!plinth::ws::ConnectionRegistry::instance().release_connections(
+                    timeout)) {
+              return false;
+            }
             drogon::app().quit();
             return true;
           },
