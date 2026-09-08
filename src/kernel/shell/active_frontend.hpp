@@ -13,9 +13,13 @@
 //     `<mount>(.*)` against it.
 //
 //   • Bytes still come from `<data_dir>/extensions/<name>/<version>/client/`
-//     (unchanged from 0.6.0). Strict CSP + immutable-cache for named
-//     assets / no-cache for the SPA index file (`frontend.entry`) is
-//     preserved verbatim.
+//     (unchanged from 0.6.0). Strict CSP + no-cache for every mutable
+//     mount URL, including named assets and the SPA entry document, is
+//     enforced. Versioned extension routes retain immutable caching.
+//     An entry document can opt into a versioned asset base with the exact
+//     `<!-- PLINTH_VERSIONED_ASSET_BASE -->` marker before its asset
+//     references. The bundled entry does this so old immutable /app cache
+//     entries cannot survive an upgrade. Other documents are served unchanged.
 //
 //   • Path-traversal hardening (`weakly_canonical` prefix check, reject
 //     `..` / `.` / NUL components) is preserved verbatim.

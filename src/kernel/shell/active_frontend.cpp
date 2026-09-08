@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -31,9 +33,11 @@ constexpr std::string_view STRICT_CSP =
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self'";
 
-constexpr std::string_view CACHE_INDEX = "no-cache";
-constexpr std::string_view CACHE_IMMUTABLE =
-    "public, max-age=31536000, immutable";
+// Every mount URL is a mutable alias, including modules, CSS and fonts.
+// Replacement frontends keep these paths; revisit must revalidate the graph.
+constexpr std::string_view CACHE_MOUNT = "no-cache";
+constexpr std::string_view ASSET_BASE_MARKER =
+    "<!-- PLINTH_VERSIONED_ASSET_BASE -->";
 
 // Process-wide cached active-frontend state for handler lookups.
 // Resolved at register_active_frontend_routes time and held under
@@ -179,6 +183,52 @@ auto serve_file(const std::filesystem::path& full_path,
   return resp;
 }
 
+auto encode_path_segment(std::string_view value) -> std::string {
+  constexpr std::string_view HEX = "0123456789ABCDEF";
+  std::string encoded;
+  for (unsigned char c : value) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+        c == '~') {
+      encoded.push_back(static_cast<char>(c));
+    } else {
+      encoded.push_back('%');
+      encoded.push_back(HEX[c >> 4]);
+      encoded.push_back(HEX[c & 15]);
+    }
+  }
+  return encoded;
+}
+
+auto serve_entry(const std::filesystem::path& full_path,
+                 const ActiveFrontend& active, std::string_view mime)
+    -> drogon::HttpResponsePtr {
+  std::ifstream input(full_path, std::ios::binary);
+  if (!input) {
+    return make_404();
+  }
+  std::string body{std::istreambuf_iterator<char>{input},
+                   std::istreambuf_iterator<char>{}};
+  if (input.bad()) {
+    return make_404();
+  }
+  const auto marker = body.find(ASSET_BASE_MARKER);
+  if (marker == std::string::npos) {
+    // Custom documents retain their own base and byte-for-byte behavior.
+    return serve_file(full_path, mime, CACHE_MOUNT);
+  }
+  const auto base = "<base href=\"/ext/" + encode_path_segment(active.name) +
+                    "/" + encode_path_segment(active.version) + "/\">";
+  body.replace(marker, ASSET_BASE_MARKER.size(), base);
+  auto response = drogon::HttpResponse::newHttpResponse();
+  response->setContentTypeString(std::string{mime});
+  response->setBody(std::move(body));
+  response->addHeader("Cache-Control", std::string{CACHE_MOUNT});
+  // The base changes URL resolution, never the authorized import-map bytes.
+  response->addHeader("Content-Security-Policy", std::string{STRICT_CSP});
+  return response;
+}
+
 auto handle_app_request(
     const drogon::HttpRequestPtr& /*req*/,
     std::function<void(const drogon::HttpResponsePtr&)>&& cb,
@@ -207,9 +257,11 @@ auto handle_app_request(
   }
   std::string ext = ascii_lower(resolved->extension().string());
   std::string_view mime = mime_for_extension(ext);
-  bool serving_index = (resolved->filename().string() == active->entry);
-  std::string_view cache = serving_index ? CACHE_INDEX : CACHE_IMMUTABLE;
-  std::move(cb)(serve_file(*resolved, mime, cache));
+  if (target_path == active->entry) {
+    std::move(cb)(serve_entry(*resolved, *active, mime));
+    return;
+  }
+  std::move(cb)(serve_file(*resolved, mime, CACHE_MOUNT));
 }
 
 // `<mount>` may or may not have a trailing slash in the manifest. The
