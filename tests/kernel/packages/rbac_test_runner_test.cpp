@@ -694,7 +694,12 @@ class PausedInstall {
       : gate(
             std::make_shared<InstallCompletionGate>(std::move(message_prefix))),
         previous_logger(spdlog::default_logger()) {
-    auto logger = previous_logger->clone("rbac-install-handoff");
+    // Full-suite logging may use an async_logger. clone() preserves that type
+    // and would pause its logging worker instead of the installer. Construct
+    // a synchronous logger while retaining the existing sinks and formatters.
+    auto logger = std::make_shared<spdlog::logger>(
+        "rbac-install-handoff", previous_logger->sinks().begin(),
+        previous_logger->sinks().end());
     logger->sinks().push_back(gate);
     logger->set_level(spdlog::level::info);
     spdlog::set_default_logger(std::move(logger));
