@@ -79,6 +79,8 @@ try {
         json: { ok: true, value: { value: 'snapshot' } },
     }));
     await page.goto(baseURL + '/app/');
+    assert.match(await page.evaluate(() => new URL(document.baseURI).pathname),
+        /^\/ext\/shell\/[^/]+\/$/, 'production document selects versioned module assets');
     assert.equal(await page.evaluate(() => document.cookie.includes('plinth_session')), false);
     await page.evaluate(async ({ channel, keepChannel }) => {
         const sdk = await import('@plinth/frontend/sdk');

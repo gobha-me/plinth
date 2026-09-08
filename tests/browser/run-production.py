@@ -92,11 +92,15 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--upgrade-cache", action="store_true",
                         help="replace two packaged frontend versions with one cached browser profile")
+    parser.add_argument("--realtime", action="store_true",
+                        help="also exercise real cookie-authenticated realtime and useData")
     parser.add_argument("--legacy-cache-negative-control", action="store_true",
                         help="also omit the replacement base; upgrade cache regression must fail")
     args = parser.parse_args()
     if args.legacy_cache_negative_control and not args.upgrade_cache:
         parser.error("--legacy-cache-negative-control requires --upgrade-cache")
+    if args.realtime and args.upgrade_cache:
+        parser.error("--realtime and --upgrade-cache use separate owned kernel runs")
     binary = args.binary.resolve(strict=True)
     repo = Path(__file__).resolve().parents[2]
     database = "plinth_browser_" + uuid.uuid4().hex
@@ -136,6 +140,9 @@ def main():
                              "staging_dir": str(root / "staging")},
                 "shell": {"bundle_path": str(bundle_path)},
             }
+            if args.realtime:
+                config["ws_heartbeat_interval_s"] = 0.2
+                config["ws_heartbeat_timeout_s"] = 1.0
             config_path = root / "config.json"
             config_path.write_text(json.dumps(config))
             child_env = os.environ.copy()
@@ -200,6 +207,10 @@ def main():
                 else:
                     run_browser(["npm", "test", "--prefix", str(repo / "tests/browser")],
                                 env=child_env, timeout=180)
+                    if args.realtime:
+                        run_browser(["npm", "run", "test:realtime", "--prefix",
+                                     str(repo / "tests/browser")],
+                                    env=child_env, timeout=180)
                 stop_kernel(child)
             except BaseException:
                 print(output_path.read_text(), flush=True)
