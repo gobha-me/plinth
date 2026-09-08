@@ -249,8 +249,13 @@ def main():
                                "AND query='COMMIT' AND state='active'") == "0"
                     # Simulate operator recovery only after independently
                     # confirming the committed old database state and pointer.
-                    sql("UPDATE plinth.packages SET state='INSTALL_FAILED' WHERE name='shell' "
-                        f"AND version='{interrupted_version}' AND state='UPLOADING'")
+                    recovery_candidate = sql("SELECT id FROM plinth.packages WHERE name='shell' "
+                        f"AND version='{interrupted_version}' AND state='VALIDATING'")
+                    assert len(recovery_candidate.splitlines()) == 1, "unexpected recovery candidate state"
+                    recovered = sql("WITH recovered AS (UPDATE plinth.packages SET state='INSTALL_FAILED' "
+                        f"WHERE name='shell' AND version='{interrupted_version}' AND state='VALIDATING' "
+                        "RETURNING id) SELECT id FROM recovered")
+                    assert recovered == recovery_candidate, "recovery did not update the inspected candidate"
                     shutil.rmtree(retained)
                 sql("DROP TRIGGER pause_bundled_commit ON plinth.packages; "
                     "DROP FUNCTION plinth.pause_bundled_commit();")
