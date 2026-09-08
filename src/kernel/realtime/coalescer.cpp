@@ -551,6 +551,8 @@ auto CoalescerRegistry::flush_batch_scope(std::uint64_t scope_id)
   for (const auto& [key, w] : buckets) {
     if (flush_snapshot(w, /*window_ms_override=*/0)) {
       ++emitted;
+    } else {
+      g_discarded_flush_failed.store(true);
     }
   }
   return emitted;
