@@ -13,9 +13,9 @@
 //     `<mount>(.*)` against it.
 //
 //   • Bytes still come from `<data_dir>/extensions/<name>/<version>/client/`
-//     (unchanged from 0.6.0). Strict CSP + immutable-cache for named
-//     assets / no-cache for the SPA index file (`frontend.entry`) is
-//     preserved verbatim.
+//     (unchanged from 0.6.0). Strict CSP + no-cache for every mutable
+//     mount URL, including named assets and the SPA entry document, is
+//     enforced. Versioned extension routes retain immutable caching.
 //
 //   • Path-traversal hardening (`weakly_canonical` prefix check, reject
 //     `..` / `.` / NUL components) is preserved verbatim.

@@ -145,10 +145,10 @@ TEST_CASE("M.01: GET / returns 302 to /app/; GET /app/ serves index.html",
   REQUIRE(r.content_type_is_custom);
 }
 
-// ── M.02 — Named JS asset gets immutable cache + JS mime ─────────────
+// ── M.02 — Mutable named JS asset revalidates with JS mime ────────────
 
 TEST_CASE("M.02: GET /app/shell.js → 200 with application/javascript and "
-          "immutable cache",
+          "revalidation",
           "[shell][active-frontend][M.02]") {
   auto root = scratch_client_root({
       {"index.html", "<!doctype html>"},
@@ -158,12 +158,31 @@ TEST_CASE("M.02: GET /app/shell.js → 200 with application/javascript and "
   REQUIRE(r.received);
   REQUIRE(r.status == drogon::k200OK);
   REQUIRE(r.body == "export const x = 1;");
-  REQUIRE(r.cache_control.find("immutable") != std::string::npos);
+  REQUIRE(r.cache_control == "no-cache");
   REQUIRE(r.cache_control.find("max-age=31536000") != std::string::npos);
   REQUIRE(r.content_type_is_custom);
 }
 
 // ── M.03 — Named index.html gets no-cache + html mime ────────────────
+
+TEST_CASE("mutable frontend styles fonts and module aliases revalidate",
+          "[shell][active-frontend][cache]") {
+  const std::vector<std::pair<std::string, std::string>> assets{
+      {"tokens.css", ":root { --version: 2; }"},
+      {"font.woff2", "font-bytes"},
+      {"dependency.mjs", "export const version = 2;"},
+      {"icon.svg", "<svg/>"},
+      {"config.json", "{}"},
+  };
+  auto root = scratch_client_root(assets);
+  for (const auto& [name, contents] : assets) {
+    INFO(name);
+    auto response = capture_app(make_active(root), name);
+    REQUIRE(response.status == drogon::k200OK);
+    REQUIRE(response.cache_control == "no-cache");
+    REQUIRE(response.body == contents);
+  }
+}
 
 TEST_CASE("M.03: GET /app/index.html serves with no-cache + html mime",
           "[shell][active-frontend][M.03]") {
@@ -264,7 +283,7 @@ TEST_CASE("active_frontend honours non-default mount and entry from manifest",
   auto r2 = capture_app(make_active(root, "/console", "main.html"), "app.js");
   REQUIRE(r2.received);
   REQUIRE(r2.status == drogon::k200OK);
-  REQUIRE(r2.cache_control.find("immutable") != std::string::npos);
+  REQUIRE(r2.cache_control == "no-cache");
 }
 
 // ── Custom root_redirect honoured by the `/` handler ─────────────────

@@ -12,6 +12,7 @@ bounded clean shutdown before dropping only its database:
 
 ```sh
 python3 tests/browser/run-production.py --binary build/plinth
+python3 tests/browser/run-production.py --binary build/plinth --upgrade-cache
 ```
 
 Set `PLINTH_PG_HOST`, `PLINTH_PG_PORT`, `PLINTH_PG_USER`,
@@ -36,6 +37,17 @@ missing sign-in screen, broken documented/versioned SDK imports, and failed
 rendering of the maintained SDK demo with both Preact and SDK hooks. The
 boundary test verifies stack omission in the shipped configuration and stack
 inclusion with an explicit development configuration.
+
+The upgrade case packages two versions of the real shell, adding observable
+version markers to their document, JavaScript files and token stylesheet. It
+visits the first package in a persistent Chromium profile, stops the kernel,
+simulates the completed frontend replacement by changing the task-owned
+installed package snapshot, and restarts on the same origin. Ordinary navigation
+must execute only the second version throughout the startup module graph and
+styles. No browser routing, cache override, hard reload or profile clearing is
+used. The actual kernel must send `no-cache` for `/app/*` and retain immutable
+headers on `/ext/shell/{version}/*`. This checks caching after replacement;
+operator installation/upgrade workflows are tested separately.
 
 `PLINTH_BROWSER` selects an existing Chromium-compatible executable. When
 required by a container that cannot run the Chromium sandbox,

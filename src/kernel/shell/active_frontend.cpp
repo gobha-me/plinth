@@ -31,9 +31,9 @@ constexpr std::string_view STRICT_CSP =
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self'";
 
-constexpr std::string_view CACHE_INDEX = "no-cache";
-constexpr std::string_view CACHE_IMMUTABLE =
-    "public, max-age=31536000, immutable";
+// Every mount URL is a mutable alias, including modules, CSS and fonts.
+// Replacement frontends keep these paths; revisit must revalidate the graph.
+constexpr std::string_view CACHE_MOUNT = "no-cache";
 
 // Process-wide cached active-frontend state for handler lookups.
 // Resolved at register_active_frontend_routes time and held under
@@ -207,9 +207,7 @@ auto handle_app_request(
   }
   std::string ext = ascii_lower(resolved->extension().string());
   std::string_view mime = mime_for_extension(ext);
-  bool serving_index = (resolved->filename().string() == active->entry);
-  std::string_view cache = serving_index ? CACHE_INDEX : CACHE_IMMUTABLE;
-  std::move(cb)(serve_file(*resolved, mime, cache));
+  std::move(cb)(serve_file(*resolved, mime, CACHE_MOUNT));
 }
 
 auto build_conninfo(const Config::Database& db) -> std::string {

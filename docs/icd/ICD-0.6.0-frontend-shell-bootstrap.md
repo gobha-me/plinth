@@ -241,12 +241,10 @@ prefix. The handler:
   must not shadow them. The `/app/*` registration ordering in Drogon
   must run **after** the kernel API filters; the SPA-fallback never
   sees an `/api/*` path.
-- Sets `Cache-Control: no-cache` on `index.html` (so a shell upgrade
-  takes effect on next page load without a hard reload) and
-  `Cache-Control: public, max-age=31536000, immutable` on the bundle
-  files (consistent with `architecture/06-frontend.md §3`'s
-  immutable-asset semantics; in 0.6.0 the immutability holds because
-  the bundle ships baked into the kernel binary).
+- Sets `Cache-Control: no-cache` on every mutable `/app/` URL,
+  including the entry document and bundle files, so replacement
+  assets revalidate on ordinary revisits after a restart. Immutable
+  caching applies only to versioned `/ext/{name}/{version}/*` URLs.
 - Sets the strict CSP `script-src 'self'; style-src 'self'
   'unsafe-inline'; connect-src 'self'` on every response, per
   `architecture/06-frontend.md §3`. No external sources.
@@ -282,7 +280,7 @@ When the browser navigates to `/app/`:
 1. Kernel returns `index.html` (200, `text/html`, `Cache-Control:
    no-cache`, CSP header).
 2. Browser parses HTML, requests `shell.js` (200, `application/
-   javascript`, immutable cache).
+   javascript`, `no-cache` revalidation).
 3. `shell.js` evaluates. The module's top-level code:
    1. Imports Preact `h` + `render` + `Component`, htm `html`.
    2. Defines `App` component (root).
@@ -605,11 +603,11 @@ handler(request, callback):
   match path:
     case "shell.js":
       callback(serve(shell_js, "application/javascript",
-                     cache: "public, max-age=31536000, immutable",
+                     cache: "no-cache",
                      csp: STRICT_CSP))
     case "shell.css":
       callback(serve(shell_css, "text/css",
-                     cache: "public, max-age=31536000, immutable",
+                     cache: "no-cache",
                      csp: STRICT_CSP))
     default:
       callback(404)
@@ -637,8 +635,8 @@ embedding strategy is sub-second to read at startup.
 - No content negotiation (no `Accept` parsing, no gzip on-the-fly —
   the kernel serves the raw file body; CDN/reverse-proxy compresses).
 - No ETag / `If-None-Match` / `If-Modified-Since` logic — the
-  immutable cache headers make conditional GET unnecessary, and the
-  no-cache `index.html` is small enough that revalidation is cheap.
+  mutable mount aliases require revalidation for the whole asset graph;
+  versioned extension URLs retain their immutable cache contract.
 - No range requests (assets are tiny; HTTP `Range` is for media).
 - No serving of unknown asset names — every served path is in the
   hardcoded set. No directory listing. No path traversal surface
@@ -808,7 +806,7 @@ the narrower 0.6.0 surface.
 |---|------|----------|------------------|
 | B.01 | Happy | `GET /` | 302; `Location: /app/` |
 | B.02 | Happy | `GET /app/` | 200; `Content-Type: text/html`; body matches embedded `index.html`; `Cache-Control: no-cache`; CSP header present |
-| B.03 | Happy | `GET /app/shell.js` | 200; `Content-Type: application/javascript`; body matches embedded `shell.js`; `Cache-Control: public, max-age=31536000, immutable`; CSP header present |
+| B.03 | Happy | `GET /app/shell.js` | 200; `Content-Type: application/javascript`; body matches embedded `shell.js`; `Cache-Control: no-cache`; CSP header present |
 | B.04 | Happy | `GET /app/some/deep/spa/path` (no extension) | 200; body matches `index.html` (SPA fallback) |
 | B.05 | Sad | `GET /app/missing.png` | 404 |
 | B.06 | Sad | `GET /api/auth/session` (handler-ordering check) | NOT shadowed by `/app/*` glob; reaches the auth handler (returns 401 if unauth, 200 if auth) |

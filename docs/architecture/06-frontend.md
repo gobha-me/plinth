@@ -153,6 +153,13 @@ browser fetches fresh assets, and the 1.2.3 assets become
 garbage-collectable after a drain window (`DESIGN-packages-v04x.md
 §install-lifecycle` for the atomic-swap contract).
 
+The active frontend mount (normally `/app/`) is a mutable alias. Every response
+under that mount, including HTML, JavaScript modules, styles, fonts and images,
+uses `Cache-Control: no-cache`. Browsers revalidate those URLs on ordinary
+revisits after frontend replacement and kernel restart; the full asset graph
+must use the replacement version without requiring a hard reload or cleared
+profile. This does not change immutable caching on `/ext/{name}/{version}/*`.
+
 **No build step.** Extensions ship source files directly. The shell
 and any other frontend loads them via native ES modules. Shared
 dependencies (Preact, htm, the kernel SDK, design tokens) live in the

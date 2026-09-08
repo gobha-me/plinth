@@ -158,6 +158,7 @@ jobs:
           (cd tests/browser && npx playwright install --with-deps chromium)
           python3 tests/browser/process_cleanup_test.py
           python3 tests/browser/run-production.py --binary build/plinth
+          python3 tests/browser/run-production.py --binary build/plinth --upgrade-cache
 
   asan-ubsan:
     name: clang-20 / ASan+UBSan
