@@ -11,7 +11,7 @@ if (($# > 1)); then
 fi
 
 mode=${1:---check}
-formatter=${CLANG_FORMAT:-clang-format-20}
+formatter=${CLANG_FORMAT:-clang-format-21}
 
 case "$mode" in
   --check | --fix) ;;
@@ -22,13 +22,13 @@ case "$mode" in
 esac
 
 if ! command -v "$formatter" >/dev/null 2>&1; then
-  echo "error: $formatter was not found; install clang-format 20.x or set CLANG_FORMAT" >&2
+  echo "error: $formatter was not found; install clang-format 21.x or set CLANG_FORMAT" >&2
   exit 1
 fi
 
 version=$($formatter --version)
-if [[ ! "$version" =~ version[[:space:]]20\. ]]; then
-  echo "error: formatting requires clang-format 20.x; found: $version" >&2
+if [[ ! "$version" =~ version[[:space:]]21\. ]]; then
+  echo "error: formatting requires clang-format 21.x; found: $version" >&2
   exit 1
 fi
 

@@ -1,0 +1,83 @@
+name: CI image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docker/ci.Dockerfile
+      - .github/workflows/ci-image.yml
+      - .github/workflows/ci.yml
+      - .github/scripts/install-llvm.sh
+      - .github/scripts/check-ci-image.sh
+      - CMakeLists.txt
+      - cmake/**
+      - third_party/**
+      - tools/**
+      - .clang-format
+      - .clang-tidy
+      - AGENTS.md
+      - CONTRIBUTING.md
+  pull_request:
+    paths:
+      - docker/ci.Dockerfile
+      - .github/workflows/ci-image.yml
+      - .github/workflows/ci.yml
+      - .github/scripts/install-llvm.sh
+      - .github/scripts/check-ci-image.sh
+      - CMakeLists.txt
+      - cmake/**
+      - third_party/**
+      - tools/**
+      - .clang-format
+      - .clang-tidy
+      - AGENTS.md
+      - CONTRIBUTING.md
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: LLVM 21 image / build, tests, and full lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+        env:
+          POSTGRES_USER: plinth
+          POSTGRES_PASSWORD: plinth
+          POSTGRES_DB: plinth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U plinth -d plinth_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the CI image locally
+        run: docker build --file docker/ci.Dockerfile --tag plinth-ci-check:local docker
+
+      - name: Build, test, format, and lint inside the image
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+        run: |
+          docker run --rm --network host \
+            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/work,readonly" \
+            --workdir /work \
+            --env PLINTH_PG_HOST --env PLINTH_PG_PORT \
+            --env PLINTH_PG_USER --env PLINTH_PG_PASSWORD --env PLINTH_PG_DATABASE \
+            plinth-ci-check:local bash -euc \
+            'git config --global --add safe.directory /work; exec bash .github/scripts/check-ci-image.sh'

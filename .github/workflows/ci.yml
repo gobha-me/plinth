@@ -37,9 +37,9 @@ jobs:
           go test ./...
           go vet ./...
 
-      - name: Install build dependencies and LLVM 20
+      - name: Install build dependencies and LLVM 21
         env:
-          CLANG_VERSION: "20"
+          CLANG_VERSION: "21"
         run: |
           set -euo pipefail
           .github/scripts/install-llvm.sh "$CLANG_VERSION"
@@ -79,10 +79,17 @@ jobs:
             cc: gcc
             cxx: g++
             install_llvm: false
+          - name: clang-21 / tests
+            cc: clang-21
+            cxx: clang++-21
+            install_llvm: true
+            llvm_version: "21"
+          # Retain the protected Clang 20 compatibility context.
           - name: clang-20 / tests
             cc: clang-20
             cxx: clang++-20
             install_llvm: true
+            llvm_version: "20"
     services:
       postgres:
         image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
@@ -102,10 +109,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install LLVM 20
+      - name: Install matrix LLVM
         if: ${{ matrix.install_llvm }}
         env:
-          CLANG_VERSION: "20"
+          CLANG_VERSION: ${{ matrix.llvm_version }}
         run: |
           set -euo pipefail
           .github/scripts/install-llvm.sh "$CLANG_VERSION"
@@ -163,7 +170,12 @@ jobs:
           python3 tests/browser/run-bundled-upgrade.py --binary build/plinth
 
   asan-ubsan:
-    name: clang-20 / ASan+UBSan
+    name: clang-${{ matrix.llvm_version }} / ASan+UBSan
+    strategy:
+      fail-fast: false
+      matrix:
+        # Clang 20 remains a protected compatibility lane during adoption.
+        llvm_version: ["20", "21"]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     services:
@@ -185,21 +197,21 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install build dependencies and LLVM 20
+      - name: Install build dependencies and matrix LLVM
         env:
-          CLANG_VERSION: "20"
+          CLANG_VERSION: ${{ matrix.llvm_version }}
         run: |
           set -euo pipefail
           .github/scripts/install-llvm.sh "$CLANG_VERSION"
           sudo apt-get install -y \
             build-essential cmake pkg-config git ca-certificates \
             libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
-            libargon2-dev nodejs libclang-rt-20-dev
+            libargon2-dev nodejs "libclang-rt-${CLANG_VERSION}-dev"
 
       - name: Configure
         env:
-          CC: clang-20
-          CXX: clang++-20
+          CC: clang-${{ matrix.llvm_version }}
+          CXX: clang++-${{ matrix.llvm_version }}
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Debug
