@@ -23,8 +23,12 @@ namespace plinth::shell {
 
 namespace {
 
+// Authorize only the bundled import map, including its whitespace. The browser
+// smoke test checks this digest against the packaged document. Other inline
+// scripts remain blocked. Update together with client/shell/client/index.html.
 constexpr std::string_view STRICT_CSP =
-    "script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "script-src 'self' 'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='; "
+    "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self'";
 
 constexpr std::string_view CACHE_INDEX = "no-cache";

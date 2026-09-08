@@ -14,8 +14,8 @@
 //   - Reconnection backoff is silent (per OQ5); state lives in this
 //     module and is not surfaced to handlers.
 
-import { h } from '../vendor/preact.module.js';
-import { useEffect, useState } from '../vendor/preact-hooks.module.js';
+import { h } from 'preact';
+import { useEffect, useState } from 'preact/hooks';
 
 // ── Error classes ───────────────────────────────────────────────────
 

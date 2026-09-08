@@ -3,15 +3,15 @@
 // avatar-popover theme + scale controls. Single-file ES module;
 // Preact + htm vendored under ./vendor/ per OQ1 (B). No build step.
 
-import { h, render, Component } from './vendor/preact.module.js';
-import htm from './vendor/htm.module.js';
-import { call as plinthCall } from './sdk.js';
+import { h, render, Component } from 'preact';
+import htm from 'htm';
+import { call as plinthCall } from '@plinth/frontend/sdk';
 const html = htm.bind(h);
 
 // ICD-0.6.3 §6.5 — sanitize boundary detail before audit emission.
 // Length-cap per ICD §6.5: error_message 1024, error_stack 8192,
 // component_path 8192. Production builds omit error_stack per OQ6
-// (gated on `window.__PLINTH_PRODUCTION__` injected from index.html).
+// (gated on `window.__PLINTH_PRODUCTION__` configured by runtime-config.js).
 const STACK_LIMIT      = 8192;
 const MESSAGE_LIMIT    = 1024;
 const COMPONENT_LIMIT  = 8192;
@@ -30,7 +30,7 @@ function sanitizeBoundaryPayload(error, info, panelId) {
     if (componentPath) {
         detail.component_path = trim(componentPath, COMPONENT_LIMIT);
     }
-    if (!window.__PLINTH_PRODUCTION__) {
+    if (window.__PLINTH_PRODUCTION__ === false) {
         const stack = error?.stack;
         if (stack) { detail.error_stack = trim(stack, STACK_LIMIT); }
     }

@@ -35,3 +35,6 @@ docker-compose.override.yml
 .claude/
 Testing/
 /Descusion*.md
+
+# Browser smoke dependencies
+/tests/browser/node_modules/

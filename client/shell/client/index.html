@@ -28,10 +28,9 @@
         }
       }
     </script>
-    <!-- ICD-0.6.3 §6.5 (boundary `error_stack` redaction) and OQ6 —
-         dev builds keep the stack; production flips this flag at
-         deploy time (out of scope for v0.6.3 — see §17 deviation). -->
-    <script>window.__PLINTH_PRODUCTION__ = false;</script>
+    <!-- External configuration runs before the shell module under strict CSP.
+         Bundled deployments redact stacks; development packages may set false. -->
+    <script src="./runtime-config.js"></script>
     <style>
       /* ICD-0.6.2 §3 — base typography + html/body styles live in
          tokens.css. This block holds layout + component styles only.

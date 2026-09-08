@@ -7,7 +7,7 @@
 
 import { h } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
-import { call, subscribe } from '@plinth/frontend/sdk';
+import { subscribe, useData } from '@plinth/frontend/sdk';
 
 export default function demo(plinthPanel) {
     plinthPanel.onActivate(() => {
@@ -24,14 +24,19 @@ export default function demo(plinthPanel) {
     });
 
     return function DemoPanel() {
-        const [theme, setTheme]   = useState('(loading)');
+        const { data: preference, error: preferenceError } = useData(
+            'ext.shell.preferences.changed', {
+                initialData: { value: '(loading)' },
+                snapshot: { capability: 'shell.preferences.get',
+                            args: { key: 'shell.theme' } },
+            });
+        const theme = preferenceError
+            ? '(error: ' + preferenceError.code + ')'
+            : (preference?.value ?? '(unset)');
         const [envelopes, setEnv] = useState([]);
         const [throwing, setThrow] = useState(false);
 
         useEffect(() => {
-            call('shell.preferences.get', { key: 'shell.theme' }).then(
-                (r) => setTheme(r.value ?? '(unset)'),
-                (e) => setTheme('(error: ' + e.code + ')'));
             const unsub = subscribe('sdk_demo:test', (env) => {
                 setEnv((prev) => [...prev.slice(-4), env]);
             });
