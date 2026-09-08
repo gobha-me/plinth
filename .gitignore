@@ -38,3 +38,4 @@ Testing/
 
 # Browser smoke dependencies
 /tests/browser/node_modules/
+/tests/browser/__pycache__/
