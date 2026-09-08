@@ -139,6 +139,26 @@ jobs:
       - name: Check version command
         run: ./build/plinth --version
 
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        if: ${{ matrix.cc == 'gcc' }}
+        with:
+          node-version: "22.23.2"
+
+      - name: Exercise packaged shell in a production browser
+        if: ${{ matrix.cc == 'gcc' }}
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+        run: |
+          sudo apt-get install -y postgresql-client
+          npm ci --prefix tests/browser
+          (cd tests/browser && npx playwright install --with-deps chromium)
+          python3 tests/browser/process_cleanup_test.py
+          python3 tests/browser/run-production.py --binary build/plinth
+
   asan-ubsan:
     name: clang-20 / ASan+UBSan
     runs-on: ubuntu-24.04

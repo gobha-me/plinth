@@ -1,8 +1,12 @@
-# Shell smoke tests (manual)
+# Shell smoke tests
+
+Automated startup, import-map/CSP, SDK hook, and boundary-redaction coverage
+now lives in [the browser harness](../browser/README.md). The walkthroughs
+below remain useful for the broader shell journeys.
 
 ICD-0.6.0 §13 documents test cases T.\*, E.\*, I.\* (and L.\* per
-deferral architect-signed-off this session). No headless-browser
-harness ships in 0.6.0 per OQ2; the case files in this directory are
+deferral architect-signed-off this session). The original 0.6.0 release had
+no headless-browser harness per OQ2; the case files in this directory are
 **documented manual smoke walkthroughs**, not automated tests. They
 are pre-positioned for the **0.6.0.N test-fixture buildout** (ROADMAP
 §0.x cleanup follow-ups) which absorbs:
@@ -11,7 +15,7 @@ are pre-positioned for the **0.6.0.N test-fixture buildout** (ROADMAP
 - The HTTP test fixture for L.\* wire-contract verification.
 - The 25-case backfill across ICD-0.4.4 / 0.4.5 / 0.5.0.3 / 0.5.4 / 0.5.5.
 
-Until the harness lands, run these walkthroughs manually before
+Run the remaining walkthroughs manually before
 shipping a 0.6.x change that touches the shell.
 
 ## How to run
