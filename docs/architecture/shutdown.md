@@ -23,8 +23,8 @@ The coordinator executes these nodes in order:
      produce its response. A pre-handling fallback rejects requests that raced
      past the earlier synchronous gate.
 3. `stop_listeners`
-   - Join the capability and realtime PostgreSQL listeners so they cannot
-     admit new cache or event work.
+   - Join the capability PostgreSQL listener so it cannot admit cache work.
+     Realtime LISTEN remains alive as a downstream consumer of accepted writes.
 4. `drain_async_tasks`
    - Drain standalone WS capability and replay coroutines. Admission closes in
      `close_ingress`; every accepted coroutine owns a completion lease.
@@ -38,10 +38,17 @@ The coordinator executes these nodes in order:
    - Close diagnostic JS admission, drain every accepted shared runtime lease,
      and destroy the diagnostic pool.
 8. `flush_database_state`
-   - Drain and join the events writer.
    - Discard any remaining database batch scopes.
-   - Stop the realtime broker.
    - Flush coalescer windows and join its event loop.
+   - Send a unique internal notification on the existing realtime LISTEN
+     connection. PostgreSQL delivers notifications in transaction commit order;
+     acknowledgment on that same connection proves that every earlier envelope
+     reached the synchronous writer handler. The listener pauses dispatch at
+     this boundary, retaining its connection and thread.
+   - Drain and join the events writer, including its in-flight INSERT/COMMIT
+     work. Queue drops and failed INSERTs make this step fail even if the queue
+     subsequently becomes empty.
+   - Stop and join the realtime listener, then stop the realtime broker.
 9. `close_audit_gate`
    - Prevent any later audit call from entering Drogon's database manager.
      The spdlog sinks remain open.
@@ -54,10 +61,9 @@ The coordinator executes these nodes in order:
 The first seven nodes establish this dependency relation:
 
 ```text
-ingress -> listeners -> owned workers -> runtime leases
-                                      -> database-backed flushes
-                                      -> Drogon database/event loops
-                                      -> logging sinks
+ingress -> capability listener -> owned workers -> runtime leases
+  -> coalescer flush -> realtime delivery acknowledgment -> durable writer drain
+  -> realtime listener/broker stop -> Drogon database/event loops -> logging sinks
 ```
 
 ## Bounds and failure policy
@@ -76,6 +82,14 @@ work. Production records the failed node, flushes the diagnostic log, and uses
 an immediate failing process exit rather than entering unsafe teardown. The
 coordinator itself remains retryable so tests can release a deliberately
 blocked worker and prove a later drain joins it.
+
+The realtime marker uses a separate internal PostgreSQL channel and never
+enters event storage or replay. A disconnected/reconnected listener cannot
+certify delivery from its previous session; marker errors and deadline expiry
+fail the drain. Realtime disabled or never started is an idempotent no-op.
+There is no sleep-based notification settling period. This graceful-drain
+barrier does not make PostgreSQL notifications a durable outbox across crashes
+or earlier connection outages.
 
 Partial startup uses the same graph through a stack owner in `main`. Every stop
 operation is idempotent and tolerates a component that never started, so an

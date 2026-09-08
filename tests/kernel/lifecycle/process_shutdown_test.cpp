@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
 
+#include "kernel/auth/crypto.hpp"
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
 
 #include <arpa/inet.h>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -274,7 +276,9 @@ auto emit_realtime_burst() -> void {
 }
 
 auto write_config(const TempTree& tree, std::uint16_t port,
-                  bool valid_migrations) -> std::filesystem::path {
+                  bool valid_migrations,
+                  const std::string& isolated_database = {})
+    -> std::filesystem::path {
   auto host = required_env("PLINTH_PG_HOST");
   auto pg_port = required_env("PLINTH_PG_PORT");
   auto user = required_env("PLINTH_PG_USER");
@@ -292,7 +296,7 @@ auto write_config(const TempTree& tree, std::uint16_t port,
         {"port", std::stoi(*pg_port)},
         {"user", *user},
         {"password", *password},
-        {"database", *database},
+        {"database", isolated_database.empty() ? *database : isolated_database},
         {"pool_size", 8}}},
       {"migrations_dir", valid_migrations
                              ? std::string{CMAKE_SOURCE_DIR} + "/migrations"
@@ -308,9 +312,12 @@ auto write_config(const TempTree& tree, std::uint16_t port,
        {{"data_dir", (tree.path / "data").string()},
         {"staging_dir", (tree.path / "staging").string()}}},
       {"shell",
-       {{"enabled", false},
+       {{"enabled", !isolated_database.empty()},
         {"bundle_path",
          std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled"}}}};
+  if (!isolated_database.empty()) {
+    config["realtime"]["coalescer"]["window_ms"] = 10000;
+  }
   auto path = tree.path / "config.json";
   std::ofstream stream(path);
   REQUIRE(stream.good());
@@ -323,6 +330,302 @@ auto read_text(const std::filesystem::path& path) -> std::string {
   std::ifstream stream(path);
   return {std::istreambuf_iterator<char>{stream},
           std::istreambuf_iterator<char>{}};
+}
+
+using PgConnection = std::unique_ptr<PGconn, decltype(&PQfinish)>;
+using PgResult = std::unique_ptr<PGresult, decltype(&PQclear)>;
+
+auto open_database(const std::string& override_name = {}) -> PgConnection {
+  auto host = required_env("PLINTH_PG_HOST");
+  auto port = required_env("PLINTH_PG_PORT");
+  auto user = required_env("PLINTH_PG_USER");
+  auto password = required_env("PLINTH_PG_PASSWORD");
+  auto database = required_env("PLINTH_PG_DATABASE");
+  REQUIRE(host);
+  REQUIRE(port);
+  REQUIRE(user);
+  REQUIRE(password);
+  REQUIRE(database);
+  const char* keywords[] = {"host",     "port",   "user",
+                            "password", "dbname", nullptr};
+  const char* values[] = {host->c_str(),
+                          port->c_str(),
+                          user->c_str(),
+                          password->c_str(),
+                          override_name.empty() ? database->c_str()
+                                                : override_name.c_str(),
+                          nullptr};
+  PgConnection connection{PQconnectdbParams(keywords, values, 0), PQfinish};
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  return connection;
+}
+
+auto sql(PGconn* connection, const std::string& query,
+         const std::vector<std::string>& parameters = {}) -> PgResult {
+  std::vector<const char*> values;
+  for (const auto& parameter : parameters) {
+    values.push_back(parameter.c_str());
+  }
+  PgResult result{PQexecParams(connection, query.c_str(),
+                               static_cast<int>(values.size()), nullptr,
+                               values.data(), nullptr, nullptr, 0),
+                  PQclear};
+  const auto status = PQresultStatus(result.get());
+  REQUIRE((status == PGRES_TUPLES_OK || status == PGRES_COMMAND_OK));
+  return result;
+}
+
+class IsolatedDatabase {
+ public:
+  IsolatedDatabase()
+      : admin(open_database()),
+        name("plinth_shutdown_" + std::to_string(::getpid()) + "_" +
+             std::to_string(sequence++)) {
+    sql(admin.get(), "CREATE DATABASE " + name);
+  }
+  ~IsolatedDatabase() {
+    // The name is generated entirely from fixed text and unsigned integers.
+    PgResult result{PQexec(admin.get(),
+                           ("DROP DATABASE " + name + " WITH (FORCE)").c_str()),
+                    PQclear};
+  }
+  IsolatedDatabase(const IsolatedDatabase&) = delete;
+  auto operator=(const IsolatedDatabase&) -> IsolatedDatabase& = delete;
+
+  PgConnection admin;
+  std::string name;
+
+ private:
+  static inline unsigned int sequence = 0;
+};
+
+auto receive_exact(int fd, std::size_t length) -> std::string {
+  std::string data(length, '\0');
+  std::size_t offset = 0;
+  while (offset < length) {
+    auto received = ::recv(fd, data.data() + offset, length - offset, 0);
+    REQUIRE(received > 0);
+    offset += static_cast<std::size_t>(received);
+  }
+  return data;
+}
+
+auto send_frame(int fd, const nlohmann::json& value) -> void {
+  const auto body = value.dump();
+  REQUIRE(body.size() <= 65535);
+  std::string frame{static_cast<char>(0x81)};
+  if (body.size() < 126) {
+    frame.push_back(static_cast<char>(0x80U | body.size()));
+  } else {
+    frame.push_back(static_cast<char>(0xfe));
+    frame.push_back(static_cast<char>((body.size() >> 8U) & 0xffU));
+    frame.push_back(static_cast<char>(body.size() & 0xffU));
+  }
+  constexpr std::array<unsigned char, 4> MASK{0x21, 0x43, 0x65, 0x07};
+  for (auto byte : MASK) {
+    frame.push_back(static_cast<char>(byte));
+  }
+  for (std::size_t i = 0; i < body.size(); ++i) {
+    frame.push_back(static_cast<char>(static_cast<unsigned char>(body[i]) ^
+                                      MASK[i % MASK.size()]));
+  }
+  REQUIRE(send_all(fd, frame));
+}
+
+auto receive_frame(int fd) -> nlohmann::json {
+  auto header = receive_exact(fd, 2);
+  REQUIRE(static_cast<unsigned char>(header[0]) == 0x81);
+  auto length = static_cast<std::size_t>(static_cast<unsigned char>(header[1]));
+  REQUIRE(length < 128); // server frames are unmasked
+  if (length == 126) {
+    auto extended = receive_exact(fd, 2);
+    length = (static_cast<std::size_t>(static_cast<unsigned char>(extended[0]))
+              << 8U) |
+             static_cast<unsigned char>(extended[1]);
+  }
+  REQUIRE(length < 65536);
+  return nlohmann::json::parse(receive_exact(fd, length));
+}
+
+auto authenticated_socket(std::uint16_t port, const std::string& token)
+    -> Socket {
+  auto socket = open_unauthenticated_websocket(port);
+  REQUIRE(socket.fd >= 0);
+  send_frame(socket.fd, {{"type", "auth"}, {"token", token}});
+  REQUIRE(receive_frame(socket.fd).at("type") == "connected");
+  return socket;
+}
+
+auto delete_preference(std::uint16_t port, const std::string& token,
+                       const std::string& key) -> void {
+  auto socket = connect_to(port);
+  REQUIRE(socket.fd >= 0);
+  const auto body = nlohmann::json{{"args", {{"key", key}}}}.dump();
+  const auto request =
+      "POST /api/cap/shell.preferences.set HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+      "Connection: close\r\nContent-Type: application/json\r\nCookie: "
+      "plinth_session=" +
+      token + "\r\nContent-Length: " + std::to_string(body.size()) +
+      "\r\n\r\n" + body;
+  REQUIRE(send_all(socket.fd, request));
+  std::string response;
+  std::array<char, 4096> buffer{};
+  while (true) {
+    auto received = ::recv(socket.fd, buffer.data(), buffer.size(), 0);
+    REQUIRE(received >= 0);
+    if (received == 0) {
+      break;
+    }
+    response.append(buffer.data(), static_cast<std::size_t>(received));
+  }
+  REQUIRE(response.starts_with("HTTP/1.1 200 "));
+  auto separator = response.find("\r\n\r\n");
+  REQUIRE(separator != std::string::npos);
+  const auto value = nlohmann::json::parse(response.substr(separator + 4));
+  REQUIRE(value.at("ok") == true);
+  REQUIRE(value.at("value").at("deleted") == true);
+}
+
+auto scalar(PGconn* connection, const std::string& query,
+            const std::vector<std::string>& parameters = {}) -> std::int64_t {
+  auto result = sql(connection, query, parameters);
+  REQUIRE(PQntuples(result.get()) == 1);
+  return std::stoll(PQgetvalue(result.get(), 0, 0));
+}
+
+template <typename Predicate>
+auto wait_for_condition(Predicate predicate, std::chrono::milliseconds timeout)
+    -> bool {
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  do {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(10ms);
+  } while (std::chrono::steady_clock::now() < deadline);
+  return false;
+}
+
+auto require_durable_shutdown(int signal, bool accepted_websocket_work)
+    -> void {
+  IsolatedDatabase database;
+  TempTree tree;
+  auto port = test_port();
+  auto config = write_config(tree, port, true, database.name);
+  ChildProcess child{{PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+                     tree.path / "process.log"};
+  REQUIRE(wait_for_health(port, 30s));
+  auto connection = open_database(database.name);
+  auto user = sql(connection.get(),
+                  "INSERT INTO plinth.users (username, password_hash) "
+                  "VALUES ('shutdown_owner', 'unused') RETURNING id::text");
+  const std::string user_id{PQgetvalue(user.get(), 0, 0)};
+  const std::string token = "fake-shutdown-session-token";
+  sql(connection.get(),
+      "INSERT INTO plinth.sessions (user_id, token_hash) VALUES ($1::uuid, $2)",
+      {user_id, plinth::auth::sha256_hex(token)});
+  sql(connection.get(),
+      "INSERT INTO plinth.group_members (group_id, user_id) "
+      "SELECT id, $1::uuid FROM plinth.groups WHERE name = 'admin'",
+      {user_id});
+  sql(connection.get(),
+      "INSERT INTO ext_shell.user_preferences (user_id, key, value) "
+      "VALUES ($1::uuid, 'shutdown_control', '1'), ($1::uuid, "
+      "'shutdown_target', '2')",
+      {user_id});
+  // A real control deletion proves that this process subscribed and persists
+  // coalescer events before the final open-window case begins.
+  delete_preference(port, token, "shutdown_control");
+  constexpr auto EVENT_CHANNEL = "plinth:data:ext_shell.user_preferences";
+  REQUIRE(wait_for_condition(
+      [&] {
+        return scalar(connection.get(),
+                      "SELECT count(*) FROM plinth.events WHERE channel = $1",
+                      {EVENT_CHANNEL}) == 1;
+      },
+      15s));
+  const auto control_seq = scalar(
+      connection.get(), "SELECT max(seq) FROM plinth.events WHERE channel = $1",
+      {EVENT_CHANNEL});
+
+  if (accepted_websocket_work) {
+    auto websocket = authenticated_socket(port, token);
+    sql(connection.get(), "BEGIN");
+    sql(connection.get(),
+        "LOCK TABLE ext_shell.user_preferences IN SHARE MODE");
+    send_frame(websocket.fd, {{"type", "call"},
+                              {"id", "final-write"},
+                              {"signature", "shell:1:preferences.set"},
+                              {"args", {{"key", "shutdown_target"}}}});
+    // PostgreSQL's lock wait proves that the WS call entered the production
+    // extension before the signal. Release it only after signaling shutdown.
+    const bool admitted = wait_for_condition(
+        [&] {
+          return scalar(connection.get(),
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> "
+                        "pg_backend_pid() "
+                        "AND wait_event_type = 'Lock' AND query LIKE 'DELETE "
+                        "FROM ext_shell.user_preferences%'") > 0;
+        },
+        3s);
+    if (admitted) {
+      child.send_signal(signal);
+    }
+    sql(connection.get(), "ROLLBACK");
+    REQUIRE(admitted);
+  } else {
+    delete_preference(port, token, "shutdown_target");
+    child.send_signal(signal);
+  }
+  auto status = child.wait_for_exit(15s);
+  INFO(read_text(tree.path / "process.log"));
+  REQUIRE(status);
+  REQUIRE(WIFEXITED(*status));
+  REQUIRE(WEXITSTATUS(*status) == 0);
+  REQUIRE(scalar(connection.get(),
+                 "SELECT count(*) FROM ext_shell.user_preferences "
+                 "WHERE user_id = $1::uuid",
+                 {user_id}) == 0);
+  const auto final_seq = scalar(
+      connection.get(), "SELECT max(seq) FROM plinth.events WHERE channel = $1",
+      {EVENT_CHANNEL});
+  REQUIRE(final_seq > control_seq);
+  REQUIRE(scalar(connection.get(),
+                 "SELECT count(*) FROM plinth.events "
+                 "WHERE channel = $1 AND seq > $2::bigint AND payload->'ops' "
+                 "@> '[{\"op\":\"delete\",\"count\":1}]'::jsonb",
+                 {EVENT_CHANNEL, std::to_string(control_seq)}) == 1);
+
+  ChildProcess restarted{
+      {PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+      tree.path / "restarted.log"};
+  REQUIRE(wait_for_health(port, 30s));
+  auto replay = authenticated_socket(port, token);
+  send_frame(replay.fd, {{"type", "subscribe"},
+                         {"channels", {EVENT_CHANNEL}},
+                         {"since_seq", control_seq}});
+  int final_events = 0;
+  bool completed = false;
+  for (int i = 0; i < 10 && !completed; ++i) {
+    auto frame = receive_frame(replay.fd);
+    if (frame.at("type") == "replay") {
+      REQUIRE(frame.at("envelope").at("seq") == final_seq);
+      ++final_events;
+    }
+    completed = frame.at("type") == "replay_done";
+  }
+  REQUIRE(completed);
+  REQUIRE(final_events == 1);
+  restarted.send_signal(signal);
+  auto restarted_status = restarted.wait_for_exit(15s);
+  REQUIRE(restarted_status);
+  REQUIRE(WIFEXITED(*restarted_status));
+  REQUIRE(WEXITSTATUS(*restarted_status) == 0);
+  REQUIRE(scalar(connection.get(),
+                 "SELECT count(*) FROM plinth.events WHERE channel = $1 AND "
+                 "seq > $2::bigint",
+                 {EVENT_CHANNEL, std::to_string(control_seq)}) == 1);
 }
 
 auto require_clean_signal_shutdown(int signal) -> void {
@@ -346,6 +649,25 @@ auto require_clean_signal_shutdown(int signal) -> void {
 }
 
 } // namespace
+
+TEST_CASE("production shutdown persists and replays the last extension write",
+          "[integration][lifecycle][subprocess][realtime][shutdown]") {
+  if (!required_env("PLINTH_PG_HOST")) {
+    SKIP("PostgreSQL environment is not configured");
+  }
+  SECTION("SIGINT after an HTTP commit") {
+    require_durable_shutdown(SIGINT, false);
+  }
+  SECTION("SIGTERM after an HTTP commit") {
+    require_durable_shutdown(SIGTERM, false);
+  }
+  SECTION("SIGINT during an accepted WebSocket write") {
+    require_durable_shutdown(SIGINT, true);
+  }
+  SECTION("SIGTERM during an accepted WebSocket write") {
+    require_durable_shutdown(SIGTERM, true);
+  }
+}
 
 TEST_CASE("explicit config failures happen before service startup",
           "[integration][lifecycle][subprocess][config]") {

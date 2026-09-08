@@ -87,6 +87,9 @@ WindowMap g_windows;
 Config::Realtime::Coalescer g_cfg;
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_shutting_down{false};
+// Timer/extension drains claim windows before emitting. A failed emission
+// cannot be certified by a later empty-map shutdown drain.
+std::atomic<bool> g_discarded_flush_failed{false};
 std::mutex g_lifecycle_mu;
 std::optional<trantor::EventLoopThread> g_loop_thread;
 
@@ -340,6 +343,7 @@ auto CoalescerRegistry::start(const Config::Realtime::Coalescer& cfg) -> void {
   }
   g_cfg = cfg;
   g_shutting_down.store(false);
+  g_discarded_flush_failed.store(false);
   if (!cfg.enabled) {
     spdlog::info("realtime coalescer: disabled by config");
     g_running.store(true);
@@ -354,7 +358,7 @@ auto CoalescerRegistry::start(const Config::Realtime::Coalescer& cfg) -> void {
 auto CoalescerRegistry::shutdown(std::chrono::milliseconds timeout) -> bool {
   std::lock_guard lock(g_lifecycle_mu);
   if (!g_running.load()) {
-    return true;
+    return !g_discarded_flush_failed.load();
   }
   g_shutting_down.store(true);
   if (!g_cfg.enabled) {
@@ -414,7 +418,7 @@ auto CoalescerRegistry::shutdown(std::chrono::milliseconds timeout) -> bool {
 
   g_running.store(false);
 
-  return true;
+  return !g_discarded_flush_failed.load();
 }
 
 auto CoalescerRegistry::record_write(std::string_view schema,
@@ -496,7 +500,9 @@ auto CoalescerRegistry::record_write(std::string_view schema,
       auto* loop = g_loop_thread->getLoop();
       w.timer_id = loop->runAfter(DELAY_S, [key]() {
         if (auto claimed = claim_window(key); claimed.has_value()) {
-          (void)flush_snapshot(*claimed);
+          if (!flush_snapshot(*claimed)) {
+            g_discarded_flush_failed.store(true);
+          }
         }
       });
     }
@@ -584,7 +590,9 @@ auto CoalescerRegistry::drain_extension(std::string_view extension_name)
   }
   for (const auto& key : matches) {
     if (auto claimed = claim_window(key); claimed.has_value()) {
-      (void)flush_snapshot(*claimed);
+      if (!flush_snapshot(*claimed)) {
+        g_discarded_flush_failed.store(true);
+      }
     }
   }
 }

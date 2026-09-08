@@ -296,6 +296,8 @@ TEST_CASE("E.05: PG INSERT failure routes through audit pipeline",
 
   CHECK(ew::writes_persisted_for_test() == 0);
   CHECK(count_events_rows(pg) == 0);
+  CHECK_FALSE(ew::stop());
+  CHECK_FALSE(ew::stop());
 }
 
 // ── E.06 ─────────────────────────────────────────────────────────────
@@ -378,11 +380,7 @@ TEST_CASE("E.08: stop() drains the queue before joining",
     REQUIRE(ew::enqueue_for_test(
         build_dispatched("data", "plinth:data:ext_e08.t")));
   }
-  // Harness destructor calls stop(); we want to assert state AFTER
-  // stop. Force the drain explicitly here so the assertion is on a
-  // running writer (pre-stop) — with the 10 s budget the harness
-  // teardown is also tested.
-  ew::apply_drain_for_test();
+  REQUIRE(ew::stop());
   CHECK(ew::writes_persisted_for_test() == static_cast<std::uint64_t>(N));
   CHECK(count_events_for_channel(pg, "plinth:data:ext_e08.t") == N);
 }
