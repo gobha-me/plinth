@@ -136,6 +136,10 @@ TEST_CASE("M.01: GET / returns 302 to /app/; GET /app/ serves index.html",
   REQUIRE(r.body == "<!doctype html><h1>shell</h1>");
   REQUIRE(r.cache_control == "no-cache");
   REQUIRE(r.csp.find("script-src 'self'") != std::string::npos);
+  REQUIRE(r.csp.find("'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='") !=
+          std::string::npos);
+  REQUIRE(r.csp.substr(0, r.csp.find(';')).find("unsafe-inline") ==
+          std::string::npos);
   REQUIRE(r.csp.find("style-src 'self'") != std::string::npos);
   REQUIRE(r.csp.find("connect-src 'self'") != std::string::npos);
   REQUIRE(r.content_type_is_custom);

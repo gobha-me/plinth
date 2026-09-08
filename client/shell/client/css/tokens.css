@@ -82,27 +82,9 @@
   /* Geometry tokens are theme-invariant; not redeclared here. */
 }
 
-/* Self-hosted typography per ICD-0.6.0 §6.3 + ICD-0.6.2 §3.8. The
-   shell vendors Inter and JetBrains Mono under client/vendor/ in
-   the bundle; absolute URLs work because the shell extension
-   serves them at /ext/shell/0.6.2/vendor/<file>. The relative
-   `url('../vendor/<file>')` resolves against the tokens.css URL
-   at /ext/shell/0.6.2/css/tokens.css. */
-@font-face {
-  font-family: 'Inter';
-  font-style: normal;
-  font-weight: 400 700;
-  font-display: swap;
-  src: url('../vendor/inter-variable.woff2') format('woff2-variations');
-}
-@font-face {
-  font-family: 'JetBrains Mono';
-  font-style: normal;
-  font-weight: 400 600;
-  font-display: swap;
-  src: url('../vendor/jetbrains-mono-variable.woff2') format('woff2-variations');
-}
-
+/* Font assets are not bundled. Use the declared system fallback stacks without
+   requesting nonexistent font files. A future self-hosted font addition must
+   ship the licensed assets with the package before declaring @font-face. */
 /* Base typography per ICD-0.6.0 §6.3 + ICD-0.6.2 §3.8. */
 :root { font-size: 13.5px; }
 html, body {

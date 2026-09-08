@@ -21,7 +21,7 @@
 //     proper kernel `plinth.panels.list` API is deferred to ICD-0.6.4
 //     per `feedback_icd_horizon.md`.
 
-import { h, render } from '../vendor/preact.module.js';
+import { h, render } from 'preact';
 import { makePanelApi, normaliseCombo } from './panel_api.js';
 
 // Single shell-wide active panel handle. 0.6.3 only mounts one primary

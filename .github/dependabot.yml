@@ -1,5 +1,12 @@
 version: 2
 updates:
+  - package-ecosystem: npm
+    directory: /tests/browser
+    schedule:
+      interval: weekly
+      day: tuesday
+    open-pull-requests-limit: 5
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

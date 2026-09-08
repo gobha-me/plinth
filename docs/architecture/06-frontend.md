@@ -342,3 +342,27 @@ document's purposes the relevant facts are:
 - **Client SDK** (`plinth.subscribe()`, `plinth.call()`,
   `plinth.useData()`, etc.) served by the active frontend under
   `/api/frontend/sdk.js` (§4).
+
+### Shell module graph and CSP
+
+The bundled document declares `preact`, `preact/hooks`, `htm`, and
+`@plinth/frontend/sdk` in one import map. Shell, panel loader, SDK hooks, and
+extension panels use those specifiers so they share the document's Preact
+instance. The SDK specifier redirects through `/api/frontend/sdk.js` to the
+active versioned package. Direct versioned SDK imports also require the
+frontend document's import map; loading the SDK in an unrelated document
+without that map is unsupported. Consumers use the documented SDK specifier
+to share its subscription state within the document.
+
+The kernel's strict `script-src` authorizes the exact bundled import map with
+a SHA-256 digest, including its whitespace. Changes to that map must update
+`STRICT_CSP` in `src/kernel/shell/active_frontend.cpp` and its header assertion.
+The browser smoke verifies the digest against the served document and
+executes the full graph. General inline scripts remain disallowed.
+
+`client/runtime-config.js` executes as an external script before the shell.
+Bundled packages set `window.__PLINTH_PRODUCTION__ = true`, omitting boundary
+stacks from audit payloads. A development package may explicitly set it to
+`false` before packaging. Missing or malformed configuration does not enable
+stack emission; URL parameters and local storage cannot select development
+mode. The browser smoke exercises both explicit configurations.
