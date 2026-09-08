@@ -10,7 +10,7 @@ regexes = ['''8b2a587ffd672c4687e7581dad4b2f6c1bb2ad6b480cd9771ba2ff48e0b8c75d''
 [[allowlists]]
 description = "RFC 6455 example WebSocket nonce"
 condition = "AND"
-paths = ['''^tests/kernel/lifecycle/process_shutdown_test\.cpp$''']
+paths = ['''^tests/kernel/(lifecycle/process_shutdown_test|ws/auth_test)\.cpp$''']
 regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']
 
 [[allowlists]]

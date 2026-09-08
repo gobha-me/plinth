@@ -28,7 +28,7 @@ auto ConnectionRegistry::instance() -> ConnectionRegistry& {
 
 auto ConnectionRegistry::register_connection(
     const RegistryKey& key, const drogon::WebSocketConnectionPtr& conn,
-    std::shared_ptr<ConnState> state) -> drogon::WebSocketConnectionPtr {
+    std::shared_ptr<ConnState> state) -> RegistryEntry {
   if (g_shutdown_pending.load(std::memory_order_acquire)) {
     return {};
   }
@@ -36,11 +36,11 @@ auto ConnectionRegistry::register_connection(
   if (sealed) {
     return {};
   }
+  RegistryEntry displaced;
   auto* loop = state ? state->loop : nullptr;
-  drogon::WebSocketConnectionPtr displaced;
   auto it = conns.find(key);
   if (it != conns.end()) {
-    displaced = it->second.conn;
+    displaced = std::move(it->second);
     it->second =
         RegistryEntry{.conn = conn, .state = std::move(state), .loop = loop};
   } else {

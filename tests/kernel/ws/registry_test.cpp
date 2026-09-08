@@ -4,6 +4,9 @@
 
 #include <atomic>
 #include <chrono>
+#include <future>
+#include <latch>
+#include <thread>
 #include <trantor/net/EventLoopThread.h>
 
 using plinth::ws::ConnectionRegistry;
@@ -42,7 +45,7 @@ TEST_CASE("register_connection on empty slot installs", "[ws][registry]") {
   auto conn = fake_conn(1);
   auto prior = reg.register_connection({.auth_type = "session", .id = "s1"},
                                        conn, nullptr);
-  REQUIRE(prior == nullptr);
+  REQUIRE(prior.conn == nullptr);
   REQUIRE(reg.size() == 1);
 }
 
@@ -52,10 +55,11 @@ TEST_CASE("register_connection on occupied slot returns displaced",
   auto conn1 = fake_conn(1);
   auto conn2 = fake_conn(2);
   REQUIRE(reg.register_connection({.auth_type = "session", .id = "s1"}, conn1,
-                                  nullptr) == nullptr);
+                                  nullptr)
+              .conn == nullptr);
   auto displaced = reg.register_connection({.auth_type = "session", .id = "s1"},
                                            conn2, nullptr);
-  REQUIRE(displaced == conn1);
+  REQUIRE(displaced.conn == conn1);
   REQUIRE(reg.size() == 1);
 }
 
@@ -81,9 +85,11 @@ TEST_CASE("session and PAT keys with same id are distinct", "[ws][registry]") {
   auto conn_s = fake_conn(1);
   auto conn_p = fake_conn(2);
   REQUIRE(reg.register_connection({.auth_type = "session", .id = "shared-id"},
-                                  conn_s, nullptr) == nullptr);
+                                  conn_s, nullptr)
+              .conn == nullptr);
   REQUIRE(reg.register_connection({.auth_type = "pat", .id = "shared-id"},
-                                  conn_p, nullptr) == nullptr);
+                                  conn_p, nullptr)
+              .conn == nullptr);
   REQUIRE(reg.size() == 2);
 }
 
@@ -99,6 +105,49 @@ TEST_CASE("for_each sees all registered connections", "[ws][registry]") {
   int count = 0;
   reg.for_each([&count](const drogon::WebSocketConnectionPtr&) { ++count; });
   REQUIRE(count == 3);
+}
+
+TEST_CASE(
+    "displacement retains target metadata after concurrent context release",
+    "[ws][registry]") {
+  ConnectionRegistry reg;
+  trantor::EventLoopThread target;
+  target.run();
+  const RegistryKey key{.auth_type = "session", .id = "displacement-race"};
+  auto first = fake_conn(1);
+  auto second = fake_conn(2);
+  auto context = std::make_shared<plinth::ws::ConnState>();
+  context->loop = target.getLoop();
+  std::weak_ptr<plinth::ws::ConnState> lifetime = context;
+  reg.register_connection(key, first, context);
+
+  // Hold the displaced caller back until the old connection's close path has
+  // unregistered and released its context on another thread. The registry
+  // entry returned by replacement must be sufficient to queue the close.
+  std::latch replaced{1};
+  std::jthread closed([&, context = std::move(context)]() mutable {
+    replaced.wait();
+    reg.unregister_connection(key, first);
+    context.reset();
+  });
+  auto displaced = reg.register_connection(key, second, nullptr);
+  replaced.count_down();
+  closed.join();
+  REQUIRE(reg.size() == 1);
+  REQUIRE(displaced.conn == first);
+  REQUIRE(displaced.loop == target.getLoop());
+  REQUIRE_FALSE(lifetime.expired());
+
+  auto acknowledged = std::make_shared<std::promise<bool>>();
+  auto done = acknowledged->get_future();
+  displaced.loop->queueInLoop([entry = std::move(displaced), acknowledged]() {
+    acknowledged->set_value(entry.state != nullptr &&
+                            trantor::EventLoop::getEventLoopOfCurrentThread() ==
+                                entry.loop);
+  });
+  REQUIRE(done.wait_for(std::chrono::seconds{2}) == std::future_status::ready);
+  REQUIRE(done.get());
+  target.getLoop()->quit();
 }
 
 TEST_CASE(

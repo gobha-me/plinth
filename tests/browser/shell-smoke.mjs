@@ -102,6 +102,15 @@ try {
                 window.__cspViolations.push(`${e.violatedDirective}: ${e.blockedURI}`);
             });
         });
+        await page.routeWebSocket(/\/ws(?:\/events)?$/, socket => {
+            socket.onMessage(message => {
+                const frame = JSON.parse(message);
+                if (frame.type === 'subscribe' || frame.type === 'unsubscribe') {
+                    socket.send(JSON.stringify({ type: frame.type + 'd', channels: frame.channels }));
+                }
+            });
+            socket.send(JSON.stringify({ type: 'connected' }));
+        });
         const response = await page.goto(baseURL + path);
         try {
             await page.getByRole('heading', { name: 'Sign in to Plinth', exact: true }).waitFor();
@@ -138,7 +147,6 @@ try {
         await page.route('**/api/cap/shell.preferences.get', route => route.fulfill({
             json: { ok: true, value: { value: 'browser-hook-ok' } },
         }));
-        await page.routeWebSocket(/\/ws(?:\/events)?$/, () => {});
         await page.evaluate(async () => {
             const container = document.createElement('div');
             container.id = 'sdk-smoke';
@@ -149,7 +157,12 @@ try {
             });
         });
         await page.getByRole('heading', { name: 'SDK Demo Panel' }).waitFor();
-        await page.getByText('browser-hook-ok', { exact: true }).waitFor();
+        try {
+            await page.getByText('browser-hook-ok', { exact: true }).waitFor({ timeout: 10000 });
+        } catch (cause) {
+            throw new Error(`SDK demo failed: ${await page.locator('#sdk-smoke').textContent()}; ` +
+                JSON.stringify(failures), { cause });
+        }
         assert.deepEqual(await page.evaluate(() => window.__cspViolations), []);
         assert.deepEqual(failures, []);
         await context.close();

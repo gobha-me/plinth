@@ -385,3 +385,49 @@ stacks from audit payloads. A development package may explicitly set it to
 `false` before packaging. Missing or malformed configuration does not enable
 stack emission; URL parameters and local storage cannot select development
 mode. The browser smoke exercises both explicit configurations.
+
+### Browser realtime sessions
+
+The browser SDK connects to `/ws/events`. Its HttpOnly `plinth_session`
+cookie accompanies the upgrade automatically; the token is never exposed to
+JavaScript, placed in a URL, or returned in a login body. Cookie upgrades
+require an exact browser `Origin` match. With `ws_browser_origin` unset, the
+expected origin is the connection's actual HTTP/HTTPS scheme plus `Host`.
+A native client without a cookie or Origin continues to send an explicit
+`{"type":"auth","token":"..."}` frame.
+
+For TLS termination at a reverse proxy, configure `ws_browser_origin` to the
+exact public origin, for example `https://plinth.example`, and preserve that
+origin's authority in the upstream `Host` header. The setting accepts only an
+absolute lowercase HTTP(S) origin with an optional valid port and no trailing
+slash, path, query, fragment or credentials. Use the browser's serialized
+origin (omit default ports). The configured authority must still equal
+`Host`; `Forwarded` and `X-Forwarded-*` headers do not establish trust. An
+invalid configured origin prevents startup. Restrict direct access to a
+proxied listener as part of the deployment's existing network boundary.
+
+Authentication and RBAC loading complete with the server's `connected` frame.
+The SDK then sends `subscribe` and `unsubscribe` frames with `channels`
+arrays. It serializes subscription changes through server acknowledgements,
+keeps only granted channels, and replies to JSON `ping` with `pong` carrying
+the same `timestamp`. Multiple handlers share one connection and one channel
+subscription. Removing the last handler for a channel prevents further local
+delivery immediately; removing the final subscription closes the connection
+and cancels reconnect work.
+
+`subscribe(channel, handler, {onError})` reports denied grants and transport
+failures through its optional error callback. `getRealtimeState()` returns
+`{status, error}`; `onRealtimeState(listener)` immediately reports that state
+and returns a listener-removal function. Status is `idle`, `connecting`,
+`connected`, `reconnecting`, or `failed`. Realtime errors have a stable `code`.
+A transient disconnect schedules one exponential-backoff timer (1–30 seconds)
+and reasserts only subscriptions still present. Authentication failure,
+authentication timeout, and session displacement are terminal and observable;
+there is no automatic retry loop. Expired/revoked sessions fail the next
+connection authentication. After successful sign-in, the shell calls
+`reconnectRealtime()` to explicitly retry current subscriptions.
+
+`useData` retains its last good data when a snapshot or live connection fails,
+exposes that error, and clears a live error when the next event arrives. Its
+snapshot request runs through `call`; its live subscription uses the same
+owned connection and cancellation behavior as `subscribe`.

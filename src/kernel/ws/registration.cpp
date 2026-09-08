@@ -11,7 +11,7 @@ namespace plinth::ws {
 auto register_ws_routes(const Config& cfg) -> void {
   auto ctrl = std::make_shared<EventsController>(
       cfg.ws_auth_timeout_s, cfg.ws_heartbeat_interval_s,
-      cfg.ws_heartbeat_timeout_s, cfg.node_id);
+      cfg.ws_heartbeat_timeout_s, cfg.node_id, cfg.ws_browser_origin);
   drogon::app().registerController(ctrl);
   spdlog::info("WebSocket routes registered (/ws/events)");
 }

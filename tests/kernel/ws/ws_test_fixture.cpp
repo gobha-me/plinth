@@ -90,6 +90,9 @@ auto test_config() -> plinth::Config {
   cfg.listen_port = TEST_PORT;
   cfg.node_id = "test-node";
   // Short timeouts so tests don't wait 30+ seconds.
+  if (const auto* origin = std::getenv("PLINTH_TEST_WS_BROWSER_ORIGIN")) {
+    cfg.ws_browser_origin = origin;
+  }
   cfg.ws_auth_timeout_s = 1.0;
   cfg.ws_heartbeat_interval_s = 0.5;
   cfg.ws_heartbeat_timeout_s = 0.5;
@@ -334,9 +337,9 @@ auto test_server_port() -> uint16_t {
 
 // ── WsTestClient ────────────────────────────────────────────────
 
-WsTestClient::WsTestClient() {
+WsTestClient::WsTestClient(const std::string& server_name) {
   auto port = test_server_port();
-  auto host = "ws://127.0.0.1:" + std::to_string(port);
+  auto host = "ws://" + server_name + ":" + std::to_string(port);
   client = drogon::WebSocketClient::newWebSocketClient(host);
 
   client->setMessageHandler([this](std::string&& message,
@@ -406,26 +409,39 @@ WsTestClient::~WsTestClient() {
   done_fut.wait();
 }
 
-auto WsTestClient::connect(std::chrono::milliseconds timeout) -> bool {
-  std::promise<bool> p;
-  auto f = p.get_future();
+auto WsTestClient::connect(
+    std::chrono::milliseconds timeout,
+    const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
+  struct Completion {
+    std::promise<bool> result;
+    std::atomic<bool> delivered{false};
+  };
+  auto completion = std::make_shared<Completion>();
+  auto future = completion->result.get_future();
   auto req = drogon::HttpRequest::newHttpRequest();
   req->setPath("/ws/events");
-  client->connectToServer(req,
-                          [this, &p](drogon::ReqResult r,
-                                     const drogon::HttpResponsePtr& /*resp*/,
-                                     const drogon::WebSocketClientPtr& /*c*/) {
-                            auto ok = (r == drogon::ReqResult::Ok);
-                            {
-                              std::lock_guard lock(mu);
-                              connected = ok;
-                            }
-                            p.set_value(ok);
-                          });
-  if (f.wait_for(timeout) != std::future_status::ready) {
+  for (const auto& [name, value] : headers) {
+    req->addHeader(name, value);
+  }
+  // A timeout can precede a connection callback or retry. The callback owns
+  // its completion and never accesses this fixture or a caller's stack.
+  client->connectToServer(
+      req, [completion](drogon::ReqResult result,
+                        const drogon::HttpResponsePtr& /*response*/,
+                        const drogon::WebSocketClientPtr& /*websocket*/) {
+        if (!completion->delivered.exchange(true)) {
+          completion->result.set_value(result == drogon::ReqResult::Ok);
+        }
+      });
+  if (future.wait_for(timeout) != std::future_status::ready) {
     return false;
   }
-  return f.get();
+  const bool ok = future.get();
+  {
+    std::lock_guard lock(mu);
+    connected = ok;
+  }
+  return ok;
 }
 
 auto WsTestClient::send_json(const Json::Value& v) -> void {

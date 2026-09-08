@@ -12,6 +12,7 @@ bounded clean shutdown before dropping only its database:
 
 ```sh
 python3 tests/browser/run-production.py --binary build/plinth
+python3 tests/browser/run-production.py --binary build/plinth --realtime
 python3 tests/browser/run-production.py --binary build/plinth --upgrade-cache
 ```
 
@@ -76,3 +77,36 @@ Run `python3 tests/browser/process_cleanup_test.py` after installing the browser
 to verify same-group, detached-child, abandoned-child, and actual Playwright
 timeout cleanup. The real-browser probe disables Playwright's signal handlers
 so its detached Chromium process must be cleaned by the external supervisor.
+
+## Realtime coverage
+
+The `--realtime` production gate runs shell startup and then realtime coverage
+against the same owned database and kernel, with accelerated heartbeat timers.
+It runs separately from `--upgrade-cache`, whose legacy HTTP fixture serves
+the retained-profile cache migration case. Both browser commands run under
+the descendant-owning supervisor described above.
+
+`npm run test:transport --prefix tests/browser` evaluates the unchanged SDK
+module with linked test imports and deterministic sockets/timers. It covers
+authentication gating, granted/denied acknowledgements, removal during auth or
+an outstanding subscribe, duplicate error/close signals, timer cancellation,
+terminal auth failure/displacement, and explicit retry.
+
+`npm run test:realtime --prefix tests/browser` requires `PLINTH_BASE_URL` plus
+`PLINTH_PG_HOST`, `PLINTH_PG_PORT`, `PLINTH_PG_USER`, `PLINTH_PG_PASSWORD`, and
+`PLINTH_PG_DATABASE` pointing to the same task-owned disposable kernel/database.
+Set that kernel's `ws_heartbeat_interval_s` to `0.2` and
+`ws_heartbeat_timeout_s` to `1.0` for the bounded three-heartbeat check.
+The test seeds a synthetic non-admin session/grants, sets its cookie HttpOnly,
+and publishes through PostgreSQL NOTIFY. The real listener, event writer,
+RBAC gates and WebSocket protocol deliver the update to the browser. It checks
+`useData` moving from a controlled HTTP snapshot to an actual published event,
+multiple heartbeat replies, disconnect/reconnect without duplicate channel
+requests, unsubscribe while another channel stays connected, and terminal
+expired-session authentication. It never mocks the WebSocket transport.
+
+C++ transport tests also cover cookie-versus-token authentication races,
+missing/cross-origin/opaque/scheme-mismatched origins, invalid/expired/revoked
+sessions, and configured HTTPS origin over an HTTP proxy upstream. The proxy
+cases run in the isolated `plinth_tests_ws_browser_proxy` CTest process because
+controller configuration is fixed at registration.

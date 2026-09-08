@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace plinth::ws_test {
@@ -87,7 +88,7 @@ auto clear_live_buffer_cap_override() -> void;
 // Synchronous wrapper around drogon::WebSocketClient. One instance per test.
 class WsTestClient {
  public:
-  WsTestClient();
+  explicit WsTestClient(const std::string& server_name = "127.0.0.1");
   ~WsTestClient();
   WsTestClient(const WsTestClient&) = delete;
   auto operator=(const WsTestClient&) -> WsTestClient& = delete;
@@ -96,7 +97,10 @@ class WsTestClient {
 
   // Connect to ws://127.0.0.1:<test_server_port>/ws/events. Returns true
   // on success, false on timeout or error.
-  auto connect(std::chrono::milliseconds timeout) -> bool;
+  auto connect(
+      std::chrono::milliseconds timeout,
+      const std::vector<std::pair<std::string, std::string>>& headers = {})
+      -> bool;
 
   // Send a JSON frame. No-op if not connected.
   auto send_json(const Json::Value& v) -> void;

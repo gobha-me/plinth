@@ -37,6 +37,9 @@ struct Config {
 
   // WebSocket connection lifecycle (per ICD-0.1.6).
   // Tests override these via JSON config to avoid 30+10s waits.
+  // Optional exact public http(s) origin for a trusted TLS-terminating proxy.
+  // Host must still match its authority; forwarded headers are never trusted.
+  std::string ws_browser_origin;
   double ws_auth_timeout_s = 5.0;
   double ws_heartbeat_interval_s = 30.0;
   double ws_heartbeat_timeout_s = 10.0;

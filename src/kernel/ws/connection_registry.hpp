@@ -41,7 +41,10 @@ struct RegistryKeyHash {
 struct RegistryEntry {
   drogon::WebSocketConnectionPtr conn;
   std::shared_ptr<ConnState> state;
-  trantor::EventLoop* loop{nullptr}; // Immutable after publication.
+  // Captured on the owning loop before publication and immutable thereafter.
+  // Displacement never reads another connection's mutable Drogon context.
+  // The coordinator keeps this loop alive through registry owner release.
+  trantor::EventLoop* loop{nullptr};
 };
 
 class ConnectionRegistry {
@@ -49,16 +52,16 @@ class ConnectionRegistry {
   static auto instance() -> ConnectionRegistry&;
 
   // Atomically install `conn` + `state` for `key`, returning the
-  // previously installed connection (if any). Caller is responsible
-  // for closing the displaced connection on its own event loop.
+  // previously installed entry (empty conn if absent). Its owned state and
+  // captured loop survive concurrent connection-context clearing. Caller is
+  // responsible for closing the displaced connection on its own event loop.
   // `state` must be the same `shared_ptr<ConnState>` attached to
   // `conn` via `setContext` — the registry holds its own copy so
   // `cancel_all_timers` can invalidate timers without ever touching
   // the connection's control block during shutdown.
   auto register_connection(const RegistryKey& key,
                            const drogon::WebSocketConnectionPtr& conn,
-                           std::shared_ptr<ConnState> state)
-      -> drogon::WebSocketConnectionPtr;
+                           std::shared_ptr<ConnState> state) -> RegistryEntry;
 
   // Remove `conn` for `key`, but only if `conn` matches the currently
   // installed pointer. Avoids racing with a displacement that already

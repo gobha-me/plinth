@@ -25,6 +25,10 @@ namespace plinth::ws {
 struct ConnState {
   plinth::auth::AuthContext auth;
   bool authenticated{false};
+  // One authentication attempt owns validation and RBAC callbacks. Failure
+  // (including the timeout) seals it against late completions.
+  bool auth_started{false};
+  bool auth_failed{false};
   bool is_admin{false};
 
   // Effective RBAC rules loaded once at WS auth completion (the same
