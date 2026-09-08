@@ -412,28 +412,36 @@ WsTestClient::~WsTestClient() {
 auto WsTestClient::connect(
     std::chrono::milliseconds timeout,
     const std::vector<std::pair<std::string, std::string>>& headers) -> bool {
-  std::promise<bool> p;
-  auto f = p.get_future();
+  struct Completion {
+    std::promise<bool> result;
+    std::atomic<bool> delivered{false};
+  };
+  auto completion = std::make_shared<Completion>();
+  auto future = completion->result.get_future();
   auto req = drogon::HttpRequest::newHttpRequest();
   req->setPath("/ws/events");
   for (const auto& [name, value] : headers) {
     req->addHeader(name, value);
   }
-  client->connectToServer(req,
-                          [this, &p](drogon::ReqResult r,
-                                     const drogon::HttpResponsePtr& /*resp*/,
-                                     const drogon::WebSocketClientPtr& /*c*/) {
-                            auto ok = (r == drogon::ReqResult::Ok);
-                            {
-                              std::lock_guard lock(mu);
-                              connected = ok;
-                            }
-                            p.set_value(ok);
-                          });
-  if (f.wait_for(timeout) != std::future_status::ready) {
+  // A timeout can precede a connection callback or retry. The callback owns
+  // its completion and never accesses this fixture or a caller's stack.
+  client->connectToServer(
+      req, [completion](drogon::ReqResult result,
+                        const drogon::HttpResponsePtr& /*response*/,
+                        const drogon::WebSocketClientPtr& /*websocket*/) {
+        if (!completion->delivered.exchange(true)) {
+          completion->result.set_value(result == drogon::ReqResult::Ok);
+        }
+      });
+  if (future.wait_for(timeout) != std::future_status::ready) {
     return false;
   }
-  return f.get();
+  const bool ok = future.get();
+  {
+    std::lock_guard lock(mu);
+    connected = ok;
+  }
+  return ok;
 }
 
 auto WsTestClient::send_json(const Json::Value& v) -> void {
