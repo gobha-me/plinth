@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "kernel/auth/crypto.hpp"
+#include "kernel/config.hpp"
 #include <catch2/catch_test_macros.hpp>
 
 #include <nlohmann/json.hpp>
@@ -66,13 +67,35 @@ class TempTree {
 class ChildProcess {
  public:
   ChildProcess(std::vector<std::string> args,
-               const std::filesystem::path& output_path) {
+               const std::filesystem::path& output_path,
+               const plinth::Config::Database* database = nullptr) {
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
     for (auto& arg : args) {
       argv.push_back(arg.data());
     }
     argv.push_back(nullptr);
+
+    std::vector<std::string> environment;
+    std::vector<char*> envp;
+    if (database != nullptr) {
+      for (auto** entry = environ; *entry != nullptr; ++entry) {
+        if (!std::string_view{*entry}.starts_with("PLINTH_PG_") &&
+            !std::string_view{*entry}.starts_with("PLINTH_DEV_MODE=")) {
+          environment.emplace_back(*entry);
+        }
+      }
+      environment.emplace_back("PLINTH_DEV_MODE=false");
+      environment.push_back("PLINTH_PG_HOST=" + database->host);
+      environment.push_back("PLINTH_PG_PORT=" + std::to_string(database->port));
+      environment.push_back("PLINTH_PG_USER=" + database->user);
+      environment.push_back("PLINTH_PG_PASSWORD=" + database->password);
+      environment.push_back("PLINTH_PG_DATABASE=" + database->database);
+      for (auto& entry : environment) {
+        envp.push_back(entry.data());
+      }
+      envp.push_back(nullptr);
+    }
 
     posix_spawn_file_actions_t actions;
     REQUIRE(::posix_spawn_file_actions_init(&actions) == 0);
@@ -81,8 +104,9 @@ class ChildProcess {
                 O_CREAT | O_WRONLY | O_TRUNC, 0600) == 0);
     REQUIRE(::posix_spawn_file_actions_adddup2(&actions, STDOUT_FILENO,
                                                STDERR_FILENO) == 0);
-    int rc = ::posix_spawn(&pid, args.front().c_str(), &actions, nullptr,
-                           argv.data(), environ);
+    int rc =
+        ::posix_spawn(&pid, args.front().c_str(), &actions, nullptr,
+                      argv.data(), database == nullptr ? environ : envp.data());
     ::posix_spawn_file_actions_destroy(&actions);
     REQUIRE(rc == 0);
   }
@@ -316,6 +340,7 @@ auto write_config(const TempTree& tree, std::uint16_t port,
         {"bundle_path",
          std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled"}}}};
   if (!isolated_database.empty()) {
+    config["dev_mode"] = false;
     config["realtime"]["coalescer"]["window_ms"] = 10000;
   }
   auto path = tree.path / "config.json";
@@ -363,6 +388,7 @@ auto open_database(const std::string& override_name = {}) -> PgConnection {
 auto sql(PGconn* connection, const std::string& query,
          const std::vector<std::string>& parameters = {}) -> PgResult {
   std::vector<const char*> values;
+  values.reserve(parameters.size());
   for (const auto& parameter : parameters) {
     values.push_back(parameter.c_str());
   }
@@ -371,6 +397,8 @@ auto sql(PGconn* connection, const std::string& query,
                                values.data(), nullptr, nullptr, 0),
                   PQclear};
   const auto status = PQresultStatus(result.get());
+  INFO(query);
+  INFO(PQresultErrorMessage(result.get()));
   REQUIRE((status == PGRES_TUPLES_OK || status == PGRES_COMMAND_OK));
   return result;
 }
@@ -400,6 +428,10 @@ class IsolatedDatabase {
 };
 
 auto receive_exact(int fd, std::size_t length) -> std::string {
+  if (fd < 0) {
+    FAIL("cannot receive a WebSocket frame from an invalid socket");
+    return {};
+  }
   std::string data(length, '\0');
   std::size_t offset = 0;
   while (offset < length) {
@@ -512,8 +544,16 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
   TempTree tree;
   auto port = test_port();
   auto config = write_config(tree, port, true, database.name);
+  plinth::Config::Database child_database;
+  child_database.host = *required_env("PLINTH_PG_HOST");
+  child_database.port =
+      static_cast<std::uint16_t>(std::stoi(*required_env("PLINTH_PG_PORT")));
+  child_database.user = *required_env("PLINTH_PG_USER");
+  child_database.password = *required_env("PLINTH_PG_PASSWORD");
+  child_database.database = database.name;
   ChildProcess child{{PLINTH_BINARY_PATH, "serve", "--config", config.string()},
-                     tree.path / "process.log"};
+                     tree.path / "process.log",
+                     &child_database};
   REQUIRE(wait_for_health(port, 30s));
   auto connection = open_database(database.name);
   auto user = sql(connection.get(),
@@ -599,7 +639,8 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
 
   ChildProcess restarted{
       {PLINTH_BINARY_PATH, "serve", "--config", config.string()},
-      tree.path / "restarted.log"};
+      tree.path / "restarted.log",
+      &child_database};
   REQUIRE(wait_for_health(port, 30s));
   auto replay = authenticated_socket(port, token);
   send_frame(replay.fd, {{"type", "subscribe"},
