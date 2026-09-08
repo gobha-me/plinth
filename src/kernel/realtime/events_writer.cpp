@@ -105,6 +105,9 @@ PreBrokerHook g_pre_broker_hook;
 
 // Process-wide success counter — Phase 3 seam for E.* assertions.
 std::atomic<std::uint64_t> g_writes_persisted{0};
+// A queue-empty observation is not proof of persistence when an entry was
+// dropped or its INSERT failed. Preserve that failure through shutdown retries.
+std::atomic<bool> g_delivery_failed{false};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -276,6 +279,7 @@ auto insert_envelope(QueueEntry entry) -> drogon::Task<void> {
     }
     auto result = hook(ev.channel, ev.envelope);
     if (!result.has_value()) {
+      g_delivery_failed.store(true);
       audit_write_failed(ev.channel, "pg_error", result.error(),
                          /*queue_depth=*/0);
       co_return;
@@ -307,6 +311,7 @@ auto insert_envelope(QueueEntry entry) -> drogon::Task<void> {
   // ── Production arm ───────────────────────────────────────────────
   auto db = db_client();
   if (!db) {
+    g_delivery_failed.store(true);
     audit_write_failed(ev.channel, "pg_error", "connection_unavailable",
                        /*queue_depth=*/0);
     co_return;
@@ -378,8 +383,11 @@ auto insert_envelope(QueueEntry entry) -> drogon::Task<void> {
   }
   if (committed) {
     g_writes_persisted.fetch_add(1, std::memory_order_relaxed);
-  } else if (!err.empty()) {
-    audit_write_failed(ev.channel, "pg_error", err, /*queue_depth=*/0);
+  } else {
+    g_delivery_failed.store(true);
+    if (!err.empty()) {
+      audit_write_failed(ev.channel, "pg_error", err, /*queue_depth=*/0);
+    }
   }
   co_return;
 }
@@ -430,9 +438,14 @@ auto drain_one() -> void {
         // out-of-scope references after the move into the coroutine frame.
         [e = std::move(*entry),
          completion = std::move(completion)]() mutable -> drogon::Task<> {
-          co_await insert_envelope(std::move(e));
+          try {
+            co_await insert_envelope(std::move(e));
+          } catch (...) {
+            g_delivery_failed.store(true);
+          }
         });
   } catch (...) {
+    g_delivery_failed.store(true);
     // bad_weak_ptr if drogon's primary loop isn't initialized
     // (test-mode subprocess); without a catch the exception escapes
     // drain_one's runEvery callback, trantor's EventLoop::loop catches
@@ -520,6 +533,7 @@ auto handler(const DispatchedEvent& ev) -> void {
     }
   }
   if (dropped) {
+    g_delivery_failed.store(true);
     audit_write_failed(ev.channel, "queue_full", /*sqlstate=*/"",
                        depth_at_drop);
   }
@@ -552,7 +566,7 @@ auto drain_until(std::chrono::steady_clock::time_point deadline) -> bool {
     try {
       drogon::sync_wait(insert_envelope(std::move(*entry)));
     } catch (...) {
-      // the audit pipeline upstream of the throw already logged.
+      g_delivery_failed.store(true);
     }
   }
 }
@@ -571,6 +585,7 @@ auto start(const Config::Realtime::Events& cfg) -> void {
     g_cfg = cfg;
   }
   g_shutting_down.store(false);
+  g_delivery_failed.store(false);
   {
     std::lock_guard alock(g_audit_mu);
     g_write_failed_windows.clear();
@@ -607,7 +622,7 @@ auto current_config() -> Config::Realtime::Events {
 auto stop(std::chrono::milliseconds timeout) -> bool {
   std::lock_guard lock(g_lifecycle_mu);
   if (!g_running.load()) {
-    return true;
+    return !g_delivery_failed.load();
   }
   g_shutting_down.store(true);
   g_queue_cv.notify_all();
@@ -659,6 +674,11 @@ auto stop(std::chrono::milliseconds timeout) -> bool {
   try {
     drogon::sync_wait(plinth::realtime::cursor_store::flush_all_for_shutdown());
   } catch (...) {
+    g_delivery_failed.store(true);
+  }
+
+  if (std::chrono::steady_clock::now() >= deadline) {
+    return false;
   }
 
   if (g_loop_thread.has_value()) {
@@ -666,7 +686,7 @@ auto stop(std::chrono::milliseconds timeout) -> bool {
     g_loop_thread.reset(); // joins thread
   }
   g_running.store(false);
-  return true;
+  return !g_delivery_failed.load();
 }
 
 auto is_running_for_test() -> bool {

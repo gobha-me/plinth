@@ -28,10 +28,11 @@
 
 - Production `main` owns startup and shutdown through one idempotent, bounded
   coordinator. Tests use that same coordinator and dependency order.
-- Shutdown order is: close ingress; cancel timers and stop listeners; cancel
-  and join owned async work; flush database-backed state while the database is
-  alive; destroy extension and JavaScript runtimes; stop Drogon/event loops;
-  close logging last.
+- Follow the graph in `docs/architecture/shutdown.md`: close ingress and its
+  timers; stop the capability listener; drain owned work and runtime leases;
+  flush coalescer windows while realtime LISTEN and the writer remain alive;
+  acknowledge notification delivery and drain persistence; stop realtime and
+  Drogon/event loops; close logging last.
 - Every thread, timer, callback, coroutine, runtime, and database operation has
   an explicit owner and join/cancel protocol. Do not detach work or let raw
   pointers cross asynchronous lifetime boundaries.

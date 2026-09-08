@@ -40,6 +40,8 @@ auto start(const Config::Realtime::Events& cfg) -> void;
 // thread. The smaller of `timeout` and `cfg.shutdown_drain_ms` is used. False
 // leaves the remaining work owned and retryable; its database and event-loop
 // dependencies must remain alive. Idempotent.
+// An entry dropped at admission or a failed INSERT is remembered until the
+// next start(): draining an empty queue cannot turn lost delivery into success.
 [[nodiscard]] auto stop(
     std::chrono::milliseconds timeout = std::chrono::seconds{40}) -> bool;
 

@@ -20,6 +20,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <future>
 #include <libpq-fe.h>
 #include <memory>
 #include <mutex>
@@ -131,6 +132,89 @@ auto settle_listen() -> void {
 }
 
 } // namespace
+
+TEST_CASE("realtime shutdown cannot acknowledge an unavailable listener",
+          "[realtime][unit][shutdown]") {
+  plinth::realtime::start_listener(unreachable_db_cfg(),
+                                   make_test_listener_cfg());
+  CHECK_FALSE(plinth::realtime::drain_listener(std::chrono::milliseconds{0}));
+  CHECK_FALSE(plinth::realtime::drain_listener(std::chrono::milliseconds{200}));
+  REQUIRE(plinth::realtime::stop_listener());
+  REQUIRE(plinth::realtime::drain_listener(std::chrono::milliseconds{0}));
+}
+
+TEST_CASE("realtime shutdown acknowledges prior handlers and hides its marker",
+          "[realtime][integration][shutdown]") {
+  using namespace std::chrono_literals;
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  std::mutex mu;
+  std::condition_variable cv;
+  bool ready = false;
+  bool entered = false;
+  bool release = false;
+  int target_calls = 0;
+  int unexpected_calls = 0;
+  plinth::realtime::clear_handlers_for_test();
+  plinth::realtime::register_handler([&](const auto& event) {
+    std::unique_lock lock(mu);
+    if (event.channel == "plinth:system:shutdown_ready") {
+      ready = true;
+      cv.notify_all();
+    } else if (event.channel == "plinth:system:shutdown_target") {
+      entered = true;
+      ++target_calls;
+      cv.notify_all();
+      cv.wait(lock, [&] { return release; });
+    } else {
+      ++unexpected_calls;
+    }
+  });
+  plinth::realtime::start_listener(pg_config(), make_test_listener_cfg());
+  struct Cleanup {
+    ~Cleanup() {
+      (void)plinth::realtime::stop_listener();
+      plinth::realtime::clear_handlers_for_test();
+    }
+  } cleanup;
+  SidePg side{pg_config()};
+  const auto deadline = std::chrono::steady_clock::now() + 3s;
+  bool listener_ready = false;
+  while (std::chrono::steady_clock::now() < deadline) {
+    REQUIRE(side_notify(
+        side,
+        R"({"layer":"system","channel":"plinth:system:shutdown_ready"})"));
+    std::unique_lock lock(mu);
+    if (cv.wait_for(lock, 10ms, [&] { return ready; })) {
+      listener_ready = true;
+      break;
+    }
+  }
+  REQUIRE(listener_ready);
+  REQUIRE(side_notify(
+      side, R"({"layer":"system","channel":"plinth:system:shutdown_target"})"));
+  bool observed = false;
+  {
+    std::unique_lock lock(mu);
+    observed = cv.wait_for(lock, 3s, [&] { return entered; });
+  }
+  auto drain = std::async(std::launch::async,
+                          [] { return plinth::realtime::drain_listener(3s); });
+  const auto blocked = drain.wait_for(25ms);
+  {
+    std::lock_guard lock(mu);
+    release = true;
+  }
+  cv.notify_all();
+  REQUIRE(observed);
+  REQUIRE(blocked == std::future_status::timeout);
+  REQUIRE(drain.get());
+  REQUIRE(plinth::realtime::drain_listener(0ms));
+  REQUIRE(plinth::realtime::stop_listener());
+  REQUIRE(target_calls == 1);
+  REQUIRE(unexpected_calls == 0);
+}
 
 TEST_CASE("R.02 start_listener with enabled=false does not spawn thread",
           "[realtime][unit]") {

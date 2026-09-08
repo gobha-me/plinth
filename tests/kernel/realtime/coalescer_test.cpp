@@ -438,3 +438,16 @@ TEST_CASE("E.04 shutdown drains an open window",
   CHECK(cap->envelopes.at(0)["channel"].asString() ==
         "plinth:data:ext_notes.notes");
 }
+
+TEST_CASE("coalescer shutdown reports an earlier discarded flush failure",
+          "[realtime][coalescer][unit][shutdown]") {
+  auto cap = std::make_shared<Captured>();
+  cap->inject_failure = true;
+  reset_and_start(default_cfg(), cap);
+  auto& reg = CoalescerRegistry::instance();
+  reg.record_write("ext_shutdown", "records", OpKind::INSERT, 1, "shutdown");
+  reg.drain_extension("shutdown");
+  REQUIRE(reg.open_window_count_for_test() == 0);
+  REQUIRE_FALSE(reg.shutdown());
+  REQUIRE_FALSE(reg.shutdown());
+}
