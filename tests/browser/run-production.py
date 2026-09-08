@@ -14,6 +14,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from process_cleanup import run_browser
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -80,8 +82,8 @@ def main():
                     if time.monotonic() >= deadline:
                         raise TimeoutError("kernel startup exceeded 30 seconds")
                     time.sleep(0.05)
-                subprocess.run(["npm", "test", "--prefix", str(repo / "tests/browser")],
-                               env=child_env, check=True, timeout=180)
+                run_browser(["npm", "test", "--prefix", str(repo / "tests/browser")],
+                            env=child_env, timeout=180)
                 child.send_signal(signal.SIGTERM)
                 if child.wait(timeout=55) != 0:
                     raise RuntimeError(f"kernel shutdown failed: {child.returncode}")
