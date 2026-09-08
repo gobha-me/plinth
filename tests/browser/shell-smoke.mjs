@@ -62,11 +62,16 @@ try {
                 }
                 const types = { '.html': 'text/html', '.js': 'application/javascript',
                     '.css': 'text/css', '.woff2': 'font/woff2' };
+                let body = await readFile(file);
+                if (relative === 'index.html') {
+                    body = Buffer.from(body.toString().replace('<!-- PLINTH_VERSIONED_ASSET_BASE -->',
+                        `<base href="${prefix}">`));
+                }
                 res.writeHead(200, {
                     'Content-Type': types[extname(file)] || 'application/octet-stream',
                     'Content-Security-Policy': csp,
                     'Cache-Control': 'no-cache',
-                }).end(await readFile(file));
+                }).end(body);
             } catch { res.writeHead(404).end(); }
         });
         await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -138,7 +143,7 @@ try {
             const container = document.createElement('div');
             container.id = 'sdk-smoke';
             document.body.append(container);
-            const { loadPanel } = await import('/app/panels/loader.js');
+            const { loadPanel } = await import(new URL('panels/loader.js', document.baseURI).href);
             await loadPanel('sdk-demo', '0.1.0', 'demo', container, {
                 panel: { id: 'demo', client_path: 'demo.js' },
             });

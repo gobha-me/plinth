@@ -153,6 +153,25 @@ browser fetches fresh assets, and the 1.2.3 assets become
 garbage-collectable after a drain window (`DESIGN-packages-v04x.md
 §install-lifecycle` for the atomic-swap contract).
 
+The active frontend mount (normally `/app/`) is a mutable alias. Every response
+under that mount, including HTML, JavaScript modules, styles, fonts and images,
+uses `Cache-Control: no-cache`. Browsers revalidate those URLs on ordinary
+revisits after frontend replacement and kernel restart; the full asset graph
+must use the replacement version without requiring a hard reload or cleared
+profile. This does not change immutable caching on `/ext/{name}/{version}/*`.
+
+Previously delivered immutable mount responses cannot be invalidated by new
+headers alone. The bundled entry therefore includes the exact opt-in marker
+`<!-- PLINTH_VERSIONED_ASSET_BASE -->` before any asset reference. The mount
+handler replaces it with `<base href="/ext/{name}/{version}/">`, encoding each
+route segment from the active package. Relative scripts, styles and import-map
+targets all resolve under that version; the import-map bytes and their CSP
+digest stay unchanged. The document URL remains at the mount. Custom frontend
+documents without the marker retain their existing bytes and base behavior;
+their authors can opt in before their asset references when adopting the same
+versioned delivery contract. This marker is interpreted only in the configured
+entry document, including SPA fallback responses.
+
 **No build step.** Extensions ship source files directly. The shell
 and any other frontend loads them via native ES modules. Shared
 dependencies (Preact, htm, the kernel SDK, design tokens) live in the

@@ -491,12 +491,12 @@ header is removed in the 0.6.1 code session.
    passes a path. The same `validate_zip_structure`,
    `extract_to_data_dir`, `run_migrations`, `register_capabilities`,
    `register_rbac_rules`, `activate_routes` calls run unchanged.
-4. **CSP / cache headers identical.** The static-asset surface
+4. **CSP retained; mutable assets revalidate.** The static-asset surface
    served by §4's manifest-driven dispatch reads from
    `<data_dir>/extensions/shell/<version>/client/` and applies the
-   same strict CSP + immutable-cache-for-named-assets / no-cache-
-   for-`index.html` posture ICD-0.6.0 §8.2 already pinned. Byte
-   identity preserved.
+   same strict CSP and `no-cache` revalidation for every mutable
+   mount URL, including named assets and `index.html`. Versioned
+   `/ext/{name}/{version}/*` assets retain immutable caching.
 
 ### 3.3 New `Provenance::Bundled` value
 
@@ -836,13 +836,20 @@ handler(request, callback):
 
   callback(serve(resolved,
                  mime_for(resolved),
-                 cache: "public, max-age=31536000, immutable",
+                 cache: "no-cache",
                  csp: STRICT_CSP))
 ```
 
 Strict CSP (`script-src 'self'; style-src 'self' 'unsafe-inline';
 connect-src 'self'`) is unchanged from ICD-0.6.0 §8.2. Cache
-headers unchanged. The `is_named_asset` predicate is satisfied if
+headers require revalidation throughout the mutable mount. The bundled entry
+opts into `<!-- PLINTH_VERSIONED_ASSET_BASE -->` before its asset references;
+the server replaces this marker with an encoded active-package `/ext/` base.
+Its complete relative asset graph therefore bypasses previously cached
+immutable mount URLs after an upgrade. Import-map bytes and their CSP digest
+stay unchanged. Custom entries without the marker retain their own base and
+byte content. The
+`is_named_asset` predicate is satisfied if
 the file exists under `client_dir`; the named-set whitelist from
 ICD-0.6.0 §8.2 is dropped because the on-disk tree is the
 authoritative set (the bundle's structural validation already
@@ -1483,8 +1490,8 @@ contract is just the round-trip.
   out-of-scope until 0.6.4 / 0.6.6.
 - **CSP + cache headers** (ICD-0.6.0 §8.2 + §11) — strict CSP
   applied verbatim by the new manifest-driven dispatch (§4.5);
-  `index.html` cached `no-cache`, named assets cached
-  `public, max-age=31536000, immutable`.
+  all mutable mount assets cached `no-cache`; versioned
+  `/ext/{name}/{version}/*` assets remain immutable.
 - **Vendored Preact + htm versions** (ICD-0.6.0 §4.3 +
   Appendix B) — `preact.module.js@10.22.0` and
   `htm.module.js@3.1.1` ship inside `shell.zip` at the same
@@ -1826,7 +1833,7 @@ asserts against the contracts here.
 | Case  | Scenario                                                                                           |
 |-------|----------------------------------------------------------------------------------------------------|
 | M.01  | Fresh install; `GET /` → 302 `/app/`; `GET /app/` → 200 `index.html` with strict CSP + no-cache    |
-| M.02  | `GET /app/shell.js` → 200 with `application/javascript` and `public, max-age=31536000, immutable` |
+| M.02  | `GET /app/shell.js` → 200 with `application/javascript` and `no-cache` |
 | M.03  | `GET /app/index.html` (named index) → 200 with no-cache + html mime                                |
 | M.04  | `GET /app/login` (no extension, SPA fallback) → 200 `index.html`                                  |
 | M.05  | `GET /app/missing.css` → 404 (not SPA-fallback because explicit extension)                         |
