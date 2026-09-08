@@ -351,6 +351,12 @@ TEST_CASE(
     PQfinish(conn);
   }
 
+  // A retained installation includes the active pointer matching its
+  // committed package row; an absent/mismatched pointer requires recovery.
+  auto installed = s.ctx.data_dir / "extensions" / "preinstalled-fe";
+  fs::create_directories(installed / "1.0.0");
+  fs::create_symlink("1.0.0", installed / "active");
+
   auto fb = plinth::shell::ensure_bundled_shell_installed(s.cfg, s.ctx);
   REQUIRE(fb.has_value());
 
