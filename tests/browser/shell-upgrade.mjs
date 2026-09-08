@@ -7,7 +7,8 @@ import { chromium } from 'playwright';
 
 const baseURL = process.env.PLINTH_BASE_URL;
 assert(baseURL, 'run through run-production.py --upgrade-cache');
-const profile = await mkdtemp(join(tmpdir(), 'plinth-upgrade-profile-'));
+const profile = process.env.PLINTH_BROWSER_PROFILE_DIR ||
+    await mkdtemp(join(tmpdir(), 'plinth-upgrade-profile-'));
 const commands = createInterface({ input: process.stdin });
 const iterator = commands[Symbol.asyncIterator]();
 let context;

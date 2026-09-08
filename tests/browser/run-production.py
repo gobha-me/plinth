@@ -17,6 +17,8 @@ import urllib.request
 import uuid
 import zipfile
 
+from process_cleanup import run_browser, start_browser, stop_browser
+
 
 def package_cache_probe(repo, root, version):
     """Package the real shell with observable versions throughout its graph."""
@@ -133,6 +135,7 @@ def main():
             child_env["PLINTH_DEV_MODE"] = "false"
             child_env["PLINTH_MIGRATIONS_DIR"] = str(repo / "migrations")
             child_env["PLINTH_BASE_URL"] = f"http://127.0.0.1:{port}"
+            child_env["PLINTH_BROWSER_PROFILE_DIR"] = str(root / "browser-profile")
             browser_tmp = root / "browser-tmp"
             browser_tmp.mkdir()
             child_env["TMPDIR"] = str(browser_tmp)
@@ -141,7 +144,7 @@ def main():
             browser = None
             try:
                 if args.upgrade_cache:
-                    browser = subprocess.Popen(
+                    browser = start_browser(
                         ["node", str(repo / "tests/browser/shell-upgrade.mjs")],
                         env=child_env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                         text=True)
@@ -179,20 +182,15 @@ def main():
                     if browser.returncode != 0:
                         raise RuntimeError(f"cached-browser upgrade failed: {browser.returncode}")
                 else:
-                    subprocess.run(["npm", "test", "--prefix", str(repo / "tests/browser")],
-                                   env=child_env, check=True, timeout=180)
+                    run_browser(["npm", "test", "--prefix", str(repo / "tests/browser")],
+                                env=child_env, timeout=180)
                 stop_kernel(child)
             except BaseException:
                 print(output_path.read_text(), flush=True)
                 raise
             finally:
-                if browser is not None and browser.poll() is None:
-                    browser.terminate()
-                    try:
-                        browser.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        browser.kill()
-                        browser.wait(timeout=5)
+                if browser is not None:
+                    stop_browser(browser)
                 if child.poll() is None:
                     child.send_signal(signal.SIGTERM)
                     try:
