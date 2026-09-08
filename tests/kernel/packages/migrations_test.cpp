@@ -598,19 +598,60 @@ TEST_CASE("caller-owned migrations roll back earlier files, data and tracking",
   write("002_change.sql", "ALTER TABLE ext_" + name +
                               ".retained ADD COLUMN extra TEXT; UPDATE ext_" +
                               name + ".retained SET value=9;");
+  bool expect_success = false;
+  bool transaction_control = true;
   SECTION("a later SQL failure cannot leave an earlier new file committed") {
     write("003_fail.sql", "SELECT 1/0;");
+    transaction_control = false;
   }
   SECTION(
       "migration transaction control cannot escape the owning transaction") {
     write("003_fail.sql", "/* legitimate comments are ignored */ COMMIT;");
   }
+  SECTION("escape strings cannot hide a following COMMIT") {
+    write("003_fail.sql", R"(SELECT E'it\'s'; COMMIT; SELECT 'x';)");
+  }
+  SECTION("ordinary strings honor standard_conforming_strings off") {
+    write("003_fail.sql", R"(SET LOCAL standard_conforming_strings=off;
+SELECT 'it\'s'; COMMIT; SELECT 'x';)");
+  }
+  SECTION("set_config changes are observed before lexing the next statement") {
+    write("003_fail.sql",
+          R"(SELECT set_config('standard_conforming_strings', 'off', true);
+SELECT 'it\'s'; COMMIT; SELECT 'x';)");
+  }
+  SECTION("ordinary standard strings do not acquire escape-string semantics") {
+    write("003_fail.sql", R"(SET LOCAL standard_conforming_strings=on;
+SELECT 'ends\'; COMMIT; SELECT 'x';)");
+  }
+  SECTION(
+      "dollar literals and nested comments cannot hide transaction control") {
+    write("003_fail.sql", R"(SELECT $quoted$'; /* COMMIT; */ '$quoted$;
+/* outer /* nested */ still outer */ COMMIT;)");
+  }
+  SECTION("quoted identifiers cannot hide a following COMMIT") {
+    write("003_fail.sql", R"(SELECT 1 AS "name; ""COMMIT"""; COMMIT;)");
+  }
+  SECTION("literal transaction keywords and procedural BEGIN remain valid") {
+    write("003_fail.sql", R"(SELECT E'it\'s; COMMIT;';
+SELECT 1 AS "name; ""COMMIT""";
+DO $body$ BEGIN PERFORM 'COMMIT;'; END $body$;
+/* outer /* nested */ comment */ SELECT 'ROLLBACK;';)");
+    expect_success = true;
+  }
   REQUIRE(PQresultStatus(pg.exec("BEGIN").get()) == PGRES_COMMAND_OK);
   auto result =
       run_migrations(name, staged.root, *pg.conn,
                      plinth::packages::MigrationTransaction::CALLER_OWNED);
-  REQUIRE_FALSE(result.has_value());
-  REQUIRE(result.error().migration_file == "003_fail.sql");
+  REQUIRE(result.has_value() == expect_success);
+  if (!expect_success) {
+    REQUIRE(result.error().migration_file == "003_fail.sql");
+    if (transaction_control) {
+      REQUIRE(result.error().message ==
+              "caller-owned migrations cannot contain transaction control");
+      REQUIRE(PQtransactionStatus(pg.conn) == PQTRANS_INTRANS);
+    }
+  }
   REQUIRE(PQresultStatus(pg.exec("ROLLBACK").get()) == PGRES_COMMAND_OK);
   REQUIRE(row_count(pg, name) == 1);
   auto retained = pg.exec("SELECT * FROM ext_" + name + ".retained");

@@ -26,6 +26,10 @@ The new package retains BUNDLED provenance. Pending bundled migrations,
 registration and activation share one database transaction; a later failing
 migration or extraction rolls back earlier new files' schema/data changes and
 migration tracking. Pending migrations cannot contain transaction-control SQL.
+The caller-owned runner executes one statement at a time using PostgreSQL's
+single-command protocol. Its lexer honors escape strings, dollar quoting,
+quoted identifiers, nested comments and the connection's current
+`standard_conforming_strings` setting before each statement.
 This transaction mode does not change ordinary USER package behavior.
 
 On a validation or migration failure, the old installation remains usable.

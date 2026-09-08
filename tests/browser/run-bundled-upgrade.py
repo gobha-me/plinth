@@ -2,6 +2,7 @@
 """Retained-install operator upgrade and persistent-profile regression (real PG/kernel)."""
 
 import argparse
+from contextlib import ExitStack
 import importlib.util
 import json
 import os
@@ -19,6 +20,7 @@ import uuid
 import zipfile
 
 from process_cleanup import start_browser, stop_browser
+from cache_transition import CacheTransition
 
 spec = importlib.util.spec_from_file_location("production", Path(__file__).with_name("run-production.py"))
 production = importlib.util.module_from_spec(spec)
@@ -47,11 +49,11 @@ def main():
 
     sql(f'CREATE DATABASE "{database}"', admin=True)
     try:
-        with tempfile.TemporaryDirectory(prefix="plinth-bundled-upgrade-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="plinth-bundled-upgrade-") as temporary, ExitStack() as owned:
             root = Path(temporary)
             bundles = root / "bundled"
             bundles.mkdir()
-            old = production.package_cache_probe(repo, root, "901.0.1")
+            old = production.package_cache_probe(repo, root, "901.0.1", legacy_document=True)
             new = production.package_cache_probe(repo, root, "901.0.2")
             shutil.copyfile(old, bundles / "shell.zip")
             with socket.socket() as probe:
@@ -70,6 +72,11 @@ def main():
                 PLINTH_MIGRATIONS_DIR=str(repo / "migrations"),
                 PLINTH_BASE_URL=f"http://127.0.0.1:{port}",
                 PLINTH_BROWSER_PROFILE_DIR=str(root / "browser-profile"))
+            browser_tmp = root / "browser-tmp"
+            browser_tmp.mkdir()
+            env["TMPDIR"] = str(browser_tmp)
+            transition = owned.enter_context(CacheTransition(port))
+            env["PLINTH_BASE_URL"] = transition.origin
             children = []
             browser = None
 
@@ -184,7 +191,8 @@ def main():
                 assert failed_id == validation_id
                 failure_audits = sql("SELECT count(*) FROM plinth.audit_log WHERE action='packages.bundled_upgrade_failed'")
                 # Transaction control cannot escape the encompassing transaction.
-                candidate("901.0.5", [first_migration, ("003_commit.sql", "COMMIT;")])
+                candidate("901.0.5", [first_migration,
+                    ("003_commit.sql", r"SELECT E'it\'s'; COMMIT; SELECT 'x';")])
                 launch(upgrade=True, fails="cannot contain transaction control")
                 unchanged()
                 # Registration failure must also roll back already successful migrations.
@@ -208,6 +216,7 @@ def main():
                 assert (collision / "sentinel").read_text() == "retain unrelated files"
                 candidate("901.0.2", [("002_upgrade_probe.sql",
                     "ALTER TABLE ext_shell.user_preferences ADD COLUMN upgrade_probe TEXT;")])
+                transition.legacy.clear()
                 child = launch(upgrade=True)
                 after = snapshot()
                 # Added column has a null default; compare preserved values explicitly.
@@ -234,16 +243,26 @@ def main():
                 production.stop_kernel(child)
                 print("PASS explicit bundled upgrade: retained data/grants/IDs/history, rollback controls, cached browser")
             finally:
-                if browser is not None:
-                    stop_browser(browser)
-                for child in children:
-                    if child.poll() is None:
-                        child.send_signal(signal.SIGTERM)
+                try:
+                    if browser is not None:
+                        stop_browser(browser)
+                finally:
+                    # Every kernel must be attempted even if another owned
+                    # process reports a cleanup failure.
+                    cleanup_error = None
+                    for child in children:
                         try:
-                            child.wait(timeout=55)
-                        except subprocess.TimeoutExpired:
-                            child.kill()
-                            child.wait(timeout=5)
+                            if child.poll() is None:
+                                child.send_signal(signal.SIGTERM)
+                                try:
+                                    child.wait(timeout=55)
+                                except subprocess.TimeoutExpired:
+                                    child.kill()
+                                    child.wait(timeout=5)
+                        except BaseException as error:
+                            cleanup_error = error
+                    if cleanup_error is not None:
+                        raise cleanup_error
     finally:
         sql(f'DROP DATABASE "{database}" WITH (FORCE)', admin=True)
 
