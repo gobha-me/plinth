@@ -973,6 +973,7 @@ TEST_CASE("production preserves PostgreSQL credentials across boot and restart",
     auto config_path = write_config(tree, port, true);
     auto config = nlohmann::json::parse(read_text(config_path));
     config["dev_mode"] = false;
+    config["shell"]["enabled"] = true;
     {
       std::ofstream stream(config_path);
       REQUIRE(stream.good());
