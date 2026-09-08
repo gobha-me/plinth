@@ -65,7 +65,7 @@ def main():
                 "listen_host": "127.0.0.1", "listen_port": port,
                 "migrations_dir": str(repo / "migrations"),
                 "packages": {"data_dir": str(root / "data"), "staging_dir": str(root / "staging")},
-                "shell": {"bundle_path": str(bundles)}}))
+                "shell": {"enabled": True, "bundle_path": str(bundles)}}))
             env = os.environ | {"PLINTH_PG_" + suffix: pg_env["PG" + suffix]
                                 for suffix in ("HOST", "PORT", "USER", "PASSWORD")}
             env.update(PLINTH_PG_DATABASE=database, PLINTH_PG_POOL_SIZE="4", PLINTH_DEV_MODE="false",
