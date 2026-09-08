@@ -589,6 +589,9 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
       {EVENT_CHANNEL});
 
   if (accepted_websocket_work) {
+    // The blocking transaction caches PostgreSQL statistics snapshots. Use an
+    // independent autocommit observer so every admission poll sees new work.
+    auto observer = open_database(database.name);
     auto websocket = authenticated_socket(port, token);
     sql(connection.get(), "BEGIN");
     sql(connection.get(),
@@ -601,7 +604,7 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
     // extension before the signal. Release it only after signaling shutdown.
     const bool admitted = wait_for_condition(
         [&] {
-          return scalar(connection.get(),
+          return scalar(observer.get(),
                         "SELECT count(*) FROM pg_stat_activity "
                         "WHERE datname = current_database() AND pid <> "
                         "pg_backend_pid() "
@@ -613,6 +616,7 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
       child.send_signal(signal);
     }
     sql(connection.get(), "ROLLBACK");
+    INFO(read_text(tree.path / "process.log"));
     REQUIRE(admitted);
   } else {
     delete_preference(port, token, "shutdown_target");
