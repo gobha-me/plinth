@@ -2,6 +2,7 @@
 """Run browser smoke against a real kernel and an owned disposable database."""
 
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -18,9 +19,10 @@ import uuid
 import zipfile
 
 from process_cleanup import run_browser, start_browser, stop_browser
+from cache_transition import CacheTransition
 
 
-def package_cache_probe(repo, root, version):
+def package_cache_probe(repo, root, version, *, legacy_document=False):
     """Package the real shell with observable versions throughout its graph."""
     stage = root / ("package-" + version)
     shutil.copytree(repo / "client/shell", stage)
@@ -33,6 +35,9 @@ def package_cache_probe(repo, root, version):
         with script.open("a") as output:
             output.write("\n;(globalThis.__plinthCacheVersions ??= []).push(" + marker + ");\n")
     document = client / "index.html"
+    if legacy_document:
+        document.write_text(document.read_text().replace(
+            "<!-- PLINTH_VERSIONED_ASSET_BASE -->", ""))
     document.write_text(document.read_text().replace(
         "</head>", f'<meta name="plinth-cache-version" content="{version}">\n</head>'))
     with (client / "css/tokens.css").open("a") as output:
@@ -87,7 +92,11 @@ def main():
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--upgrade-cache", action="store_true",
                         help="replace two packaged frontend versions with one cached browser profile")
+    parser.add_argument("--legacy-cache-negative-control", action="store_true",
+                        help="also omit the replacement base; upgrade cache regression must fail")
     args = parser.parse_args()
+    if args.legacy_cache_negative_control and not args.upgrade_cache:
+        parser.error("--legacy-cache-negative-control requires --upgrade-cache")
     binary = args.binary.resolve(strict=True)
     repo = Path(__file__).resolve().parents[2]
     database = "plinth_browser_" + uuid.uuid4().hex
@@ -104,15 +113,17 @@ def main():
 
     sql(f'CREATE DATABASE "{database}"')
     try:
-        with tempfile.TemporaryDirectory(prefix="plinth-browser-server-") as temporary:
+        with tempfile.TemporaryDirectory(prefix="plinth-browser-server-") as temporary, ExitStack() as resources:
             root = Path(temporary)
             bundle_path = binary.parent / "share/plinth/bundled"
             replacement = None
             if args.upgrade_cache:
                 bundle_path = root / "bundled"
                 bundle_path.mkdir()
-                shutil.copyfile(package_cache_probe(repo, root, "901.0.1"), bundle_path / "shell.zip")
-                replacement = package_cache_probe(repo, root, "901.0.2")
+                shutil.copyfile(package_cache_probe(repo, root, "901.0.1", legacy_document=True),
+                                bundle_path / "shell.zip")
+                replacement = package_cache_probe(repo, root, "901.0.2",
+                                                  legacy_document=args.legacy_cache_negative_control)
             with socket.socket() as probe:
                 probe.bind(("127.0.0.1", 0))
                 port = probe.getsockname()[1]
@@ -135,6 +146,10 @@ def main():
             child_env["PLINTH_DEV_MODE"] = "false"
             child_env["PLINTH_MIGRATIONS_DIR"] = str(repo / "migrations")
             child_env["PLINTH_BASE_URL"] = f"http://127.0.0.1:{port}"
+            transition = None
+            if args.upgrade_cache:
+                transition = resources.enter_context(CacheTransition(port))
+                child_env["PLINTH_BASE_URL"] = transition.origin
             child_env["PLINTH_BROWSER_PROFILE_DIR"] = str(root / "browser-profile")
             browser_tmp = root / "browser-tmp"
             browser_tmp.mkdir()
@@ -155,6 +170,7 @@ def main():
                         if browser.stdout.readline().strip() != "ready_for_upgrade":
                             raise RuntimeError("browser failed before frontend replacement")
                     stop_kernel(child)
+                    transition.legacy.clear()
                     # Simulate the completed supported replacement while stopped.
                     # Install/upgrade operator behavior has its own regression;
                     # this case isolates mount caching across two package snapshots.
@@ -189,15 +205,17 @@ def main():
                 print(output_path.read_text(), flush=True)
                 raise
             finally:
-                if browser is not None:
-                    stop_browser(browser)
-                if child.poll() is None:
-                    child.send_signal(signal.SIGTERM)
-                    try:
-                        child.wait(timeout=55)
-                    except subprocess.TimeoutExpired:
-                        child.kill()
-                        child.wait(timeout=5)
+                try:
+                    if browser is not None:
+                        stop_browser(browser)
+                finally:
+                    if child.poll() is None:
+                        child.send_signal(signal.SIGTERM)
+                        try:
+                            child.wait(timeout=55)
+                        except subprocess.TimeoutExpired:
+                            child.kill()
+                            child.wait(timeout=5)
     finally:
         sql(f'DROP DATABASE "{database}" WITH (FORCE)')
 

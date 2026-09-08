@@ -842,7 +842,13 @@ handler(request, callback):
 
 Strict CSP (`script-src 'self'; style-src 'self' 'unsafe-inline';
 connect-src 'self'`) is unchanged from ICD-0.6.0 §8.2. Cache
-headers require revalidation throughout the mutable mount. The
+headers require revalidation throughout the mutable mount. The bundled entry
+opts into `<!-- PLINTH_VERSIONED_ASSET_BASE -->` before its asset references;
+the server replaces this marker with an encoded active-package `/ext/` base.
+Its complete relative asset graph therefore bypasses previously cached
+immutable mount URLs after an upgrade. Import-map bytes and their CSP digest
+stay unchanged. Custom entries without the marker retain their own base and
+byte content. The
 `is_named_asset` predicate is satisfied if
 the file exists under `client_dir`; the named-set whitelist from
 ICD-0.6.0 §8.2 is dropped because the on-disk tree is the

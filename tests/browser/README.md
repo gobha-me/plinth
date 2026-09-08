@@ -39,14 +39,22 @@ boundary test verifies stack omission in the shipped configuration and stack
 inclusion with an explicit development configuration.
 
 The upgrade case packages two versions of the real shell, adding observable
-version markers to their document, JavaScript files and token stylesheet. It
-visits the first package in a persistent Chromium profile, stops the kernel,
+version markers to their document, JavaScript files and token stylesheet.
+An owned loopback HTTP fixture forwards the actual kernel's responses. During
+warm-up the installed document omits the versioned-base marker, and the fixture
+reproduces the historical immutable `/app/*` asset headers; document bytes,
+MIME, CSP, and auth still come from the kernel. It visits this legacy package
+in a persistent Chromium profile, stops the kernel,
 simulates the completed frontend replacement by changing the task-owned
 installed package snapshot, and restarts on the same origin. Ordinary navigation
 must execute only the second version throughout the startup module graph and
-styles. No browser routing, cache override, hard reload or profile clearing is
-used. The actual kernel must send `no-cache` for `/app/*` and retain immutable
-headers on `/ext/shell/{version}/*`. This checks caching after replacement;
+styles, using `/ext/shell/{version}/*` URLs from the server-rendered asset base.
+The fixture passes candidate responses unchanged after the restart. No browser
+routing, cache override, hard reload or profile clearing is used. Mutable
+`/app/*` aliases retain `no-cache`; versioned assets remain immutable.
+`--upgrade-cache --legacy-cache-negative-control` removes the replacement
+document's opt-in too and must fail by detecting executed stale module markers.
+This checks caching after replacement;
 operator installation/upgrade workflows are tested separately.
 
 `PLINTH_BROWSER` selects an existing Chromium-compatible executable. When

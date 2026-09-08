@@ -195,6 +195,60 @@ TEST_CASE("M.03: GET /app/index.html serves with no-cache + html mime",
   REQUIRE(r.cache_control == "no-cache");
 }
 
+TEST_CASE("entry opt-in resolves the whole asset graph against its package",
+          "[shell][active-frontend][cache]") {
+  const std::string document =
+      "<head><!-- PLINTH_VERSIONED_ASSET_BASE -->"
+      "<script type=\"importmap\">{\"imports\":{\"preact\":"
+      "\"./vendor/preact.module.js\"}}</script></head>";
+  auto root = scratch_client_root({{"index.html", document}});
+  auto active = make_active(root);
+  for (const std::string version : {"901.0.1", "901.0.2+build.7"}) {
+    active.version = version;
+    for (const std::string path : {"", "index.html", "nested/route"}) {
+      auto response = capture_app(active, path);
+      REQUIRE(response.status == drogon::k200OK);
+      REQUIRE(response.cache_control == "no-cache");
+      REQUIRE(response.body.find("PLINTH_VERSIONED_ASSET_BASE") ==
+              std::string::npos);
+      const auto encoded_version =
+          version == "901.0.1" ? "901.0.1" : "901.0.2%2Bbuild.7";
+      REQUIRE(response.body ==
+              "<head><base href=\"/ext/shell/" + std::string{encoded_version} +
+                  "/\"><script type=\"importmap\">{\"imports\":{\"preact\":"
+                  "\"./vendor/preact.module.js\"}}</script></head>");
+      REQUIRE(response.csp.find(
+                  "'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='") !=
+              std::string::npos);
+    }
+  }
+  fs::remove_all(root.parent_path());
+}
+
+TEST_CASE("asset base encodes route data and custom entries stay unchanged",
+          "[shell][active-frontend][cache]") {
+  const std::string custom =
+      "<head><base href=\"/custom/\"></head><script src=\"entry.js\"></script>";
+  auto root = scratch_client_root({
+      {"main.html", custom},
+      {"index.html", "<!-- PLINTH_VERSIONED_ASSET_BASE -->"},
+      {"note.js", "// <!-- PLINTH_VERSIONED_ASSET_BASE -->"},
+  });
+  auto active = make_active(root);
+  active.name = "name\"<>&/";
+  active.version = "1.0.0+build\"/";
+  auto response = capture_app(active, "");
+  REQUIRE(response.body ==
+          "<base href=\"/ext/name%22%3C%3E%26%2F/1.0.0%2Bbuild%22%2F/\">");
+  REQUIRE(capture_app(active, "note.js").body ==
+          "// <!-- PLINTH_VERSIONED_ASSET_BASE -->");
+  active.entry = "main.html";
+  active.mount = "/console";
+  REQUIRE(capture_app(active, "").body == custom);
+  REQUIRE(capture_app(active, "deep/link").body == custom);
+  fs::remove_all(root.parent_path());
+}
+
 // ── M.04 — SPA fallback for path with no extension ───────────────────
 
 TEST_CASE("M.04: GET /app/login (no extension, SPA fallback) → 200 index.html",

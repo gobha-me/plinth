@@ -245,6 +245,9 @@ prefix. The handler:
   including the entry document and bundle files, so replacement
   assets revalidate on ordinary revisits after a restart. Immutable
   caching applies only to versioned `/ext/{name}/{version}/*` URLs.
+  The manifest-driven bundled entry additionally opts into the versioned
+  asset base described in ICD-0.6.1 §4.5, so profiles with historical
+  immutable mount responses migrate without clearing their cache.
 - Sets the strict CSP `script-src 'self'; style-src 'self'
   'unsafe-inline'; connect-src 'self'` on every response, per
   `architecture/06-frontend.md §3`. No external sources.

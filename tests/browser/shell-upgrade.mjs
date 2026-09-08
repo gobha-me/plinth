@@ -33,7 +33,8 @@ try {
         responses.length = 0;
         const sessionResponse = page.waitForResponse(response =>
             new URL(response.url()).pathname === '/api/auth/session');
-        await page.goto(baseURL + '/app/');
+        const documentResponse = await page.goto(baseURL + '/app/');
+        assert.equal(documentResponse.headers()['cache-control'], 'no-cache');
         // The sign-in heading can render before the session lookup finishes.
         // Finish that owned request before later navigating away from the page.
         assert.equal(await (await sessionResponse).finished(), null);
@@ -48,16 +49,26 @@ try {
         for (const [module, observed] of executed) {
             assert.equal(observed, version, `${module} ran stale or mixed package code`);
         }
+        if (version === '901.0.1') {
+            assert.equal(await page.locator('base').count(), 0, 'warm-up must use the historical document');
+        } else {
+            assert.equal(await page.locator('base').getAttribute('href'), `/ext/shell/${version}/`);
+        }
         for (const required of ['shell.js', 'sdk.js', 'prepaint.js', 'vendor/preact.module.js']) {
             assert(executed.some(([module]) => module === required), `${required} did not execute`);
         }
         assert.equal(await page.evaluate(() => getComputedStyle(document.documentElement)
             .getPropertyValue('--plinth-cache-version').trim()), version);
-        assert(responses.some(response => new URL(response.url()).pathname === '/app/css/tokens.css'));
+        const assetPrefix = version === '901.0.1' ? '/app/' : `/ext/shell/${version}/`;
+        assert(responses.some(response => new URL(response.url()).pathname === assetPrefix + 'css/tokens.css'));
         for (const response of responses) {
             assert(response.status() < 400, `${response.status()} ${response.url()}`);
-            if (version === '901.0.2' && new URL(response.url()).pathname.startsWith('/app/')) {
-                assert.equal(response.headers()['cache-control'], 'no-cache', response.url());
+            const path = new URL(response.url()).pathname;
+            if (path.startsWith(assetPrefix)) {
+                assert.equal(response.headers()['cache-control'], 'public, max-age=31536000, immutable', response.url());
+            }
+            if (version === '901.0.2') {
+                assert(!path.startsWith('/app/'), `replacement requested a mutable asset: ${path}`);
             }
         }
         const versioned = await context.request.get(`${baseURL}/ext/shell/${version}/sdk.js`);
@@ -73,7 +84,7 @@ try {
             assert.equal(command.value, 'continue');
         }
     }
-    console.log('PASS persistent profile: replacement HTML, complete JS graph and CSS; versioned assets immutable');
+    console.log('PASS legacy immutable cache -> versioned replacement: HTML, startup JS graph, CSS; one persistent profile');
 } finally {
     commands.close();
     await context?.close();
