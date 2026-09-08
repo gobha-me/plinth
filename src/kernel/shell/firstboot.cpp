@@ -1,4 +1,5 @@
 #include "kernel/shell/firstboot.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/config.hpp"
 #include "kernel/logging.hpp"
@@ -14,7 +15,6 @@
 #include <fstream>
 #include <ios>
 #include <span>
-#include <sstream>
 #include <vector>
 
 namespace plinth::shell {
@@ -54,10 +54,7 @@ auto emit_failed(const Config::Database& db, std::string_view failure_kind,
 struct PgGuard {
   PGconn* conn = nullptr;
   explicit PgGuard(const Config::Database& db) {
-    std::ostringstream ss;
-    ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-       << " user=" << db.user << " password=" << db.password;
-    conn = PQconnectdb(ss.str().c_str());
+    conn = PQconnectdb(plinth::db::connection_info(db).c_str());
   }
   ~PgGuard() {
     if (conn != nullptr) {

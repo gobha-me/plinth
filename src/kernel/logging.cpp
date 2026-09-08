@@ -1,4 +1,5 @@
 #include "kernel/logging.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/auth/middleware.hpp"
 #include "kernel/config.hpp"
@@ -13,7 +14,6 @@
 #include <spdlog/async_logger.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <sstream>
 
 namespace plinth::log {
 
@@ -60,14 +60,6 @@ constexpr std::size_t LOG_ASYNC_THREADS = 1;
 // Module-level node_id. Set once at startup; read on every audit insert.
 // is process-wide and set before any audit call
 std::string g_node_id;
-
-auto build_conninfo(const Config::Database& db_cfg) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db_cfg.host << " port=" << db_cfg.port
-     << " dbname=" << db_cfg.database << " user=" << db_cfg.user
-     << " password=" << db_cfg.password;
-  return ss.str();
-}
 
 } // namespace
 
@@ -153,7 +145,7 @@ auto audit(std::string_view action, const Json::Value& detail,
 
 auto audit_sync(const Config::Database& db, std::string_view action,
                 const Json::Value& detail) -> void {
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("audit_sync: PG connect failed: {}", PQerrorMessage(conn));

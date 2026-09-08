@@ -1,4 +1,5 @@
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/registration.hpp"
@@ -81,17 +82,10 @@ namespace {
 
 using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 struct PgGuard {
   PGconn* conn = nullptr;
   explicit PgGuard(const Config::Database& db) {
-    conn = PQconnectdb(build_conninfo(db).c_str());
+    conn = PQconnectdb(plinth::db::connection_info(db).c_str());
   }
   ~PgGuard() {
     if (conn != nullptr) {

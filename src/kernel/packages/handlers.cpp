@@ -1,4 +1,5 @@
 #include "kernel/packages/handlers.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/rbac/enforcement.hpp"
@@ -169,13 +170,6 @@ auto caller_user_id(const drogon::HttpRequestPtr& req) -> std::string {
   return attrs->get<std::string>("plinth.user_id");
 }
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 // ─── POST /api/packages ──────────────────────────────────────────────
 
 auto handle_post_packages(
@@ -297,7 +291,7 @@ auto handle_get_packages(
   int offset = parse_int_param(offset_s, 0, 0, std::numeric_limits<int>::max());
   bool include_failed = !req->getParameter("include_failed").empty();
 
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   auto conn_guard =
       std::unique_ptr<PGconn, decltype(&PQfinish)>(conn, PQfinish);
@@ -359,7 +353,7 @@ auto handle_get_package_by_id(
     // Drogon handler signature; cb is invoked, not moved.
     std::function<void(const drogon::HttpResponsePtr&)>&& cb,
     const Config::Database& db, const std::string& id) -> void {
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   auto conn_guard =
       std::unique_ptr<PGconn, decltype(&PQfinish)>(conn, PQfinish);

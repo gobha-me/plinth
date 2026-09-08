@@ -1,6 +1,7 @@
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/parser.hpp"
+#include "kernel/db/connection_info.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/logging.hpp"
 
@@ -14,7 +15,6 @@
 #include <ranges>
 #include <shared_mutex>
 #include <spdlog/spdlog.h>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -187,13 +187,6 @@ auto register_lh0_harness_handlers_locked() -> void {
 
 using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 // Pulls every `enabled = true` row. Disabled rows are intentionally
 // excluded: dispatch resolves strictly against the enabled snapshot,
 // and the disable/enable audit trail plus the NOTIFY refresh (0.2.3)
@@ -206,7 +199,7 @@ auto build_conninfo(const Config::Database& db) -> std::string {
 // — 0.2.4). The caller is responsible for clearing tier2_cache first
 // if a full refresh is required; this function only inserts.
 auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
-  auto conninfo = build_conninfo(db_cfg);
+  auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);

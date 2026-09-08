@@ -94,14 +94,16 @@ include(FetchContent)
 set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING  OFF CACHE BOOL "" FORCE)
 # third_party/drogon-patches/ applies surgical upstreamable diffs to
-# the fetched source tree (see that dir's README). Currently only
-# ftype-accessor.patch — exposes Field::oid() for ICD-0.5.3 OID-driven
-# type mapping. The shell wrapper makes the PATCH_COMMAND idempotent:
+# the fetched source tree (see that dir's README). They expose Field::oid()
+# and preserve whitespace in PostgreSQL connection parameters.
+# The shell wrapper makes the PATCH_COMMAND idempotent:
 # FetchContent's update step re-runs PATCH_COMMAND on every cmake
 # reconfigure, so we `git apply --reverse --check` first to detect an
 # already-applied patch and skip quietly; otherwise apply normally.
 set(PLINTH_DROGON_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/ftype-accessor.patch)
+set(PLINTH_DROGON_CONNINFO_PATCH
+    ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/connection-whitespace.patch)
 FetchContent_Declare(
   drogon
   GIT_REPOSITORY https://github.com/drogonframework/drogon.git
@@ -109,6 +111,9 @@ FetchContent_Declare(
   PATCH_COMMAND sh -c
     "git apply --reverse --check '${PLINTH_DROGON_PATCH}' 2>/dev/null \
      || git apply --whitespace=nowarn '${PLINTH_DROGON_PATCH}'"
+  COMMAND sh -c
+    "git apply --reverse --check '${PLINTH_DROGON_CONNINFO_PATCH}' 2>/dev/null \
+     || git apply --whitespace=nowarn '${PLINTH_DROGON_CONNINFO_PATCH}'"
 )
 FetchContent_MakeAvailable(drogon)
 set(DROGON_TARGET drogon)
@@ -499,6 +504,7 @@ add_executable(plinth_tests
   tests/kernel/lifecycle/process_shutdown_test.cpp
   tests/kernel/config_test.cpp
   tests/kernel/db/bootstrap_test.cpp
+  tests/kernel/db/connection_info_test.cpp
   tests/kernel/audit/audit_test.cpp
   tests/kernel/audit/audit_teardown_test.cpp
   tests/kernel/auth/crypto_test.cpp
@@ -762,9 +768,20 @@ set_tests_properties(plinth_tests_batch_transaction
              TIMEOUT 60)
 
 add_test(NAME plinth_tests_pg
-  COMMAND plinth_tests "[integration] ~[ws] ~[js]"
+  COMMAND plinth_tests "[integration] ~[ws] ~[js] ~[subprocess]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pg
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             TIMEOUT 300)
+
+# Repeated production boots need their own aggregate budget under sanitizers.
+# Keep the per-process lifecycle bounds unchanged and serialize both groups
+# against the shared PostgreSQL fixture, including when CTest runs in parallel.
+add_test(NAME plinth_tests_subprocess
+  COMMAND plinth_tests "[integration] [subprocess] ~[ws] ~[js]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_subprocess
   PROPERTIES RESOURCE_LOCK plinth_pg_schema
              LABELS "needs_pg"
              TIMEOUT 300)

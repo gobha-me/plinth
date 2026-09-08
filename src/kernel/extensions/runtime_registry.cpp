@@ -5,6 +5,7 @@
 // See ICD-0.5.0.3-extension-dispatch §RuntimeRegistry.
 
 #include "kernel/extensions/runtime_registry.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include "kernel/js/async_op.hpp"
 #include "kernel/js/bridge_context.hpp"
@@ -722,11 +723,8 @@ auto invoke_handler(plinth::js::BridgeContext& bc,
 // `drogon::app().run()` (no event loop available yet).
 auto connect_and_list_active_extensions(const Config::Database& db_cfg,
                                         std::vector<std::string>& out) -> bool {
-  std::ostringstream conninfo;
-  conninfo << "host=" << db_cfg.host << " port=" << db_cfg.port
-           << " dbname=" << db_cfg.database << " user=" << db_cfg.user
-           << " password=" << db_cfg.password;
-  PGconn* conn = PQconnectdb(conninfo.str().c_str());
+  auto conninfo = plinth::db::connection_info(db_cfg);
+  PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);

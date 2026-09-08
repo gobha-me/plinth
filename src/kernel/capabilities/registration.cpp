@@ -1,5 +1,6 @@
 #include "kernel/capabilities/registration.hpp"
 #include "kernel/capabilities/validation.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include <array>
 #include <cstring>
@@ -21,18 +22,11 @@ constexpr const char* SQLSTATE_UNIQUE_VIOLATION = "23505";
 
 using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
 struct PgConn {
   PGconn* conn = nullptr;
 
   explicit PgConn(const Config::Database& db) {
-    conn = PQconnectdb(build_conninfo(db).c_str());
+    conn = PQconnectdb(plinth::db::connection_info(db).c_str());
   }
   ~PgConn() {
     if (conn != nullptr) {

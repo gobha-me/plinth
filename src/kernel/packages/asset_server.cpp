@@ -1,4 +1,5 @@
 #include "kernel/packages/asset_server.hpp"
+#include "kernel/db/connection_info.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -12,7 +13,6 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
-#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -325,20 +325,9 @@ auto cancel_all_registrations() noexcept -> void {
   }
 }
 
-namespace {
-
-auto build_conninfo(const Config::Database& db) -> std::string {
-  std::ostringstream ss;
-  ss << "host=" << db.host << " port=" << db.port << " dbname=" << db.database
-     << " user=" << db.user << " password=" << db.password;
-  return ss.str();
-}
-
-} // namespace
-
 auto restore_routes(const Config::Database& db,
                     const std::filesystem::path& data_dir) -> void {
-  auto conninfo = build_conninfo(db);
+  auto conninfo = plinth::db::connection_info(db);
   PGconn* conn = PQconnectdb(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::warn("asset_server::restore_routes: PG connect failed: {}",
