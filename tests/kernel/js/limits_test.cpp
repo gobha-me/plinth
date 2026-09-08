@@ -23,6 +23,7 @@
 #include <chrono>
 #include <drogon/utils/coroutine.h>
 #include <json/value.h>
+#include <quickjs.h>
 #include <string_view>
 
 using plinth::async_bridge_test::ensure_drogon_running;
@@ -63,28 +64,42 @@ TEST_CASE("limits: memory cap survives an intervening await",
   auto cfg = test_config();
   auto limits = default_runtime_limits();
   limits.memory_limit_bytes = 4UL * 1024UL * 1024UL; // 4 MiB
+  // Isolate memory enforcement from CPU overhead under sanitizers, as in N.40.
+  limits.cpu_time_limit = std::chrono::milliseconds(5000);
+  limits.wall_clock_limit = std::chrono::milliseconds(10000);
   RuntimePool pool(/*ext=*/nullptr, limits, cfg, 1);
 
-  // Pre-allocate ~3 MiB, then a single await, then continue allocating
-  // until the cap trips. The post-await allocation loop is the N.37
-  // property: a frame-crossing OOM must still classify as MEMORY_LIMIT.
+  // Leave room for the real database await: 75 * 5000 array slots already
+  // exceed 4 MiB with 16-byte JSValues on 64-bit QuickJS. Keep the smaller
+  // allocation alive across the await, then grow it until the cap trips.
+  // The marker proves that OOM occurred after the await completed.
   const auto* src = R"(
         (async () => {
-            const preallocated = [];
-            for (let i = 0; i < 75; i++) {
-                preallocated.push(new Array(5000).fill(0));
+            globalThis.__n37AwaitCompleted = false;
+            const keep = [];
+            for (let i = 0; i < 8; i++) {
+                keep.push(new Array(5000).fill(0));
             }
             await db.query('SELECT 1');
-            const tail = [];
+            globalThis.__n37AwaitCompleted = true;
             for (let i = 0; i < 10000; i++) {
-                tail.push(new Array(5000).fill(0));
+                keep.push(new Array(5000).fill(0));
             }
             return 'should-not-reach';
         })()
     )";
   auto* bc = pool.acquire();
   auto r = drive(*bc, src);
+  // drive has joined the execution. Inspect without starting another eval,
+  // which would reset limit state; release JS handles before destroying bc.
+  auto global = JS_GetGlobalObject(bc->ctx);
+  auto marker = JS_GetPropertyStr(bc->ctx, global, "__n37AwaitCompleted");
+  const bool await_completed =
+      JS_IsBool(marker) && JS_ToBool(bc->ctx, marker) == 1;
+  JS_FreeValue(bc->ctx, marker);
+  JS_FreeValue(bc->ctx, global);
   pool.destroy(bc);
+  REQUIRE(await_completed);
   REQUIRE_FALSE(r.value.has_value());
   REQUIRE(r.value.error().kind == EvalErrorKind::MEMORY_LIMIT);
 }
