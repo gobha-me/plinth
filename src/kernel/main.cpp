@@ -352,6 +352,22 @@ auto main(int argc, char* argv[]) -> int {
       .default_value(false)
       .implicit_value(true)
       .help("Enable dev_mode (destructive schema reset on startup)");
+  serve_cmd.add_argument("--upgrade-bundled-shell")
+      .default_value(false)
+      .implicit_value(true)
+      .help("Explicitly upgrade the installed bundled shell before serving "
+            "(requires dev_mode=false)");
+
+  argparse::ArgumentParser shell_cmd("shell");
+  shell_cmd.add_description("Inspect bundled shell maintenance state");
+  argparse::ArgumentParser shell_status_cmd("status");
+  shell_status_cmd.add_description("Read installed and available bundled shell "
+                                   "versions without changing state");
+  shell_status_cmd.add_argument("--config", "-c")
+      .help("Path to a required JSON configuration file");
+  shell_status_cmd.add_argument("--json").default_value(false).implicit_value(
+      true);
+  shell_cmd.add_subparser(shell_status_cmd);
 
   // ── validate subcommand ─────────────────────────────────
   argparse::ArgumentParser validate_cmd("validate");
@@ -409,6 +425,7 @@ auto main(int argc, char* argv[]) -> int {
   program.add_subparser(serve_cmd);
   program.add_subparser(validate_cmd);
   program.add_subparser(test_cmd);
+  program.add_subparser(shell_cmd);
 
   try {
     program.parse_args(argc, argv);
@@ -419,6 +436,51 @@ auto main(int argc, char* argv[]) -> int {
   }
 
   try {
+    if (program.is_subcommand_used("shell")) {
+      if (!shell_cmd.is_subcommand_used("status")) {
+        std::cerr << shell_cmd;
+        return 1;
+      }
+      block_shutdown_signals();
+      ShutdownSignalOwner signals;
+      plinth::db::OperationScope database_operations{signals.token()};
+      auto cfg = shell_status_cmd.is_used("--config")
+                     ? plinth::load_config(
+                           shell_status_cmd.get<std::string>("--config"))
+                     : plinth::load_config();
+      const auto status = plinth::shell::bundled_shell_status(cfg);
+      database_operations.checkpoint();
+      if (!status) {
+        std::cerr << "shell status failed: " << status.error() << '\n';
+        return 1;
+      }
+      std::string action = "installed shell is current";
+      if (!status->installed_version) {
+        action = "start plinth serve for first-boot installation";
+      } else if (status->upgrade_available) {
+        action = "stop the kernel, then restart with plinth serve "
+                 "--upgrade-bundled-shell using the same config";
+      } else if (*status->installed_version != status->available_version) {
+        action = "available bundle is older or has equivalent version "
+                 "precedence; downgrade is unsupported";
+      }
+      if (shell_status_cmd.get<bool>("--json")) {
+        Json::Value output;
+        output["installed_version"] =
+            status->installed_version ? Json::Value{*status->installed_version}
+                                      : Json::Value{Json::nullValue};
+        output["available_version"] = status->available_version;
+        output["upgrade_available"] = status->upgrade_available;
+        output["action"] = action;
+        std::cout << output.toStyledString();
+      } else {
+        std::cout << "Installed shell: "
+                  << status->installed_version.value_or("none")
+                  << "\nAvailable bundle: " << status->available_version
+                  << "\nAction: " << action << '\n';
+      }
+      return 0;
+    }
     // ── serve ───────────────────────────────────────────
     if (program.is_subcommand_used("serve")) {
       const bool has_config = serve_cmd.is_used("--config");
@@ -433,6 +495,11 @@ auto main(int argc, char* argv[]) -> int {
       // CLI overrides (layer 3)
       if (serve_cmd.get<bool>("--dev")) {
         cfg.dev_mode = true;
+      }
+      if (serve_cmd.get<bool>("--upgrade-bundled-shell") && cfg.dev_mode) {
+        std::cerr << "--upgrade-bundled-shell requires dev_mode=false; "
+                     "refusing destructive development reset\n";
+        return 1;
       }
       auto cli_port = serve_cmd.get<int>("--port");
       if (cli_port > 0) {
@@ -654,9 +721,14 @@ auto main(int argc, char* argv[]) -> int {
         database_operations.checkpoint();
         plinth::packages::reconcile_in_flight_installs(bootstrap_ctx);
         if (auto fb = plinth::shell::ensure_bundled_shell_installed(
-                cfg, bootstrap_ctx);
+                cfg, bootstrap_ctx,
+                serve_cmd.get<bool>("--upgrade-bundled-shell"));
             !fb.has_value()) {
-          database_operations.checkpoint();
+          // A cancelled COMMIT may have committed remotely. Never turn its
+          // recovery requirement into the clean exit used for startup cancel.
+          if (!fb.error().recovery_required) {
+            database_operations.checkpoint();
+          }
           spdlog::critical(
               "shell::firstboot: aborting boot — kind={} message={}",
               fb.error().kind_string(), fb.error().message);

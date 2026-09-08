@@ -251,7 +251,8 @@ auto handle_post_packages(
   if (!r.has_value()) {
     const auto& f = r.error();
     Json::Value body(Json::objectValue);
-    body["state"] = "INSTALL_FAILED";
+    body["state"] =
+        f.failed_at == InstallStage::ACTIVE ? "ACTIVE" : "INSTALL_FAILED";
     body["failed_at_stage"] = std::string{stage_to_string(f.failed_at)};
     body["kind"] = f.kind;
     body["message"] = f.message;

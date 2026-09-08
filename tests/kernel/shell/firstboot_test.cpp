@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -349,4 +350,76 @@ TEST_CASE("B.06: pre-existing user package name='shell' → exit code 3 + "
   REQUIRE(fb.error().exit_code() == 3);
   REQUIRE(audit_count(s.db, "shell.firstboot.bundled_install_failed") == 1);
   REQUIRE(count_packages_by_name(s.db, "shell") == 1); // still the user row
+}
+
+TEST_CASE("bundled shell upgrade cannot be invoked as a user package",
+          "[shell][firstboot][integration]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  REQUIRE(plinth::shell::ensure_bundled_shell_installed(s.cfg, s.ctx));
+  PGconn* raw = PQconnectdb(conninfo_of(s.db).c_str());
+  std::unique_ptr<PGconn, decltype(&PQfinish)> conn{raw, PQfinish};
+  REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+  std::unique_ptr<PGresult, decltype(&PQclear)> row{
+      PQexec(conn.get(),
+             "SELECT id::text FROM plinth.packages WHERE name='shell'"),
+      PQclear};
+  REQUIRE(PQresultStatus(row.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(row.get()) == 1);
+  auto rejected =
+      plinth::packages::upgrade_package({}, PQgetvalue(row.get(), 0, 0), s.ctx);
+  REQUIRE_FALSE(rejected);
+  REQUIRE(rejected.error().report["kind"] == "provenance-mismatch");
+
+  s.cfg.dev_mode = false;
+  fs::remove(s.base / "data/extensions/shell/active");
+  fs::create_symlink("uncommitted-version",
+                     s.base / "data/extensions/shell/active");
+  auto inconsistent =
+      plinth::shell::ensure_bundled_shell_installed(s.cfg, s.ctx);
+  REQUIRE_FALSE(inconsistent);
+  REQUIRE(inconsistent.error().recovery_required);
+  REQUIRE(inconsistent.error().exit_code() == 2);
+  REQUIRE(inconsistent.error().message.find("operator recovery required") !=
+          std::string::npos);
+}
+
+TEST_CASE("shell status rejects invalid bundle sources before database access",
+          "[shell][firstboot]") {
+  const auto path = fs::temp_directory_path() /
+                    ("plinth_status_" + std::to_string(::getpid()) + "_" +
+                     std::to_string(g_fb_scratch_counter.fetch_add(1)));
+  struct Cleanup {
+    fs::path path;
+    ~Cleanup() {
+      std::error_code ec;
+      fs::remove_all(path, ec);
+    }
+  } cleanup{path};
+  fs::create_directories(path);
+  plinth::Config cfg;
+  cfg.shell.bundle_path = path.string();
+  SECTION("invalid ZIP") {
+    std::ofstream{path / "shell.zip"} << "not a zip";
+    auto result = plinth::shell::bundled_shell_status(cfg);
+    REQUIRE_FALSE(result);
+    REQUIRE(result.error() == "invalid bundled ZIP");
+  }
+  SECTION("symlink") {
+    std::ofstream{path / "other"} << "not a zip";
+    fs::create_symlink("other", path / "shell.zip");
+    auto result = plinth::shell::bundled_shell_status(cfg);
+    REQUIRE_FALSE(result);
+    REQUIRE(result.error().find("not readable") != std::string::npos);
+  }
+  SECTION("oversized archive") {
+    std::ofstream{path / "shell.zip"} << "x";
+    fs::resize_file(path / "shell.zip", 1024 * 1024 + 1);
+    cfg.packages_max_package_size_mb = 1;
+    auto result = plinth::shell::bundled_shell_status(cfg);
+    REQUIRE_FALSE(result);
+    REQUIRE(result.error().find("package size limit") != std::string::npos);
+  }
 }

@@ -64,6 +64,7 @@ PostgreSQL-backed tests use the `PLINTH_PG_*` variables shown in CI. See
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Configuration and deployment](docs/CONFIGURATION.md)
+- [Retained-install bundled shell upgrades](docs/bundled-shell-upgrade.md)
 - [Extension guide](docs/EXTENSION-GUIDE.md)
 - [Shutdown dependency graph](docs/architecture/shutdown.md)
 - [Roadmap](docs/ROADMAP.md)

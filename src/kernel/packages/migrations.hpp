@@ -20,6 +20,12 @@ using PGconn = pg_conn;
 
 namespace plinth::packages {
 
+// CALLER_OWNED requires an active transaction; the caller commits or rolls
+// back the entire operation. Transaction-control SQL in pending files is
+// rejected, and the migration advisory lock lasts until transaction end.
+// PER_FILE preserves the ordinary extension-install/upgrade contract.
+enum class MigrationTransaction : unsigned char { PER_FILE, CALLER_OWNED };
+
 struct MigrationReport {
   std::vector<std::string> applied;
   std::vector<std::string> skipped;
@@ -35,9 +41,10 @@ struct MigrationReport {
 // Preconditions:
 //   - `extension_name` matches ^[a-z][a-z0-9_-]{2,62}$ (0.4.1 regex).
 //   - `admin_conn` has `PQstatus == CONNECTION_OK` and CREATE privileges.
-auto run_migrations(std::string_view extension_name,
-                    const std::filesystem::path& package_root,
-                    PGconn& admin_conn)
+auto run_migrations(
+    std::string_view extension_name, const std::filesystem::path& package_root,
+    PGconn& admin_conn,
+    MigrationTransaction transaction = MigrationTransaction::PER_FILE)
     -> std::expected<MigrationReport, MigrationFailure>;
 
 // Companion teardown for 0.4.4's first-install failure path. Drops

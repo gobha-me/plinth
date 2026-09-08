@@ -9,6 +9,7 @@
 #include "kernel/capabilities/types.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
@@ -22,16 +23,23 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <expected>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <spdlog/sinks/sink.h>
+#include <spdlog/spdlog.h>
 #include <sstream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -103,6 +111,26 @@ auto drop_all_schemas(const plinth::Config::Database& db) -> void {
 
 std::atomic<std::uint64_t> g_scratch_counter{0};
 
+// A fixture cannot safely clear shared resolver/database state while an owned
+// worker still uses it. Destructors fail the process without throwing through
+// Catch's assertion unwinding if the bounded join cannot establish ownership.
+auto drain_fixture_workers() -> void {
+  if (!plinth::packages::rbac_test::shutdown_async_workers(
+          std::chrono::seconds{5})) {
+    std::fputs("RBAC fixture cleanup failed: worker drain did not complete\n",
+               stderr);
+    std::_Exit(2);
+  }
+}
+
+auto reopen_fixture_workers() -> void {
+  if (!plinth::packages::rbac_test::start_async_workers()) {
+    std::fputs("RBAC fixture cleanup failed: worker registry did not reopen\n",
+               stderr);
+    std::_Exit(2);
+  }
+}
+
 struct Scratch {
   plinth::Config::Database db;
   PGconn* conn = nullptr;
@@ -111,6 +139,10 @@ struct Scratch {
   fs::path base; // per-test tmp dir (install-driven tests)
 
   Scratch() : db(pg_config()) {
+    // The first Scratch can follow a different package fixture that scheduled
+    // workers. Join those owners before resetting their resolver/database.
+    drain_fixture_workers();
+    reopen_fixture_workers();
     drop_all_schemas(db);
     plinth::db::bootstrap_schema(
         db, std::string{CMAKE_SOURCE_DIR} + "/migrations", true);
@@ -130,6 +162,7 @@ struct Scratch {
     ctx.max_package_size_bytes = 50ULL * 1024ULL * 1024ULL;
   }
   ~Scratch() {
+    drain_fixture_workers();
     plinth::capabilities::clear_resolver_for_test();
     if (conn != nullptr) {
       PQfinish(conn);
@@ -137,6 +170,7 @@ struct Scratch {
     drop_all_schemas(db);
     std::error_code ec;
     fs::remove_all(base, ec);
+    reopen_fixture_workers();
   }
   Scratch(const Scratch&) = delete;
   auto operator=(const Scratch&) -> Scratch& = delete;
@@ -151,8 +185,8 @@ auto exec_params(PGconn* conn, const char* sql,
   for (const auto& s : vs) {
     values.push_back(s.c_str());
   }
-  return {PQexecParams(conn, sql, static_cast<int>(values.size()), nullptr,
-                       values.data(), nullptr, nullptr, 0),
+  return {plinth::db::exec_params(conn, sql, static_cast<int>(values.size()),
+                                  nullptr, values.data(), nullptr, nullptr, 0),
           PQclear};
 }
 
@@ -598,6 +632,116 @@ auto wait_rbac_test_audit_count(PGconn* conn, std::string_view pid, long target,
          count_audit(conn, "packages.rbac_test_failed", pid);
 }
 
+// Unlike base_sink<mutex>, this sink releases its mutex while pausing the
+// installer, so the RBAC worker can still report lock_failed through it.
+class InstallCompletionGate final : public spdlog::sinks::sink {
+ public:
+  explicit InstallCompletionGate(std::string message_prefix)
+      : message_prefix(std::move(message_prefix)) {}
+  auto log(const spdlog::details::log_msg& message) -> void override {
+    const std::string_view text{message.payload.data(), message.payload.size()};
+    std::unique_lock lock(mu);
+    if (text.starts_with("rbac_test: lock_failed:")) {
+      lock_failed = true;
+      cv.notify_all();
+    } else if (text.starts_with(message_prefix)) {
+      entered = true;
+      cv.notify_all();
+      if (!cv.wait_for(lock, 10s, [&] { return released; })) {
+        expired = true;
+      }
+    }
+  }
+  auto flush() -> void override {}
+  auto set_pattern(const std::string&) -> void override {}
+  auto set_formatter(std::unique_ptr<spdlog::formatter>) -> void override {}
+
+  auto wait_for_entry() -> bool {
+    std::unique_lock lock(mu);
+    return cv.wait_for(lock, 5s, [&] { return entered; });
+  }
+  auto wait_for_lock_failure(std::chrono::milliseconds timeout) -> bool {
+    std::unique_lock lock(mu);
+    return cv.wait_for(lock, timeout, [&] { return lock_failed; });
+  }
+  auto timed_out() -> bool {
+    std::lock_guard lock(mu);
+    return expired;
+  }
+  auto release() -> void {
+    std::lock_guard lock(mu);
+    released = true;
+    cv.notify_all();
+  }
+
+ private:
+  const std::string message_prefix;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool entered = false;
+  bool released = false;
+  bool lock_failed = false;
+  bool expired = false;
+};
+
+class PausedInstall {
+ public:
+  using Result = std::expected<plinth::packages::PackageRecord,
+                               plinth::packages::InstallFailure>;
+
+  explicit PausedInstall(
+      std::string message_prefix = "install complete: notes ")
+      : gate(
+            std::make_shared<InstallCompletionGate>(std::move(message_prefix))),
+        previous_logger(spdlog::default_logger()) {
+    // Full-suite logging may use an async_logger. clone() preserves that type
+    // and would pause its logging worker instead of the installer. Construct
+    // a synchronous logger while retaining the existing sinks and formatters.
+    auto logger = std::make_shared<spdlog::logger>(
+        "rbac-install-handoff", previous_logger->sinks().begin(),
+        previous_logger->sinks().end());
+    logger->sinks().push_back(gate);
+    logger->set_level(spdlog::level::info);
+    spdlog::set_default_logger(std::move(logger));
+  }
+  ~PausedInstall() {
+    gate->release(); // Also runs when a REQUIRE unwinds the test.
+    if (installer.joinable()) {
+      if (result.valid() && result.wait_for(10s) != std::future_status::ready) {
+        std::fputs("RBAC fixture cleanup failed: installer did not stop\n",
+                   stderr);
+        std::_Exit(2);
+      }
+      installer.join();
+    }
+    // Finish every possible logger caller before restoring the default logger.
+    drain_fixture_workers();
+    spdlog::set_default_logger(previous_logger);
+    reopen_fixture_workers();
+  }
+  PausedInstall(const PausedInstall&) = delete;
+  auto operator=(const PausedInstall&) -> PausedInstall& = delete;
+
+  auto start(std::vector<std::byte> blob,
+             plinth::packages::InstallerContext context) -> void {
+    std::packaged_task<Result()> task{
+        [blob = std::move(blob), context = std::move(context)] {
+          plinth::db::OperationScope operations{std::stop_token{}, 5s};
+          return plinth::packages::install_package(
+              blob, plinth::packages::Provenance::USER, context);
+        }};
+    result = task.get_future();
+    installer = std::thread(std::move(task));
+  }
+
+  std::shared_ptr<InstallCompletionGate> gate;
+  std::future<Result> result;
+
+ private:
+  std::shared_ptr<spdlog::logger> previous_logger;
+  std::thread installer;
+};
+
 // Seed a bare ACTIVE package row (no rules) with a specific installed_at.
 auto seed_package_at(PGconn* conn, std::string_view name,
                      std::string_view version, std::string_view installed_expr)
@@ -747,16 +891,8 @@ TEST_CASE("PB.13 install_package triggers RBAC test end-to-end",
   }
   REQUIRE(r.has_value());
 
-  // Populate the Tier 2 cache from the freshly-registered DB rows.
-  // Production gets this via LISTEN/NOTIFY; the test binary has no
-  // listener thread, so the detached RBAC test worker would otherwise
-  // see capability_not_found. The reload is small (single SELECT);
-  // the worker's startup (PG connect + advisory lock + ephemeral user
-  // INSERTs) comfortably exceeds the reload, so this wins the race
-  // in practice — if CI surfaces a flake, promote this into the
-  // kernel trigger sites.
-  plinth::capabilities::reload_tier2_cache(s.ctx.db);
-
+  // Installation must make registered capabilities visible before admitting
+  // its RBAC worker, without a test-side cache reload or LISTEN timing.
   REQUIRE(wait_rbac_test(s.conn, r->id));
   // happy-all-pass has 2 rules with test_contract + 1 without — all pass.
   auto j = pkg_result(s.conn, r->id);
@@ -779,6 +915,150 @@ TEST_CASE("PB.13 install_package triggers RBAC test end-to-end",
   REQUIRE(PQresultStatus(trig.get()) == PGRES_TUPLES_OK);
   REQUIRE(PQntuples(trig.get()) == 1);
   REQUIRE(std::string{PQgetvalue(trig.get(), 0, 0)} == "install");
+}
+
+TEST_CASE("install releases its lifecycle lock before asynchronous RBAC starts",
+          "[rbac_test][integration][install-handoff]") {
+  if (!pg_available()) {
+    SKIP("PG unavailable");
+  }
+  Scratch s;
+  auto blob = read_fixture(
+      "valid-install"); // notes, no test contracts/cache dependency
+  REQUIRE(!blob.empty());
+  PausedInstall pending;
+  pending.start(std::move(blob), s.ctx);
+  REQUIRE(pending.gate->wait_for_entry());
+  REQUIRE(pending.result.wait_for(0ms) == std::future_status::timeout);
+  plinth::db::OperationScope observations{std::stop_token{}, 1s};
+
+  auto row = exec_params(s.conn,
+                         "SELECT id::text FROM plinth.packages WHERE "
+                         "name='notes' AND version='1.2.3'",
+                         {});
+  REQUIRE(PQresultStatus(row.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(row.get()) == 1);
+  const std::string id = PQgetvalue(row.get(), 0, 0);
+  bool completed = false;
+  bool lock_failed = false;
+  const auto deadline = std::chrono::steady_clock::now() + 5s;
+  while (std::chrono::steady_clock::now() < deadline) {
+    auto marker = exec_params(s.conn,
+                              "SELECT last_rbac_test_run_at IS NOT NULL FROM "
+                              "plinth.packages WHERE id=$1::uuid",
+                              {id});
+    REQUIRE(PQresultStatus(marker.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(marker.get()) == 1);
+    if (*PQgetvalue(marker.get(), 0, 0) == 't') {
+      completed = true;
+      break;
+    }
+    if (pending.gate->wait_for_lock_failure(20ms)) {
+      lock_failed = true;
+      break;
+    }
+  }
+  INFO("RBAC worker reported lock_failed while installer remained at its final "
+       "log: "
+       << lock_failed);
+  REQUIRE_FALSE(lock_failed);
+  REQUIRE(completed);
+  REQUIRE_FALSE(pending.gate->timed_out());
+  REQUIRE(pending.result.wait_for(0ms) == std::future_status::timeout);
+  REQUIRE(pkg_state(s.conn, id) == "ACTIVE");
+  REQUIRE(count_audit(s.conn, "packages.rbac_test_passed", id) == 1);
+  pending.gate->release();
+  REQUIRE(pending.result.wait_for(5s) == std::future_status::ready);
+  auto installed = pending.result.get();
+  REQUIRE(installed.has_value());
+  REQUIRE(installed->id == id);
+}
+
+TEST_CASE(
+    "lost lock release acknowledgment preserves the committed installation",
+    "[rbac_test][integration][install-handoff-failure]") {
+  if (!pg_available()) {
+    SKIP("PG unavailable");
+  }
+  Scratch s;
+  auto blob = read_fixture("valid-install");
+  REQUIRE(!blob.empty());
+  // This synchronous log is after ACTIVE/files/runtime/cache publication but
+  // before the installer sends its checked advisory unlock.
+  PausedInstall pending{"tier2 cache resynced:"};
+  pending.start(std::move(blob), s.ctx);
+  REQUIRE(pending.gate->wait_for_entry());
+  REQUIRE(pending.result.wait_for(0ms) == std::future_status::timeout);
+  plinth::db::OperationScope observations{std::stop_token{}, 2s};
+
+  auto row = exec_params(s.conn,
+                         "SELECT id::text, state FROM plinth.packages WHERE "
+                         "name='notes' AND version='1.2.3'",
+                         {});
+  REQUIRE(PQresultStatus(row.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(row.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(row.get(), 0, 1)} == "ACTIVE");
+  const std::string id = PQgetvalue(row.get(), 0, 0);
+  const auto version = s.ctx.data_dir / "extensions/notes/1.2.3";
+  const auto active = version.parent_path() / "active";
+  const auto manifest = read_file_bytes(version / "manifest.json");
+  REQUIRE(!manifest.empty());
+  REQUIRE(fs::read_symlink(active) == fs::path{"1.2.3"});
+
+  // PostgreSQL splits a signed bigint advisory key into unsigned high/low
+  // 32-bit OIDs. Match both halves, its bigint-key discriminator, and this
+  // database, so only this fixture's exact notes installer can be terminated.
+  auto owner = exec_params(
+      s.conn,
+      "WITH target AS (SELECT hashtextextended($1, 0) AS key) "
+      "SELECT locks.pid::text FROM pg_locks locks CROSS JOIN target "
+      "WHERE locks.locktype='advisory' AND locks.granted "
+      "AND locks.mode='ExclusiveLock' AND locks.objsubid=1 "
+      "AND locks.database=(SELECT oid FROM pg_database WHERE "
+      "datname=current_database()) "
+      "AND locks.classid=((target.key >> 32) & 4294967295)::oid "
+      "AND locks.objid=(target.key & 4294967295)::oid "
+      "AND locks.pid<>pg_backend_pid()",
+      {"plinth.packages.notes"});
+  REQUIRE(PQresultStatus(owner.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(owner.get()) == 1);
+  const std::string backend = PQgetvalue(owner.get(), 0, 0);
+  auto terminated = exec_params(
+      s.conn, "SELECT pg_terminate_backend($1::integer, 1000)", {backend});
+  REQUIRE(PQresultStatus(terminated.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(terminated.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(terminated.get(), 0, 0)} == "t");
+
+  pending.gate->release();
+  REQUIRE(pending.result.wait_for(5s) == std::future_status::ready);
+  auto installed = pending.result.get();
+  REQUIRE_FALSE(installed.has_value());
+  const auto& failure = installed.error();
+  REQUIRE(failure.failed_at == plinth::packages::InstallStage::ACTIVE);
+  REQUIRE(failure.package_id == id);
+  REQUIRE(failure.kind == "rbac-test-lock-release-failed");
+  REQUIRE(failure.report.at("committed") == true);
+  REQUIRE(failure.report.at("state") == "ACTIVE");
+  REQUIRE(failure.report.at("rbac_test_scheduled") == false);
+  REQUIRE_FALSE(pending.gate->timed_out());
+  REQUIRE(plinth::packages::rbac_test::active_async_worker_count_for_test() ==
+          0);
+  REQUIRE(pkg_state(s.conn, id) == "ACTIVE");
+  REQUIRE(read_file_bytes(version / "manifest.json") == manifest);
+  REQUIRE(fs::is_regular_file(version / "server/main.js"));
+  REQUIRE(fs::read_symlink(active) == fs::path{"1.2.3"});
+  auto retained = exec_params(s.conn,
+                              "SELECT version, last_rbac_test_run_at IS NULL, "
+                              "to_regclass('ext_notes.notes') IS NOT NULL FROM "
+                              "plinth.packages WHERE id=$1::uuid",
+                              {id});
+  REQUIRE(PQresultStatus(retained.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(retained.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(retained.get(), 0, 0)} == "1.2.3");
+  REQUIRE(std::string{PQgetvalue(retained.get(), 0, 1)} == "t");
+  REQUIRE(std::string{PQgetvalue(retained.get(), 0, 2)} == "t");
+  REQUIRE(count_audit(s.conn, "packages.rbac_test_passed", id) == 0);
+  REQUIRE(count_audit(s.conn, "packages.rbac_test_failed", id) == 0);
 }
 
 TEST_CASE("PB.14 upgrade fires RBAC test on new row; old SUPERSEDED untouched",
@@ -846,6 +1126,9 @@ TEST_CASE("PB.15 sequential re-runs each acquire fresh advisory lock",
 
   plinth::packages::rbac_test::schedule_rbac_test(pid, s.ctx, "install");
   REQUIRE(wait_rbac_test_audit_count(s.conn, pid, 1) == 1);
+  // Audit precedes the final result UPDATE and advisory unlock. Only the
+  // completion timestamp proves that the next run can acquire the lock.
+  REQUIRE(wait_rbac_test(s.conn, pid));
 
   // Clear last_rbac_test_run_at so wait_rbac_test can tell when run 2 lands.
   auto reset =
@@ -857,6 +1140,7 @@ TEST_CASE("PB.15 sequential re-runs each acquire fresh advisory lock",
 
   plinth::packages::rbac_test::schedule_rbac_test(pid, s.ctx, "cli");
   REQUIRE(wait_rbac_test_audit_count(s.conn, pid, 2) == 2);
+  REQUIRE(wait_rbac_test(s.conn, pid));
 
   auto res = exec_params(
       s.conn,

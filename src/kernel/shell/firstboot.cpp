@@ -5,18 +5,26 @@
 #include "kernel/config.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/manifest.hpp"
 
 #include <json/value.h>
 #include <libpq-fe.h>
 #include <spdlog/spdlog.h>
 
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <fcntl.h>
 #include <fstream>
 #include <ios>
+#include <memory>
 #include <span>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <vector>
+#include <zip.h>
 
 namespace plinth::shell {
 
@@ -98,17 +106,21 @@ enum class DetectOutcome : std::uint8_t {
 struct DetectResult {
   DetectOutcome outcome = DetectOutcome::NONE;
   bool user_shell_present = false;
+  std::string id;
+  std::string name;
+  std::string version;
 };
 
 auto detect_active_bundled_frontend(PGconn* conn)
     -> std::expected<DetectResult, std::string> {
   PgResult res{plinth::db::exec(
-      conn, "SELECT name, provenance, state "
+      conn, "SELECT name, provenance, state, id::text, version "
             "FROM plinth.packages "
             "WHERE name = 'shell' "
             "   OR (provenance = 'bundled' "
             "       AND frontend_mount IS NOT NULL "
             "       AND state IN ('ACTIVE','ACTIVE_FLAGGED'))")};
+
   if (PQresultStatus(res.res) != PGRES_TUPLES_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.res)});
   }
@@ -122,6 +134,9 @@ auto detect_active_bundled_frontend(PGconn* conn)
     bool is_active = (state == "ACTIVE" || state == "ACTIVE_FLAGGED");
     if (prov == "bundled" && is_active) {
       ++active_bundled;
+      d.id = PQgetvalue(res.res, i, 3);
+      d.name = name;
+      d.version = PQgetvalue(res.res, i, 4);
     }
     if (name == "shell" && prov == "user") {
       d.user_shell_present = true;
@@ -137,30 +152,113 @@ auto detect_active_bundled_frontend(PGconn* conn)
   return d;
 }
 
-auto read_bundle_bytes(const fs::path& path)
+auto read_bundle_bytes(const fs::path& path, std::size_t max_bytes)
     -> std::expected<std::vector<std::byte>, std::string> {
-  std::error_code ec;
-  if (!fs::exists(path, ec) || ec) {
-    return std::unexpected("bundle file not found at " + path.string());
+  const int fd =
+      ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+  if (fd < 0) {
+    return std::unexpected("bundle file is not readable at " + path.string());
   }
-  std::ifstream in(path, std::ios::binary);
-  if (!in) {
-    return std::unexpected("bundle file at " + path.string() +
-                           " is not readable");
+  struct FileOwner {
+    int fd;
+    ~FileOwner() { ::close(fd); }
+  } owner{fd};
+  struct stat info{};
+  if (::fstat(fd, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size <= 0 ||
+      static_cast<std::uintmax_t>(info.st_size) > max_bytes) {
+    return std::unexpected(
+        "bundle must be a nonempty regular file within the package size limit");
   }
-  auto size = fs::file_size(path, ec);
-  if (ec) {
-    return std::unexpected("bundle file_size failed: " + ec.message());
-  }
-  std::vector<std::byte> buf(size);
-  if (size > 0) {
-    in.read(reinterpret_cast<char*>(buf.data()),
-            static_cast<std::streamsize>(size));
-    if (in.gcount() != static_cast<std::streamsize>(size)) {
-      return std::unexpected("bundle short read at " + path.string());
+  std::vector<std::byte> buf(static_cast<std::size_t>(info.st_size));
+  std::size_t offset = 0;
+  while (offset < buf.size()) {
+    auto count = ::read(fd, buf.data() + offset, buf.size() - offset);
+    if (count < 0 && errno == EINTR) {
+      continue;
     }
+    if (count <= 0) {
+      return std::unexpected("bundle read failed or changed during inspection");
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  std::byte extra{};
+  if (::read(fd, &extra, 1) != 0) {
+    return std::unexpected("bundle changed during inspection");
   }
   return buf;
+}
+
+struct BundleSnapshot {
+  std::vector<std::byte> bytes;
+  std::string version;
+};
+
+auto inspect_bundle(const fs::path& path, std::size_t max_bytes)
+    -> std::expected<BundleSnapshot, std::string> {
+  auto bytes = read_bundle_bytes(path, max_bytes);
+  if (!bytes) {
+    return std::unexpected(bytes.error());
+  }
+  zip_error_t error;
+  zip_error_init(&error);
+  auto* source =
+      zip_source_buffer_create(bytes->data(), bytes->size(), 0, &error);
+  if (source == nullptr) {
+    zip_error_fini(&error);
+    return std::unexpected("cannot inspect bundled ZIP");
+  }
+  auto* raw = zip_open_from_source(source, ZIP_RDONLY | ZIP_CHECKCONS, &error);
+  zip_error_fini(&error);
+  if (raw == nullptr) {
+    zip_source_free(source);
+    return std::unexpected("invalid bundled ZIP");
+  }
+  std::unique_ptr<zip_t, decltype(&zip_close)> archive{raw, zip_close};
+  const auto entries = zip_get_num_entries(raw, 0);
+  if (entries < 1 || entries > 4096) {
+    return std::unexpected("bundled ZIP exceeds the entry limit");
+  }
+  std::optional<zip_uint64_t> manifest_index;
+  zip_uint64_t manifest_size = 0;
+  for (zip_int64_t i = 0; i < entries; ++i) {
+    zip_stat_t info;
+    zip_stat_init(&info);
+    if (zip_stat_index(raw, static_cast<zip_uint64_t>(i), 0, &info) != 0 ||
+        info.name == nullptr) {
+      return std::unexpected("invalid bundled ZIP entry");
+    }
+    if (std::string_view{info.name} == "manifest.json") {
+      if (manifest_index || (info.valid & ZIP_STAT_SIZE) == 0 ||
+          info.size == 0 || info.size > zip_uint64_t{256} * 1024) {
+        return std::unexpected(
+            "bundled ZIP requires one bounded root manifest");
+      }
+      manifest_index = static_cast<zip_uint64_t>(i);
+      manifest_size = info.size;
+    }
+  }
+  if (!manifest_index) {
+    return std::unexpected("bundled ZIP has no root manifest.json");
+  }
+  std::unique_ptr<zip_file_t, decltype(&zip_fclose)> file{
+      zip_fopen_index(raw, *manifest_index, 0), zip_fclose};
+  if (!file) {
+    return std::unexpected("bundled manifest cannot be opened");
+  }
+  std::string text(static_cast<std::size_t>(manifest_size), '\0');
+  if (zip_fread(file.get(), text.data(), text.size()) !=
+      static_cast<zip_int64_t>(text.size())) {
+    return std::unexpected("bundled manifest cannot be read");
+  }
+  const auto parsed =
+      packages::PackageManifest::parse(text, "shell.zip/manifest.json", true);
+  if (!parsed.value || parsed.value->name != "shell" ||
+      !parsed.value->frontend) {
+    return std::unexpected(
+        "bundle must contain a valid shell frontend manifest");
+  }
+  return BundleSnapshot{.bytes = std::move(*bytes),
+                        .version = parsed.value->version};
 }
 
 } // namespace
@@ -211,9 +309,57 @@ auto resolve_bundle_path(const std::string& configured) -> fs::path {
   return bin_dir.parent_path() / "share" / "plinth" / "bundled";
 }
 
+auto bundled_shell_status(const Config& cfg)
+    -> std::expected<BundledShellStatus, std::string> {
+  auto bundle = inspect_bundle(
+      resolve_bundle_path(cfg.shell.bundle_path) / "shell.zip",
+      cfg.packages_max_package_size_mb * std::size_t{1024} * 1024);
+  if (!bundle) {
+    return std::unexpected(bundle.error());
+  }
+  PgGuard pg(cfg.db);
+  if (!pg.ok()) {
+    return std::unexpected("cannot connect to inspect installed shell");
+  }
+  BundledShellStatus status{.available_version = bundle->version};
+  PgResult exists{plinth::db::exec(
+      pg.conn, "SELECT to_regclass('plinth.packages') IS NOT NULL")};
+  if (PQresultStatus(exists.res) != PGRES_TUPLES_OK ||
+      PQntuples(exists.res) != 1) {
+    return std::unexpected("cannot inspect package schema");
+  }
+  if (std::string_view{PQgetvalue(exists.res, 0, 0)} == "f") {
+    return status;
+  }
+  auto detected = detect_active_bundled_frontend(pg.conn);
+  if (!detected) {
+    return std::unexpected(detected.error());
+  }
+  if (detected->outcome == DetectOutcome::TOO_MANY ||
+      detected->user_shell_present) {
+    return std::unexpected(
+        "installed frontend state requires operator reconciliation");
+  }
+  if (detected->outcome == DetectOutcome::EXACTLY_ONE) {
+    if (detected->name != "shell") {
+      return std::unexpected(
+          "active bundled frontend is not the reserved shell");
+    }
+    status.installed_version = detected->version;
+    status.upgrade_available =
+        packages::compare_semver(bundle->version, detected->version) > 0;
+  }
+  return status;
+}
+
 auto ensure_bundled_shell_installed(
-    const Config& cfg, const packages::InstallerContext& bootstrap_ctx)
-    -> std::expected<void, FirstBootFailure> {
+    const Config& cfg, const packages::InstallerContext& bootstrap_ctx,
+    bool upgrade_requested) -> std::expected<void, FirstBootFailure> {
+  if (upgrade_requested && cfg.dev_mode) {
+    return std::unexpected(FirstBootFailure{
+        .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
+        .message = "bundled-shell upgrades require dev_mode=false"});
+  }
   PgGuard pg(cfg.db);
   if (!pg.ok()) {
     std::string msg = pg.conn != nullptr
@@ -260,6 +406,64 @@ auto ensure_bundled_shell_installed(
     });
   }
   if (detect->outcome == DetectOutcome::EXACTLY_ONE) {
+    // PG and the active symlink cannot commit atomically across a process
+    // crash. Refuse ingress when they disagree; an operator can restore the
+    // pointer to the database's committed version before restarting.
+    std::error_code link_error;
+    auto target = fs::read_symlink(bootstrap_ctx.data_dir / "extensions" /
+                                       detect->name / "active",
+                                   link_error);
+    if (link_error || target != fs::path{detect->version}) {
+      return std::unexpected(FirstBootFailure{
+          .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
+          .message = "bundled frontend active symlink disagrees with installed "
+                     "version; operator recovery required",
+          .recovery_required = true});
+    }
+    if (upgrade_requested) {
+      if (detect->name != "shell") {
+        return std::unexpected(FirstBootFailure{
+            .kind = FirstBootError::SCHEMA_RESERVED,
+            .message = "active bundled frontend is not the reserved shell"});
+      }
+      auto bundle = inspect_bundle(resolve_bundle_path(cfg.shell.bundle_path) /
+                                       "shell.zip",
+                                   bootstrap_ctx.max_package_size_bytes);
+      if (!bundle) {
+        return std::unexpected(
+            FirstBootFailure{.kind = FirstBootError::BUNDLE_INSTALL_FAILED,
+                             .message = bundle.error()});
+      }
+      const int order =
+          packages::compare_semver(bundle->version, detect->version);
+      if (order == 0) {
+        spdlog::info("shell: installed bundle version {} is already current",
+                     detect->version);
+        return {};
+      }
+      if (order < 0) {
+        return std::unexpected(
+            FirstBootFailure{.kind = FirstBootError::BUNDLE_INSTALL_FAILED,
+                             .message = "available shell is older than "
+                                        "installed shell; downgrade refused"});
+      }
+      auto upgraded =
+          packages::upgrade_package(bundle->bytes, detect->id, bootstrap_ctx,
+                                    packages::Provenance::BUNDLED);
+      if (!upgraded) {
+        return std::unexpected(FirstBootFailure{
+            .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
+            .message =
+                "bundled-shell upgrade failed: " + upgraded.error().message,
+            .recovery_required =
+                upgraded.error().report.value("kind", "") ==
+                    "upgrade-recovery-required" ||
+                upgraded.error().report.value("committed", false)});
+      }
+      spdlog::info("shell: explicitly upgraded bundled shell {} to {}",
+                   detect->version, upgraded->new_record.version);
+      return {};
+    }
     spdlog::info("shell::firstboot: bundled frontend already ACTIVE — skipping "
                  "first-boot install");
     return {};
@@ -284,7 +488,8 @@ auto ensure_bundled_shell_installed(
   }
   plinth::log::audit_sync(cfg.db, AUDIT_STARTED, started_detail);
 
-  auto bytes = read_bundle_bytes(zip_path);
+  auto bytes =
+      read_bundle_bytes(zip_path, bootstrap_ctx.max_package_size_bytes);
   if (!bytes.has_value()) {
     emit_failed(cfg.db, "bundle-missing", bytes.error());
     return std::unexpected(FirstBootFailure{
@@ -319,6 +524,8 @@ auto ensure_bundled_shell_installed(
     return std::unexpected(FirstBootFailure{
         .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
         .message = std::move(msg),
+        .recovery_required =
+            f.report.is_object() && f.report.value("committed", false),
     });
   }
 

@@ -135,6 +135,11 @@ struct InstallerContext {
 // INSTALL_FAILED. On success: PackageRecord; on failure:
 // InstallFailure (plus a `plinth.packages` row in INSTALL_FAILED
 // state, unless the failure was pre-INSERT in UPLOADING).
+// A post-commit RBAC handoff error has failed_at=ACTIVE and
+// report.committed=true: the package remains installed; inspect state and
+// explicitly rerun its RBAC test. Install/enable/upgrade schedule only after
+// cutover, synchronous cache reload, and acknowledged name-lock release. Cache
+// reload remains best-effort.
 //
 // Dry-run mode (ICD-0.4.4 §HTTP Surface line 173, I.19): when
 // `dry_run=true`, runs UPLOADING + VALIDATING and returns early
@@ -181,6 +186,7 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
 // DISABLED → ACTIVE. Checksum-verifies on-disk manifest before state
 // flip; rematerialises capabilities + asset routes; clears
 // `orphaned_at` on every rbac_rules row for the extension.
+// A post-commit RBAC handoff error reports committed=true and preserves ACTIVE.
 auto enable_package(std::string_view package_id, const InstallerContext& ctx)
     -> std::expected<PackageRecord, TransitionFailure>;
 
@@ -200,9 +206,13 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
 // capability calls (≤ ctx.upgrade_drain_timeout_ms), commit
 // old→SUPERSEDED+retired_at + new→ACTIVE, symlink rename, route +
 // capability cutover. Old row retained for GC.
+// A post-commit RBAC handoff error reports committed=true and preserves the
+// completed swap and both versions; it does not mark the new row
+// INSTALL_FAILED.
 auto upgrade_package(std::span<const std::byte> zip_blob,
                      std::string_view existing_package_id,
-                     const InstallerContext& ctx)
+                     const InstallerContext& ctx,
+                     Provenance provenance = Provenance::USER)
     -> std::expected<UpgradeReport, TransitionFailure>;
 
 // GC contract body. Invocation is owned by a 0.7.x scheduler; 0.4.5
