@@ -41,17 +41,18 @@ auto peer_ip(const drogon::WebSocketConnectionPtr& conn) -> std::string {
   return conn->peerAddr().toIp();
 }
 
-// Close a displaced peer on its own event loop (captured in ConnState).
-// Fallback: close inline if the displaced state is missing (race at tear-down).
-auto close_displaced(const drogon::WebSocketConnectionPtr& displaced) -> void {
-  auto close_fn = [displaced]() {
-    send_error_and_close(displaced, WsCloseCode::ALREADY_CONNECTED,
+// The registry snapshots the target loop and owns the displaced state under
+// its lock. Never read another connection's context from the new peer's loop:
+// handleConnectionClosed may concurrently clear that shared_ptr on the target.
+auto close_displaced(RegistryEntry displaced) -> void {
+  auto* loop = displaced.loop;
+  auto close_fn = [displaced = std::move(displaced)]() {
+    send_error_and_close(displaced.conn, WsCloseCode::ALREADY_CONNECTED,
                          "already_connected",
                          "Another connection has claimed this session");
   };
-  auto* state = displaced->getContext<ConnState>().get();
-  if (state != nullptr && state->loop != nullptr) {
-    state->loop->queueInLoop(close_fn);
+  if (loop != nullptr) {
+    loop->queueInLoop(std::move(close_fn));
   } else {
     close_fn();
   }
@@ -93,14 +94,14 @@ auto finish_auth(const drogon::WebSocketConnectionPtr& conn, bool is_admin,
 
   auto displaced = ConnectionRegistry::instance().register_connection(
       make_key(state->auth), conn, state_ptr);
-  if (displaced && displaced.get() != conn.get()) {
+  if (displaced.conn && displaced.conn.get() != conn.get()) {
     Json::Value detail;
     detail["new_peer"] = peer_ip(conn);
     plinth::log::audit("ws.displaced", detail,
                        {.user_id = state->auth.user_id,
                         .session_id = state->auth.session_id,
-                        .ip_address = peer_ip(displaced)});
-    close_displaced(displaced);
+                        .ip_address = peer_ip(displaced.conn)});
+    close_displaced(std::move(displaced));
   }
 
   conn->sendJson(msg::make_connected(state->auth.user_id, state->auth.username,
