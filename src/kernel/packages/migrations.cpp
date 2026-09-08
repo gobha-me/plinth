@@ -570,10 +570,12 @@ auto pq_escape(PGconn& conn, std::string_view s) -> std::string {
 
 // Acquire an advisory lock keyed by hashtextextended('plinth.migrations.' ||
 // name, 0). Returns true on acquire, false if another session holds it.
-auto try_advisory_lock(PGconn& conn, std::string_view name)
+auto try_advisory_lock(PGconn& conn, std::string_view name, bool caller_owned)
     -> std::expected<bool, std::string> {
   std::string sql =
-      "SELECT pg_try_advisory_lock(hashtextextended(" +
+      std::string{caller_owned
+                      ? "SELECT pg_try_advisory_xact_lock(hashtextextended("
+                      : "SELECT pg_try_advisory_lock(hashtextextended("} +
       pq_escape(conn, std::string{"plinth.migrations."} + std::string{name}) +
       ", 0))";
   auto res = make_result(plinth::db::exec(&conn, sql.c_str()));
@@ -615,13 +617,16 @@ class AdvisoryLock {
   bool held;
 };
 
-auto ensure_schema_and_role(PGconn& conn, std::string_view name)
+auto ensure_schema_and_role(PGconn& conn, std::string_view name,
+                            bool manage_transaction)
     -> std::optional<MigrationFailure> {
   std::string ext = "ext_";
   ext += name;
   std::string role = ext + "_role";
   std::ostringstream sql;
-  sql << "BEGIN;\n";
+  if (manage_transaction) {
+    sql << "BEGIN;\n";
+  }
   sql << "  CREATE SCHEMA IF NOT EXISTS " << ext << ";\n";
   sql << "  DO $$ BEGIN\n"
       << "    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
@@ -632,7 +637,9 @@ auto ensure_schema_and_role(PGconn& conn, std::string_view name)
   sql << "  GRANT USAGE, CREATE ON SCHEMA " << ext << " TO " << role << ";\n";
   sql << "  GRANT USAGE ON SCHEMA plinth TO " << role << ";\n";
   sql << "  GRANT SELECT ON plinth.users TO " << role << ";\n";
-  sql << "COMMIT;";
+  if (manage_transaction) {
+    sql << "COMMIT;";
+  }
 
   auto res = make_result(plinth::db::exec(&conn, sql.str().c_str()));
   auto status = PQresultStatus(res.get());
@@ -645,7 +652,9 @@ auto ensure_schema_and_role(PGconn& conn, std::string_view name)
   while (!err.empty() && (err.back() == '\n' || err.back() == '\r')) {
     err.pop_back();
   }
-  (void)exec_ok(conn, "ROLLBACK");
+  if (manage_transaction) {
+    (void)exec_ok(conn, "ROLLBACK");
+  }
   return MigrationFailure{
       .kind = MigrationError::SCHEMA_CREATE_FAILED,
       .extension_name = std::string{name},
@@ -682,8 +691,11 @@ auto already_applied_checksum(PGconn& conn, std::string_view extension_name,
 }
 
 auto apply_one(PGconn& conn, std::string_view extension_name,
-               const MigrationFile& file) -> std::optional<MigrationFailure> {
-  if (auto err = exec_ok(conn, "BEGIN"); err.has_value()) {
+               const MigrationFile& file, bool manage_transaction)
+    -> std::optional<MigrationFailure> {
+  auto begin_error = manage_transaction ? exec_ok(conn, "BEGIN")
+                                        : std::optional<std::string>{};
+  if (auto err = begin_error; err.has_value()) {
     return MigrationFailure{
         .kind = MigrationError::MIGRATION_APPLY_FAILED,
         .extension_name = std::string{extension_name},
@@ -705,7 +717,9 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
              (err_msg.back() == '\n' || err_msg.back() == '\r')) {
         err_msg.pop_back();
       }
-      (void)exec_ok(conn, "ROLLBACK");
+      if (manage_transaction) {
+        (void)exec_ok(conn, "ROLLBACK");
+      }
       return MigrationFailure{
           .kind = MigrationError::MIGRATION_APPLY_FAILED,
           .extension_name = std::string{extension_name},
@@ -726,7 +740,9 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
     if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
       auto sqlstate = get_sqlstate(res.get());
       const char* msg = PQresultErrorMessage(res.get());
-      (void)exec_ok(conn, "ROLLBACK");
+      if (manage_transaction) {
+        (void)exec_ok(conn, "ROLLBACK");
+      }
       return MigrationFailure{
           .kind = MigrationError::MIGRATION_APPLY_FAILED,
           .extension_name = std::string{extension_name},
@@ -738,8 +754,12 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
     }
   }
 
-  if (auto err = exec_ok(conn, "COMMIT"); err.has_value()) {
-    (void)exec_ok(conn, "ROLLBACK");
+  auto commit_error = manage_transaction ? exec_ok(conn, "COMMIT")
+                                         : std::optional<std::string>{};
+  if (auto err = commit_error; err.has_value()) {
+    if (manage_transaction) {
+      (void)exec_ok(conn, "ROLLBACK");
+    }
     return MigrationFailure{
         .kind = MigrationError::MIGRATION_APPLY_FAILED,
         .extension_name = std::string{extension_name},
@@ -767,7 +787,8 @@ auto validate_extension_name(std::string_view name) -> bool {
 } // namespace
 
 auto run_migrations(std::string_view extension_name,
-                    const fs::path& package_root, PGconn& admin_conn)
+                    const fs::path& package_root, PGconn& admin_conn,
+                    MigrationTransaction transaction)
     -> std::expected<MigrationReport, MigrationFailure> {
   assert(validate_extension_name(extension_name) &&
          "extension_name must match ^[a-z][a-z0-9_-]{2,62}$");
@@ -784,7 +805,16 @@ auto run_migrations(std::string_view extension_name,
     });
   }
 
-  auto lock_res = try_advisory_lock(admin_conn, extension_name);
+  const bool caller_owned = transaction == MigrationTransaction::CALLER_OWNED;
+  if (caller_owned && PQtransactionStatus(&admin_conn) != PQTRANS_INTRANS) {
+    return std::unexpected(MigrationFailure{
+        .kind = MigrationError::MIGRATION_APPLY_FAILED,
+        .extension_name = std::string{extension_name},
+        .migration_file = std::nullopt,
+        .pg_sqlstate = std::nullopt,
+        .message = "caller-owned migrations require an active transaction"});
+  }
+  auto lock_res = try_advisory_lock(admin_conn, extension_name, caller_owned);
   if (!lock_res.has_value()) {
     return std::unexpected(MigrationFailure{
         .kind = MigrationError::ADVISORY_LOCK_FAILED,
@@ -804,9 +834,10 @@ auto run_migrations(std::string_view extension_name,
                    std::string{extension_name},
     });
   }
-  AdvisoryLock lock_guard{admin_conn, extension_name, true};
+  AdvisoryLock lock_guard{admin_conn, extension_name, !caller_owned};
 
-  if (auto fail = ensure_schema_and_role(admin_conn, extension_name);
+  if (auto fail =
+          ensure_schema_and_role(admin_conn, extension_name, !caller_owned);
       fail.has_value()) {
     return std::unexpected(*fail);
   }
@@ -852,7 +883,25 @@ auto run_migrations(std::string_view extension_name,
       continue;
     }
 
-    if (auto fail = apply_one(admin_conn, extension_name, file);
+    if (caller_owned) {
+      // A migration must not commit the surrounding bundled upgrade. SQL
+      // literals and procedural bodies are ignored by this command scanner.
+      static const std::regex transaction_control{
+          R"((^|;)\s*(BEGIN|START\s+TRANSACTION|COMMIT|END|ROLLBACK|ABORT|PREPARE\s+TRANSACTION)\b)",
+          std::regex::icase};
+      if (std::regex_search(detail::strip_sql_noise(file.contents),
+                            transaction_control)) {
+        return std::unexpected(MigrationFailure{
+            .kind = MigrationError::MIGRATION_APPLY_FAILED,
+            .extension_name = std::string{extension_name},
+            .migration_file = file.filename,
+            .pg_sqlstate = std::nullopt,
+            .message =
+                "caller-owned migrations cannot contain transaction control"});
+      }
+    }
+
+    if (auto fail = apply_one(admin_conn, extension_name, file, !caller_owned);
         fail.has_value()) {
       return std::unexpected(*fail);
     }

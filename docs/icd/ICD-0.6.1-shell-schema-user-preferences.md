@@ -275,12 +275,12 @@ changes from kernel-baked to on-disk-installed.
   registration which Drogon does not support. Admin-driven swap
   (uninstall current frontend, install new, restart kernel) is
   the supported workflow.
-- **Bundled-shell upgrade path.** ICD-0.6.1 pins the *first-boot*
-  install. Upgrading the bundled shell to a new version is the
-  same as any extension upgrade per ICD-0.4.5 §Upgrade Contract —
-  drop in a new shell.zip on disk, kernel runs the upgrade
-  lifecycle on next boot. The first-boot detection skips because
-  the active-row predicate already matches.
+- **Bundled-shell upgrade path.** Replacing `shell.zip` does not upgrade
+  an installed shell. The operator stops the kernel and restarts with
+  `plinth serve --config config.json --upgrade-bundled-shell`, with
+  `dev_mode=false`. `plinth shell status --config config.json` reports
+  installed and available versions without changing the installation.
+  See [the operator workflow](../bundled-shell-upgrade.md).
 - **Headless-browser harness for `M.*` mount routing cases.** Out
   of scope; deferred to 0.6.0.N test-fixture buildout's
   browser-harness slot per ICD-0.6.0 OQ2 — same posture as the
@@ -536,12 +536,10 @@ both legal:
    on-disk bytes change; previous install row stays as
    `'ACTIVE'`. Detection returns one row; pre-flight short-
    circuits. The replacement bytes are *not* installed
-   automatically — admin must explicitly upgrade through
-   ICD-0.4.5 §Upgrade Contract (e.g.
-   `POST /api/packages` with the new bundle, or future admin CLI
-   `plinth bundled-shell upgrade`). The kernel does not auto-
-   upgrade on bundle-bytes change because that would mask
-   accidental corruption.
+   automatically. The explicit operator command is
+   `plinth serve --config config.json --upgrade-bundled-shell`.
+   HTTP package uploads remain USER provenance and cannot replace the
+   reserved shell. See [the operator workflow](../bundled-shell-upgrade.md).
 
 ### 3.5 Failure modes
 
@@ -2090,13 +2088,13 @@ the current 0.6.x roadmap.
 
 ### Bundled-shell upgrade workflow
 
-§3.4 documents that admin-driven upgrade through ICD-0.4.5 is the
-path. A *kernel-driven* auto-upgrade on bundle-bytes change would
-require checksum tracking + change detection on disk; this masks
-operator mistakes (corrupt bundle replaces working install). **Not
-planned.** If operator workflow demands automation, a future
-admin CLI command (`plinth bundled-shell upgrade`) is the surface,
-not kernel-internal autopilot.
+The explicit startup flag and read-only status command now implement this
+workflow. Bundle-byte changes alone still never trigger an upgrade. Trusted
+bundled upgrades use a caller-owned transaction for pending migrations,
+registration and activation, preserving the previous installation on ordinary
+validation, migration or extraction failure. The generic USER package contract
+remains per-file migration transactions. See [the operator workflow](../bundled-shell-upgrade.md)
+for retry, restart, and crash recovery boundaries.
 
 ### Migration of existing user-installed `name='shell'` packages
 
@@ -2359,14 +2357,11 @@ ship CHANGELOG.
    three I.* browser/full-stack cases remain deferred; they are not part of
    the server fixture and are tracked in `docs/DEFERRED.md`.
 
-6. **`upgrade_package` parses with `Provenance::USER`.** §15
-   defers bundled-shell upgrade workflow; the existing user-
-   driven upgrade path always parses with `Provenance::USER`. A
-   user upload with `name='shell'` is rejected at
-   `install_package`'s parse stage (RESERVED_NAME) before
-   reaching `upgrade_package`. Future kernel-driven bundled
-   upgrade must thread the existing row's provenance to
-   `read_minimal_manifest`.
+6. **Upgrade provenance is explicit.** `upgrade_package` defaults to USER;
+   only the kernel's explicit bundled operation supplies BUNDLED. The passed
+   provenance must equal the installed row's provenance before any mutation.
+   Both minimal and full manifest validation use that same provenance.
+   HTTP reserved-name rejection remains in force.
 
 ### Default-grants infrastructure (general)
 

@@ -202,7 +202,8 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
 // capability cutover. Old row retained for GC.
 auto upgrade_package(std::span<const std::byte> zip_blob,
                      std::string_view existing_package_id,
-                     const InstallerContext& ctx)
+                     const InstallerContext& ctx,
+                     Provenance provenance = Provenance::USER)
     -> std::expected<UpgradeReport, TransitionFailure>;
 
 // GC contract body. Invocation is owned by a 0.7.x scheduler; 0.4.5

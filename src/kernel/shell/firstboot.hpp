@@ -17,17 +17,18 @@
 //      bytes to `install_lifecycle::install_package` with
 //      `Provenance::BUNDLED`. Emits `shell.firstboot.bundled_install_*`
 //      audits at the boundaries.
-//   3. One row: short-circuit (no install).
+//   3. One row: verify its active symlink, then short-circuit unless
+//      explicitly requested to upgrade the configured trusted bundle.
 //   4. Two or more rows: ERR_MULTIPLE_ACTIVE_FRONTENDS.
 //
 // Failure aborts boot via the `FirstBootFailure::exit_code()` value.
-// The audit row is persisted (synchronous via `audit_sync`) before
-// the error return so operators see the failure cause without
-// chasing PG state.
+// First-install and attempted-upgrade audit rows use synchronous audit_sync;
+// preflight errors also report the reason directly to the operator.
 
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace plinth {
@@ -65,12 +66,24 @@ struct FirstBootFailure {
 [[nodiscard]] auto resolve_bundle_path(const std::string& configured)
     -> std::filesystem::path;
 
+struct BundledShellStatus {
+  std::optional<std::string> installed_version;
+  std::string available_version;
+  bool upgrade_available = false;
+};
+
+// Read the installed row and inspect the configured archive without schema
+// bootstrap, extraction, audits or package mutations. Inspection is bounded
+// by the configured package limit and a 256 KiB root manifest limit.
+[[nodiscard]] auto bundled_shell_status(const Config& cfg)
+    -> std::expected<BundledShellStatus, std::string>;
+
 // Boot pre-flight per ICD-0.6.1 §3.1. The InstallerContext supplied is
 // the same `bootstrap_ctx` main.cpp constructs for
 // `reconcile_in_flight_installs` — passed by reference to avoid re-constructing
 // the package paths.
 auto ensure_bundled_shell_installed(
-    const Config& cfg, const packages::InstallerContext& bootstrap_ctx)
-    -> std::expected<void, FirstBootFailure>;
+    const Config& cfg, const packages::InstallerContext& bootstrap_ctx,
+    bool upgrade_requested = false) -> std::expected<void, FirstBootFailure>;
 
 } // namespace plinth::shell

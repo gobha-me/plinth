@@ -1077,6 +1077,7 @@ struct LoadedPackage {
   std::string name;
   std::string version;
   std::string state; // raw PG string
+  std::string provenance;
   std::string manifest_checksum;
   std::optional<std::string> frontend_mount;
   std::optional<std::string> frontend_entry; // ICD-0.6.1 §4.3
@@ -1090,7 +1091,7 @@ auto load_package_row(PGconn* conn, std::string_view package_id)
       plinth::db::exec_params(
           conn,
           "SELECT name, version, state, manifest_checksum, frontend_mount, "
-          "       frontend_entry "
+          "       frontend_entry, provenance "
           "FROM plinth.packages WHERE id = $1::uuid",
           1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
@@ -1105,6 +1106,7 @@ auto load_package_row(PGconn* conn, std::string_view package_id)
   lp.name = PQgetvalue(res.get(), 0, 0);
   lp.version = PQgetvalue(res.get(), 0, 1);
   lp.state = PQgetvalue(res.get(), 0, 2);
+  lp.provenance = PQgetvalue(res.get(), 0, 6);
   lp.manifest_checksum = PQgetvalue(res.get(), 0, 3);
   if (PQgetisnull(res.get(), 0, 4) == 0) {
     lp.frontend_mount = std::string{PQgetvalue(res.get(), 0, 4)};
@@ -1471,7 +1473,7 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
       // a sane user-visible outcome.
       release_lock();
       lg.f = {}; // prevent LockGuard double-release on scope exit
-      auto up = upgrade_package(zip_blob, coll->existing_id, ctx);
+      auto up = upgrade_package(zip_blob, coll->existing_id, ctx, provenance);
       if (!up.has_value()) {
         const auto& tf = up.error();
         return std::unexpected(InstallFailure{
@@ -2821,12 +2823,12 @@ auto emit_upgrade_audit(const InstallerContext& ctx, std::string_view action,
   plinth::log::audit_sync(ctx.db, std::string{action}, detail);
 }
 
-auto insert_upgrade_row(PGconn* admin, std::string_view new_id,
+auto insert_upgrade_row(PGconn* admin, std::string& new_id,
                         const MinimalManifest& minimal,
                         std::string_view supersedes_id,
                         std::string_view manifest_checksum,
                         std::string_view manifest_raw,
-                        std::string_view caller_user_id)
+                        std::string_view caller_user_id, Provenance provenance)
     -> std::expected<void, std::string> {
   std::string id_s{new_id};
   std::string name_s{minimal.name};
@@ -2835,6 +2837,7 @@ auto insert_upgrade_row(PGconn* admin, std::string_view new_id,
   std::string ck_s{manifest_checksum};
   std::string mf_s{manifest_raw};
   std::string caller_s{caller_user_id};
+  std::string provenance_s{provenance_to_string(provenance)};
   std::string mount_s = minimal.frontend_mount.value_or(std::string{});
   std::string fentry_s = minimal.frontend_entry.value_or(std::string{});
   std::string entry_s = minimal.entry_point;
@@ -2844,32 +2847,49 @@ auto insert_upgrade_row(PGconn* admin, std::string_view new_id,
   const char* fentry_ptr =
       minimal.frontend_entry.has_value() ? fentry_s.c_str() : nullptr;
   std::array<const char*, 11> values = {
-      id_s.c_str(),    // $1 id
-      name_s.c_str(),  // $2 name
-      ver_s.c_str(),   // $3 version
-      sup_s.c_str(),   // $4 supersedes_id
-      mf_s.c_str(),    // $5 manifest_json
-      mount_ptr,       // $6 frontend_mount (nullable)
-      fentry_ptr,      // $7 frontend_entry (nullable; ICD-0.6.1 §4.3)
-      entry_s.c_str(), // $8 entry_point
-      ck_s.c_str(),    // $9 manifest_checksum
-      caller_ptr,      // $10 installed_by_user_id (nullable)
-      "user",          // $11 provenance — upgrades always admin POST
+      id_s.c_str(),         // $1 id
+      name_s.c_str(),       // $2 name
+      ver_s.c_str(),        // $3 version
+      sup_s.c_str(),        // $4 supersedes_id
+      mf_s.c_str(),         // $5 manifest_json
+      mount_ptr,            // $6 frontend_mount (nullable)
+      fentry_ptr,           // $7 frontend_entry (nullable; ICD-0.6.1 §4.3)
+      entry_s.c_str(),      // $8 entry_point
+      ck_s.c_str(),         // $9 manifest_checksum
+      caller_ptr,           // $10 installed_by_user_id (nullable)
+      provenance_s.c_str(), // $11 trusted caller provenance
   };
-  PgResultPtr res(
-      plinth::db::exec_params(
-          admin,
-          "INSERT INTO plinth.packages "
-          "(id, name, version, state, provenance, supersedes_id, "
-          " manifest_json, frontend_mount, frontend_entry, entry_point, "
-          " manifest_checksum, installed_by_user_id) "
-          "VALUES ($1::uuid, $2, $3, 'UPLOADING', $11, $4::uuid, "
-          " $5::jsonb, $6, $7, $8, $9, NULLIF($10, '')::uuid)",
-          11, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
-  if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
+  std::string sql =
+      "INSERT INTO plinth.packages "
+      "(id, name, version, state, provenance, supersedes_id, "
+      " manifest_json, frontend_mount, frontend_entry, entry_point, "
+      " manifest_checksum, installed_by_user_id) "
+      "VALUES ($1::uuid, $2, $3, 'UPLOADING', $11, $4::uuid, "
+      " $5::jsonb, $6, $7, $8, $9, NULLIF($10, '')::uuid)";
+  if (provenance == Provenance::BUNDLED) {
+    sql += " ON CONFLICT (name, version) DO UPDATE SET state='UPLOADING', "
+           "manifest_json=EXCLUDED.manifest_json, "
+           "frontend_mount=EXCLUDED.frontend_mount, "
+           "frontend_entry=EXCLUDED.frontend_entry, "
+           "entry_point=EXCLUDED.entry_point, "
+           "manifest_checksum=EXCLUDED.manifest_checksum "
+           "WHERE plinth.packages.state='INSTALL_FAILED' "
+           "AND plinth.packages.provenance='bundled' "
+           "AND plinth.packages.supersedes_id=EXCLUDED.supersedes_id";
+  }
+  sql += " RETURNING id::text";
+  PgResultPtr res(plinth::db::exec_params(admin, sql.c_str(), 11, nullptr, values.data(),
+                               nullptr, nullptr, 0),
+                  PQclear);
+  if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
+
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
+  if (PQntuples(res.get()) != 1) {
+    return std::unexpected(
+        "existing candidate is not an eligible bundled retry");
+  }
+  new_id = PQgetvalue(res.get(), 0, 0);
   return {};
 }
 
@@ -2921,7 +2941,7 @@ auto compute_v1_only_capabilities(PGconn* admin, std::string_view name,
 // choreography; splitting into helpers scatters the rollback flow.
 auto upgrade_package(std::span<const std::byte> zip_blob,
                      std::string_view existing_package_id,
-                     const InstallerContext& ctx)
+                     const InstallerContext& ctx, Provenance provenance)
     -> std::expected<UpgradeReport, TransitionFailure> {
   PgGuard pg(ctx.db);
   if (!pg.ok()) {
@@ -2937,6 +2957,11 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
         upgrade_failure(existing_package_id, code, lp_r.error()));
   }
   LoadedPackage existing = *lp_r;
+  if (existing.provenance != provenance_to_string(provenance)) {
+    return std::unexpected(
+        upgrade_failure(existing_package_id, "provenance-mismatch",
+                        "upgrade provenance must match the installed package"));
+  }
   if (existing.state != "ACTIVE" && existing.state != "ACTIVE_FLAGGED") {
     return std::unexpected(
         upgrade_failure(existing_package_id, "invalid-state-transition",
@@ -2992,11 +3017,9 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     return std::unexpected(upgrade_failure(existing_package_id, ex.error().kind,
                                            ex.error().message));
   }
-  // ICD-0.6.1 §5.5: upgrade_package only ever reaches here for user-uploaded
-  // upgrades — bundled-shell upgrade workflow is deferred per §15 and rides
-  // a separate kernel-driven path. A user upload with `name='shell'` is
-  // rejected at install_package's parse stage before reaching upgrade.
-  auto minimal_r = read_minimal_manifest(staging, Provenance::USER);
+  // Only the kernel's explicit bundled-shell operation supplies BUNDLED.
+  // HTTP callers retain USER and cannot upgrade a reserved bundled package.
+  auto minimal_r = read_minimal_manifest(staging, provenance);
   if (!minimal_r.has_value()) {
     return std::unexpected(upgrade_failure(
         existing_package_id, "manifest-parse", minimal_r.error().message));
@@ -3025,11 +3048,35 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   std::string manifest_checksum = sha256_hex(manifest_raw);
   if (auto ins = insert_upgrade_row(pg.conn, new_id, minimal, existing.id,
                                     manifest_checksum, manifest_raw,
-                                    ctx.caller_user_id);
+                                    ctx.caller_user_id, provenance);
       !ins.has_value()) {
     return std::unexpected(
         upgrade_failure(existing_package_id, "db-error", ins.error()));
   }
+
+  const bool bundled = provenance == Provenance::BUNDLED;
+  bool bundle_transaction_open = false;
+  bool bundle_committed = false;
+  std::optional<fs::path> owned_version_dir;
+  auto rollback_bundle = [&]() {
+    if (bundle_transaction_open) {
+      if (auto r = pg_exec(pg.conn, "ROLLBACK"); !r) {
+        spdlog::error("bundled upgrade ROLLBACK failed: {}", r.error());
+      }
+      bundle_transaction_open = false;
+    }
+  };
+  LockGuard bundle_guard{[&]() {
+    rollback_bundle();
+    if (owned_version_dir && !bundle_committed) {
+      std::error_code cleanup_error;
+      fs::remove_all(*owned_version_dir, cleanup_error);
+      if (cleanup_error) {
+        spdlog::error("bundled upgrade file cleanup failed: {}",
+                      cleanup_error.message());
+      }
+    }
+  }};
 
   auto fail_and_mark =
       [&](std::string_view code, std::string_view msg,
@@ -3042,7 +3089,18 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
         r[it.key()] = it.value();
       }
     }
+    rollback_bundle();
     mark_upgrade_failed(pg.conn, new_id, r);
+    if (bundled) {
+      Json::Value detail(Json::objectValue);
+      detail["id"] = new_id;
+      detail["name"] = minimal.name;
+      detail["version"] = minimal.version;
+      detail["kind"] = std::string{code};
+      detail["message"] = std::string{msg};
+      plinth::log::audit_sync(ctx.db, "packages.bundled_upgrade_failed",
+                              detail);
+    }
     return TransitionFailure{
         .kind = TransitionKind::UPGRADE,
         .package_id = new_id,
@@ -3060,6 +3118,7 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   vcfg.cross_file = true;
   vcfg.against_running_kernel = false; // RT1 whitelisted via in-process path
   vcfg.upgrade_from_id = existing.id;
+  vcfg.is_bundled = (provenance == Provenance::BUNDLED);
   auto vr = validate(staging, vcfg);
   if (vr.disposition() == 1) {
     return std::unexpected(fail_and_mark("validation-errors",
@@ -3067,12 +3126,24 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
                                          build_validation_report(vr)));
   }
 
+  // Trusted bundled upgrades retain one transaction through migration,
+  // registration, extraction and activation. A later failure restores the
+  // installed shell's schema, data and identities, including migration rows.
+  if (bundled) {
+    if (auto begin_bundle = pg_exec(pg.conn, "BEGIN"); !begin_bundle) {
+      return std::unexpected(fail_and_mark("db-error", begin_bundle.error()));
+    }
+    bundle_transaction_open = true;
+  }
+
   // 7. MIGRATING.
   if (auto u = update_packages_state(pg.conn, new_id, "MIGRATING");
       !u.has_value()) {
     return std::unexpected(fail_and_mark("db-error", u.error()));
   }
-  auto mig = run_migrations(minimal.name, staging, *pg.conn);
+  auto mig = run_migrations(minimal.name, staging, *pg.conn,
+                            bundled ? MigrationTransaction::CALLER_OWNED
+                                    : MigrationTransaction::PER_FILE);
   if (!mig.has_value()) {
     const auto& me = mig.error();
     nlohmann::json r;
@@ -3110,13 +3181,15 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   }
 
   // 8. REGISTERING — upgrade variant, single tx.
-  auto begin = pg_exec(pg.conn, "BEGIN");
-  if (!begin.has_value()) {
-    return std::unexpected(fail_and_mark("db-error", begin.error()));
+  if (!bundled) {
+    auto begin = pg_exec(pg.conn, "BEGIN");
+    if (!begin.has_value()) {
+      return std::unexpected(fail_and_mark("db-error", begin.error()));
+    }
   }
   bool reg_committed = false;
   auto reg_rollback = [&]() {
-    if (!reg_committed) {
+    if (!bundled && !reg_committed) {
       if (auto r = pg_exec(pg.conn, "ROLLBACK"); !r) {
         spdlog::warn("upgrade: REGISTERING ROLLBACK failed: {}", r.error());
       }
@@ -3155,9 +3228,11 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     // Instead: snapshot BEFORE REGISTERING — do this below.
     (void)v1_only_caps; // populated below from a pre-tx snapshot
 
-    auto commit = pg_exec(pg.conn, "COMMIT");
-    if (!commit.has_value()) {
-      return std::unexpected(fail_and_mark("db-error", commit.error()));
+    if (!bundled) {
+      auto commit = pg_exec(pg.conn, "COMMIT");
+      if (!commit.has_value()) {
+        return std::unexpected(fail_and_mark("db-error", commit.error()));
+      }
     }
     reg_committed = true;
   }
@@ -3172,6 +3247,15 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   fs::create_directories(new_version_dir.parent_path(), ec);
   if (ec) {
     return std::unexpected(fail_and_mark("extraction-failed", ec.message()));
+  }
+  if (bundled) {
+    // Never overwrite or clean up a directory owned by another attempt.
+    if (!fs::create_directory(new_version_dir, ec)) {
+      return std::unexpected(fail_and_mark(
+          "extraction-failed",
+          ec ? ec.message() : "incoming version directory already exists"));
+    }
+    owned_version_dir = new_version_dir;
   }
   fs::copy(staging, new_version_dir,
            fs::copy_options::recursive | fs::copy_options::skip_symlinks, ec);
@@ -3218,14 +3302,16 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   }
 
   // T3 — swap tx: old → SUPERSEDED+retired_at, new → ACTIVE.
-  auto swap_begin = pg_exec(pg.conn, "BEGIN");
-  if (!swap_begin.has_value()) {
-    return std::unexpected(
-        fail_and_mark("upgrade-swap-failed", swap_begin.error()));
+  if (!bundled) {
+    auto swap_begin = pg_exec(pg.conn, "BEGIN");
+    if (!swap_begin.has_value()) {
+      return std::unexpected(
+          fail_and_mark("upgrade-swap-failed", swap_begin.error()));
+    }
   }
   bool swap_committed = false;
   auto swap_rollback = [&]() {
-    if (!swap_committed) {
+    if (!bundled && !swap_committed) {
       if (auto r = pg_exec(pg.conn, "ROLLBACK"); !r) {
         spdlog::warn("upgrade: T3 ROLLBACK failed: {}", r.error());
       }
@@ -3267,10 +3353,12 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
         PQntuples(rt.get()) == 1) {
       retired_at_s = PQgetvalue(rt.get(), 0, 0);
     }
-    auto commit = pg_exec(pg.conn, "COMMIT");
-    if (!commit.has_value()) {
-      return std::unexpected(
-          fail_and_mark("upgrade-swap-failed", commit.error()));
+    if (!bundled) {
+      auto commit = pg_exec(pg.conn, "COMMIT");
+      if (!commit.has_value()) {
+        return std::unexpected(
+            fail_and_mark("upgrade-swap-failed", commit.error()));
+      }
     }
     swap_committed = true;
     (void)retired_at_s; // structured report sent at T4
@@ -3291,6 +3379,47 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     return std::unexpected(fail_and_mark(
         "upgrade-swap-failed", "rename(active.tmp → active) failed: " +
                                    std::string{std::strerror(errno)}));
+  }
+
+  if (bundled) {
+    auto commit = pg_exec(pg.conn, "COMMIT");
+    if (!commit) {
+      // A lost COMMIT acknowledgement has an uncertain database outcome.
+      // Retain both versions even if restoring the old pointer succeeds.
+      owned_version_dir.reset();
+      const bool outcome_unknown =
+          PQstatus(pg.conn) != CONNECTION_OK ||
+          PQtransactionStatus(pg.conn) == PQTRANS_UNKNOWN;
+      // The process is still before HTTP ingress. Restore the old pointer
+      // before reporting failure and rolling the database transaction back.
+      fs::create_symlink(existing.version, tmp_path, ec);
+      if (ec || ::rename(tmp_path.c_str(), active_path.c_str()) != 0) {
+        // Retain the new files if the pointer cannot be restored.
+        owned_version_dir.reset();
+        if (outcome_unknown) {
+          bundle_transaction_open = false;
+          return std::unexpected(upgrade_failure(
+              new_id, "upgrade-recovery-required",
+              "database commit outcome is unknown and the active pointer could "
+              "not be restored; inspect retained versions"));
+        }
+        return std::unexpected(
+            fail_and_mark("upgrade-recovery-required",
+                          "database commit failed and the active symlink could "
+                          "not be restored"));
+      }
+      if (outcome_unknown) {
+        bundle_transaction_open = false;
+        return std::unexpected(upgrade_failure(
+            new_id, "upgrade-recovery-required",
+            "database commit outcome is unknown; inspect installed version and "
+            "retained files before restart"));
+      }
+      return std::unexpected(
+          fail_and_mark("upgrade-swap-failed", commit.error()));
+    }
+    bundle_transaction_open = false;
+    bundle_committed = true;
   }
 
   emit_upgrade_audit(ctx, "packages.upgrade_swapped", existing, new_id,
@@ -3349,7 +3478,7 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   report.new_record.name = minimal.name;
   report.new_record.version = minimal.version;
   report.new_record.state = InstallStage::ACTIVE;
-  report.new_record.provenance = Provenance::USER;
+  report.new_record.provenance = provenance;
   report.new_record.manifest_json =
       nlohmann::json::parse(manifest_raw, nullptr, false);
   report.new_record.installed_at = std::chrono::system_clock::now();

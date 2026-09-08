@@ -574,3 +574,47 @@ TEST_CASE("migrations: drop_schema_and_migrations is idempotent",
   auto d2 = drop_schema_and_migrations(name, *pg.conn);
   REQUIRE(d2.has_value());
 }
+
+TEST_CASE("caller-owned migrations roll back earlier files, data and tracking",
+          "[packages][migrations][integration]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Pg pg{conninfo_of(pg_env())};
+  ensure_plinth_schema(pg);
+  auto name = next_ext_name();
+  ExtensionScope scope{pg, name};
+  StagedFixture staged{fs::temp_directory_path() / (name + "_atomic")};
+  fs::create_directories(staged.root / "migrations");
+  auto write = [&](std::string_view filename, const std::string& sql) {
+    std::ofstream out{staged.root / "migrations" / filename};
+    out << sql;
+    REQUIRE(out.good());
+  };
+  write("001_init.sql", "CREATE TABLE ext_" + name +
+                            ".retained(value INTEGER); INSERT INTO ext_" +
+                            name + ".retained VALUES(7);");
+  REQUIRE(run_migrations(name, staged.root, *pg.conn).has_value());
+  write("002_change.sql", "ALTER TABLE ext_" + name +
+                              ".retained ADD COLUMN extra TEXT; UPDATE ext_" +
+                              name + ".retained SET value=9;");
+  SECTION("a later SQL failure cannot leave an earlier new file committed") {
+    write("003_fail.sql", "SELECT 1/0;");
+  }
+  SECTION(
+      "migration transaction control cannot escape the owning transaction") {
+    write("003_fail.sql", "/* legitimate comments are ignored */ COMMIT;");
+  }
+  REQUIRE(PQresultStatus(pg.exec("BEGIN").get()) == PGRES_COMMAND_OK);
+  auto result =
+      run_migrations(name, staged.root, *pg.conn,
+                     plinth::packages::MigrationTransaction::CALLER_OWNED);
+  REQUIRE_FALSE(result.has_value());
+  REQUIRE(result.error().migration_file == "003_fail.sql");
+  REQUIRE(PQresultStatus(pg.exec("ROLLBACK").get()) == PGRES_COMMAND_OK);
+  REQUIRE(row_count(pg, name) == 1);
+  auto retained = pg.exec("SELECT * FROM ext_" + name + ".retained");
+  REQUIRE(PQresultStatus(retained.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQnfields(retained.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(retained.get(), 0, 0)} == "7");
+}
