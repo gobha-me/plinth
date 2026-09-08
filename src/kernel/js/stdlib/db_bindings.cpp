@@ -310,9 +310,12 @@ auto db_query(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
   // `check_in_batch_admission` so the function bodies stay flat.
   if (bc->batch_state.depth > 0) {
     if (auto err = check_in_batch_admission(ctx, bc, op.sql)) {
+      JS_FreeValue(ctx, promise);
       return *err;
     }
     op.batch_scope_id = bc->batch_state.scope_id;
+    // Capture the owning transaction on the JS loop, as db.exec does.
+    op.batch_pinned_conn = bc->batch_state.pinned_conn;
     ++bc->batch_state.ops_in_batch;
   }
   bc->pending_ops.push_back(std::move(op));

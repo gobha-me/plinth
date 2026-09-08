@@ -86,20 +86,19 @@ struct TestPg {
   auto operator=(TestPg&&) -> TestPg& = delete;
 
   auto exec(const std::string& sql) const -> void {
-    PGresult* res = PQexec(conn, sql.c_str());
-    PQclear(res);
+    const std::unique_ptr<PGresult, decltype(&PQclear)> res{
+        PQexec(conn, sql.c_str()), PQclear};
+    REQUIRE(PQresultStatus(res.get()) == PGRES_COMMAND_OK);
   }
 
   [[nodiscard]] auto count_rows(const std::string& qualified_table) const
       -> int {
-    PGresult* res =
-        PQexec(conn, ("SELECT COUNT(*) FROM " + qualified_table).c_str());
-    int n = 0;
-    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
-      n = std::stoi(PQgetvalue(res, 0, 0));
-    }
-    PQclear(res);
-    return n;
+    const std::unique_ptr<PGresult, decltype(&PQclear)> res{
+        PQexec(conn, ("SELECT COUNT(*) FROM " + qualified_table).c_str()),
+        PQclear};
+    REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(res.get()) == 1);
+    return std::stoi(PQgetvalue(res.get(), 0, 0));
   }
 
   [[nodiscard]] auto count_audit(const std::string& action,
@@ -202,6 +201,90 @@ TEST_CASE("B.02: rollback on user throw — 0 rows + rolled_back audit fires",
   REQUIRE(r.value->asString() == "err:user.boom");
   REQUIRE(pg.count_rows("ext_batch.notes") == 0);
   REQUIRE(wait_for_audit(pg, "db.batch.rolled_back", "batch", 1));
+}
+
+TEST_CASE("batch query reads its own exec writes and commits returning DML",
+          "[js][async][db][batch][batch-transaction]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+  auto cfg = test_config();
+  reset_for_batch_test(cfg);
+  TestPg pg(cfg.db);
+  setup_ext_batch(pg);
+  auto pool = make_pool(cfg);
+  auto r = eval_as(pool, "batch", R"JS(
+    db.batch(async () => {
+      await db.exec("INSERT INTO notes(body) VALUES($1)", ["first"]);
+      const {rows} = await db.query("SELECT body FROM notes ORDER BY id");
+      if (rows.length !== 1 || rows[0].body !== "first")
+        throw {code: "test.missing_uncommitted_write"};
+      const {rows: inserted} = await db.query(
+        "INSERT INTO notes(body) VALUES($1) RETURNING body", ["second"]);
+      if (inserted.length !== 1 || inserted[0].body !== "second")
+        throw {code: "test.missing_returning_row"};
+      return "ok";
+    }).then(v => v, e => "err:" + e.code)
+  )JS");
+  REQUIRE(r.value.has_value());
+  REQUIRE(r.value->asString() == "ok");
+  REQUIRE(pg.count_rows("ext_batch.notes") == 2);
+}
+
+TEST_CASE("batch query returning DML rolls back with exec on user exception",
+          "[js][async][db][batch][batch-transaction]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+  auto cfg = test_config();
+  reset_for_batch_test(cfg);
+  TestPg pg(cfg.db);
+  setup_ext_batch(pg);
+  auto pool = make_pool(cfg);
+  auto r = eval_as(pool, "batch", R"JS(
+    db.batch(async () => {
+      await db.exec("INSERT INTO notes(body) VALUES($1)", ["exec"]);
+      const {rows} = await db.query(
+        "INSERT INTO notes(body) VALUES($1) RETURNING body", ["query"]);
+      if (rows.length !== 1 || rows[0].body !== "query")
+        throw {code: "test.missing_returning_row"};
+      throw {code: "test.rollback"};
+    }).then(() => "unexpected commit", e => e.code)
+  )JS");
+  REQUIRE(r.value.has_value());
+  REQUIRE(r.value->asString() == "test.rollback");
+  REQUIRE(pg.count_rows("ext_batch.notes") == 0);
+}
+
+TEST_CASE("batch query database error rolls back preceding mixed writes",
+          "[js][async][db][batch][batch-transaction]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+  auto cfg = test_config();
+  reset_for_batch_test(cfg);
+  TestPg pg(cfg.db);
+  setup_ext_batch(pg);
+  pg.exec("ALTER TABLE ext_batch.notes ADD UNIQUE(body)");
+  auto pool = make_pool(cfg);
+  auto r = eval_as(pool, "batch", R"JS(
+    db.batch(async () => {
+      await db.exec("INSERT INTO notes(body) VALUES($1)", ["exec"]);
+      await db.query("INSERT INTO notes(body) VALUES($1) RETURNING body", ["query"]);
+      await db.query("INSERT INTO notes(body) VALUES($1) RETURNING body", ["exec"]);
+    }).then(() => ({code: "unexpected commit"}), e => ({code: e.code, message: e.message}))
+  )JS");
+  REQUIRE(r.value.has_value());
+  // PgBatchConnection currently loses SQLSTATE for this error; still require
+  // the intended constraint's diagnostic so unrelated DB failures cannot pass.
+  const auto code = (*r.value)["code"].asString();
+  REQUIRE((code == "db.constraint_violation" || code == "db.internal"));
+  REQUIRE((*r.value)["message"].asString().find("notes_body_key") !=
+          std::string::npos);
+  REQUIRE(pg.count_rows("ext_batch.notes") == 0);
 }
 
 // ─── B.03 ─────────────────────────────────────────────────────────

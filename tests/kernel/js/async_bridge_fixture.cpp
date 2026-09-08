@@ -79,6 +79,9 @@ auto test_config() -> plinth::Config {
   if (const auto* v = env("PLINTH_PG_DATABASE")) {
     cfg.db.database = v;
   }
+  if (const auto* v = env("PLINTH_TEST_DB_POOL_SIZE")) {
+    cfg.db.pool_size = std::stoi(v);
+  }
   return cfg;
 }
 
