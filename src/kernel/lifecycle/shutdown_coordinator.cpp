@@ -59,12 +59,9 @@ auto production_shutdown_hooks() -> ShutdownHooks {
           },
       .stop_listeners =
           [](std::chrono::milliseconds timeout) {
-            auto deadline = std::chrono::steady_clock::now() + timeout;
-            if (!plinth::capabilities::stop_notify_listener(
-                    remaining_until(deadline))) {
-              return false;
-            }
-            return plinth::realtime::stop_listener(remaining_until(deadline));
+            // Realtime LISTEN is a downstream database consumer. It must
+            // remain available to writes from already accepted producers.
+            return plinth::capabilities::stop_notify_listener(timeout);
           },
       .drain_async_tasks =
           [](std::chrono::milliseconds timeout) {
@@ -85,14 +82,21 @@ auto production_shutdown_hooks() -> ShutdownHooks {
       .flush_database_state =
           [](std::chrono::milliseconds timeout) {
             auto deadline = std::chrono::steady_clock::now() + timeout;
+            plinth::js::discard_all_batches();
+            if (!plinth::realtime::CoalescerRegistry::instance().shutdown(
+                    remaining_until(deadline)) ||
+                !plinth::realtime::drain_listener(remaining_until(deadline))) {
+              return false;
+            }
             if (!plinth::realtime::events_writer::stop(
                     remaining_until(deadline))) {
               return false;
             }
-            plinth::js::discard_all_batches();
+            if (!plinth::realtime::stop_listener(remaining_until(deadline))) {
+              return false;
+            }
             plinth::realtime::broker::stop();
-            return plinth::realtime::CoalescerRegistry::instance().shutdown(
-                remaining_until(deadline));
+            return true;
           },
       .close_audit_gate =
           [](std::chrono::milliseconds) {
@@ -100,7 +104,11 @@ auto production_shutdown_hooks() -> ShutdownHooks {
             return true;
           },
       .stop_drogon =
-          [](std::chrono::milliseconds) {
+          [](std::chrono::milliseconds timeout) {
+            if (!plinth::ws::ConnectionRegistry::instance().release_connections(
+                    timeout)) {
+              return false;
+            }
             drogon::app().quit();
             return true;
           },

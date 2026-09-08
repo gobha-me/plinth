@@ -11,18 +11,10 @@ namespace plinth::ws {
 
 namespace {
 
-// Shutdown gate: during process teardown, an IO loop may dispatch a
-// `handleConnectionClosed` event for a connection whose TCP-level close is
-// still pending. The coordinator flips this gate before stopping Drogon and
-// joins the application thread before static destruction begins, so no late
-// callback can touch the registry while its members are being destroyed.
-//
-// The test fixture / main.cpp flip this flag **before**
-// `drogon::app().quit()`; every public method checks the flag on
-// entry and no-ops if set. The flag lives at file scope (anonymous
-// namespace) so its zero-initialized storage outlives the singleton's
-// dynamic-init-ordered destruction.
-// gate across threads
+// Late callbacks stop consulting the singleton once shutdown starts. Admission
+// also checks the per-registry seal under its mutex, closing the check/lock
+// race. The coordinator releases registry owners while their IO loops are
+// alive, then joins Drogon before singleton destruction.
 std::atomic<bool> g_shutdown_pending{false};
 
 } // namespace
@@ -41,13 +33,20 @@ auto ConnectionRegistry::register_connection(
     return {};
   }
   std::lock_guard lock(mu);
+  if (sealed) {
+    return {};
+  }
+  auto* loop = state ? state->loop : nullptr;
   drogon::WebSocketConnectionPtr displaced;
   auto it = conns.find(key);
   if (it != conns.end()) {
     displaced = it->second.conn;
-    it->second = RegistryEntry{.conn = conn, .state = std::move(state)};
+    it->second =
+        RegistryEntry{.conn = conn, .state = std::move(state), .loop = loop};
   } else {
-    conns.emplace(key, RegistryEntry{.conn = conn, .state = std::move(state)});
+    conns.emplace(
+        key,
+        RegistryEntry{.conn = conn, .state = std::move(state), .loop = loop});
   }
   return displaced;
 }
@@ -96,6 +95,47 @@ auto ConnectionRegistry::size() const -> std::size_t {
 
 auto ConnectionRegistry::initiate_shutdown() noexcept -> void {
   g_shutdown_pending.store(true, std::memory_order_release);
+  auto& registry = instance();
+  std::lock_guard lock(registry.mu);
+  registry.sealed = true;
+}
+
+auto ConnectionRegistry::release_connections(std::chrono::milliseconds timeout)
+    -> bool {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::vector<std::shared_future<void>> pending;
+  {
+    std::lock_guard lock(mu);
+    sealed = true;
+    // A missing owner loop is a contract failure. Keep these references alive
+    // and prevent the coordinator from destroying their dependencies.
+    for (const auto& [_, entry] : conns) {
+      if (entry.loop == nullptr) {
+        return false;
+      }
+    }
+    releases.reserve(releases.size() + conns.size());
+    for (auto& [_, entry] : conns) {
+      auto done = std::make_shared<std::promise<void>>();
+      releases.push_back(done->get_future().share());
+      auto* loop = entry.loop;
+      loop->queueInLoop([owned = std::move(entry), done]() mutable {
+        // WebSocketConnection's destructor invalidates a Drogon timer. Both
+        // owners must be gone before acknowledging that this loop may stop.
+        owned.conn.reset();
+        owned.state.reset();
+        done->set_value();
+      });
+    }
+    conns.clear();
+    pending = releases;
+  }
+  for (const auto& done : pending) {
+    if (done.wait_until(deadline) != std::future_status::ready) {
+      return false;
+    }
+  }
+  return true;
 }
 
 auto ConnectionRegistry::cancel_all_timers(std::chrono::milliseconds timeout)

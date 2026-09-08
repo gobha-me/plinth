@@ -2,6 +2,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
+#include <trantor/net/EventLoopThread.h>
+
 using plinth::ws::ConnectionRegistry;
 using plinth::ws::RegistryKey;
 
@@ -95,4 +99,58 @@ TEST_CASE("for_each sees all registered connections", "[ws][registry]") {
   int count = 0;
   reg.for_each([&count](const drogon::WebSocketConnectionPtr&) { ++count; });
   REQUIRE(count == 3);
+}
+
+TEST_CASE(
+    "registry releases owners on their loop before acknowledging shutdown",
+    "[ws][registry]") {
+  trantor::EventLoopThread thread;
+  auto* loop = thread.getLoop();
+  ConnectionRegistry reg;
+  auto released = std::make_shared<std::atomic<bool>>(false);
+  auto on_owner_loop = std::make_shared<std::atomic<bool>>(false);
+  // This identity-only pointer has a tracking deleter; never dereference it.
+  auto* raw = reinterpret_cast<drogon::WebSocketConnection*>(std::uintptr_t{1});
+  drogon::WebSocketConnectionPtr conn{
+      raw, [released, on_owner_loop, loop](drogon::WebSocketConnection*) {
+        on_owner_loop->store(loop->isInLoopThread());
+        released->store(true);
+      }};
+  auto state = std::make_shared<plinth::ws::ConnState>();
+  state->loop = loop;
+  std::weak_ptr<plinth::ws::ConnState> state_owner = state;
+  reg.register_connection({.auth_type = "session", .id = "owned"}, conn, state);
+  conn.reset();
+  state.reset();
+
+  // The loop has not started. Both attempts must retain the pending release,
+  // although the map is already empty after the first attempt.
+  CHECK_FALSE(reg.release_connections(std::chrono::milliseconds{1}));
+  CHECK_FALSE(reg.release_connections(std::chrono::milliseconds{1}));
+  CHECK_FALSE(released->load());
+  CHECK_FALSE(state_owner.expired());
+  auto late = fake_conn(2);
+  reg.register_connection({.auth_type = "session", .id = "late"}, late,
+                          nullptr);
+  CHECK(reg.size() == 0);
+
+  thread.run();
+  CHECK(reg.release_connections(std::chrono::seconds{5}));
+  CHECK(released->load());
+  CHECK(on_owner_loop->load());
+  CHECK(state_owner.expired());
+  CHECK(reg.release_connections(std::chrono::milliseconds{0}));
+  loop->quit();
+  thread.wait();
+}
+
+TEST_CASE("registry retains owners if their loop was not published",
+          "[ws][registry]") {
+  ConnectionRegistry reg;
+  auto conn = fake_conn(1);
+  reg.register_connection({.auth_type = "session", .id = "invalid"}, conn,
+                          nullptr);
+  CHECK_FALSE(reg.release_connections(std::chrono::milliseconds{1}));
+  CHECK(reg.size() == 1);
+  CHECK(conn.use_count() == 2);
 }

@@ -69,6 +69,14 @@ auto clear_handlers_for_test() -> void;
 auto start_listener(const Config::Database& db_cfg,
                     const Config::Realtime::Listener& listener_cfg) -> void;
 
+// After all local producers have joined and committed their final NOTIFY,
+// acknowledge a marker on the existing LISTEN connection. Earlier events have
+// then reached every synchronous handler. Pause dispatch at that boundary so
+// the writer can close admission and persist its queue before stop_listener().
+// No-op if never started/disabled. A lost connection or deadline returns false;
+// reconnecting cannot recover notifications that the old session missed.
+[[nodiscard]] auto drain_listener(std::chrono::milliseconds timeout) -> bool;
+
 // Signal the listener to stop, wake the poll, and join the thread within
 // `timeout`. A timeout leaves the thread owned and retryable. Idempotent. The
 // caller must keep Drogon and logging alive until this returns true.
