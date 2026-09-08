@@ -159,7 +159,6 @@ TEST_CASE("M.02: GET /app/shell.js → 200 with application/javascript and "
   REQUIRE(r.status == drogon::k200OK);
   REQUIRE(r.body == "export const x = 1;");
   REQUIRE(r.cache_control == "no-cache");
-  REQUIRE(r.cache_control.find("max-age=31536000") != std::string::npos);
   REQUIRE(r.content_type_is_custom);
 }
 

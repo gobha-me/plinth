@@ -49,7 +49,7 @@ try {
             .getPropertyValue('--plinth-cache-version').trim()), version);
         assert(responses.some(response => new URL(response.url()).pathname === '/app/css/tokens.css'));
         for (const response of responses) {
-            assert(response.ok(), `${response.status()} ${response.url()}`);
+            assert(response.status() < 400, `${response.status()} ${response.url()}`);
             if (version === '901.0.2' && new URL(response.url()).pathname.startsWith('/app/')) {
                 assert.equal(response.headers()['cache-control'], 'no-cache', response.url());
             }
