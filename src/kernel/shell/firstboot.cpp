@@ -455,8 +455,10 @@ auto ensure_bundled_shell_installed(
             .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
             .message =
                 "bundled-shell upgrade failed: " + upgraded.error().message,
-            .recovery_required = upgraded.error().report.value("kind", "") ==
-                                 "upgrade-recovery-required"});
+            .recovery_required =
+                upgraded.error().report.value("kind", "") ==
+                    "upgrade-recovery-required" ||
+                upgraded.error().report.value("committed", false)});
       }
       spdlog::info("shell: explicitly upgraded bundled shell {} to {}",
                    detect->version, upgraded->new_record.version);
@@ -522,6 +524,8 @@ auto ensure_bundled_shell_installed(
     return std::unexpected(FirstBootFailure{
         .kind = FirstBootError::BUNDLE_INSTALL_FAILED,
         .message = std::move(msg),
+        .recovery_required =
+            f.report.is_object() && f.report.value("committed", false),
     });
   }
 

@@ -4,6 +4,7 @@
 
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/registration.hpp"
+#include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/types.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/js/db_batch_audit.hpp"
@@ -199,6 +200,40 @@ auto release_name_lock(PGconn* conn, std::string_view name) -> void {
                       nullptr, values.data(), nullptr, nullptr, 0),
                   PQclear);
   (void)res; // best-effort; backend cleanup covers us on connection drop
+}
+
+// Worker scheduling is a handoff to another PostgreSQL session. Unlike the
+// best-effort unwind path, it must observe the server's unlock acknowledgement.
+auto release_name_lock_checked(PGconn* conn, std::string_view name)
+    -> std::expected<void, std::string> {
+  const auto seed = advisory_lock_key(name);
+  const char* value = seed.c_str();
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT pg_advisory_unlock(hashtextextended($1, 0))", 1,
+                      nullptr, &value, nullptr, nullptr, 0),
+                  PQclear);
+  if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
+    return std::unexpected(std::string{PQresultErrorMessage(res.get())});
+  }
+  if (PQntuples(res.get()) != 1 || PQnfields(res.get()) != 1 ||
+      PQgetisnull(res.get(), 0, 0) != 0 ||
+      std::strcmp(PQgetvalue(res.get(), 0, 0), "t") != 0) {
+    return std::unexpected("package name lock release was not acknowledged");
+  }
+  return {};
+}
+
+auto rbac_handoff_failure_report(std::string_view error) -> nlohmann::json {
+  return {{"kind", "rbac-test-lock-release-failed"},
+          {"message",
+           "Package is committed ACTIVE, but the name lock release "
+           "was not acknowledged; RBAC testing was not scheduled. "
+           "Inspect package state and explicitly rerun its RBAC test."},
+          {"committed", true},
+          {"state", "ACTIVE"},
+          {"rbac_test_scheduled", false},
+          {"detail", std::string{error}}};
 }
 
 // ─── Audit emission (terminal only) ──────────────────────────────────
@@ -1711,13 +1746,28 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
 
   (void)mig_report; // reserved for future last_install_report augmentation
   emit_installed_audit(ctx, rec);
-  rbac_test::schedule_rbac_test(rec.id, ctx, "install");
   // ICD-0.5.0.3 §Lifecycle — spin up the extension's RuntimePool now
   // that ACTIVE is committed. A client-only package (no server/ tree)
   // returns false silently; an error is logged but does not roll back
   // the install (subsequent dispatch rejects with cap.extension_not_loaded
   // until a retry).
   plinth::extensions::create_pool(rec.name);
+  // LISTEN delivery may lag the commit. Publish the capability snapshot before
+  // handing this package to its RBAC worker (the reload API is best-effort).
+  static_cast<void>(plinth::capabilities::reload_tier2_cache(ctx.db));
+  if (auto released = release_name_lock_checked(pg.conn, rec.name); !released) {
+    auto report = rbac_handoff_failure_report(released.error());
+    // ACTIVE and its runtime/routes are already committed. Do not use fail_at,
+    // which would mislabel this installed package as INSTALL_FAILED.
+    return std::unexpected(
+        InstallFailure{.failed_at = InstallStage::ACTIVE,
+                       .package_id = rec.id,
+                       .kind = report["kind"].get<std::string>(),
+                       .message = report["message"].get<std::string>(),
+                       .report = std::move(report)});
+  }
+  lg.f = {};
+  rbac_test::schedule_rbac_test(rec.id, ctx, "install");
   spdlog::info("install complete: {} {} ({})", rec.name, rec.version,
                provenance_to_string(provenance));
   return rec;
@@ -2128,6 +2178,16 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
   plinth::extensions::create_pool(lp.name);
 
   emit_transition_audit(ctx, "packages.enabled", lp, "enabled_by_user_id");
+  static_cast<void>(plinth::capabilities::reload_tier2_cache(ctx.db));
+  if (auto released = release_name_lock_checked(pg.conn, lp.name); !released) {
+    auto report = rbac_handoff_failure_report(released.error());
+    return std::unexpected(
+        TransitionFailure{.kind = TransitionKind::ENABLE,
+                          .package_id = lp.id,
+                          .message = report["message"].get<std::string>(),
+                          .report = std::move(report)});
+  }
+  lg.f = {};
   rbac_test::schedule_rbac_test(lp.id, ctx, "enable");
 
   PackageRecord rec{
@@ -3277,8 +3337,15 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   auto drain_state = capabilities::drain::begin_drain(existing.name);
   struct DrainGuard {
     std::string name;
+    bool active = true;
     explicit DrainGuard(std::string n) : name(std::move(n)) {}
-    ~DrainGuard() { capabilities::drain::end_drain(name); }
+    ~DrainGuard() { finish(); }
+    auto finish() -> void {
+      if (active) {
+        capabilities::drain::end_drain(name);
+        active = false;
+      }
+    }
     DrainGuard(const DrainGuard&) = delete;
     auto operator=(const DrainGuard&) -> DrainGuard& = delete;
     DrainGuard(DrainGuard&&) = delete;
@@ -3468,6 +3535,20 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
 
   emit_upgrade_audit(ctx, "packages.upgrade_completed", existing, new_id,
                      minimal.version);
+  static_cast<void>(plinth::capabilities::reload_tier2_cache(ctx.db));
+  dg.finish();
+  if (auto released = release_name_lock_checked(pg.conn, minimal.name);
+      !released) {
+    auto report = rbac_handoff_failure_report(released.error());
+    // The swap is committed. Preserve both version rows and installed files;
+    // fail_and_mark is only for errors before this completed cutover.
+    return std::unexpected(
+        TransitionFailure{.kind = TransitionKind::UPGRADE,
+                          .package_id = new_id,
+                          .message = report["message"].get<std::string>(),
+                          .report = std::move(report)});
+  }
+  lg.f = {};
   rbac_test::schedule_rbac_test(new_id, ctx, "upgrade");
 
   // T5 — retention starts with retired_at on the old row. 0.7.x
