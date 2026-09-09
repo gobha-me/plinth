@@ -811,6 +811,13 @@ add_test(NAME plinth_tests_auth_http
     --binary $<TARGET_FILE:plinth> --scenario disabled-session)
 set_tests_properties(plinth_tests_auth_http PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
+foreach(auth_scenario bootstrap-disabled bootstrap-enabled bootstrap-rollback)
+  add_test(NAME plinth_tests_auth_${auth_scenario}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/auth_http.py
+      --binary $<TARGET_FILE:plinth> --scenario ${auth_scenario})
+  set_tests_properties(plinth_tests_auth_${auth_scenario} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
+endforeach()
 
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s
 # main loop, so `[js][async]` tests now share `plinth_tests_js`'s

@@ -4,11 +4,13 @@
 import argparse
 import base64
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import http.client
 from http.cookies import SimpleCookie
 import json
 import os
 from pathlib import Path
+import selectors
 import socket
 import struct
 import subprocess
@@ -194,10 +196,138 @@ def disabled_session(binary, pg_env):
     print("disabled-account HTTP/session/PAT/login and fresh WebSocket checks passed", flush=True)
 
 
+class InsertBarrier:
+    """Keep SELECT available while every concurrent user INSERT must wait."""
+    def __init__(self, kernel):
+        self.kernel = kernel
+        self.child = None
+
+    def __enter__(self):
+        self.child = subprocess.Popen(["psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
+                                      env=self.kernel.pg_env, stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.child.stdin.write("BEGIN; LOCK TABLE plinth.users IN SHARE MODE; "
+                                   "SELECT 'insert-barrier-ready';\n")
+            self.child.stdin.flush()
+            with selectors.DefaultSelector() as ready:
+                ready.register(self.child.stdout, selectors.EVENT_READ)
+                assert ready.select(timeout=5), "database barrier did not become ready"
+                assert self.child.stdout.readline().strip() == "insert-barrier-ready"
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        if self.child is None:
+            return
+        try:
+            self.child.communicate("ROLLBACK;\n", timeout=5)
+        except subprocess.TimeoutExpired:
+            self.child.kill()
+            self.child.communicate(timeout=5)
+            raise AssertionError("database barrier did not release") from None
+        assert self.child.returncode == 0, "database barrier failed"
+
+    def __exit__(self, *_):
+        self.close()
+
+
+def bootstrap_concurrent(binary, pg_env, enabled):
+    with running_kernel(binary, pg_env, enabled) as kernel:
+        count = 6
+        # Under the vulnerable implementation all INSERTs wait here, after
+        # their independent decisions. With the repair, the first INSERT and
+        # other registration-lock acquisitions wait. Observe the actual DB
+        # waits before releasing; elapsed sleeps never stand in for readiness.
+        with ThreadPoolExecutor(max_workers=count) as workers:
+            with InsertBarrier(kernel):
+                pending = [workers.submit(kernel.request, "POST", "/api/auth/register",
+                                          {"username": f"bootstrap-{index}",
+                                           "password": "fake-concurrent-password"})
+                           for index in range(count)]
+                deadline = time.monotonic() + 4
+                while True:
+                    waiting = int(kernel.sql(
+                        "SELECT count(*) FROM pg_stat_activity WHERE "
+                        "datname=current_database() AND state='active' AND "
+                        "wait_event_type='Lock' AND (query LIKE 'INSERT INTO plinth.users%' "
+                        "OR query LIKE 'SELECT pg_advisory_xact_lock%')"))
+                    if waiting == count:
+                        break
+                    assert not any(item.done() for item in pending), \
+                        "registration completed before the database barrier released"
+                    assert time.monotonic() < deadline, \
+                        f"only {waiting}/{count} registrations reached the database barrier"
+                    time.sleep(0.01)  # Poll an explicit database-state condition.
+            results = [item.result(timeout=12) for item in pending]
+        statuses = sorted(result[0] for result in results)
+        expected = [201] * count if enabled else [201] + [403] * (count - 1)
+        administrators = kernel.sql(
+            "SELECT count(*) FROM plinth.group_members gm JOIN plinth.groups g "
+            "ON g.id=gm.group_id WHERE g.name='admin'")
+        assert statuses == expected, \
+            f"concurrent registration statuses: {statuses}; administrators={administrators}"
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == \
+            str(count if enabled else 1)
+        assert administrators == "1", \
+            "concurrent bootstrap did not create exactly one administrator"
+        for status, body, _ in results:
+            if status == 403:
+                assert body["error"] == "registration_disabled"
+        # The committed winner is usable, not just a membership without a user.
+        winner = kernel.sql("SELECT u.username FROM plinth.users u JOIN plinth.group_members gm "
+                            "ON gm.user_id=u.id JOIN plinth.groups g ON g.id=gm.group_id "
+                            "WHERE g.name='admin'")
+        assert kernel.request("POST", "/api/auth/login",
+                              {"username": winner, "password": "fake-concurrent-password"})[0] == 200
+    print(f"six concurrent registrations, registration_enabled={enabled}: one administrator", flush=True)
+
+
+def bootstrap_rollback(binary, pg_env):
+    # Cover both the membership statement and the final COMMIT. Neither may
+    # publish a user/201 before the administrator membership is durable.
+    for deferred in (False, True):
+        with running_kernel(binary, pg_env, False) as kernel:
+            kernel.sql("CREATE FUNCTION public.reject_fixture_membership() RETURNS trigger "
+                       "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture membership failure'; "
+                       "END $$")
+            if deferred:
+                kernel.sql("CREATE CONSTRAINT TRIGGER reject_fixture_membership "
+                           "AFTER INSERT ON plinth.group_members DEFERRABLE INITIALLY DEFERRED "
+                           "FOR EACH ROW EXECUTE FUNCTION public.reject_fixture_membership()")
+            else:
+                kernel.sql("CREATE TRIGGER reject_fixture_membership BEFORE INSERT "
+                           "ON plinth.group_members FOR EACH ROW "
+                           "EXECUTE FUNCTION public.reject_fixture_membership()")
+            credentials = {"username": "recoverable-bootstrap", "password": "fake-recovery-password"}
+            status, body, _ = kernel.request("POST", "/api/auth/register", credentials)
+            assert status == 500 and body["error"] == "internal_error", \
+                f"failed bootstrap unexpectedly returned {status}"
+            # An error may initiate rollback asynchronously; wait for the
+            # transaction lock on users to be released before observing state.
+            kernel.sql("BEGIN; SET LOCAL lock_timeout='5s'; "
+                       "LOCK TABLE plinth.users IN SHARE MODE; COMMIT")
+            assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "0", \
+                "failed bootstrap left an unprivileged first user"
+            assert kernel.sql("SELECT count(*) FROM plinth.group_members") == "0"
+            kernel.sql("DROP TRIGGER reject_fixture_membership ON plinth.group_members; "
+                       "DROP FUNCTION public.reject_fixture_membership()")
+            status, user, _ = kernel.request("POST", "/api/auth/register", credentials)
+            assert status == 201, f"bootstrap retry returned {status}"
+            user_id = str(uuid.UUID(user["id"]))
+            assert kernel.sql("SELECT count(*) FROM plinth.group_members gm JOIN plinth.groups g "
+                              "ON g.id=gm.group_id WHERE g.name='admin' AND "
+                              f"gm.user_id='{user_id}'::uuid") == "1"
+    print("membership and COMMIT failures roll back bootstrap and allow a usable retry", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--scenario", choices=["disabled-session"], required=True)
+    parser.add_argument("--scenario", choices=["disabled-session", "bootstrap-disabled",
+                                               "bootstrap-enabled", "bootstrap-rollback"], required=True)
     args = parser.parse_args()
     if not os.environ.get("PLINTH_PG_HOST"):
         print("PostgreSQL fixture is not configured")
@@ -205,7 +335,13 @@ def main():
     pg_env = os.environ.copy()
     for suffix in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE"):
         pg_env["PG" + suffix] = os.environ["PLINTH_PG_" + suffix]
-    disabled_session(args.binary.resolve(), pg_env)
+    binary = args.binary.resolve()
+    if args.scenario == "disabled-session":
+        disabled_session(binary, pg_env)
+    elif args.scenario == "bootstrap-rollback":
+        bootstrap_rollback(binary, pg_env)
+    else:
+        bootstrap_concurrent(binary, pg_env, args.scenario == "bootstrap-enabled")
     return 0
 
 

@@ -14,6 +14,7 @@ namespace {
 
 using Callback = std::function<void(const drogon::HttpResponsePtr&)>;
 using SharedCb = std::shared_ptr<Callback>;
+using TransactionPtr = std::shared_ptr<drogon::orm::Transaction>;
 
 auto share(Callback&& cb) -> SharedCb {
   return std::make_shared<Callback>(std::move(cb));
@@ -71,55 +72,6 @@ auto respond_registered(const std::string& user_id, const std::string& username,
   return resp;
 }
 
-// Adds the first user to the admin group, then responds 201.
-// The admin group is guaranteed to exist (created by bootstrap_groups()).
-auto ensure_first_user_admin(const drogon::orm::DbClientPtr& db,
-                             const std::string& user_id,
-                             const std::string& username,
-                             const std::string& created_at,
-                             const std::string& ip, const SharedCb& cb)
-    -> void {
-  db->execSqlAsync(
-      "SELECT id FROM plinth.groups WHERE name = 'admin'",
-      [db, user_id, username, created_at, ip,
-       cb](const drogon::orm::Result& grp_result) {
-        if (grp_result.empty()) {
-          spdlog::error(
-              "admin group not found — bootstrap_groups() may not have run");
-          (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
-                           "Registration failed"));
-          return;
-        }
-        auto group_id = grp_result[0]["id"].as<std::string>();
-        db->execSqlAsync(
-            "INSERT INTO plinth.group_members (group_id, user_id) "
-            "VALUES ($1::uuid, $2::uuid) "
-            "ON CONFLICT DO NOTHING",
-            [user_id, username, created_at, ip,
-             cb](const drogon::orm::Result&) {
-              Json::Value detail;
-              detail["username"] = username;
-              detail["first_user"] = true;
-              plinth::log::audit(
-                  "user.registered", detail,
-                  {.user_id = user_id, .session_id = "", .ip_address = ip});
-              (*cb)(respond_registered(user_id, username, created_at));
-            },
-            [cb](const drogon::orm::DrogonDbException& e) {
-              spdlog::error("admin membership insert failed: {}",
-                            e.base().what());
-              (*cb)(json_error(drogon::k500InternalServerError,
-                               "internal_error", "Registration failed"));
-            },
-            group_id, user_id);
-      },
-      [cb](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("admin group lookup failed: {}", e.base().what());
-        (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
-                         "Registration failed"));
-      });
-}
-
 auto handle_insert_error(const SharedCb& cb,
                          const drogon::orm::DrogonDbException& e) -> void {
   auto msg = std::string{e.base().what()};
@@ -134,55 +86,129 @@ auto handle_insert_error(const SharedCb& cb,
   }
 }
 
-// After user INSERT RETURNING: check if first user, set up admin group if so.
-auto complete_user_registration(const drogon::orm::DbClientPtr& db,
-                                const std::string& user_id,
-                                const std::string& username,
-                                const std::string& created_at,
-                                const std::string& ip, const SharedCb& cb)
-    -> void {
-  db->execSqlAsync(
-      "SELECT COUNT(*) AS cnt FROM plinth.users WHERE is_test_user = false",
-      [db, user_id, username, created_at, ip,
-       cb](const drogon::orm::Result& cnt_result) {
-        if (cnt_result[0]["cnt"].as<int64_t>() == 1) {
-          ensure_first_user_admin(db, user_id, username, created_at, ip, cb);
-        } else {
-          Json::Value detail;
-          detail["username"] = username;
-          detail["first_user"] = false;
-          plinth::log::audit(
-              "user.registered", detail,
-              {.user_id = user_id, .session_id = "", .ip_address = ip});
-          (*cb)(respond_registered(user_id, username, created_at));
+// This callback deliberately does not own tx. Releasing its last query owner
+// requests COMMIT; only PostgreSQL's commit acknowledgment may publish 201.
+auto finish_registration(const TransactionPtr& tx, const std::string& user_id,
+                         const std::string& username,
+                         const std::string& created_at, const std::string& ip,
+                         bool first_user, const SharedCb& cb) -> void {
+  tx->setCommitCallback(
+      [user_id, username, created_at, ip, first_user, cb](bool committed) {
+        if (!committed) {
+          (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                           "Registration failed"));
+          return;
         }
-      },
-      [cb](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("user count failed: {}", e.base().what());
-        (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
-                         "Registration failed"));
+        Json::Value detail;
+        detail["username"] = username;
+        detail["first_user"] = first_user;
+        plinth::log::audit(
+            "user.registered", detail,
+            {.user_id = user_id, .session_id = "", .ip_address = ip});
+        (*cb)(respond_registered(user_id, username, created_at));
       });
 }
 
-// Insert user row, then complete registration (admin check, audit, respond).
-auto insert_user_then_complete(const drogon::orm::DbClientPtr& db,
-                               const std::string& username,
-                               const std::string& password_hash,
-                               const std::string& ip, const SharedCb& cb)
-    -> void {
-  db->execSqlAsync(
+auto insert_registered_user(const TransactionPtr& tx,
+                            const std::string& username,
+                            const std::string& password_hash,
+                            const std::string& ip, bool first_user,
+                            const SharedCb& cb) -> void {
+  tx->execSqlAsync(
       "INSERT INTO plinth.users (username, password_hash) "
       "VALUES ($1, $2) RETURNING id, username, created_at",
-      [db, ip, cb](const drogon::orm::Result& result) {
-        auto row = result[0];
-        complete_user_registration(db, row["id"].as<std::string>(),
-                                   row["username"].as<std::string>(),
-                                   row["created_at"].as<std::string>(), ip, cb);
+      [tx, ip, first_user, cb](const drogon::orm::Result& result) {
+        const auto user_id = result[0]["id"].as<std::string>();
+        const auto username = result[0]["username"].as<std::string>();
+        const auto created_at = result[0]["created_at"].as<std::string>();
+        if (!first_user) {
+          finish_registration(tx, user_id, username, created_at, ip, false, cb);
+          return;
+        }
+        tx->execSqlAsync(
+            "INSERT INTO plinth.group_members (group_id, user_id) "
+            "SELECT id, $1::uuid FROM plinth.groups WHERE name = 'admin' "
+            "RETURNING group_id",
+            [tx, user_id, username, created_at, ip,
+             cb](const drogon::orm::Result& membership) {
+              if (membership.size() != 1) {
+                tx->rollback();
+                spdlog::error("admin group missing during first registration");
+                (*cb)(json_error(drogon::k500InternalServerError,
+                                 "internal_error", "Registration failed"));
+                return;
+              }
+              finish_registration(tx, user_id, username, created_at, ip, true,
+                                  cb);
+            },
+            [cb](const drogon::orm::DrogonDbException& e) {
+              // Drogon rolls a failed statement's transaction back before its
+              // owners release. The user and membership cannot commit apart.
+              spdlog::error("admin membership insert failed: {}",
+                            e.base().what());
+              (*cb)(json_error(drogon::k500InternalServerError,
+                               "internal_error", "Registration failed"));
+            },
+            user_id);
       },
       [cb](const drogon::orm::DrogonDbException& e) {
         handle_insert_error(cb, e);
       },
       username, password_hash);
+}
+
+auto register_user_atomic(const drogon::orm::DbClientPtr& db,
+                          const std::string& username,
+                          const std::string& password_hash,
+                          const std::string& ip, bool registration_enabled,
+                          const SharedCb& cb) -> void {
+  db->newTransactionAsync([username, password_hash, ip, registration_enabled,
+                           cb](const TransactionPtr& tx) {
+    if (!tx) {
+      (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                       "Registration failed"));
+      return;
+    }
+    tx->setTimeout(5.0);
+    auto on_error = [cb](const drogon::orm::DrogonDbException& e) {
+      spdlog::error("registration transaction failed: {}", e.base().what());
+      (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                       "Registration failed"));
+    };
+    // Count in a fresh statement after acquiring the lock. A snapshot
+    // taken before waiting could miss the preceding winner's committed row.
+    tx->execSqlAsync(
+        "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+        [tx, username, password_hash, ip, registration_enabled, cb,
+         on_error](const drogon::orm::Result&) {
+          tx->execSqlAsync(
+              "SELECT pg_advisory_xact_lock("
+              "hashtextextended('plinth.auth.registration', 0))",
+              [tx, username, password_hash, ip, registration_enabled, cb,
+               on_error](const drogon::orm::Result&) {
+                tx->execSqlAsync(
+                    "SELECT COUNT(*) AS cnt FROM plinth.users "
+                    "WHERE is_test_user = false",
+                    [tx, username, password_hash, ip, registration_enabled,
+                     cb](const drogon::orm::Result& count) {
+                      const bool first_user =
+                          count[0]["cnt"].as<int64_t>() == 0;
+                      if (!first_user && !registration_enabled) {
+                        tx->rollback();
+                        (*cb)(json_error(drogon::k403Forbidden,
+                                         "registration_disabled",
+                                         "Registration is disabled"));
+                        return;
+                      }
+                      insert_registered_user(tx, username, password_hash, ip,
+                                             first_user, cb);
+                    },
+                    on_error);
+              },
+              on_error);
+        },
+        on_error);
+  });
 }
 
 // ── Route handlers ───────────────────────────────────────────────────
@@ -225,31 +251,18 @@ auto handle_register(const drogon::HttpRequestPtr& req, Callback&& callback,
   auto cb = share(std::move(callback));
 
   if (!registration_enabled) {
-    // Allow registration if no users exist yet (first-user bootstrap)
+    // Fast rejection avoids hashing when bootstrap is already closed. This
+    // preflight is not authoritative: register_user_atomic rechecks under lock.
     db->execSqlAsync(
         "SELECT COUNT(*) AS cnt FROM plinth.users WHERE is_test_user = false",
         [db, username, password, ip, cb](const drogon::orm::Result& result) {
-          if (result[0]["cnt"].as<int64_t>() > 0) {
+          if (result[0]["cnt"].as<int64_t>() != 0) {
             (*cb)(json_error(drogon::k403Forbidden, "registration_disabled",
                              "Registration is disabled"));
             return;
           }
-          // First user — insert and go straight to admin setup
-          auto password_hash = hash_password(password);
-          db->execSqlAsync(
-              "INSERT INTO plinth.users (username, password_hash) "
-              "VALUES ($1, $2) RETURNING id, username, created_at",
-              [db, ip, cb](const drogon::orm::Result& res) {
-                auto row = res[0];
-                ensure_first_user_admin(db, row["id"].as<std::string>(),
-                                        row["username"].as<std::string>(),
-                                        row["created_at"].as<std::string>(), ip,
-                                        cb);
-              },
-              [cb](const drogon::orm::DrogonDbException& e) {
-                handle_insert_error(cb, e);
-              },
-              username, password_hash);
+          register_user_atomic(db, username, hash_password(password), ip, false,
+                               cb);
         },
         [cb](const drogon::orm::DrogonDbException& e) {
           spdlog::error("user count check failed: {}", e.base().what());
@@ -258,27 +271,7 @@ auto handle_register(const drogon::HttpRequestPtr& req, Callback&& callback,
         });
     return;
   }
-
-  // Registration enabled — standard flow
-  auto password_hash = hash_password(password);
-
-  // Check for disabled_at (username reuse prevention)
-  db->execSqlAsync(
-      "SELECT disabled_at FROM plinth.users WHERE username = $1",
-      [db, username, password_hash, ip, cb](const drogon::orm::Result& result) {
-        if (!result.empty() && !result[0]["disabled_at"].isNull()) {
-          (*cb)(json_error(drogon::k409Conflict, "username_taken",
-                           "Username is unavailable"));
-          return;
-        }
-        insert_user_then_complete(db, username, password_hash, ip, cb);
-      },
-      [cb](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("disabled check failed: {}", e.base().what());
-        (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
-                         "Registration failed"));
-      },
-      username);
+  register_user_atomic(db, username, hash_password(password), ip, true, cb);
 }
 
 auto handle_login(const drogon::HttpRequestPtr& req, Callback&& callback,
