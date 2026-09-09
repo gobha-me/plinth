@@ -18,6 +18,40 @@ CREATE TABLE IF NOT EXISTS plinth.extension_database_credentials (
 );
 REVOKE ALL ON plinth.extension_database_credentials FROM PUBLIC;
 
+-- Reconciled for existing databases as well as fresh schema creation. Raw
+-- PostgreSQL NOTIFY has no channel ACL, so its payload is only an untrusted
+-- wake hint. Authoritative envelopes live here and are writable solely through
+-- this kernel-owned function. The advisory xact lock is acquired before the
+-- BIGSERIAL value is allocated and held through caller commit, making ids
+-- monotonic in commit order even when emitters use caller-owned transactions.
+CREATE TABLE IF NOT EXISTS plinth.realtime_outbox (
+    id          BIGSERIAL   PRIMARY KEY,
+    payload     JSONB       NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS realtime_outbox_created_at_idx
+    ON plinth.realtime_outbox (created_at);
+REVOKE ALL ON plinth.realtime_outbox FROM PUBLIC;
+REVOKE ALL ON SEQUENCE plinth.realtime_outbox_id_seq FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION plinth.enqueue_realtime_event(envelope JSONB)
+RETURNS BIGINT LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $enqueue$
+DECLARE
+    event_id BIGINT;
+BEGIN
+    IF envelope IS NULL OR jsonb_typeof(envelope) <> 'object' THEN
+        RAISE EXCEPTION USING ERRCODE = '22023',
+            MESSAGE = 'realtime envelope must be a JSON object';
+    END IF;
+    PERFORM pg_advisory_xact_lock(4643982238346725961::BIGINT);
+    INSERT INTO plinth.realtime_outbox(payload)
+        VALUES (envelope) RETURNING id INTO event_id;
+    PERFORM pg_notify('plinth:realtime', event_id::TEXT);
+    RETURN event_id;
+END
+$enqueue$;
+REVOKE ALL ON FUNCTION plinth.enqueue_realtime_event(JSONB) FROM PUBLIC;
+
 -- Deferred callbacks must never survive a guarded migration and run under
 -- the privileged transaction committer. This check includes temporary objects.
 CREATE OR REPLACE FUNCTION plinth.assert_extension_immediate_constraints(role_id OID)

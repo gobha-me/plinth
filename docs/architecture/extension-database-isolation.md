@@ -41,6 +41,14 @@ and use objects in its own schema. Shared user lookup grants only `SELECT` on
 password hashes, credentials, sessions, or other extensions' schemas. PUBLIC
 application-schema privileges and PUBLIC function execution are removed.
 
+PostgreSQL provides no producer ACL for `NOTIFY`, so notification payloads are
+never an authority boundary. Capability notifications are coalescible hints
+that trigger a full reload from `plinth.capabilities`. Realtime envelopes are
+inserted by the kernel into `plinth.realtime_outbox`; the wire notification
+carries only the ordered row id. Extension roles cannot read or write the
+outbox or execute its enqueue function, and replayed or forged hints cannot
+alter the listener's monotonic cursor or dispatch an event.
+
 Random login secrets are generated inside PostgreSQL and stored in
 `plinth.extension_database_credentials`, accessible only to the kernel account.
 Application-generated provisioning SQL contains no secret values. Runtime

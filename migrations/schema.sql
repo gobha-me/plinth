@@ -213,6 +213,20 @@ CREATE INDEX events_channel_seq_idx ON plinth.events (channel, seq);
 -- Serves the cleanup sweep `WHERE created_at < NOW() - INTERVAL ...`.
 CREATE INDEX events_created_at_idx  ON plinth.events (created_at);
 
+-- Kernel-owned realtime transport. PostgreSQL NOTIFY carries only the row id;
+-- listeners load and validate the envelope from this protected table. The
+-- transaction-scoped advisory lock in enqueue_realtime_event serializes id
+-- allocation with commit order, so each listener can reject replayed hints by
+-- advancing one monotonic cursor.
+CREATE TABLE plinth.realtime_outbox (
+    id          BIGSERIAL   PRIMARY KEY,
+    payload     JSONB       NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX realtime_outbox_created_at_idx
+    ON plinth.realtime_outbox (created_at);
+
 CREATE TABLE plinth.user_event_cursors (
     user_id    UUID        PRIMARY KEY
                            REFERENCES plinth.users(id) ON DELETE CASCADE,

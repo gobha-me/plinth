@@ -3,9 +3,9 @@
 // ICD-0.5.0-pg-listen-notify-bridge §NOTIFY Emission Helper.
 //
 // Generalizes registration.cpp:67-95 send_notify into a typed,
-// validated, reusable emit surface. The PG wire channel is always the
-// literal string "plinth:realtime"; the logical channel rides inside
-// the envelope's `channel` field.
+// validated, reusable emit surface. The authoritative envelope is persisted in
+// `plinth.realtime_outbox`; the PG wire channel carries only its row id as an
+// untrusted wake hint.
 
 #pragma once
 
@@ -25,11 +25,11 @@ enum class NotifyError : std::uint8_t {
   INVALID_CHANNEL,   // channel fails §Channel Naming regex
   LAYER_MISMATCH,    // envelope.layer conflicts with channel's layer prefix
   PAYLOAD_TOO_LARGE, // serialized envelope > max_payload_bytes
-  PG_FAILURE,        // pg_notify returned non-OK / DrogonDbException
+  PG_FAILURE,        // outbox enqueue returned non-OK / DrogonDbException
 };
 
 // Validate an envelope per ICD §Validation pipeline steps 1-5 and, on
-// success, return the compact-serialized payload ready for pg_notify.
+// success, return the compact-serialized payload ready for the outbox.
 // The sync and async emit helpers compose this — exposing it lets
 // unit tests exercise every rejection path without a live PGconn.
 auto validate_envelope(const Json::Value& envelope)
@@ -44,10 +44,10 @@ auto set_max_payload_bytes(std::size_t bytes) -> void;
 // Read the current limit. Primarily for tests' RAII restore guards.
 auto get_max_payload_bytes() -> std::size_t;
 
-// Sync emit via a caller-owned PGconn. Validates the envelope, then
-// runs `SELECT pg_notify('plinth:realtime', <serialized>)`. Callers
-// SHOULD run inside BEGIN/COMMIT so NOTIFY fires only on post-write
-// success (PG buffers NOTIFYs until COMMIT).
+// Sync emit via a caller-owned PGconn. Validates the envelope, then enqueues it
+// through the protected database function. Callers may compose it inside an
+// existing transaction; both the row and its wake hint become visible only at
+// commit.
 auto emit_notify(PGconn& conn, const Json::Value& envelope)
     -> std::expected<void, NotifyError>;
 

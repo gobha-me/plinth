@@ -83,7 +83,7 @@ auto reject_inline(JSContext* ctx, std::string code, std::string msg)
 
 // Serialize to compact JSON — matches the emit helper's wire format
 // for pre-enqueue size checking. The dispatch arm re-serializes when
-// actually calling pg_notify; the size budget here is therefore the
+// actually enqueuing the outbox row; the size budget here is therefore the
 // same as validate_envelope enforces.
 auto compact_size_estimate(const std::string& channel,
                            const Json::Value& payload) -> std::size_t {

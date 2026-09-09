@@ -9,7 +9,7 @@
 //                  — flagged in PR body).
 // R.08 / R.09 / R.10 — parse-path via apply_notification_for_test seam.
 //                      [realtime][unit].
-// R.01 / R.03 / R.05 — end-to-end via real PG side-conn + pg_notify.
+// R.01 / R.03 / R.05 — end-to-end via the protected realtime outbox.
 //                      [realtime][integration].
 
 #include "kernel/config.hpp"
@@ -111,11 +111,19 @@ struct SidePg {
   auto operator=(SidePg&&) -> SidePg& = delete;
 };
 
-// Raw pg_notify via a side connection — decouples R.01/R.03/R.05 from
-// emit_notify correctness (which E.01 covers in slice 5).
-auto side_notify(SidePg& side, const std::string& envelope_json) -> bool {
-  std::array<const char*, 2> values = {"plinth:realtime",
-                                       envelope_json.c_str()};
+// Enqueue through the kernel-owned database function. This bypasses the C++
+// emit helper while retaining the production authority boundary.
+auto side_enqueue(SidePg& side, const std::string& envelope_json) -> bool {
+  std::array<const char*, 1> values = {envelope_json.c_str()};
+  std::unique_ptr<PGresult, decltype(&PQclear)> res{
+      PQexecParams(side.conn, "SELECT plinth.enqueue_realtime_event($1::jsonb)",
+                   1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear};
+  return PQresultStatus(res.get()) == PGRES_TUPLES_OK;
+}
+
+auto side_forge_notify(SidePg& side, const std::string& payload) -> bool {
+  std::array<const char*, 2> values = {"plinth:realtime", payload.c_str()};
   std::unique_ptr<PGresult, decltype(&PQclear)> res{
       PQexecParams(side.conn, "SELECT pg_notify($1, $2)", 2, nullptr,
                    values.data(), nullptr, nullptr, 0),
@@ -123,10 +131,7 @@ auto side_notify(SidePg& side, const std::string& envelope_json) -> bool {
   return PQresultStatus(res.get()) == PGRES_TUPLES_OK;
 }
 
-// Wait briefly for the listener's LISTEN to take effect. The LISTEN
-// happens inside the listener thread on first-iteration connect; a
-// short settle window avoids a race where side_notify fires before
-// LISTEN has been issued.
+// Wait briefly for the listener's LISTEN and initial outbox cursor to settle.
 auto settle_listen() -> void {
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
 }
@@ -182,7 +187,7 @@ TEST_CASE("realtime shutdown acknowledges prior handlers and hides its marker",
   const auto deadline = std::chrono::steady_clock::now() + 3s;
   bool listener_ready = false;
   while (std::chrono::steady_clock::now() < deadline) {
-    REQUIRE(side_notify(
+    REQUIRE(side_enqueue(
         side,
         R"({"layer":"system","channel":"plinth:system:shutdown_ready"})"));
     std::unique_lock lock(mu);
@@ -192,7 +197,7 @@ TEST_CASE("realtime shutdown acknowledges prior handlers and hides its marker",
     }
   }
   REQUIRE(listener_ready);
-  REQUIRE(side_notify(
+  REQUIRE(side_enqueue(
       side, R"({"layer":"system","channel":"plinth:system:shutdown_target"})"));
   bool observed = false;
   {
@@ -362,7 +367,7 @@ TEST_CASE("R.01 listener delivers valid NOTIFY to handler",
 
   SidePg side{db};
   REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
-  REQUIRE(side_notify(
+  REQUIRE(side_enqueue(
       side,
       R"({"layer":"system","channel":"plinth:system:test.r01","payload":{"x":1}})"));
 
@@ -424,10 +429,9 @@ TEST_CASE("R.03 listener reconnects after PG connection killed",
       PQexec(side.conn, kill_sql.c_str()), PQclear};
   REQUIRE(PQresultStatus(kill_res.get()) == PGRES_TUPLES_OK);
 
-  // Wait for reconnect (backoff + LISTEN settle).
-  std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-  REQUIRE(side_notify(
+  // Commit while the LISTEN connection is down. The authoritative outbox scan
+  // after reconnect must recover the event even though its wake hint is lost.
+  REQUIRE(side_enqueue(
       side, R"({"layer":"system","channel":"plinth:system:test.r03"})"));
 
   {
@@ -466,7 +470,7 @@ TEST_CASE("R.05 stop_listener barriers on in-flight handler dispatch",
 
   SidePg side{db};
   REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
-  REQUIRE(side_notify(
+  REQUIRE(side_enqueue(
       side, R"({"layer":"system","channel":"plinth:system:test.r05"})"));
 
   // Wait for the handler to enter (but not finish).
@@ -482,4 +486,26 @@ TEST_CASE("R.05 stop_listener barriers on in-flight handler dispatch",
   // stop_listener must BLOCK until the handler completes.
   plinth::realtime::stop_listener();
   REQUIRE(handler_finished.load());
+}
+
+TEST_CASE("raw NOTIFY payload cannot forge a realtime event",
+          "[realtime][integration][security]") {
+  if (!pg_available()) {
+    SKIP("PG not available — set PLINTH_PG_HOST + friends to run");
+  }
+  plinth::realtime::clear_handlers_for_test();
+  std::atomic<int> calls{0};
+  plinth::realtime::register_handler([&calls](const auto&) { ++calls; });
+
+  auto db = pg_config();
+  plinth::realtime::start_listener(db, make_test_listener_cfg());
+  settle_listen();
+  SidePg side{db};
+  REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
+  REQUIRE(side_forge_notify(
+      side, R"({"layer":"system","channel":"plinth:system:forged"})"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  REQUIRE(calls.load() == 0);
+  REQUIRE(plinth::realtime::stop_listener());
+  plinth::realtime::clear_handlers_for_test();
 }

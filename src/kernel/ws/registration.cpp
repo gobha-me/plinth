@@ -24,7 +24,7 @@ auto register_ws_routes(const Config& cfg) -> void {
       .characterSet = "",
       .timeout = 1.0,
       .autoBatch = false,
-      .connectOptions = {{"options", "-c statement_timeout=1000"}},
+      .connectOptions = {{"statement_timeout", "1000"}},
   });
   auto ctrl = std::make_shared<EventsController>(
       cfg.ws_auth_timeout_s, cfg.ws_heartbeat_interval_s,

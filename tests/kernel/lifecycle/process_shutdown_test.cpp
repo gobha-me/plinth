@@ -418,11 +418,11 @@ auto emit_realtime_burst() -> void {
   REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
   using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
   Result result{PQexec(connection.get(),
-                       "SELECT pg_notify('plinth:realtime', json_build_object("
+                       "SELECT plinth.enqueue_realtime_event(json_build_object("
                        "'layer', 'data', "
                        "'channel', 'plinth:data:lifecycle.signal', "
                        "'emitted_at', clock_timestamp()::text, "
-                       "'test_sequence', series_value)::text) "
+                       "'test_sequence', series_value)::jsonb) "
                        "FROM generate_series(1, 200) AS series_value"),
                 PQclear};
   REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
@@ -983,9 +983,10 @@ auto require_authenticated_listener(const plinth::Config::Database& db,
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (std::chrono::steady_clock::now() < deadline) {
     using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
-    Result sent{PQexecParams(
-                    connection.get(), "SELECT pg_notify('plinth:realtime', $1)",
-                    1, nullptr, payload_params.data(), nullptr, nullptr, 0),
+    Result sent{PQexecParams(connection.get(),
+                             "SELECT plinth.enqueue_realtime_event($1::jsonb)",
+                             1, nullptr, payload_params.data(), nullptr,
+                             nullptr, 0),
                 PQclear};
     REQUIRE(PQresultStatus(sent.get()) == PGRES_TUPLES_OK);
     Result found{

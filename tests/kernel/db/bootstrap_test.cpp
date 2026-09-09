@@ -151,6 +151,7 @@ TEST_CASE("bootstrap_schema dev_mode creates tables",
   REQUIRE(table_exists(db, "users"));
   REQUIRE(table_exists(db, "sessions"));
   REQUIRE(table_exists(db, "audit_log"));
+  REQUIRE(table_exists(db, "realtime_outbox"));
 
   // Clean up
   drop_plinth_schema(db);

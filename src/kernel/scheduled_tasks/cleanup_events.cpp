@@ -99,6 +99,7 @@ auto run(Config::Realtime::Events cfg) -> drogon::Task<void> {
   }
   const auto STARTED_AT = std::chrono::steady_clock::now();
   std::int64_t deleted = 0;
+  std::int64_t outbox_deleted = 0;
   std::int64_t oldest_remain = 0;
   bool got_lock = false;
   std::string err;
@@ -121,6 +122,12 @@ auto run(Config::Realtime::Events cfg) -> drogon::Task<void> {
         "WHERE created_at < NOW() - INTERVAL '1 second' * " +
         std::to_string(cfg.retention_seconds) + "::int");
     deleted = static_cast<std::int64_t>(del_r.affectedRows());
+
+    auto outbox_del_r = co_await tx->execSqlCoro(
+        "DELETE FROM plinth.realtime_outbox "
+        "WHERE created_at < NOW() - INTERVAL '1 second' * " +
+        std::to_string(cfg.retention_seconds) + "::int");
+    outbox_deleted = static_cast<std::int64_t>(outbox_del_r.affectedRows());
 
     auto remain_r = co_await tx->execSqlCoro(
         "SELECT COALESCE(MIN(seq), 0) AS oldest FROM plinth.events");
@@ -146,6 +153,7 @@ auto run(Config::Realtime::Events cfg) -> drogon::Task<void> {
                            .count();
   Json::Value swept(Json::objectValue);
   swept["rows_deleted"] = static_cast<Json::Int64>(deleted);
+  swept["outbox_rows_deleted"] = static_cast<Json::Int64>(outbox_deleted);
   swept["sweep_duration_ms"] = static_cast<Json::Int64>(WALL_MS);
   swept["oldest_remaining_seq"] = static_cast<Json::Int64>(oldest_remain);
   audit_event("realtime.events.cleanup_swept", swept, cfg.audit_window_ms);

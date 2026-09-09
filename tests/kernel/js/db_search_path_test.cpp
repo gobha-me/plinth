@@ -405,13 +405,16 @@ TEST_CASE("extension database sessions cannot regain kernel authority",
   REQUIRE((*identity.value)["session_user"] == role);
   REQUIRE(pg.count_rows("ext_secure_notes.owned") == 1);
 
-  const std::array<std::string, 10> denied_sql{
+  const std::array<std::string, 13> denied_sql{
       "SELECT * FROM ext_secure_foreign.marker",
       "SELECT * FROM \"ext_secure_foreign\".\"marker\"",
       "INSERT INTO ext_secure_foreign.marker VALUES ('forbidden')",
       "SELECT password_hash FROM plinth.users",
       "SELECT * FROM plinth.sessions",
       "SELECT password FROM plinth.extension_database_credentials",
+      "SELECT * FROM plinth.realtime_outbox",
+      R"(INSERT INTO plinth.realtime_outbox(payload) VALUES ('{}'::jsonb))",
+      R"(SELECT plinth.enqueue_realtime_event('{}'::jsonb))",
       "SET ROLE " + cfg.db.user,
       "SET SESSION AUTHORIZATION " + cfg.db.user,
       "SELECT set_config('role', '" + cfg.db.user + "', false)",

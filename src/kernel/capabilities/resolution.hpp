@@ -174,8 +174,8 @@ auto call_capability_async(const CapabilityCall& call, const UserContext& ctx,
     -> drogon::Task<ResolveResult>;
 
 // Full Tier 2 cache resync from plinth.capabilities. Takes the
-// resolver write lock, clears tier2_cache, and re-runs the `enabled =
-// true` load. Returns the number of rows loaded.
+// resolver write lock, clears tier2_cache, and reloads all canonical rows,
+// including their enabled state. Returns the number of rows loaded.
 //
 // Cache-invalidation policy (0.2.4): LISTEN/NOTIFY is the primary
 // channel, but a NOTIFY delivered during a reconnect backoff window

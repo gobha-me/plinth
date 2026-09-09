@@ -106,9 +106,11 @@ Most `kernel:1:*` calls land here.
 
 **Tier 2 — Local-node (in-memory registry).**
 Capabilities provided by other extensions running on this node resolve
-via a local in-memory cache of the registry. No PG hit. Cache is
-invalidated by PG `LISTEN/NOTIFY` when the registry changes (package
-install/uninstall/enable/disable — rare events, not per-request).
+via a local in-memory cache of the registry. No PG hit. A PG
+`LISTEN/NOTIFY` hint triggers a full reload from the authoritative registry when
+it changes (package install/uninstall/enable/disable — rare events, not
+per-request). Notification payload fields never mutate cache state because
+PostgreSQL channels do not have producer ACLs.
 
 - **Stale cache window.** Registry changes propagate via `LISTEN/NOTIFY`
   which is asynchronous. There is a window (tens of milliseconds) where

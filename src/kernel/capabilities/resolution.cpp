@@ -188,12 +188,9 @@ auto register_lh0_harness_handlers_locked() -> void {
 
 using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 
-// Pulls every `enabled = true` row. Disabled rows are intentionally
-// excluded: dispatch resolves strictly against the enabled snapshot,
-// and the disable/enable audit trail plus the NOTIFY refresh (0.2.3)
-// keeps cache membership in sync. For tests that want to exercise the
-// "capability_disabled" branch, seed_tier2_cache_for_test accepts
-// enabled=false directly.
+// Pulls every canonical row, including disabled entries. Retaining the enabled
+// bit preserves the caller-visible `capability_disabled` outcome while letting
+// untrusted NOTIFY payloads trigger a full authoritative refresh.
 //
 // Called under the state_mutex write lock from both init_resolver
 // (one-shot startup) and reload_tier2_cache (listener reconnect resync
@@ -213,9 +210,8 @@ auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
   PgResultPtr res{
       plinth::db::exec(conn, "SELECT signature, provider_type, "
                              "       COALESCE(extension_name, ''), scope, "
-                             "       rbac_rule "
-                             "FROM plinth.capabilities "
-                             "WHERE enabled = true"),
+                             "       rbac_rule, enabled "
+                             "FROM plinth.capabilities"),
       PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("tier2 load: SELECT failed: {}",
@@ -233,7 +229,7 @@ auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
         .scope = PQgetvalue(res.get(), i, 3),
         .user_id = {}, // user-scope deferred to 0.4.x
         .rbac_rule = PQgetvalue(res.get(), i, 4),
-        .enabled = true,
+        .enabled = std::string_view{PQgetvalue(res.get(), i, 5)} == "t",
     };
     // Only instance-scope rows exist in 0.2.x (per ICD-0.2.0
     // user-scope deferral). The user_scope_key path is still

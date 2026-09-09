@@ -620,7 +620,7 @@ auto notify_error_to_rejection(plinth::realtime::NotifyError err)
     case NotifyError::PG_FAILURE:
     default:
       return {.code = "pubsub.pg_error",
-              .message = "pg_notify failed",
+              .message = "realtime outbox enqueue failed",
               .sqlstate = std::nullopt};
   }
 }

@@ -390,10 +390,10 @@ explicitly when they know it's appropriate (`batch()` or `silent`).
 
 | Layer | Mechanism | Purpose |
 |-------|-----------|---------|
-| **1. DB events** | PG `LISTEN/NOTIFY`, auto-emitted (debounced) | CRUD reactivity — default behavior, zero code |
-| **2. Kernel events** | PG `LISTEN/NOTIFY`, kernel-emitted | System events: user login, package install, node join/leave, `users.deleted` |
-| **3. Extension events** | PG `LISTEN/NOTIFY`, extension-emitted | Custom events: `pubsub.publish("chat:typing", ...)` |
-| **4. Sidecar events** | Sidecar → kernel HTTP → PG NOTIFY | Sidecar status, long-running task progress |
+| **1. DB events** | Protected outbox + PG wake hint, auto-emitted (debounced) | CRUD reactivity — default behavior, zero code |
+| **2. Kernel events** | Protected outbox + PG wake hint, kernel-emitted | System events: user login, package install, node join/leave, `users.deleted` |
+| **3. Extension events** | Kernel `pubsub.publish` → protected outbox | Custom events: `pubsub.publish("chat:typing", ...)` |
+| **4. Sidecar events** | Sidecar → kernel HTTP → protected outbox | Sidecar status, long-running task progress |
 
 ### 3.4 Frontend SDK — Debounced Smart Re-Query
 
@@ -462,23 +462,24 @@ resync" signal and the client re-queries all subscribed data.
 
 ### 3.6 HA Realtime
 
-PG `LISTEN/NOTIFY` is the backbone. All nodes listen on the same
-channels. A write on Node A triggers a NOTIFY that Node B receives and
-fans out to its connected WebSocket clients. No additional coordination
-needed — PG is the event bus. See
+The kernel-owned `plinth.realtime_outbox` is the authority and PG
+`LISTEN/NOTIFY` is only its low-latency wake mechanism. All nodes scan the same
+ordered outbox and fan authoritative rows out to their connected WebSocket
+clients. See
 `architecture/04-services-ha.md §5` for the HA model.
 
 #### 3.6.1 Physical Channel Fan-In
 
-Live since v0.5.0. Every realtime NOTIFY the platform emits rides
-the **single physical PG channel `plinth:realtime`** — Layer 1/2/3
-logical channel names (`plinth:data:<schema>.<table>`,
-`plinth:system:<event_class>`, `plinth:ext:<extension>:<event_class>`)
-live in the envelope's `channel` field, not as PG channel names.
-Each node's `plinth::realtime::listener` (ICD-0.5.0 §Listener
-Subsystem) opens one PG connection that `LISTEN "plinth:realtime"`s
-and dispatches incoming envelopes to registered in-process
-`EventHandler`s after channel regex validation. This fan-in design
+Every realtime envelope is inserted through the kernel-only
+`plinth.enqueue_realtime_event` function. It serializes row-id allocation with
+transaction commit order and emits only that id on the **single physical PG
+channel `plinth:realtime`**. Each node's listener treats the payload as an
+untrusted hint, scans rows after its monotonic cursor, and validates the stored
+envelope before dispatch. Replayed hints are no-ops, and periodic scans recover
+missed or coalesced notifications. Layer 1/2/3 logical channel names
+(`plinth:data:<schema>.<table>`, `plinth:system:<event_class>`,
+`plinth:ext:<extension>:<event_class>`) live only in the protected row. This
+fan-in design
 avoids the per-logical-channel LISTEN proliferation that would
 otherwise scale poorly under cross-extension subscription patterns.
 Since v0.5.5, `plinth::realtime::events_writer` is the listener's sole
@@ -504,12 +505,10 @@ Kernel DB Layer (within ext_notes schema)
     └── Coalescer: start/extend 50ms debounce window
               │
               ▼  (window expires)
-         Emit ONE PG NOTIFY:
-         channel: 'plinth:data:ext_notes.notes'
-         payload: { table, schema, ops, seq }
+         Insert ONE protected outbox row and emit its id as a PG wake hint
               │
               ▼
-         PG LISTEN/NOTIFY propagates to ALL kernel nodes
+         Each kernel node scans authoritative rows after its local cursor
               │
               ▼
          Each node's WS Broker checks client subscriptions

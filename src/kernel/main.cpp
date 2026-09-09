@@ -586,29 +586,13 @@ auto main(int argc, char* argv[]) -> int {
         database_operations.checkpoint();
         plinth::capabilities::start_notify_listener(cfg.db);
 
-        // ICD-0.5.0 §Deterministic Teardown + §Startup placement
-        // — per-node LISTEN subscriber for the realtime event bus.
-        // Runs as a sibling to the 0.2.3 capability listener; see
-        // ICD §Relationship to the 0.2.3 Capability Listener.
-        database_operations.checkpoint();
-        plinth::realtime::start_listener(cfg.db, cfg.realtime.listener);
-
-        // ICD-0.5.1 §Startup + shutdown wiring — spin up the PG
-        // auto-event coalescer after the listener. The coalescer's
-        // dedicated event-loop thread hosts the window timers; the shutdown
-        // coordinator reverses the dependency order.
-        database_operations.checkpoint();
-        plinth::realtime::CoalescerRegistry::instance().start(
-            cfg.realtime.coalescer);
-
         // ICD-0.5.2 §Broker Subsystem → Lifecycle integration. As
         // of ICD-0.5.5 §5 the broker is no longer a peer listener
         // handler; `broker::start` only flips `broker_enabled` and
         // pulls config so the writer-downstream `broker::dispatch`
         // call from `events_writer::insert_envelope` knows it is
-        // safe to fan out. Order is still listener → coalescer →
-        // broker → events_writer (so the writer's call into the
-        // broker sees `broker_enabled=true` from the start).
+        // safe to fan out. Start it before the writer and listener so no
+        // authoritative outbox row reaches an unready downstream consumer.
         database_operations.checkpoint();
         plinth::realtime::broker::start(cfg.realtime.broker);
 
@@ -621,6 +605,18 @@ auto main(int argc, char* argv[]) -> int {
         // database-backed work before destroying Drogon.
         database_operations.checkpoint();
         plinth::realtime::events_writer::start(cfg.realtime.events);
+
+        // Register the broker and writer before the listener begins advancing
+        // its authoritative outbox cursor. A remote event arriving during
+        // startup can therefore never be accepted without its sole consumer.
+        database_operations.checkpoint();
+        plinth::realtime::start_listener(cfg.db, cfg.realtime.listener);
+
+        // Spin up local producers only after listener admission is live. The
+        // shutdown coordinator reverses this dependency order.
+        database_operations.checkpoint();
+        plinth::realtime::CoalescerRegistry::instance().start(
+            cfg.realtime.coalescer);
 
         // ICD-0.5.3 §OID-Driven PG-Type → JS-Type Mapping §Feature
         // flag — propagate `db.oid_mapping.enabled` into the kernel
