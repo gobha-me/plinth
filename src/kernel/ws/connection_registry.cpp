@@ -85,6 +85,20 @@ auto ConnectionRegistry::for_each(
   }
 }
 
+auto ConnectionRegistry::snapshot_entries() const
+    -> std::vector<RegistryEntry> {
+  if (g_shutdown_pending.load(std::memory_order_acquire)) {
+    return {};
+  }
+  std::lock_guard lock(mu);
+  std::vector<RegistryEntry> snapshot;
+  snapshot.reserve(conns.size());
+  for (const auto& [_, entry] : conns) {
+    snapshot.push_back(entry);
+  }
+  return snapshot;
+}
+
 auto ConnectionRegistry::size() const -> std::size_t {
   if (g_shutdown_pending.load(std::memory_order_acquire)) {
     return 0;
@@ -186,6 +200,15 @@ auto ConnectionRegistry::cancel_all_timers(std::chrono::milliseconds timeout)
     // heap-owned instead of capturing a stack promise that the timeout path
     // has already destroyed.
     loop->queueInLoop([state, done]() {
+      state->authority_stopped = true;
+      state->authority_until_ms->store(0, std::memory_order_release);
+      if (state->replay_abort_flag) {
+        state->replay_abort_flag->store(true, std::memory_order_release);
+      }
+      if (state->authority_timer_id != trantor::InvalidTimerId) {
+        state->loop->invalidateTimer(state->authority_timer_id);
+        state->authority_timer_id = trantor::InvalidTimerId;
+      }
       if (state->auth_timer_id != trantor::InvalidTimerId &&
           state->loop != nullptr) {
         state->loop->invalidateTimer(state->auth_timer_id);

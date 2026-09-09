@@ -65,7 +65,8 @@ auto to_user_context(const ConnState& state, const std::string& ip)
 auto on_call(const drogon::WebSocketConnectionPtr& conn,
              const Json::Value& msg_in) -> void {
   auto* state = conn->getContext<ConnState>().get();
-  if (state == nullptr || !state->authenticated) {
+  if (state == nullptr || !state->authenticated ||
+      !authority_is_current(*state)) {
     return;
   }
 

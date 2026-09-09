@@ -11,6 +11,7 @@
 #include "kernel/auth/middleware.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -31,7 +32,16 @@ struct ConnState {
   bool auth_failed{false};
   bool is_admin{false};
 
-  // Effective RBAC rules loaded once at WS auth completion (the same
+  // Database authority is leased for at most two seconds. Rules and identity
+  // remain immutable after auth; any change closes the socket for reauth.
+  // The writer pre-pass and replay copies share only this atomic deadline.
+  std::shared_ptr<std::atomic<std::int64_t>> authority_until_ms{
+      std::make_shared<std::atomic<std::int64_t>>(0)};
+  bool authority_refresh_pending{false};
+  bool authority_stopped{false};
+  trantor::TimerId authority_timer_id{trantor::InvalidTimerId};
+
+  // Effective RBAC rules loaded at WS auth completion (the same
   // union-across-groups query the HTTP `RbacFilter` uses). The
   // per-channel subscribe gate (`on_subscribe`) and the defense-in-
   // depth delivery re-check (`publish_dispatched`) both read from
@@ -106,5 +116,13 @@ struct ConnState {
   // Touched only on the conn's owning loop, no mutex needed.
   std::unordered_map<std::string, std::int64_t> last_live_seen_seq;
 };
+
+inline auto authority_is_current(const ConnState& state) -> bool {
+  const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+  return state.authority_until_ms != nullptr &&
+         now < state.authority_until_ms->load(std::memory_order_acquire);
+}
 
 } // namespace plinth::ws

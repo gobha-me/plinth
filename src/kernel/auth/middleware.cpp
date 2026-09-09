@@ -83,11 +83,12 @@ auto extract_token(const drogon::HttpRequestPtr& req)
 }
 
 auto validate_session_token(const std::string& raw_token,
-                            TokenValidationCallback cb) -> void {
+                            TokenValidationCallback cb,
+                            drogon::orm::DbClientPtr database) -> void {
   auto token_hash = sha256_hex(raw_token);
   auto shared_cb = std::make_shared<TokenValidationCallback>(std::move(cb));
 
-  auto db = drogon::app().getDbClient();
+  auto db = database ? std::move(database) : drogon::app().getDbClient();
   db->execSqlAsync(
       "SELECT s.id, s.user_id, u.username, s.revoked_at, "
       "       (s.expires_at <= NOW()) AS is_expired "
@@ -138,7 +139,8 @@ auto validate_session_token(const std::string& raw_token,
 }
 
 auto validate_pat_token(const std::string& raw_token,
-                        TokenValidationCallback cb) -> void {
+                        TokenValidationCallback cb,
+                        drogon::orm::DbClientPtr database) -> void {
   if (!std::string_view{raw_token}.starts_with(PAT_PREFIX) ||
       raw_token.size() <= PAT_PREFIX.size()) {
     cb({.ok = false, .context = {}, .error_code = "not_authenticated"});
@@ -150,7 +152,7 @@ auto validate_pat_token(const std::string& raw_token,
   auto token_hash = sha256_hex(random_part);
   auto shared_cb = std::make_shared<TokenValidationCallback>(std::move(cb));
 
-  auto db = drogon::app().getDbClient();
+  auto db = database ? std::move(database) : drogon::app().getDbClient();
   db->execSqlAsync(
       "SELECT p.id, p.user_id, u.username "
       "FROM plinth.pats p "
@@ -202,13 +204,13 @@ auto validate_pat_token(const std::string& raw_token,
       token_hash);
 }
 
-auto validate_token(const std::string& raw_token, TokenValidationCallback cb)
-    -> void {
+auto validate_token(const std::string& raw_token, TokenValidationCallback cb,
+                    drogon::orm::DbClientPtr database) -> void {
   if (std::string_view{raw_token}.starts_with(PAT_PREFIX) &&
       raw_token.size() > PAT_PREFIX.size()) {
-    validate_pat_token(raw_token, std::move(cb));
+    validate_pat_token(raw_token, std::move(cb), std::move(database));
   } else {
-    validate_session_token(raw_token, std::move(cb));
+    validate_session_token(raw_token, std::move(cb), std::move(database));
   }
 }
 

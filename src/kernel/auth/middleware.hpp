@@ -1,6 +1,7 @@
 #pragma once
 
 #include <drogon/HttpFilter.h>
+#include <drogon/orm/DbClient.h>
 #include <functional>
 #include <optional>
 #include <string>
@@ -71,16 +72,18 @@ using TokenValidationCallback = std::function<void(TokenValidationResult)>;
 
 // Validate a session token (raw, not yet hashed). Async DB call.
 auto validate_session_token(const std::string& raw_token,
-                            TokenValidationCallback cb) -> void;
+                            TokenValidationCallback cb,
+                            drogon::orm::DbClientPtr database = {}) -> void;
 
 // Validate a PAT (raw, must be prefixed with "plinth_"). Async DB call.
 // Also fires a non-blocking last_used_at update on success.
 auto validate_pat_token(const std::string& raw_token,
-                        TokenValidationCallback cb) -> void;
+                        TokenValidationCallback cb,
+                        drogon::orm::DbClientPtr database = {}) -> void;
 
 // Dispatch by prefix: tokens starting with "plinth_" go to validate_pat_token,
 // all others to validate_session_token.
-auto validate_token(const std::string& raw_token, TokenValidationCallback cb)
-    -> void;
+auto validate_token(const std::string& raw_token, TokenValidationCallback cb,
+                    drogon::orm::DbClientPtr database = {}) -> void;
 
 } // namespace plinth::auth

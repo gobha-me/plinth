@@ -2,6 +2,7 @@
 
 #include "kernel/logging.hpp"
 #include "kernel/ws/auth_flow.hpp"
+#include "kernel/ws/authority.hpp"
 #include "kernel/ws/call_dispatch.hpp"
 #include "kernel/ws/close_codes.hpp"
 #include "kernel/ws/conn_state.hpp"
@@ -124,6 +125,7 @@ auto EventsController::handleNewMessage(
 
 auto EventsController::handleConnectionClosed(
     const drogon::WebSocketConnectionPtr& conn) -> void {
+  stop_authority_monitor(conn);
   auto* state = conn->getContext<ConnState>().get();
   if (state == nullptr) {
     return;

@@ -152,3 +152,11 @@ handshake, a groups-bootstrap table lock, and a package-reconciliation row
 lock, then sends each shutdown signal. Lock tests retain the conflicting
 transaction until the cancelled backend disappears. Fresh boot, restart,
 ordinary active-work shutdown, and partial-startup tests remain applicable.
+
+
+WebSocket authority validation and renewal follow
+[the authority lifetime contract](websocket-authority.md). Their named database
+pool is owned by Drogon; each accepted completion holds an async task lease.
+Closing ingress cancels authority timers and invalidates their deadlines before
+async work drains. The one-second callback/statement timeouts bound blocked
+renewals without keeping the connection's event loop alive indefinitely.

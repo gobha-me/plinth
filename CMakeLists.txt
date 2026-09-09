@@ -427,6 +427,7 @@ add_executable(plinth
   src/kernel/rbac/ephemeral_user.cpp
   src/kernel/rbac/subscribe_rule.cpp
   src/kernel/ws/connection_registry.cpp
+  src/kernel/ws/authority.cpp
   src/kernel/ws/auth_flow.cpp
   src/kernel/ws/heartbeat.cpp
   src/kernel/ws/subscriptions.cpp
@@ -639,6 +640,7 @@ add_executable(plinth_tests
   src/kernel/rbac/ephemeral_user.cpp
   src/kernel/rbac/subscribe_rule.cpp
   src/kernel/ws/connection_registry.cpp
+  src/kernel/ws/authority.cpp
   src/kernel/ws/auth_flow.cpp
   src/kernel/ws/heartbeat.cpp
   src/kernel/ws/subscriptions.cpp
@@ -820,6 +822,11 @@ foreach(auth_scenario bootstrap-disabled bootstrap-enabled bootstrap-rollback)
   set_tests_properties(plinth_tests_auth_${auth_scenario} PROPERTIES
     RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
 endforeach()
+add_test(NAME plinth_tests_ws_authority
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/ws_authority.py
+          --binary $<TARGET_FILE:plinth>)
+set_tests_properties(plinth_tests_ws_authority PROPERTIES
+  LABELS "needs_pg" SKIP_RETURN_CODE 77 TIMEOUT 180)
 
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s
 # main loop, so `[js][async]` tests now share `plinth_tests_js`'s

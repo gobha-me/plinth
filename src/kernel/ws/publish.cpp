@@ -147,6 +147,9 @@ auto emit_gap_detected(const drogon::WebSocketConnectionPtr& conn,
 // 0.1.6 admin-only semantics (S.09), else rule lookup.
 auto delivery_rbac_allows(const ConnState& state, std::string_view channel)
     -> bool {
+  if (!authority_is_current(state)) {
+    return false;
+  }
   if (state.is_admin) {
     return true;
   }
@@ -263,18 +266,15 @@ auto publish(std::string_view channel, const Json::Value& payload) -> void {
       std::make_shared<std::string>(build_event_frame(channel, payload));
 
   // Snapshot current connections under the registry lock.
-  std::vector<drogon::WebSocketConnectionPtr> snapshot;
-  ConnectionRegistry::instance().for_each(
-      [&snapshot](const drogon::WebSocketConnectionPtr& conn) {
-        snapshot.push_back(conn);
-      });
+  const auto snapshot = ConnectionRegistry::instance().snapshot_entries();
 
   // Dispatch to each connection on its owning loop. We deliberately do
   // not check ConnState.channels here (it's mutated on the owning loop
   // and reading it from an arbitrary thread is a race) — the per-loop
   // lambda below does that check where it's safe.
-  for (const auto& conn : snapshot) {
-    auto* state = conn->getContext<ConnState>().get();
+  for (const auto& entry : snapshot) {
+    const auto& conn = entry.conn;
+    auto* state = entry.state.get();
     if (state == nullptr || state->loop == nullptr) {
       continue;
     }
@@ -288,7 +288,7 @@ auto publish(std::string_view channel, const Json::Value& payload) -> void {
         std::lock_guard lk(*s->channels_mu);
         subscribed = s->channels.contains(channel_str);
       }
-      if (subscribed) {
+      if (subscribed && delivery_rbac_allows(*s, channel_str)) {
         conn->send(*frame);
       }
     });
@@ -313,11 +313,7 @@ auto publish_dispatched(const plinth::realtime::DispatchedEvent& ev) -> void {
     seq = ev.envelope["seq"].asInt64();
   }
 
-  std::vector<drogon::WebSocketConnectionPtr> snapshot;
-  ConnectionRegistry::instance().for_each(
-      [&snapshot](const drogon::WebSocketConnectionPtr& conn) {
-        snapshot.push_back(conn);
-      });
+  const auto snapshot = ConnectionRegistry::instance().snapshot_entries();
 
   // ICD-0.5.4 §When `record_delivered` fires — synchronous pre-pass
   // populates `ev.delivered_to_users` BEFORE the per-conn loop hops.
@@ -332,9 +328,9 @@ auto publish_dispatched(const plinth::realtime::DispatchedEvent& ev) -> void {
   // pre-pass (e.g. conn dropped between the two). That's acceptable
   // per ICD §SC8 (cursor advance is fire-and-forget; on rare drops
   // the duplicate-tolerance contract handles re-delivery).
-  for (const auto& conn : snapshot) {
-    auto* state = conn->getContext<ConnState>().get();
-    if (state == nullptr || !state->authenticated) {
+  for (const auto& entry : snapshot) {
+    auto* state = entry.state.get();
+    if (state == nullptr || !authority_is_current(*state)) {
       continue;
     }
     {
@@ -351,8 +347,9 @@ auto publish_dispatched(const plinth::realtime::DispatchedEvent& ev) -> void {
     }
   }
 
-  for (const auto& conn : snapshot) {
-    auto* state = conn->getContext<ConnState>().get();
+  for (const auto& entry : snapshot) {
+    const auto& conn = entry.conn;
+    auto* state = entry.state.get();
     if (state == nullptr || state->loop == nullptr) {
       continue;
     }
@@ -373,17 +370,14 @@ auto drain_ws_subscriptions_for_extension(std::string_view name)
   // synchronous path the test seam relies on, tests call
   // `drain_ws_subscriptions_for_extension` on the same loop they
   // subscribed from so the lambda runs inline.
-  std::vector<drogon::WebSocketConnectionPtr> snapshot;
-  ConnectionRegistry::instance().for_each(
-      [&snapshot](const drogon::WebSocketConnectionPtr& conn) {
-        snapshot.push_back(conn);
-      });
+  const auto snapshot = ConnectionRegistry::instance().snapshot_entries();
 
   auto removed = std::make_shared<std::atomic<std::size_t>>(0);
   const std::string NAME{name};
 
-  for (const auto& conn : snapshot) {
-    auto* state = conn->getContext<ConnState>().get();
+  for (const auto& entry : snapshot) {
+    const auto& conn = entry.conn;
+    auto* state = entry.state.get();
     if (state == nullptr || state->loop == nullptr) {
       continue;
     }
