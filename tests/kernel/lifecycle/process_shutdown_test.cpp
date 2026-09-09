@@ -1254,3 +1254,71 @@ TEST_CASE("shell status cancels a stalled PostgreSQL handshake",
     REQUIRE(read_text(log).contains("PostgreSQL startup operation cancelled"));
   }
 }
+
+TEST_CASE("production keeps serving after malformed WebSocket field types",
+          "[integration][subprocess][ws-input]") {
+  if (!required_env("PLINTH_PG_HOST")) {
+    SKIP("PostgreSQL environment is not configured");
+  }
+  IsolatedDatabase database;
+  TempTree tree;
+  auto port = test_port();
+  auto config = write_config(tree, port, true, database.name);
+  plinth::Config::Database child_database;
+  child_database.host = *required_env("PLINTH_PG_HOST");
+  child_database.port =
+      static_cast<std::uint16_t>(std::stoi(*required_env("PLINTH_PG_PORT")));
+  child_database.user = *required_env("PLINTH_PG_USER");
+  child_database.password = *required_env("PLINTH_PG_PASSWORD");
+  child_database.database = database.name;
+  ChildProcess child{{PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+                     tree.path / "process.log",
+                     &child_database};
+  REQUIRE(wait_for_health(port, 30s));
+  auto connection = open_database(database.name);
+  const std::string token = "fake-ws-input-session-token";
+  sql(connection.get(),
+      "WITH u AS (INSERT INTO plinth.users (username, password_hash) "
+      "VALUES ('ws_input_owner', 'unused') RETURNING id) "
+      "INSERT INTO plinth.sessions (user_id, token_hash) SELECT id, $1 FROM u",
+      {plinth::auth::sha256_hex(token)});
+  auto socket = open_unauthenticated_websocket(port);
+  REQUIRE(socket.fd >= 0);
+  // Authentication behind each malformed type is a same-socket ordering
+  // barrier: an unrelated health response cannot race ahead of the bad frame.
+  for (const auto& invalid : std::vector<nlohmann::json>{
+           nullptr, true, 17, 1.5, nlohmann::json::object(),
+           nlohmann::json::array()}) {
+    send_frame(socket.fd, {{"type", invalid}});
+  }
+  send_frame(socket.fd, {{"type", "auth"}, {"token", token}});
+  REQUIRE(receive_frame(socket.fd).at("type") == "connected");
+  for (const auto& invalid : std::vector<nlohmann::json>{
+           nullptr, true, 1.5, "wrong", nlohmann::json::object(),
+           nlohmann::json::array(), 18446744073709551615ULL}) {
+    send_frame(socket.fd, {{"type", "pong"}, {"timestamp", invalid}});
+    send_frame(socket.fd, {{"type", "debounce_renegotiate"},
+                           {"channel", "plinth:system:test"},
+                           {"debounce_ms", invalid}});
+    send_frame(socket.fd, {{"type", "subscribe"},
+                           {"channels", nlohmann::json::array()},
+                           {"since_seq", invalid}});
+    REQUIRE(receive_frame(socket.fd).at("type") == "error");
+  }
+  send_frame(socket.fd,
+             {{"type", "subscribe"}, {"channels", nlohmann::json::array()}});
+  REQUIRE(receive_frame(socket.fd).at("type") == "subscribed");
+  // Invalid credentials retain the existing error/close policy and do not
+  // disturb the healthy authenticated connection.
+  auto bad_auth = open_unauthenticated_websocket(port);
+  REQUIRE(bad_auth.fd >= 0);
+  send_frame(bad_auth.fd,
+             {{"type", "auth"}, {"token", nlohmann::json::object()}});
+  REQUIRE(receive_frame(bad_auth.fd).at("error") == "auth_failed");
+  REQUIRE(health_is_ready(port));
+  child.send_signal(SIGTERM);
+  auto status = child.wait_for_exit(15s);
+  REQUIRE(status.has_value());
+  REQUIRE(WIFEXITED(*status));
+  REQUIRE(WEXITSTATUS(*status) == 0);
+}

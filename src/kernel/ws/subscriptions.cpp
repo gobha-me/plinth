@@ -293,7 +293,7 @@ auto extract_since_seq(const Json::Value& msg) -> SinceSeqParse {
     return {};
   }
   const auto& v = msg["since_seq"];
-  if (!v.isIntegral()) {
+  if (!v.isIntegral() || !v.isInt64()) {
     return {.value = std::nullopt, .error = "resubscribe.invalid_since_seq"};
   }
   auto i = v.asInt64();
@@ -525,6 +525,10 @@ auto on_debounce_renegotiate(const drogon::WebSocketConnectionPtr& conn,
   // malformed renegotiate has no effect either way; logging at
   // debug keeps the audit pipeline focused on real overrides.
   if (!msg.isMember("channel") || !msg["channel"].isString()) {
+    return;
+  }
+  if (msg.isMember("debounce_ms") &&
+      (!msg["debounce_ms"].isIntegral() || !msg["debounce_ms"].isInt64())) {
     return;
   }
   const auto CHANNEL = msg["channel"].asString();
