@@ -277,6 +277,45 @@ auto required_env(const char* name) -> std::optional<std::string> {
 
 // Owns only uniquely named credentials and a database on the disposable
 // PostgreSQL instance selected by the integration-test environment.
+auto drop_test_database(PGconn* admin, const std::string& database) -> void {
+  using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
+  const std::array<const char*, 1> parameters{database.c_str()};
+  Result roles{
+      PQexecParams(
+          admin,
+          "SELECT DISTINCT r.rolname FROM pg_roles r JOIN pg_shdepend d "
+          "ON d.refclassid='pg_authid'::regclass AND d.refobjid=r.oid "
+          "JOIN pg_database db ON db.oid=d.dbid WHERE db.datname=$1 "
+          "AND r.rolname ~ '^px_[0-9a-f]{60}$'",
+          1, nullptr, parameters.data(), nullptr, nullptr, 0),
+      PQclear};
+  CHECK(PQresultStatus(roles.get()) == PGRES_TUPLES_OK);
+  if (PQresultStatus(roles.get()) != PGRES_TUPLES_OK) {
+    return;
+  }
+  const auto drop = [admin](const std::string& prefix, const std::string& name,
+                            const std::string& suffix) {
+    std::unique_ptr<char, decltype(&PQfreemem)> identifier{
+        PQescapeIdentifier(admin, name.data(), name.size()), PQfreemem};
+    if (!identifier) {
+      return false;
+    }
+    const auto query = prefix + identifier.get() + suffix;
+    Result result{PQexec(admin, query.c_str()), PQclear};
+    return PQresultStatus(result.get()) == PGRES_COMMAND_OK;
+  };
+  const bool removed = drop("DROP DATABASE ", database, " WITH (FORCE)");
+  CHECK(removed);
+  if (!removed) {
+    return;
+  }
+  // Database-scoped runtime logins belong to this fixture. Cluster-wide
+  // historical aliases may be shared and must not be guessed or deleted.
+  for (int row = 0; row < PQntuples(roles.get()); ++row) {
+    CHECK(drop("DROP ROLE ", PQgetvalue(roles.get(), row, 0), ""));
+  }
+}
+
 class CredentialDatabase {
  public:
   CredentialDatabase() {
@@ -299,8 +338,7 @@ class CredentialDatabase {
 
   ~CredentialDatabase() {
     if (database_created) {
-      CHECK(
-          exec("DROP DATABASE " + quote(db.database, false) + " WITH (FORCE)"));
+      drop_test_database(admin.get(), db.database);
     }
     if (role_created) {
       CHECK(exec("DROP ROLE " + quote(db.user, false)));
@@ -502,12 +540,7 @@ class IsolatedDatabase {
              std::to_string(sequence++)) {
     sql(admin.get(), "CREATE DATABASE " + name);
   }
-  ~IsolatedDatabase() {
-    // The name is generated entirely from fixed text and unsigned integers.
-    PgResult result{PQexec(admin.get(),
-                           ("DROP DATABASE " + name + " WITH (FORCE)").c_str()),
-                    PQclear};
-  }
+  ~IsolatedDatabase() { drop_test_database(admin.get(), name); }
   IsolatedDatabase(const IsolatedDatabase&) = delete;
   auto operator=(const IsolatedDatabase&) -> IsolatedDatabase& = delete;
 
