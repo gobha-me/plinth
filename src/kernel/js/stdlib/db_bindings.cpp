@@ -303,6 +303,7 @@ auto db_query(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
              .audit_event_type = {},
              .audit_payload = {}};
   op.bc_extension_name = bc->extension_name;
+  op.extension_database_clients = bc->extension_database_clients;
   // ICD-0.5.3 §`db.batch()` §AsyncOp additions — stamp the scope id
   // when inside a batch so the dispatch arm routes through the
   // pinned connection and the coalescer tags counters accordingly.
@@ -383,6 +384,7 @@ auto db_exec(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
              .audit_event_type = {},
              .audit_payload = {}};
   op.bc_extension_name = bc->extension_name;
+  op.extension_database_clients = bc->extension_database_clients;
   if (bc->batch_state.depth > 0) {
     // Free the promise capability before returning the rejection
     // — register_pending already took ownership of the
@@ -446,6 +448,7 @@ auto enqueue_batch_op(JSContext* ctx, AsyncOp::Type type,
              .audit_event_type = {},
              .audit_payload = {}};
   op.bc_extension_name = bc->extension_name;
+  op.extension_database_clients = bc->extension_database_clients;
   op.batch_scope_id = scope_id;
   if (rollback_err.has_value()) {
     op.rollback_error = std::move(*rollback_err);

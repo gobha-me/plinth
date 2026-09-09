@@ -108,6 +108,13 @@ struct PgConnection {
 };
 
 auto reset_development_schemas(const PgConnection& pg) -> void {
+  std::vector<std::string> extension_roles;
+  if (pg.has_rows(
+          "SELECT 1 WHERE to_regclass('plinth.extension_database_credentials') "
+          "IS NOT NULL")) {
+    extension_roles = pg.query_strings(
+        "SELECT role_name FROM plinth.extension_database_credentials");
+  }
   // Every package migration is constrained to an `ext_<name>` schema and an
   // `ext_<name>_role`. A dev reset that only drops `plinth` leaves those
   // objects behind, so the next first-boot is not actually a clean boot.
@@ -122,18 +129,25 @@ auto reset_development_schemas(const PgConnection& pg) -> void {
                        "ORDER BY schema_name");
 
   for (const auto& schema : schemas) {
+    extension_roles.push_back(schema + "_role");
     pg.exec("DROP SCHEMA IF EXISTS " + pg.quote_identifier(schema) +
             " CASCADE");
   }
   pg.exec("DROP SCHEMA IF EXISTS plinth CASCADE");
 
-  for (const auto& schema : schemas) {
-    auto role = schema + "_role";
+  for (const auto& role : extension_roles) {
     auto quoted_role = pg.quote_identifier(role);
     if (pg.has_rows("SELECT 1 FROM pg_roles WHERE rolname = " +
                     pg.quote_literal(role))) {
       pg.exec("DROP OWNED BY " + quoted_role + " CASCADE");
-      pg.exec("DROP ROLE " + quoted_role);
+      if (!pg.has_rows(
+              "SELECT 1 FROM pg_shdepend d JOIN pg_roles r ON r.oid=d.refobjid "
+              "WHERE d.refclassid='pg_authid'::regclass AND r.rolname=" +
+              pg.quote_literal(role) +
+              " AND d.dbid NOT IN (0, (SELECT oid FROM pg_database WHERE "
+              "datname=current_database()))")) {
+        pg.exec("DROP ROLE " + quoted_role);
+      }
     }
   }
 }
@@ -188,6 +202,28 @@ auto bootstrap_schema(const Config::Database& db_cfg,
       spdlog::info("schema created");
     }
   }
+  std::ifstream isolation_file(migrations_dir + "/extension_database.sql");
+  if (!isolation_file.is_open()) {
+    throw std::runtime_error(
+        "cannot open extension database privilege migration");
+  }
+  std::ostringstream isolation_sql;
+  isolation_sql << isolation_file.rdbuf();
+  pg.exec("BEGIN");
+  pg.exec(isolation_sql.str());
+  for (const auto& extension :
+       pg.query_strings("SELECT DISTINCT COALESCE(credentials.extension_name, "
+                        "packages.name, substring(n.nspname FROM 5)) "
+                        "FROM pg_namespace n LEFT JOIN "
+                        "plinth.extension_database_credentials credentials "
+                        "ON credentials.schema_name=n.nspname LEFT JOIN "
+                        "plinth.packages packages "
+                        "ON left('ext_' || packages.name, 63)=n.nspname "
+                        "WHERE n.nspname LIKE 'ext\\_%' ESCAPE '\\'")) {
+    pg.exec("SELECT plinth.provision_extension_database(" +
+            pg.quote_literal(extension) + ")");
+  }
+  pg.exec("COMMIT");
 }
 
 } // namespace plinth::db

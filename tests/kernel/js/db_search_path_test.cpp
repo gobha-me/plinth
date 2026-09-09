@@ -13,6 +13,7 @@
 #include "async_bridge_fixture.hpp"
 
 #include "kernel/config.hpp"
+#include "kernel/db/extension_identity.hpp"
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/js/db_search_path.hpp"
 #include "kernel/js/run_on_context.hpp"
@@ -21,6 +22,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <drogon/utils/coroutine.h>
+#include <json/writer.h>
 #include <libpq-fe.h>
 
 #include <array>
@@ -208,19 +210,14 @@ TEST_CASE("P.04: cross-extension schema isolation — PG permissions prevail",
   pg.exec("CREATE TABLE ext_terminal.sessions (id serial primary key, "
           "body text)");
 
-  // `notes` ext writes against `ext_terminal.sessions`. Both schemas
-  // are created by the superuser test connection, so PG permissions
-  // don't block the write in this harness — instead, the assertion
-  // is that the search_path wrapper does NOT expand the unqualified
-  // table name to ext_terminal (it expands to ext_notes). The
-  // qualified write still works; test proves the search_path
-  // doesn't silently redirect cross-extension writes.
+  // A privileged fixture connection does not confer its authority on SQL
+  // executed by an extension, including explicitly qualified identifiers.
   auto pool = make_pool(cfg);
   auto r = eval_as(
       pool, "notes",
       "db.exec(\"INSERT INTO ext_terminal.sessions(body) VALUES('x')\")");
-  REQUIRE(r.value.has_value());
-  REQUIRE(pg.count_rows("ext_terminal.sessions") == 1);
+  REQUIRE_FALSE(r.value.has_value());
+  REQUIRE(pg.count_rows("ext_terminal.sessions") == 0);
   // The unqualified-`sessions` case: the wrapper points search_path
   // at ext_notes. `sessions` doesn't exist there → PG errors.
   auto r2 = eval_as(pool, "notes",
@@ -323,7 +320,7 @@ TEST_CASE("P.07: identity-regex defense — malicious extension_name rejected",
 }
 
 // ─── P.08 ─────────────────────────────────────────────────────────
-TEST_CASE("P.08: enforce=false disables wrapper — raw exec, no BEGIN/COMMIT",
+TEST_CASE("P.08: disabling search_path never disables privilege isolation",
           "[js][async][db][search_path]") {
   if (!pg_available()) {
     SKIP("PG not available");
@@ -349,14 +346,14 @@ TEST_CASE("P.08: enforce=false disables wrapper — raw exec, no BEGIN/COMMIT",
   auto pool = make_pool(cfg);
   auto r = eval_as(pool, "notes",
                    "db.exec(\"INSERT INTO notes(body) VALUES('hi')\")");
-  REQUIRE(r.value.has_value());
+  REQUIRE_FALSE(r.value.has_value());
 
   // With enforce=false, no SET LOCAL fires → unqualified `notes`
   // resolves via PG's default search_path. Depending on PG's schema
   // path default (usually `\"$user\", public`), the row lands in
   // public.notes — NOT ext_notes.notes (which would require the
   // wrapper).
-  REQUIRE(pg.count_rows("public.notes") == 1);
+  REQUIRE(pg.count_rows("public.notes") == 0);
   REQUIRE(pg.count_rows("ext_notes.notes") == 0);
 
   // Restore for subsequent tests in the subprocess.
@@ -372,3 +369,70 @@ TEST_CASE("P.08: enforce=false disables wrapper — raw exec, no BEGIN/COMMIT",
 
 // P.02 defers to phase 4 (B.02 single-SET-LOCAL-per-batch assertion
 // belongs with the db.batch TU where the batch-scope wrapper lives).
+
+TEST_CASE("extension database sessions cannot regain kernel authority",
+          "[js][async][db][security][search_path]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+  auto cfg = test_config();
+  reset_for_search_path_test(cfg);
+  TestPg pg(cfg.db);
+  pg.exec("SELECT plinth.provision_extension_database('secure_notes')");
+  pg.exec("SELECT plinth.provision_extension_database('secure_foreign')");
+  pg.exec("CREATE TABLE ext_secure_foreign.marker(value text)");
+  pg.exec(
+      "INSERT INTO ext_secure_foreign.marker VALUES ('fake-private-marker')");
+  pg.exec("INSERT INTO plinth.users(username, password_hash) "
+          "VALUES ('fake-security-user', 'fake-private-hash')");
+  auto pool = make_pool(cfg);
+
+  auto identity = eval_as(pool, "secure_notes", R"JS(
+    (async () => {
+      await db.exec("RESET ROLE");
+      await db.exec("RESET SESSION AUTHORIZATION");
+      const {rows} = await db.query("SELECT current_user, session_user");
+      await db.exec("CREATE TABLE ext_secure_notes.owned(value text)");
+      await db.exec("INSERT INTO owned VALUES($1)", ["own-row"]);
+      return rows[0];
+    })()
+  )JS");
+  REQUIRE(identity.value.has_value());
+  const auto role =
+      plinth::db::extension_role_name(cfg.db.database, "secure_notes");
+  REQUIRE((*identity.value)["current_user"] == role);
+  REQUIRE((*identity.value)["session_user"] == role);
+  REQUIRE(pg.count_rows("ext_secure_notes.owned") == 1);
+
+  const std::array<std::string, 10> denied_sql{
+      "SELECT * FROM ext_secure_foreign.marker",
+      "SELECT * FROM \"ext_secure_foreign\".\"marker\"",
+      "INSERT INTO ext_secure_foreign.marker VALUES ('forbidden')",
+      "SELECT password_hash FROM plinth.users",
+      "SELECT * FROM plinth.sessions",
+      "SELECT password FROM plinth.extension_database_credentials",
+      "SET ROLE " + cfg.db.user,
+      "SET SESSION AUTHORIZATION " + cfg.db.user,
+      "SELECT set_config('role', '" + cfg.db.user + "', false)",
+      "DO $$ BEGIN EXECUTE 'SET ROLE " + cfg.db.user + "'; END $$"};
+  for (const auto& sql : denied_sql) {
+    INFO(sql);
+    Json::Value query{sql};
+    Json::StreamWriterBuilder writer;
+    const auto encoded = Json::writeString(writer, query);
+    for (const auto* method : {"query", "exec"}) {
+      const auto call = std::string{"db."} + method + "(" + encoded + ")";
+      auto standalone = eval_as(pool, "secure_notes", call);
+      REQUIRE_FALSE(standalone.value.has_value());
+      auto batch = eval_as(pool, "secure_notes",
+                           "db.batch(async () => { await " + call + "; })");
+      REQUIRE_FALSE(batch.value.has_value());
+    }
+  }
+  auto lookup = eval_as(pool, "secure_notes",
+                        "db.query('SELECT id, username FROM plinth.users')");
+  REQUIRE(lookup.value.has_value());
+  REQUIRE((*lookup.value)["rows"].size() == 1);
+  REQUIRE(pg.count_rows("ext_secure_foreign.marker") == 1);
+}

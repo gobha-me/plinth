@@ -34,6 +34,7 @@
 #include "kernel/js/db_search_path.hpp"
 #include "kernel/js/db_silent_audit.hpp"
 #include "kernel/js/eval_guard.hpp"
+#include "kernel/js/extension_database.hpp"
 #include "kernel/js/stdlib/cap_bindings.hpp"
 #include "kernel/js/stdlib/db_error_map.hpp"
 #include "kernel/js/stdlib/db_result_to_json.hpp"
@@ -379,9 +380,32 @@ auto prepare_search_path_wrapper(std::shared_ptr<drogon::orm::DbClient> db,
   co_return out;
 }
 
+auto database_for_operation(
+    std::string extension_name,
+    std::shared_ptr<ExtensionDatabaseClients> extension_clients)
+    -> drogon::Task<std::shared_ptr<drogon::orm::DbClient>> {
+  if (extension_name.empty()) {
+    co_return drogon::app().getDbClient();
+  }
+  if (!extension_clients) {
+    throw std::runtime_error("extension database owner is unavailable");
+  }
+  co_return co_await extension_clients->get(std::move(extension_name));
+}
+
 auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
   try {
-    auto db = drogon::app().getDbClient();
+    if (!op.bc_extension_name.empty() &&
+        (!db::is_valid_extension_name(op.bc_extension_name) ||
+         op.bc_extension_name.size() > 63)) {
+      db::audit_search_path_set_failed(op.bc_extension_name, "");
+      co_return std::unexpected(
+          PromiseRejection{.code = "db.search_path.set_failed",
+                           .message = "invalid extension database identity",
+                           .sqlstate = std::nullopt});
+    }
+    auto db = co_await database_for_operation(op.bc_extension_name,
+                                              op.extension_database_clients);
     if (!db) {
       co_return std::unexpected(
           PromiseRejection{.code = "db.connection_error",
@@ -431,7 +455,17 @@ auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
 
 auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
   try {
-    auto db = drogon::app().getDbClient();
+    if (!op.bc_extension_name.empty() &&
+        (!db::is_valid_extension_name(op.bc_extension_name) ||
+         op.bc_extension_name.size() > 63)) {
+      db::audit_search_path_set_failed(op.bc_extension_name, "");
+      co_return std::unexpected(
+          PromiseRejection{.code = "db.search_path.set_failed",
+                           .message = "invalid extension database identity",
+                           .sqlstate = std::nullopt});
+    }
+    auto db = co_await database_for_operation(op.bc_extension_name,
+                                              op.extension_database_clients);
     if (!db) {
       co_return std::unexpected(
           PromiseRejection{.code = "db.connection_error",
@@ -756,7 +790,8 @@ auto finalize_batch(BridgeContext& bc, AsyncOp::Type type, AsyncOp op,
 auto handle_db_batch_begin(BridgeContext& bc, AsyncOp op,
                            trantor::EventLoop* main_loop) -> drogon::Task<> {
   try {
-    auto db = drogon::app().getDbClient();
+    auto db = co_await database_for_operation(op.bc_extension_name,
+                                              op.extension_database_clients);
     if (!db) {
       finalize_batch(bc, AsyncOp::Type::DB_BATCH_BEGIN, std::move(op),
                      main_loop, nullptr,

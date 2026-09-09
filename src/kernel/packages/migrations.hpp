@@ -32,7 +32,7 @@ struct MigrationReport {
   std::vector<MigrationWarning> warnings;
 };
 
-// Idempotent. Creates ext_{extension_name} schema + ext_{extension_name}_role
+// Idempotent. Creates ext_{extension_name} schema + database-scoped login role
 // + GRANTs on the first call, then applies unseen migrations from
 // {package_root}/migrations in numeric order, recording each in
 // plinth.migrations with a SHA-256 checksum. Re-running with the same
@@ -40,7 +40,8 @@ struct MigrationReport {
 //
 // Preconditions:
 //   - `extension_name` matches ^[a-z][a-z0-9_-]{2,62}$ (0.4.1 regex).
-//   - `admin_conn` has `PQstatus == CONNECTION_OK` and CREATE privileges.
+//   - `admin_conn` has `PQstatus == CONNECTION_OK` and superuser bootstrap
+//     authority; extension_database.sql has installed the DDL isolation guard.
 auto run_migrations(
     std::string_view extension_name, const std::filesystem::path& package_root,
     PGconn& admin_conn,
@@ -48,7 +49,7 @@ auto run_migrations(
     -> std::expected<MigrationReport, MigrationFailure>;
 
 // Companion teardown for 0.4.4's first-install failure path. Drops
-// ext_{extension_name} CASCADE, drops ext_{extension_name}_role (if
+// ext_{extension_name} CASCADE, drops its database-scoped login role (if
 // present), and deletes the extension's rows from plinth.migrations.
 // Idempotent: missing schema / role / rows are not errors.
 auto drop_schema_and_migrations(std::string_view extension_name,

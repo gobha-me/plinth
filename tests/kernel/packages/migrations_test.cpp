@@ -8,6 +8,7 @@
 #include "kernel/packages/migrations_internal.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include <libpq-fe.h>
 #include <unistd.h>
@@ -111,6 +112,11 @@ auto ensure_plinth_schema(Pg& pg) -> void {
     auto r2 = pg.exec(buf.str());
     REQUIRE(PQresultStatus(r2.get()) == PGRES_COMMAND_OK);
   }
+  std::ifstream isolation{std::string{CMAKE_SOURCE_DIR} +
+                          "/migrations/extension_database.sql"};
+  std::ostringstream sql;
+  sql << isolation.rdbuf();
+  REQUIRE(PQresultStatus(pg.exec(sql.str()).get()) == PGRES_COMMAND_OK);
 }
 
 auto next_ext_name() -> std::string {
@@ -248,8 +254,142 @@ TEST_CASE("migrations: M.01 empty fixture — schema only",
       pg.exec("SELECT 1 FROM pg_namespace WHERE nspname = 'ext_" + name + "'");
   REQUIRE(PQntuples(s.get()) == 1);
   auto role =
-      pg.exec("SELECT 1 FROM pg_roles WHERE rolname = 'ext_" + name + "_role'");
+      pg.exec("SELECT 1 FROM pg_roles WHERE rolname = (SELECT role_name FROM "
+              "plinth.extension_database_credentials WHERE extension_name='" +
+              name + "')");
   REQUIRE(PQntuples(role.get()) == 1);
+}
+
+TEST_CASE(
+    "migrations execute with extension privileges including deferred triggers",
+    "[packages][migrations][pg][security]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Pg pg{conninfo_of(pg_env())};
+  ensure_plinth_schema(pg);
+  auto name = next_ext_name();
+  ExtensionScope scope{pg, name};
+  auto foreign = next_ext_name();
+  ExtensionScope foreign_scope{pg, foreign};
+  auto foreign_fixture = stage_fixture("single-migration", foreign);
+  REQUIRE(run_migrations(foreign, foreign_fixture.root, *pg.conn).has_value());
+  StagedFixture staged{fs::temp_directory_path() / (name + "_security")};
+  fs::create_directories(staged.root / "migrations");
+  const auto transaction =
+      GENERATE(plinth::packages::MigrationTransaction::PER_FILE,
+               plinth::packages::MigrationTransaction::CALLER_OWNED);
+  std::string sql;
+  SECTION("qualified foreign schema DDL is forbidden") {
+    sql = "DO $$ BEGIN EXECUTE 'CREATE TABLE ext_" + foreign +
+          ".forbidden(value text)'; END $$";
+  }
+  SECTION("kernel password hashes are forbidden") {
+    sql = "SELECT password_hash FROM plinth.users";
+  }
+  SECTION("reset role is forbidden even for a privileged session identity") {
+    sql = "RESET ROLE; SELECT password_hash FROM plinth.users";
+  }
+  SECTION("session authorization cannot regain kernel identity") {
+    sql = "RESET SESSION AUTHORIZATION";
+  }
+  SECTION("set_config cannot regain kernel identity") {
+    sql = "SELECT set_config('role', session_user, false)";
+  }
+  SECTION("deferred triggers cannot survive into privileged commit") {
+    sql =
+        "CREATE TABLE ext_" + name +
+        ".source(value integer); "
+        "CREATE FUNCTION ext_" +
+        name +
+        ".attack() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN PERFORM password_hash FROM plinth.users; "
+        "RETURN NEW; END $$; CREATE CONSTRAINT TRIGGER malicious "
+        "AFTER INSERT ON ext_" +
+        name +
+        ".source DEFERRABLE INITIALLY DEFERRED "
+        "FOR EACH ROW EXECUTE FUNCTION ext_" +
+        name +
+        ".attack(); "
+        "INSERT INTO ext_" +
+        name + ".source VALUES(1)";
+  }
+  SECTION("nested triggers cannot defer a second privileged callback") {
+    sql = replace_all(R"sql(
+CREATE TABLE ext_{EXT_NAME}.first_source(value integer);
+CREATE TABLE ext_{EXT_NAME}.second_source(value integer);
+CREATE FUNCTION ext_{EXT_NAME}.first_callback() RETURNS trigger LANGUAGE plpgsql AS $first$
+BEGIN SET CONSTRAINTS ALL DEFERRED;
+INSERT INTO ext_{EXT_NAME}.second_source VALUES(1); RETURN NEW; END $first$;
+CREATE FUNCTION ext_{EXT_NAME}.second_callback() RETURNS trigger LANGUAGE plpgsql AS $second$
+BEGIN PERFORM password_hash FROM plinth.users; RETURN NEW; END $second$;
+CREATE CONSTRAINT TRIGGER first_trigger AFTER INSERT ON ext_{EXT_NAME}.first_source
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ext_{EXT_NAME}.first_callback();
+CREATE CONSTRAINT TRIGGER second_trigger AFTER INSERT ON ext_{EXT_NAME}.second_source
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ext_{EXT_NAME}.second_callback();
+INSERT INTO ext_{EXT_NAME}.first_source VALUES(1);
+)sql",
+                      "{EXT_NAME}", name);
+  }
+  SECTION("dynamic SQL cannot create a deferred temporary callback") {
+    // The outer DO bypasses the qualification convenience check; PostgreSQL's
+    // authority guard must protect temporary relations as well as ext_* ones.
+    sql = replace_all(R"sql(
+DO $outer$ BEGIN
+EXECUTE 'CREATE TEMP TABLE deferred_temp(value integer)';
+EXECUTE 'CREATE FUNCTION ext_{EXT_NAME}.temporary_callback() RETURNS trigger
+LANGUAGE plpgsql AS $body$ BEGIN PERFORM password_hash FROM plinth.users; RETURN NEW; END $body$';
+EXECUTE 'CREATE CONSTRAINT TRIGGER temporary_trigger AFTER INSERT ON deferred_temp
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ext_{EXT_NAME}.temporary_callback()';
+EXECUTE 'INSERT INTO deferred_temp VALUES(1)'; END $outer$;
+)sql",
+                      "{EXT_NAME}", name);
+  }
+  SECTION("ALTER cannot defer an initially immediate foreign key") {
+    sql = replace_all(R"sql(
+CREATE TABLE ext_{EXT_NAME}.parent(id integer PRIMARY KEY);
+CREATE TABLE ext_{EXT_NAME}.child(id integer,
+CONSTRAINT child_parent FOREIGN KEY(id) REFERENCES ext_{EXT_NAME}.parent(id));
+ALTER TABLE ext_{EXT_NAME}.child ALTER CONSTRAINT child_parent DEFERRABLE;
+)sql",
+                      "{EXT_NAME}", name);
+  }
+  SECTION("temporary catalog names cannot hide deferred objects") {
+    sql = replace_all(R"sql(
+DO $outer$ BEGIN
+CREATE TEMP TABLE pg_trigger(tgrelid oid, tgdeferrable boolean);
+CREATE TEMP TABLE pg_constraint(conrelid oid, condeferrable boolean);
+CREATE TABLE ext_{EXT_NAME}.source(id integer);
+EXECUTE 'CREATE FUNCTION ext_{EXT_NAME}.shadow_callback() RETURNS trigger LANGUAGE plpgsql
+AS $body$ BEGIN PERFORM password_hash FROM plinth.users; RETURN NEW; END $body$';
+CREATE CONSTRAINT TRIGGER shadow_trigger AFTER INSERT ON ext_{EXT_NAME}.source
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ext_{EXT_NAME}.shadow_callback();
+INSERT INTO ext_{EXT_NAME}.source VALUES(1); END $outer$;
+)sql",
+                      "{EXT_NAME}", name);
+  }
+  SECTION("deferrable unique constraints are rejected before data changes") {
+    sql = "CREATE TABLE ext_" + name +
+          ".source(id integer UNIQUE DEFERRABLE INITIALLY DEFERRED)";
+  }
+  std::ofstream file{staged.root / "migrations" / "001_attack.sql"};
+  file << sql;
+  file.close();
+  if (transaction == plinth::packages::MigrationTransaction::CALLER_OWNED) {
+    REQUIRE(PQresultStatus(pg.exec("BEGIN").get()) == PGRES_COMMAND_OK);
+  }
+  auto result = run_migrations(name, staged.root, *pg.conn, transaction);
+  if (transaction == plinth::packages::MigrationTransaction::CALLER_OWNED) {
+    REQUIRE(PQresultStatus(pg.exec("ROLLBACK").get()) == PGRES_COMMAND_OK);
+  }
+  REQUIRE_FALSE(result.has_value());
+  REQUIRE(result.error().kind == MigrationError::MIGRATION_APPLY_FAILED);
+  REQUIRE(row_count(pg, name) == 0);
+  REQUIRE(PQtransactionStatus(pg.conn) == PQTRANS_IDLE);
+  auto guards = pg.exec("SELECT 1 FROM pg_proc p JOIN pg_namespace n ON "
+                        "n.oid=p.pronamespace WHERE n.nspname='plinth' "
+                        "AND p.proname='__extension_migration'");
+  REQUIRE(PQntuples(guards.get()) == 0);
 }
 
 TEST_CASE("migrations: M.02 single migration applies",
@@ -268,6 +408,89 @@ TEST_CASE("migrations: M.02 single migration applies",
   REQUIRE(r->applied == std::vector<std::string>{"001_create_foo.sql"});
   REQUIRE(r->skipped.empty());
   REQUIRE(row_count(pg, name) == 1);
+}
+
+TEST_CASE(
+    "migration isolation permits immediate callbacks in the caller transaction",
+    "[packages][migrations][pg][security]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Pg pg{conninfo_of(pg_env())};
+  ensure_plinth_schema(pg);
+  auto name = next_ext_name();
+  ExtensionScope scope{pg, name};
+  StagedFixture staged{fs::temp_directory_path() / (name + "_immediate")};
+  fs::create_directories(staged.root / "migrations");
+  std::ofstream file{staged.root / "migrations" / "001_immediate.sql"};
+  file << replace_all(R"sql(
+CREATE TABLE ext_{EXT_NAME}.parent(id integer PRIMARY KEY);
+CREATE TABLE ext_{EXT_NAME}.child(id integer REFERENCES ext_{EXT_NAME}.parent(id));
+CREATE TABLE ext_{EXT_NAME}.identities(name text);
+CREATE FUNCTION ext_{EXT_NAME}.record_identity() RETURNS trigger LANGUAGE plpgsql AS $body$
+BEGIN INSERT INTO ext_{EXT_NAME}.identities VALUES(current_user); RETURN NEW; END $body$;
+CREATE TRIGGER record_identity AFTER INSERT ON ext_{EXT_NAME}.child
+FOR EACH ROW EXECUTE FUNCTION ext_{EXT_NAME}.record_identity();
+INSERT INTO ext_{EXT_NAME}.parent VALUES(1);
+INSERT INTO ext_{EXT_NAME}.child VALUES(1);
+DO $temp$ BEGIN CREATE TEMP TABLE immediate_temp(value integer) ON COMMIT DROP;
+INSERT INTO immediate_temp VALUES(1); END $temp$;
+)sql",
+                      "{EXT_NAME}", name);
+  file.close();
+  REQUIRE(PQresultStatus(pg.exec("BEGIN").get()) == PGRES_COMMAND_OK);
+  auto migrated =
+      run_migrations(name, staged.root, *pg.conn,
+                     plinth::packages::MigrationTransaction::CALLER_OWNED);
+  // Capture observations before rollback, but assert afterward so failure
+  // never strands the fixture cleanup in a caller-owned transaction.
+  auto identities = pg.exec("SELECT name FROM ext_" + name + ".identities");
+  auto credentials = pg.exec(
+      "SELECT role_name FROM plinth.extension_database_credentials WHERE "
+      "extension_name='" +
+      name + "'");
+  REQUIRE(PQresultStatus(pg.exec("ROLLBACK").get()) == PGRES_COMMAND_OK);
+  REQUIRE(migrated.has_value());
+  REQUIRE(PQresultStatus(identities.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(identities.get()) == 1);
+  REQUIRE(PQntuples(credentials.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(identities.get(), 0, 0)} ==
+          PQgetvalue(credentials.get(), 0, 0));
+  auto relation = pg.exec("SELECT to_regclass('ext_" + name + ".child')");
+  REQUIRE(PQgetisnull(relation.get(), 0, 0) == 1);
+  REQUIRE(row_count(pg, name) == 0);
+}
+
+TEST_CASE("migration isolation refuses pre-existing deferred objects",
+          "[packages][migrations][pg][security]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Pg pg{conninfo_of(pg_env())};
+  ensure_plinth_schema(pg);
+  auto name = next_ext_name();
+  ExtensionScope scope{pg, name};
+  auto staged = stage_fixture("empty", name);
+  REQUIRE(run_migrations(name, staged.root, *pg.conn).has_value());
+  auto credentials = pg.exec(
+      "SELECT role_name FROM plinth.extension_database_credentials WHERE "
+      "extension_name='" +
+      name + "'");
+  REQUIRE(PQntuples(credentials.get()) == 1);
+  const std::string ROLE{PQgetvalue(credentials.get(), 0, 0)};
+  // A privileged fixture models an old package that predates this guard.
+  // Startup provisioning must reject it even without new migration SQL.
+  REQUIRE(
+      PQresultStatus(
+          pg.exec("CREATE TABLE ext_" + name +
+                  ".legacy(id integer UNIQUE DEFERRABLE); ALTER TABLE ext_" +
+                  name + ".legacy OWNER TO " + ROLE)
+              .get()) == PGRES_COMMAND_OK);
+  auto migrated = run_migrations(name, staged.root, *pg.conn);
+  REQUIRE_FALSE(migrated.has_value());
+  REQUIRE(migrated.error().kind == MigrationError::SCHEMA_CREATE_FAILED);
+  REQUIRE(row_count(pg, name) == 0);
+  REQUIRE(PQtransactionStatus(pg.conn) == PQTRANS_IDLE);
 }
 
 TEST_CASE("migrations: M.03 three migrations in order",
@@ -566,7 +789,9 @@ TEST_CASE("migrations: drop_schema_and_migrations is idempotent",
       pg.exec("SELECT 1 FROM pg_namespace WHERE nspname = 'ext_" + name + "'");
   REQUIRE(PQntuples(s.get()) == 0);
   auto role =
-      pg.exec("SELECT 1 FROM pg_roles WHERE rolname = 'ext_" + name + "_role'");
+      pg.exec("SELECT 1 FROM pg_roles WHERE rolname = (SELECT role_name FROM "
+              "plinth.extension_database_credentials WHERE extension_name='" +
+              name + "')");
   REQUIRE(PQntuples(role.get()) == 0);
   REQUIRE(row_count(pg, name) == 0);
 

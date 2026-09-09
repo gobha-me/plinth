@@ -19,6 +19,8 @@
 
 namespace plinth::js {
 
+class ExtensionDatabaseClients;
+
 // Owning pair of QuickJS callable references obtained from
 // JS_NewPromiseCapability. Each JSValue carries refcount 1 on
 // construction (no JS_DupValue at registration time — ICD-0.3.3
@@ -133,6 +135,7 @@ struct AsyncOp {
   // rather than reaching back into `bc`. Empty for kernel-scope
   // DB_EXEC (no coalescence intended there).
   std::string bc_extension_name;
+  std::shared_ptr<ExtensionDatabaseClients> extension_database_clients;
 
   // ICD-0.5.3 §`db.batch()` §AsyncOp additions — zero means "not
   // in a batch". Populated by the db.batch binding's scope

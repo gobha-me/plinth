@@ -10,6 +10,7 @@
 #include "kernel/js/conversion.hpp"
 #include "kernel/js/eval.hpp"
 #include "kernel/js/eval_guard.hpp"
+#include "kernel/js/extension_database.hpp"
 #include "kernel/js/stdlib_inject.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/realtime/broker.hpp"
@@ -445,7 +446,9 @@ RuntimePool::RuntimePool(const Extension* ext, RuntimeLimits runtime_limits,
                    ? *user
                    : plinth::capabilities::UserContext::anonymous()),
       ext_name(std::move(extension_name)),
-      capacity(resolve_pool_size(pool_size)) {
+      capacity(resolve_pool_size(pool_size)),
+      extension_database_clients(
+          std::make_shared<ExtensionDatabaseClients>(cfg.db)) {
   // ICD §Security Constraints #2: memory / stack / cpu / wall-clock
   // must all be set before any JS code runs. There is no fallback to
   // an unlimited default — a missing limit is a programming error,
@@ -533,6 +536,7 @@ auto RuntimePool::create_entry(bool transient) -> EntryPtr {
   // handler invocation. Host-eval pools pass an empty string; kernel-
   // scope behavior is preserved.
   entry->bc.extension_name = ext_name;
+  entry->bc.extension_database_clients = extension_database_clients;
   entry->bc.cpu_time_limit = limits.cpu_time_limit;
   entry->bc.wall_clock_limit = limits.wall_clock_limit;
   entry->bc.max_call_depth = limits.max_call_depth;

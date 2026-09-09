@@ -144,6 +144,7 @@ class RuntimePool {
   plinth::capabilities::UserContext user_ctx;
   std::string ext_name; // see ctor comment
   int capacity;
+  std::shared_ptr<ExtensionDatabaseClients> extension_database_clients;
 
   mutable std::mutex mu;
   std::vector<EntryPtr> free_list;

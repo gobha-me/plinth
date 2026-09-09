@@ -441,6 +441,7 @@ add_executable(plinth
   src/kernel/js/db_batch_audit.cpp
   src/kernel/js/db_batch_schema_check.cpp
   src/kernel/js/db_search_path.cpp
+  src/kernel/js/extension_database.cpp
   src/kernel/js/db_silent_audit.cpp
   src/kernel/js/runtime_pool.cpp
   src/kernel/js/stdlib_inject.cpp
@@ -652,6 +653,7 @@ add_executable(plinth_tests
   src/kernel/js/db_batch_audit.cpp
   src/kernel/js/db_batch_schema_check.cpp
   src/kernel/js/db_search_path.cpp
+  src/kernel/js/extension_database.cpp
   src/kernel/js/db_silent_audit.cpp
   src/kernel/js/runtime_pool.cpp
   src/kernel/js/stdlib_inject.cpp

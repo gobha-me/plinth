@@ -7,7 +7,7 @@
 // `SET LOCAL search_path TO ext_<extension_name>, plinth;` pinned
 // to the transaction. Kernel-scope bcs (empty `extension_name`) run
 // raw. The feature flag `db.search_path.enforce` disables the
-// wrapper process-wide as a deployment-ramp escape hatch.
+// wrapper process-wide. It never disables authenticated role isolation.
 //
 // This module owns the feature flag + identity-regex check + the
 // `db.search_path.set_failed` rate-limited audit event. The wrapper
