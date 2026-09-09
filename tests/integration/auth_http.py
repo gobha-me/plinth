@@ -117,7 +117,16 @@ def running_kernel(binary, pg_env, registration_enabled):
             finally:
                 kernel.stop()
     finally:
+        # Capture only logins with dependencies on this uniquely owned database.
+        # Legacy aliases are shared names and are deliberately left alone.
+        roles = sql(pg_env,
+            "SELECT DISTINCT r.rolname FROM pg_roles r JOIN pg_shdepend d "
+            "ON d.refclassid='pg_authid'::regclass AND d.refobjid=r.oid "
+            "JOIN pg_database db ON db.oid=d.dbid "
+            f"WHERE db.datname='{database}' AND r.rolname ~ '^px_[0-9a-f]{{60}}$'").splitlines()
         sql(pg_env, f'DROP DATABASE "{database}" WITH (FORCE)')
+        for role in roles:
+            sql(pg_env, 'DROP ROLE "' + role.replace('"', '""') + '"')
 
 
 def websocket_auth(kernel, token):
