@@ -30,8 +30,8 @@ namespace {
 // ICD §Channel Subscription — single-channel fan-in. The PG wire
 // channel is always this literal; logical Layer 1/2/3 channels are
 // discriminated by the envelope's `channel` + `layer` fields.
-constexpr const char *WIRE_CHANNEL = "plinth:realtime";
-constexpr const char *BARRIER_CHANNEL = "plinth:realtime:shutdown";
+constexpr const char* WIRE_CHANNEL = "plinth:realtime";
+constexpr const char* BARRIER_CHANNEL = "plinth:realtime:shutdown";
 constexpr int POLL_TIMEOUT_MS = 1000;
 
 // ── Module-local state ───────────────────────────────────────────────
@@ -134,13 +134,13 @@ auto parse_envelope(std::string_view channel, std::string_view payload_json)
   return ev;
 }
 
-auto dispatch(const DispatchedEvent &ev) -> bool {
+auto dispatch(const DispatchedEvent& ev) -> bool {
   std::lock_guard lock(handlers_mutex);
   bool delivered = true;
-  for (const auto &h : handlers) {
+  for (const auto& h : handlers) {
     try {
       h(ev);
-    } catch (const std::exception &e) {
+    } catch (const std::exception& e) {
       delivered = false;
       spdlog::warn("realtime listener: handler threw: {}", e.what());
     } catch (...) {
@@ -153,7 +153,7 @@ auto dispatch(const DispatchedEvent &ev) -> bool {
 
 // ── Thread body (connect + LISTEN + poll + dispatch loop) ──────────
 
-auto read_latest_outbox_id(PGconn *conn) -> std::optional<std::int64_t> {
+auto read_latest_outbox_id(PGconn* conn) -> std::optional<std::int64_t> {
   PgResultPtr res{
       plinth::db::exec(
           conn, "SELECT COALESCE(MAX(id), 0) FROM plinth.realtime_outbox"),
@@ -166,16 +166,16 @@ auto read_latest_outbox_id(PGconn *conn) -> std::optional<std::int64_t> {
   }
   try {
     return std::stoll(PQgetvalue(res.get(), 0, 0));
-  } catch (const std::exception &e) {
+  } catch (const std::exception& e) {
     spdlog::error("realtime listener: invalid outbox cursor: {}", e.what());
     return std::nullopt;
   }
 }
 
-auto open_listen_conn(const Config::Database &db_cfg,
-                      std::optional<std::int64_t> &outbox_cursor) -> PGconn * {
+auto open_listen_conn(const Config::Database& db_cfg,
+                      std::optional<std::int64_t>& outbox_cursor) -> PGconn* {
   auto conninfo = plinth::db::connection_info(db_cfg);
-  PGconn *conn = plinth::db::connect(conninfo.c_str());
+  PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     spdlog::error("realtime listener: connect failed: {}",
                   PQerrorMessage(conn));
@@ -209,12 +209,12 @@ auto open_listen_conn(const Config::Database &db_cfg,
   return conn;
 }
 
-auto drain_outbox(PGconn *conn, std::int64_t &cursor, bool &delivery_failed)
+auto drain_outbox(PGconn* conn, std::int64_t& cursor, bool& delivery_failed)
     -> bool {
   constexpr int BATCH_SIZE = 256;
   while (true) {
     const std::string cursor_text = std::to_string(cursor);
-    const std::array<const char *, 1> values{cursor_text.c_str()};
+    const std::array<const char*, 1> values{cursor_text.c_str()};
     PgResultPtr res{plinth::db::exec_params(
                         conn,
                         "SELECT id, payload::text "
@@ -232,7 +232,7 @@ auto drain_outbox(PGconn *conn, std::int64_t &cursor, bool &delivery_failed)
       std::optional<std::int64_t> id;
       try {
         id.emplace(std::stoll(PQgetvalue(res.get(), row, 0)));
-      } catch (const std::exception &e) {
+      } catch (const std::exception& e) {
         delivery_failed = true;
         spdlog::warn("realtime listener: invalid outbox id: {}", e.what());
         continue;
@@ -253,15 +253,15 @@ auto drain_outbox(PGconn *conn, std::int64_t &cursor, bool &delivery_failed)
   }
 }
 
-auto drain_notifications(PGconn *conn, std::string_view marker = {},
-                         bool *marker_seen = nullptr) -> bool {
+auto drain_notifications(PGconn* conn, std::string_view marker = {},
+                         bool* marker_seen = nullptr) -> bool {
   if (PQconsumeInput(conn) == 0) {
     spdlog::warn("realtime listener: PQconsumeInput failed: {}",
                  PQerrorMessage(conn));
     return false;
   }
   while (marker_seen == nullptr || !*marker_seen) {
-    auto *n = PQnotifies(conn);
+    auto* n = PQnotifies(conn);
     if (n == nullptr) {
       break;
     }
@@ -289,8 +289,8 @@ auto drain_notifications(PGconn *conn, std::string_view marker = {},
 
 // Only the listener thread accesses PGconn. The shutdown caller owns just a
 // request and a condition-variable wait, never a database pointer or task.
-auto acknowledge_drain(PGconn *conn, std::int64_t &outbox_cursor,
-                       bool &delivery_failed, const std::stop_token &tok,
+auto acknowledge_drain(PGconn* conn, std::int64_t& outbox_cursor,
+                       bool& delivery_failed, const std::stop_token& tok,
                        int wake_fd) -> bool {
   std::chrono::steady_clock::time_point deadline;
   std::string marker;
@@ -308,7 +308,7 @@ auto acknowledge_drain(PGconn *conn, std::int64_t &outbox_cursor,
   if (PQsetnonblocking(conn, 1) != 0) {
     return false;
   }
-  const std::array<const char *, 2> values{BARRIER_CHANNEL, marker.c_str()};
+  const std::array<const char*, 2> values{BARRIER_CHANNEL, marker.c_str()};
   if (PQsendQueryParams(conn, "SELECT pg_notify($1, $2)", 2, nullptr,
                         values.data(), nullptr, nullptr, 0) == 0) {
     return false;
@@ -369,10 +369,10 @@ auto wait_for_reconnect(int wake_fd, int backoff_ms) -> void {
   }
 }
 
-auto run_listener(const std::stop_token &tok, const Config::Database &db_cfg,
+auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
                   int wake_fd, int backoff_ms) -> bool {
   plinth::db::OperationScope database_operations{tok, std::chrono::seconds{5}};
-  PGconn *conn = nullptr;
+  PGconn* conn = nullptr;
   std::optional<std::int64_t> outbox_cursor;
   bool delivery_lost = false;
   while (!tok.stop_requested()) {
@@ -472,8 +472,8 @@ auto clear_handlers_for_test() -> void {
   handlers.clear();
 }
 
-auto start_listener(const Config::Database &db_cfg,
-                    const Config::Realtime::Listener &listener_cfg) -> void {
+auto start_listener(const Config::Database& db_cfg,
+                    const Config::Realtime::Listener& listener_cfg) -> void {
   std::lock_guard lock(lifecycle_mutex);
   if (!listener_cfg.enabled) {
     spdlog::info("realtime listener: disabled by config");
@@ -499,7 +499,7 @@ auto start_listener(const Config::Database &db_cfg,
     listener_exited = false;
     listener_clean = true;
   }
-  listener_thread.emplace([db_cfg, fd, backoff_ms](const std::stop_token &tok) {
+  listener_thread.emplace([db_cfg, fd, backoff_ms](const std::stop_token& tok) {
     bool clean = run_listener(tok, db_cfg, fd, backoff_ms);
     {
       std::lock_guard exit_lock(listener_exit_mutex);
