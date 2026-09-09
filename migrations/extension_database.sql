@@ -171,6 +171,7 @@ BEGIN
     FOR item IN SELECT c.relname, c.relkind FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = schema_name AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+        ORDER BY CASE c.relkind WHEN 'S' THEN 1 ELSE 0 END, c.oid
     LOOP
         EXECUTE format('ALTER %s %I.%I OWNER TO %I',
             CASE item.relkind WHEN 'S' THEN 'SEQUENCE' WHEN 'v' THEN 'VIEW'
