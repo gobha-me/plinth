@@ -1116,6 +1116,7 @@ auto drop_schema_and_migrations(std::string_view extension_name,
   ext += extension_name;
   std::string role =
       plinth::db::extension_role_name(PQdb(&admin_conn), extension_name);
+  const std::string legacy_role = (ext + "_role").substr(0, 63);
 
   std::ostringstream sql;
   sql << "BEGIN;\n";
@@ -1129,6 +1130,22 @@ auto drop_schema_and_migrations(std::string_view extension_name,
       // "role has privileges that must be revoked first".
       << "      EXECUTE 'DROP OWNED BY " << role << " CASCADE';\n"
       << "      EXECUTE 'DROP ROLE " << role << "';\n"
+      << "    END IF;\n"
+      << "  END $$;\n";
+  // The historical alias may be shared by another database. Revoke this
+  // database's remaining grants, then remove only an otherwise unused alias.
+  sql << "  DO $$ BEGIN\n"
+      << "    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
+      << pq_escape(admin_conn, legacy_role) << ") THEN\n"
+      << "      EXECUTE 'DROP OWNED BY " << legacy_role << " CASCADE';\n"
+      << "      IF NOT EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_roles r ON "
+         "r.oid=d.refobjid WHERE d.refclassid='pg_authid'::regclass AND "
+         "r.rolname="
+      << pq_escape(admin_conn, legacy_role)
+      << " AND d.dbid NOT IN (0, (SELECT oid FROM pg_database WHERE "
+         "datname=current_database()))) THEN\n"
+      << "        EXECUTE 'DROP ROLE " << legacy_role << "';\n"
+      << "      END IF;\n"
       << "    END IF;\n"
       << "  END $$;\n";
   sql << "  DELETE FROM plinth.migrations WHERE extension_name = "

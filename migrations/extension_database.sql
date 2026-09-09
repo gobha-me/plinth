@@ -74,6 +74,12 @@ BEGIN
     IF role_name = current_user THEN
         RAISE EXCEPTION 'kernel and extension database identities must differ';
     END IF;
+    -- Published migrations can name this historical grant target. Keep their
+    -- checksums valid without giving the authenticated runtime any membership
+    -- in the cluster-wide alias. Never change an existing alias in another DB.
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = legacy_role) THEN
+        EXECUTE format('CREATE ROLE %I NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS', legacy_role);
+    END IF;
     IF role_id IS NULL THEN
         EXECUTE format('CREATE ROLE %I LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS', role_name);
         SELECT oid INTO role_id FROM pg_roles WHERE rolname = role_name;

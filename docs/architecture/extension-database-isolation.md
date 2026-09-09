@@ -79,3 +79,10 @@ This contract supersedes the historical `NOLOGIN`/`SET ROLE` sketch and broad
 not the authorization boundary. Tests use privileged fixture/admin sessions and
 the same restricted runtime logins as production, including adversarial SQL and
 deferred-trigger migrations.
+
+Historical migrations may still grant their own table privileges to
+`ext_<name>_role`. Provisioning preserves this grant target, creating a `NOLOGIN`
+role only when absent and leaving any existing cluster-wide role settings
+unchanged. The runtime receives no membership in that role, and the alias has
+no schema access in this database. This preserves published migration checksums
+without restoring the old authorization model.

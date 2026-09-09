@@ -493,6 +493,37 @@ TEST_CASE("migration isolation refuses pre-existing deferred objects",
   REQUIRE(PQtransactionStatus(pg.conn) == PQTRANS_IDLE);
 }
 
+TEST_CASE("historical migration grants preserve isolation and checksums",
+          "[packages][migrations][pg][security]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Pg pg{conninfo_of(pg_env())};
+  ensure_plinth_schema(pg);
+  const auto name = next_ext_name();
+  ExtensionScope scope{pg, name};
+  StagedFixture staged{fs::temp_directory_path() / (name + "_legacy_grant")};
+  fs::create_directories(staged.root / "migrations");
+  std::ofstream file{staged.root / "migrations" / "001_legacy.sql"};
+  file << "CREATE TABLE ext_" << name << ".data(id integer PRIMARY KEY); "
+       << "GRANT SELECT, INSERT ON ext_" << name << ".data TO ext_" << name
+       << "_role;";
+  file.close();
+  REQUIRE(run_migrations(name, staged.root, *pg.conn).has_value());
+  REQUIRE(run_migrations(name, staged.root, *pg.conn).has_value());
+  REQUIRE(row_count(pg, name) == 1);
+  auto permissions = pg.exec(
+      "SELECT has_schema_privilege('ext_" + name + "_role','ext_" + name +
+      "','USAGE'), pg_has_role(role_name,'ext_" + name +
+      "_role','MEMBER') FROM plinth.extension_database_credentials WHERE "
+      "extension_name='" +
+      name + "'");
+  REQUIRE(PQresultStatus(permissions.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(permissions.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(permissions.get(), 0, 0)} == "f");
+  REQUIRE(std::string{PQgetvalue(permissions.get(), 0, 1)} == "f");
+}
+
 TEST_CASE("migrations: M.03 three migrations in order",
           "[packages][migrations][integration]") {
   if (!pg_available()) {
