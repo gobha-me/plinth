@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from database_cleanup import drop_database
 import zipfile
 
 from process_cleanup import run_browser, start_browser, stop_browser
@@ -228,7 +229,7 @@ def main():
                             child.kill()
                             child.wait(timeout=5)
     finally:
-        sql(f'DROP DATABASE "{database}" WITH (FORCE)')
+        drop_database(database, pg_env)
 
 
 if __name__ == "__main__":
