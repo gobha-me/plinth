@@ -804,6 +804,14 @@ set_tests_properties(plinth_tests_ws_browser_proxy
              ENVIRONMENT "PLINTH_TEST_WS_BROWSER_ORIGIN=https://127.0.0.1:28099"
              TIMEOUT 30)
 
+# Exercise production handlers with a separate disposable database and pool.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME plinth_tests_auth_http
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/auth_http.py
+    --binary $<TARGET_FILE:plinth> --scenario disabled-session)
+set_tests_properties(plinth_tests_auth_http PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
+
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s
 # main loop, so `[js][async]` tests now share `plinth_tests_js`'s
 # subprocess (folded above). Pre-0.5.5.2 they were dispatched per-

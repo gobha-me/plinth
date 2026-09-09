@@ -93,7 +93,7 @@ auto validate_session_token(const std::string& raw_token,
       "       (s.expires_at <= NOW()) AS is_expired "
       "FROM plinth.sessions s "
       "JOIN plinth.users u ON u.id = s.user_id "
-      "WHERE s.token_hash = $1",
+      "WHERE s.token_hash = $1 AND u.disabled_at IS NULL",
       [shared_cb, token_hash](const drogon::orm::Result& result) {
         if (result.empty()) {
           (*shared_cb)(
