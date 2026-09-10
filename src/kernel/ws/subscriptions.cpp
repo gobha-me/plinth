@@ -172,9 +172,10 @@ auto post_replay_cleanup(const drogon::WebSocketConnectionPtr& conn,
       if (it == s->live_buffer.end()) {
         continue;
       }
-      if (!resync_fired) {
+      if (!resync_fired && authority_is_current(*s) &&
+          subscribe_allowed(*s, ch)) {
         for (auto& fp : it->second) {
-          if (conn->connected()) {
+          if (conn->connected() && authority_is_current(*s)) {
             conn->send(*fp);
           }
         }
@@ -194,12 +195,12 @@ auto build_send_fn(const drogon::WebSocketConnectionPtr& conn,
     -> std::function<void(std::string)> {
   return [conn, loop](std::string frame) {
     if (loop == nullptr) {
-      conn->send(frame);
       return;
     }
     auto frame_shared = std::make_shared<std::string>(std::move(frame));
     loop->queueInLoop([conn, frame_shared]() {
-      if (!conn->connected()) {
+      auto state = conn->getContext<ConnState>();
+      if (!conn->connected() || !state || !authority_is_current(*state)) {
         return;
       }
       conn->send(*frame_shared);
@@ -229,6 +230,7 @@ auto fire_replay(const drogon::WebSocketConnectionPtr& conn,
   plinth::ws::ConnState state_copy;
   state_copy.is_admin = state.is_admin;
   state_copy.authenticated = true;
+  state_copy.authority_until_ms = state.authority_until_ms;
   state_copy.auth.user_id = state.auth.user_id;
   state_copy.auth.session_id = state.auth.session_id;
   state_copy.effective_rules = state.effective_rules;
@@ -293,7 +295,7 @@ auto extract_since_seq(const Json::Value& msg) -> SinceSeqParse {
     return {};
   }
   const auto& v = msg["since_seq"];
-  if (!v.isIntegral()) {
+  if (!v.isIntegral() || !v.isInt64()) {
     return {.value = std::nullopt, .error = "resubscribe.invalid_since_seq"};
   }
   auto i = v.asInt64();
@@ -322,7 +324,8 @@ auto layer_token(std::string_view channel) -> std::string_view {
 auto on_subscribe(const drogon::WebSocketConnectionPtr& conn,
                   const Json::Value& msg) -> void {
   auto* state = conn->getContext<ConnState>().get();
-  if (state == nullptr || !state->authenticated) {
+  if (state == nullptr || !state->authenticated ||
+      !authority_is_current(*state)) {
     return;
   }
 
@@ -424,7 +427,8 @@ auto on_subscribe(const drogon::WebSocketConnectionPtr& conn,
 auto on_unsubscribe(const drogon::WebSocketConnectionPtr& conn,
                     const Json::Value& msg) -> void {
   auto* state = conn->getContext<ConnState>().get();
-  if (state == nullptr || !state->authenticated) {
+  if (state == nullptr || !state->authenticated ||
+      !authority_is_current(*state)) {
     return;
   }
 
@@ -517,7 +521,8 @@ auto claim_debounce_audit_slot(const std::string& key,
 auto on_debounce_renegotiate(const drogon::WebSocketConnectionPtr& conn,
                              const Json::Value& msg) -> void {
   auto* state = conn->getContext<ConnState>().get();
-  if (state == nullptr || !state->authenticated) {
+  if (state == nullptr || !state->authenticated ||
+      !authority_is_current(*state)) {
     return;
   }
   // Channel is required for the audit's window key. Frames missing
@@ -525,6 +530,10 @@ auto on_debounce_renegotiate(const drogon::WebSocketConnectionPtr& conn,
   // malformed renegotiate has no effect either way; logging at
   // debug keeps the audit pipeline focused on real overrides.
   if (!msg.isMember("channel") || !msg["channel"].isString()) {
+    return;
+  }
+  if (msg.isMember("debounce_ms") &&
+      (!msg["debounce_ms"].isIntegral() || !msg["debounce_ms"].isInt64())) {
     return;
   }
   const auto CHANNEL = msg["channel"].asString();

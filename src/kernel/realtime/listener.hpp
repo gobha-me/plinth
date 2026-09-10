@@ -4,10 +4,10 @@
 //
 // Per-node PostgreSQL LISTEN subscriber. Clones the jthread+eventfd+
 // reconnect pattern from src/kernel/capabilities/listener.{hpp,cpp}
-// (the 0.2.3 Tier-2 cache-invalidation listener) — duplicate, not
-// shared, per ICD §OQ3. The 0.2.3 listener remains frozen to its
-// capability channel; this subsystem runs as a sibling on the broader
-// realtime channel (the single PG channel `plinth:realtime`).
+// (the 0.2.3 Tier-2 cache-invalidation listener). PostgreSQL NOTIFY is an
+// untrusted wake hint only. The listener reads authoritative envelopes from
+// the kernel-owned `plinth.realtime_outbox` and advances a monotonic local
+// cursor, which rejects replayed hints and recovers missed notifications.
 
 #pragma once
 
@@ -46,11 +46,9 @@ struct DispatchedEvent {
   mutable std::vector<std::string> delivered_to_users;
 };
 
-// A consumer registers once at process startup. The listener invokes
-// every registered handler for every parsed NOTIFY whose envelope
-// passes validation. Handlers run on the listener thread; they MUST be
-// fast (non-blocking). 0.5.0 ships with zero default consumers — the
-// 0.5.2 WS broker will be the first.
+// A consumer registers once at process startup. The listener invokes every
+// registered handler for every validated authoritative outbox envelope.
+// Handlers run on the listener thread; they MUST be fast (non-blocking).
 using EventHandler = std::function<void(const DispatchedEvent&)>;
 
 // Add a handler. Idempotent add; not removable in 0.5.0 (ICD §OQ5).
@@ -69,12 +67,11 @@ auto clear_handlers_for_test() -> void;
 auto start_listener(const Config::Database& db_cfg,
                     const Config::Realtime::Listener& listener_cfg) -> void;
 
-// After all local producers have joined and committed their final NOTIFY,
-// acknowledge a marker on the existing LISTEN connection. Earlier events have
-// then reached every synchronous handler. Pause dispatch at that boundary so
-// the writer can close admission and persist its queue before stop_listener().
-// No-op if never started/disabled. A lost connection or deadline returns false;
-// reconnecting cannot recover notifications that the old session missed.
+// After all local producers have joined and committed their final outbox row,
+// scan the authoritative rows and acknowledge a marker on the existing LISTEN
+// connection. Earlier events have then reached every synchronous handler.
+// Pause dispatch at that boundary so the writer can close admission and persist
+// its queue before stop_listener(). No-op if never started/disabled.
 [[nodiscard]] auto drain_listener(std::chrono::milliseconds timeout) -> bool;
 
 // Signal the listener to stop, wake the poll, and join the thread within

@@ -21,6 +21,7 @@ import zipfile
 
 from process_cleanup import start_browser, stop_browser
 from cache_transition import CacheTransition
+from database_cleanup import drop_database
 
 spec = importlib.util.spec_from_file_location("production", Path(__file__).with_name("run-production.py"))
 production = importlib.util.module_from_spec(spec)
@@ -309,7 +310,7 @@ def main():
                     if cleanup_error is not None:
                         raise cleanup_error
     finally:
-        sql(f'DROP DATABASE "{database}" WITH (FORCE)', admin=True)
+        drop_database(database, pg_env)
 
 
 if __name__ == "__main__":

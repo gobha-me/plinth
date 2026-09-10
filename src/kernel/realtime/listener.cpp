@@ -153,7 +153,27 @@ auto dispatch(const DispatchedEvent& ev) -> bool {
 
 // ── Thread body (connect + LISTEN + poll + dispatch loop) ──────────
 
-auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
+auto read_latest_outbox_id(PGconn* conn) -> std::optional<std::int64_t> {
+  PgResultPtr res{
+      plinth::db::exec(
+          conn, "SELECT COALESCE(MAX(id), 0) FROM plinth.realtime_outbox"),
+      PQclear};
+  if (PQresultStatus(res.get()) != PGRES_TUPLES_OK ||
+      PQntuples(res.get()) != 1) {
+    spdlog::error("realtime listener: outbox cursor query failed: {}",
+                  PQresultErrorMessage(res.get()));
+    return std::nullopt;
+  }
+  try {
+    return std::stoll(PQgetvalue(res.get(), 0, 0));
+  } catch (const std::exception& e) {
+    spdlog::error("realtime listener: invalid outbox cursor: {}", e.what());
+    return std::nullopt;
+  }
+}
+
+auto open_listen_conn(const Config::Database& db_cfg,
+                      std::optional<std::int64_t>& outbox_cursor) -> PGconn* {
   auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
@@ -161,6 +181,18 @@ auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
                   PQerrorMessage(conn));
     PQfinish(conn);
     return nullptr;
+  }
+  // On first startup, ignore retained historical transport rows. Read the
+  // baseline before LISTEN; a row committed in the small interval before
+  // LISTEN is recovered by the immediate authoritative scan below. On
+  // reconnect, preserve the cursor and recover every row committed while the
+  // old connection was unavailable.
+  if (!outbox_cursor.has_value()) {
+    outbox_cursor = read_latest_outbox_id(conn);
+    if (!outbox_cursor.has_value()) {
+      PQfinish(conn);
+      return nullptr;
+    }
   }
   PgResultPtr res{
       plinth::db::exec(
@@ -175,6 +207,50 @@ auto open_listen_conn(const Config::Database& db_cfg) -> PGconn* {
   }
   spdlog::info("realtime listener: subscribed to {}", WIRE_CHANNEL);
   return conn;
+}
+
+auto drain_outbox(PGconn* conn, std::int64_t& cursor, bool& delivery_failed)
+    -> bool {
+  constexpr int BATCH_SIZE = 256;
+  while (true) {
+    const std::string cursor_text = std::to_string(cursor);
+    const std::array<const char*, 1> values{cursor_text.c_str()};
+    PgResultPtr res{plinth::db::exec_params(
+                        conn,
+                        "SELECT id, payload::text "
+                        "FROM plinth.realtime_outbox WHERE id > $1::bigint "
+                        "ORDER BY id LIMIT 256",
+                        1, nullptr, values.data(), nullptr, nullptr, 0),
+                    PQclear};
+    if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
+      spdlog::warn("realtime listener: outbox read failed: {}",
+                   PQresultErrorMessage(res.get()));
+      return false;
+    }
+    const int rows = PQntuples(res.get());
+    for (int row = 0; row < rows; ++row) {
+      std::optional<std::int64_t> id;
+      try {
+        id.emplace(std::stoll(PQgetvalue(res.get(), row, 0)));
+      } catch (const std::exception& e) {
+        delivery_failed = true;
+        spdlog::warn("realtime listener: invalid outbox id: {}", e.what());
+        continue;
+      }
+      const std::string payload = PQgetvalue(res.get(), row, 1);
+      auto ev = parse_envelope(WIRE_CHANNEL, payload);
+      if (!ev.has_value() || !dispatch(*ev)) {
+        delivery_failed = true;
+      }
+      // The row is authoritative but malformed data must not wedge every
+      // later event. Advance once it has been inspected; retain the sticky
+      // failure so shutdown cannot certify a clean drain.
+      cursor = *id;
+    }
+    if (rows < BATCH_SIZE) {
+      return true;
+    }
+  }
 }
 
 auto drain_notifications(PGconn* conn, std::string_view marker = {},
@@ -203,19 +279,19 @@ auto drain_notifications(PGconn* conn, std::string_view marker = {},
       }
       continue;
     }
-    if (auto ev = parse_envelope(channel, payload); ev.has_value()) {
-      if (!dispatch(*ev)) {
-        return false;
-      }
-    }
+    // Ordinary NOTIFY payloads are untrusted wake hints. The caller scans the
+    // protected outbox after draining the socket; accepting envelope data here
+    // would let any database login forge kernel realtime events.
+    (void)payload;
   }
   return true;
 }
 
 // Only the listener thread accesses PGconn. The shutdown caller owns just a
 // request and a condition-variable wait, never a database pointer or task.
-auto acknowledge_drain(PGconn* conn, const std::stop_token& tok, int wake_fd)
-    -> bool {
+auto acknowledge_drain(PGconn* conn, std::int64_t& outbox_cursor,
+                       bool& delivery_failed, const std::stop_token& tok,
+                       int wake_fd) -> bool {
   std::chrono::steady_clock::time_point deadline;
   std::string marker;
   {
@@ -223,8 +299,13 @@ auto acknowledge_drain(PGconn* conn, const std::stop_token& tok, int wake_fd)
     deadline = drain_deadline;
     marker = std::to_string(++drain_sequence);
   }
-  if (std::chrono::steady_clock::now() >= deadline ||
-      PQsetnonblocking(conn, 1) != 0) {
+  if (std::chrono::steady_clock::now() >= deadline) {
+    return false;
+  }
+  if (!drain_outbox(conn, outbox_cursor, delivery_failed) || delivery_failed) {
+    return false;
+  }
+  if (PQsetnonblocking(conn, 1) != 0) {
     return false;
   }
   const std::array<const char*, 2> values{BARRIER_CHANNEL, marker.c_str()};
@@ -292,7 +373,7 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
                   int wake_fd, int backoff_ms) -> bool {
   plinth::db::OperationScope database_operations{tok, std::chrono::seconds{5}};
   PGconn* conn = nullptr;
-  bool connected_once = false;
+  std::optional<std::int64_t> outbox_cursor;
   bool delivery_lost = false;
   while (!tok.stop_requested()) {
     DrainState requested;
@@ -301,10 +382,10 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
       requested = drain_state;
     }
     if (requested == DrainState::REQUESTED) {
-      const bool clean = !delivery_lost &&
-                         !database_operations.cancellation_failed() &&
-                         conn != nullptr && PQstatus(conn) == CONNECTION_OK &&
-                         acknowledge_drain(conn, tok, wake_fd);
+      const bool clean =
+          !delivery_lost && !database_operations.cancellation_failed() &&
+          conn != nullptr && PQstatus(conn) == CONNECTION_OK &&
+          acknowledge_drain(conn, *outbox_cursor, delivery_lost, tok, wake_fd);
       complete_drain(clean);
       continue;
     }
@@ -318,20 +399,20 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
     // backend cancellation remain sticky and cannot certify delivery.
     database_operations.retry();
     if (conn == nullptr || PQstatus(conn) != CONNECTION_OK) {
-      delivery_lost = delivery_lost || connected_once;
       if (conn != nullptr) {
         PQfinish(conn);
         conn = nullptr;
       }
-      conn = open_listen_conn(db_cfg);
+      conn = open_listen_conn(db_cfg, outbox_cursor);
       if (conn == nullptr) {
         wait_for_reconnect(wake_fd, backoff_ms);
         continue;
       }
-      connected_once = true;
-      // 0.5.0 has no resync-on-reconnect hook — §OQ3 + ICD
-      // Listener Subsystem / Threading & reconnect bullet 5
-      // (reserved for 0.5.2+ broker).
+      if (!drain_outbox(conn, *outbox_cursor, delivery_lost)) {
+        PQfinish(conn);
+        conn = nullptr;
+        continue;
+      }
     }
 
     std::array<pollfd, 2> fds{};
@@ -351,11 +432,20 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
     }
     if ((fds[0].revents & POLLIN) != 0) {
       if (!drain_notifications(conn)) {
-        delivery_lost = true;
+        PQfinish(conn);
+        conn = nullptr;
+        continue;
       }
     }
     if ((fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-      delivery_lost = true;
+      PQfinish(conn);
+      conn = nullptr;
+      continue;
+    }
+    // Scan on every poll tick as well as every wake. NOTIFY is only a latency
+    // hint, so forged, lost, or coalesced notifications cannot affect event
+    // authority or recovery.
+    if (!drain_outbox(conn, *outbox_cursor, delivery_lost)) {
       PQfinish(conn);
       conn = nullptr;
     }

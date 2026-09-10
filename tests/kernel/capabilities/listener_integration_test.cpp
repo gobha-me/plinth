@@ -21,8 +21,8 @@
 // Tests for the ICD-0.2.3 NOTIFY-driven cache invalidation. Divided into
 // three layers:
 //
-//   * Parse + apply unit tests (no PG — drive apply_notification_for_test
-//     against pre-seeded cache entries).
+//   * Legacy payload-parser unit tests (no PG — the production listener no
+//     longer uses payload fields as authority).
 //   * Register-apply integration test (PG required; exercises the
 //     fetch_row path after a real INSERT).
 //   * Full-loop integration test (PG required; starts the listener
@@ -342,6 +342,18 @@ TEST_CASE("start_notify_listener: cache converges across all four actions",
   auto out_reg = call_shell();
   REQUIRE_FALSE(out_reg.has_value());
   REQUIRE(plinth::capabilities::error_code(out_reg.error()) ==
+          "async_required");
+
+  // Raw notification payloads are not producer-authenticated in PostgreSQL.
+  // A forged cache mutation must only trigger an authoritative reload.
+  auto forged = pg.exec_params(
+      "SELECT pg_notify('plinth_capability_changed', $1)",
+      {R"({"action":"disable","signature":"","scope":"","extension_name":"terminal"})"});
+  REQUIRE(PQresultStatus(forged.get()) == PGRES_TUPLES_OK);
+  std::this_thread::sleep_for(std::chrono::milliseconds{300});
+  auto after_forgery = call_shell();
+  REQUIRE_FALSE(after_forgery.has_value());
+  REQUIRE(plinth::capabilities::error_code(after_forgery.error()) ==
           "async_required");
 
   // ── disable ─────────────────────────────────────────────

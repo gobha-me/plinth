@@ -427,6 +427,7 @@ add_executable(plinth
   src/kernel/rbac/ephemeral_user.cpp
   src/kernel/rbac/subscribe_rule.cpp
   src/kernel/ws/connection_registry.cpp
+  src/kernel/ws/authority.cpp
   src/kernel/ws/auth_flow.cpp
   src/kernel/ws/heartbeat.cpp
   src/kernel/ws/subscriptions.cpp
@@ -441,6 +442,7 @@ add_executable(plinth
   src/kernel/js/db_batch_audit.cpp
   src/kernel/js/db_batch_schema_check.cpp
   src/kernel/js/db_search_path.cpp
+  src/kernel/js/extension_database.cpp
   src/kernel/js/db_silent_audit.cpp
   src/kernel/js/runtime_pool.cpp
   src/kernel/js/stdlib_inject.cpp
@@ -638,6 +640,7 @@ add_executable(plinth_tests
   src/kernel/rbac/ephemeral_user.cpp
   src/kernel/rbac/subscribe_rule.cpp
   src/kernel/ws/connection_registry.cpp
+  src/kernel/ws/authority.cpp
   src/kernel/ws/auth_flow.cpp
   src/kernel/ws/heartbeat.cpp
   src/kernel/ws/subscriptions.cpp
@@ -652,6 +655,7 @@ add_executable(plinth_tests
   src/kernel/js/db_batch_audit.cpp
   src/kernel/js/db_batch_schema_check.cpp
   src/kernel/js/db_search_path.cpp
+  src/kernel/js/extension_database.cpp
   src/kernel/js/db_silent_audit.cpp
   src/kernel/js/runtime_pool.cpp
   src/kernel/js/stdlib_inject.cpp
@@ -803,6 +807,26 @@ set_tests_properties(plinth_tests_ws_browser_proxy
              LABELS "needs_pg"
              ENVIRONMENT "PLINTH_TEST_WS_BROWSER_ORIGIN=https://127.0.0.1:28099"
              TIMEOUT 30)
+
+# Exercise production handlers with a separate disposable database and pool.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+add_test(NAME plinth_tests_auth_http
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/auth_http.py
+    --binary $<TARGET_FILE:plinth> --scenario disabled-session)
+set_tests_properties(plinth_tests_auth_http PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
+foreach(auth_scenario bootstrap-disabled bootstrap-enabled bootstrap-rollback)
+  add_test(NAME plinth_tests_auth_${auth_scenario}
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/auth_http.py
+      --binary $<TARGET_FILE:plinth> --scenario ${auth_scenario})
+  set_tests_properties(plinth_tests_auth_${auth_scenario} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
+endforeach()
+add_test(NAME plinth_tests_ws_authority
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/ws_authority.py
+          --binary $<TARGET_FILE:plinth>)
+set_tests_properties(plinth_tests_ws_authority PROPERTIES
+  LABELS "needs_pg" SKIP_RETURN_CODE 77 TIMEOUT 180)
 
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s
 # main loop, so `[js][async]` tests now share `plinth_tests_js`'s

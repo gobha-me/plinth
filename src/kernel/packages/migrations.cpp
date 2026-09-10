@@ -2,6 +2,7 @@
 #include "kernel/db/operations.hpp"
 #include "kernel/packages/migrations_internal.hpp"
 
+#include "kernel/db/extension_identity.hpp"
 #include <libpq-fe.h>
 #include <openssl/evp.h>
 
@@ -623,21 +624,12 @@ auto ensure_schema_and_role(PGconn& conn, std::string_view name,
     -> std::optional<MigrationFailure> {
   std::string ext = "ext_";
   ext += name;
-  std::string role = ext + "_role";
   std::ostringstream sql;
   if (manage_transaction) {
     sql << "BEGIN;\n";
   }
-  sql << "  CREATE SCHEMA IF NOT EXISTS " << ext << ";\n";
-  sql << "  DO $$ BEGIN\n"
-      << "    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
-      << pq_escape(conn, role) << ") THEN\n"
-      << "      CREATE ROLE " << role << " NOLOGIN;\n"
-      << "    END IF;\n"
-      << "  END $$;\n";
-  sql << "  GRANT USAGE, CREATE ON SCHEMA " << ext << " TO " << role << ";\n";
-  sql << "  GRANT USAGE ON SCHEMA plinth TO " << role << ";\n";
-  sql << "  GRANT SELECT ON plinth.users TO " << role << ";\n";
+  sql << "SELECT plinth.provision_extension_database(" << pq_escape(conn, name)
+      << ");\n";
   if (manage_transaction) {
     sql << "COMMIT;";
   }
@@ -831,9 +823,34 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
     };
   }
 
+  // This guard exists only in this transaction and is invoked once. Never
+  // persist an extension-owned function for a later privileged invocation:
+  // its owner could change it to SECURITY INVOKER between calls.
+  const std::string guard = "plinth.__extension_migration";
+  const std::string role =
+      plinth::db::extension_role_name(PQdb(&conn), extension_name);
+  const std::string create_guard =
+      "SET search_path = pg_catalog, pg_temp; CREATE FUNCTION " + guard +
+      "(sql pg_catalog.text) RETURNS pg_catalog.void LANGUAGE plpgsql SECURITY "
+      "DEFINER "
+      "SET search_path = pg_catalog, pg_temp AS 'BEGIN "
+      "PERFORM "
+      "plinth.assert_extension_immediate_constraints(current_user::pg_catalog."
+      "regrole::"
+      "pg_catalog.oid); "
+      "EXECUTE sql; END'; "
+      "ALTER FUNCTION " +
+      guard + "(pg_catalog.text) OWNER TO " + role +
+      "; "
+      "REVOKE ALL ON FUNCTION " +
+      guard +
+      "(pg_catalog.text) FROM PUBLIC; "
+      "GRANT EXECUTE ON FUNCTION " +
+      guard + "(pg_catalog.text) TO CURRENT_USER";
+
   std::size_t offset = 0;
   do {
-    std::string statement;
+    std::string statement = file.contents;
     if (!manage_transaction) {
       const char* strings =
           PQparameterStatus(&conn, "standard_conforming_strings");
@@ -853,11 +870,19 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
       statement = file.contents.substr(offset, parsed->length);
       offset += parsed->length;
     }
-    auto res = make_result(
-        manage_transaction
-            ? plinth::db::exec(&conn, file.contents.c_str())
-            : plinth::db::exec_params(&conn, statement.c_str(), 0, nullptr,
-                                      nullptr, nullptr, nullptr, 0));
+    if (auto err = exec_ok(conn, create_guard); err.has_value()) {
+      if (manage_transaction) {
+        (void)exec_ok(conn, "ROLLBACK");
+      }
+      return MigrationFailure{
+          .kind = MigrationError::MIGRATION_APPLY_FAILED,
+          .extension_name = std::string{extension_name},
+          .migration_file = file.filename,
+          .pg_sqlstate = std::nullopt,
+          .message = "migration privilege guard setup failed: " + *err};
+    }
+    auto res = exec_with_params(conn, ("SELECT " + guard + "($1)").c_str(),
+                                {statement});
 
     auto status = PQresultStatus(res.get());
     if (status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK &&
@@ -887,6 +912,22 @@ auto apply_one(PGconn& conn, std::string_view extension_name,
           .migration_file = file.filename,
           .pg_sqlstate = std::nullopt,
           .message = "caller-owned migration lost its transaction"};
+    }
+    // An ordinary SET inside a function can outlive its SET clause. Restore
+    // trusted resolution before privileged metadata work or the next guard.
+    if (auto err = exec_ok(conn, "SET search_path = pg_catalog, pg_temp; "
+                                 "DROP FUNCTION " +
+                                     guard + "(pg_catalog.text)");
+        err.has_value()) {
+      if (manage_transaction) {
+        (void)exec_ok(conn, "ROLLBACK");
+      }
+      return MigrationFailure{
+          .kind = MigrationError::MIGRATION_APPLY_FAILED,
+          .extension_name = std::string{extension_name},
+          .migration_file = file.filename,
+          .pg_sqlstate = std::nullopt,
+          .message = "migration privilege guard cleanup failed: " + *err};
     }
   } while (!manage_transaction && offset < file.contents.size());
 
@@ -1073,7 +1114,9 @@ auto drop_schema_and_migrations(std::string_view extension_name,
 
   std::string ext = "ext_";
   ext += extension_name;
-  std::string role = ext + "_role";
+  std::string role =
+      plinth::db::extension_role_name(PQdb(&admin_conn), extension_name);
+  const std::string legacy_role = (ext + "_role").substr(0, 63);
 
   std::ostringstream sql;
   sql << "BEGIN;\n";
@@ -1089,7 +1132,26 @@ auto drop_schema_and_migrations(std::string_view extension_name,
       << "      EXECUTE 'DROP ROLE " << role << "';\n"
       << "    END IF;\n"
       << "  END $$;\n";
+  // The historical alias may be shared by another database. Revoke this
+  // database's remaining grants, then remove only an otherwise unused alias.
+  sql << "  DO $$ BEGIN\n"
+      << "    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
+      << pq_escape(admin_conn, legacy_role) << ") THEN\n"
+      << "      EXECUTE 'DROP OWNED BY " << legacy_role << " CASCADE';\n"
+      << "      IF NOT EXISTS (SELECT 1 FROM pg_shdepend d JOIN pg_roles r ON "
+         "r.oid=d.refobjid WHERE d.refclassid='pg_authid'::regclass AND "
+         "r.rolname="
+      << pq_escape(admin_conn, legacy_role)
+      << " AND d.dbid NOT IN (0, (SELECT oid FROM pg_database WHERE "
+         "datname=current_database()))) THEN\n"
+      << "        EXECUTE 'DROP ROLE " << legacy_role << "';\n"
+      << "      END IF;\n"
+      << "    END IF;\n"
+      << "  END $$;\n";
   sql << "  DELETE FROM plinth.migrations WHERE extension_name = "
+      << pq_escape(admin_conn, std::string{extension_name}) << ";\n";
+  sql << "  DELETE FROM plinth.extension_database_credentials WHERE "
+         "extension_name = "
       << pq_escape(admin_conn, std::string{extension_name}) << ";\n";
   sql << "COMMIT;";
 

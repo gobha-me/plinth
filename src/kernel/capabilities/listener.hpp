@@ -2,11 +2,12 @@
 
 // plinth::capabilities — PG LISTEN/NOTIFY cache invalidation (ICD-0.2.3).
 //
-// The producer side (registration.cpp) emits `pg_notify(
-//   'plinth_capability_changed', <json>)` after each successful mutation.
-// This module hosts the consumer: a long-lived libpq connection that
-// subscribes to the channel and keeps the Tier 2 cache in resolution.cpp
-// in sync with the authoritative plinth.capabilities table.
+// The producer side (registration.cpp) emits on
+// `plinth_capability_changed` after each successful mutation. This module hosts
+// the consumer: a long-lived libpq connection that treats every notification
+// as an untrusted wake hint and reloads the Tier 2 cache from the authoritative
+// plinth.capabilities table. PostgreSQL does not provide channel ACLs, so
+// production must never apply state carried only in the NOTIFY payload.
 //
 // Payload shape per ICD-0.2.2 §Cache Invalidation:
 //   { "action": "register" | "deregister" | "disable" | "enable",
@@ -45,11 +46,9 @@ auto start_notify_listener(const Config::Database& db_cfg) -> void;
 auto stop_notify_listener(
     std::chrono::milliseconds timeout = std::chrono::seconds{5}) -> bool;
 
-// Test seam — parse a raw NOTIFY payload and apply it to the Tier 2
-// cache exactly as the listener loop would. Opens its own short-lived
-// PGconn when the `register` action requires fetching the new row.
-// Returns true on a valid + applied payload, false on parse error or
-// unknown action (both paths are logged at warn).
+// Legacy parser test seam. Production never calls this path: it ignores all
+// payload fields and performs an authoritative full reload. Retained only for
+// focused compatibility tests of the historical payload parser.
 auto apply_notification_for_test(const Config::Database& db_cfg,
                                  std::string_view payload_json) -> bool;
 

@@ -16,11 +16,6 @@ namespace plinth::realtime {
 
 namespace {
 
-// ICD §Channel Subscription — single PG wire channel. All logical
-// Layer-1/2/3 channels are tunnelled through this one PG channel with
-// the layer discriminator in the envelope.
-constexpr const char* WIRE_CHANNEL = "plinth:realtime";
-
 // Atomic so tests can flip it without serialized access. Default is
 // the ICD hard ceiling (§Config Surface); config-load lowers it per
 // realtime.notify.max_payload_bytes. Guaranteed in (0, 8000] by
@@ -94,16 +89,17 @@ auto emit_notify(PGconn& conn, const Json::Value& envelope)
     return std::unexpected(serialized.error());
   }
 
-  // Steps 6-7: parameterized pg_notify + result check. Channel is a
-  // compile-time constant so no interpolation; payload flows as $2
-  // per ICD §Security Constraint 2.
-  std::array<const char*, 2> values = {WIRE_CHANNEL, serialized->c_str()};
+  // Steps 6-7: persist the authoritative envelope through the protected
+  // kernel function. PostgreSQL NOTIFY carries only the resulting row id as an
+  // untrusted wake hint; listeners never accept envelope data from NOTIFY.
+  std::array<const char*, 1> values = {serialized->c_str()};
   std::unique_ptr<PGresult, decltype(&PQclear)> res{
-      plinth::db::exec_params(&conn, "SELECT pg_notify($1, $2)", 2, nullptr,
-                              values.data(), nullptr, nullptr, 0),
+      plinth::db::exec_params(&conn,
+                              "SELECT plinth.enqueue_realtime_event($1::jsonb)",
+                              1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear};
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
-    spdlog::error("realtime emit: pg_notify failed: {}",
+    spdlog::error("realtime emit: outbox enqueue failed: {}",
                   PQresultErrorMessage(res.get()));
     return std::unexpected(NotifyError::PG_FAILURE);
   }
@@ -117,11 +113,12 @@ auto emit_notify_async(drogon::orm::DbClientPtr db, Json::Value envelope)
     co_return std::unexpected(serialized.error());
   }
   try {
-    auto r = co_await db->execSqlCoro("SELECT pg_notify($1, $2)",
-                                      std::string{WIRE_CHANNEL}, *serialized);
+    auto r = co_await db->execSqlCoro(
+        "SELECT plinth.enqueue_realtime_event($1::jsonb)", *serialized);
     (void)r;
   } catch (const drogon::orm::DrogonDbException& e) {
-    spdlog::error("realtime emit: pg_notify async failed: {}", e.base().what());
+    spdlog::error("realtime emit: outbox enqueue async failed: {}",
+                  e.base().what());
     co_return std::unexpected(NotifyError::PG_FAILURE);
   }
   co_return {};

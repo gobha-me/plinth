@@ -109,12 +109,25 @@ auto count_events(PgRaw& pg) -> int {
   return std::stoi(PQgetvalue(r.get(), 0, 0));
 }
 
+auto count_outbox(PgRaw& pg) -> int {
+  auto r = pg.exec("SELECT COUNT(*) FROM plinth.realtime_outbox");
+  return std::stoi(PQgetvalue(r.get(), 0, 0));
+}
+
 // Insert one row with `created_at` set N seconds in the past.
 auto insert_aged(PgRaw& pg, std::string_view channel, int seconds_ago) -> void {
   auto r = pg.exec_params(
       "INSERT INTO plinth.events (channel, payload, created_at) "
       "VALUES ($1, '{}'::jsonb, NOW() - INTERVAL '1 second' * $2::int)",
       {std::string{channel}, std::to_string(seconds_ago)});
+  REQUIRE(PQresultStatus(r.get()) == PGRES_COMMAND_OK);
+}
+
+auto insert_aged_outbox(PgRaw& pg, int seconds_ago) -> void {
+  auto r = pg.exec_params(
+      "INSERT INTO plinth.realtime_outbox (payload, created_at) "
+      "VALUES ('{}'::jsonb, NOW() - INTERVAL '1 second' * $1::int)",
+      {std::to_string(seconds_ago)});
   REQUIRE(PQresultStatus(r.get()) == PGRES_COMMAND_OK);
 }
 
@@ -158,6 +171,8 @@ TEST_CASE("K.01: sweep DELETEs rows older than retention",
   insert_aged(pg, "plinth:data:ext_k01.t", /*seconds_ago=*/0);
   insert_aged(pg, "plinth:data:ext_k01.t", /*seconds_ago=*/30);
   insert_aged(pg, "plinth:data:ext_k01.t", /*seconds_ago=*/120);
+  insert_aged_outbox(pg, /*seconds_ago=*/0);
+  insert_aged_outbox(pg, /*seconds_ago=*/120);
 
   plinth::Config::Realtime::Events cfg;
   cfg.retention_seconds = 60; // delete rows older than 60s
@@ -165,6 +180,7 @@ TEST_CASE("K.01: sweep DELETEs rows older than retention",
   drogon::sync_wait(ce::run(cfg));
 
   CHECK(count_events(pg) == 2); // ancient (120s) deleted
+  CHECK(count_outbox(pg) == 1);
   CHECK(ce::last_swept_for_test() == 1);
 }
 

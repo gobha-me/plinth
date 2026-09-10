@@ -260,3 +260,13 @@ Added by RE-EVAL following 0.3.3 (2026-04-18). 0.3.3.1 shipped a second-half fix
 5. **ConnectionRegistry shutdown gate.** The `ConnectionRegistry` Meyers singleton is destroyed in reverse-construction order at program exit. That order places it before Drogon's `EventLoopThreadPool` destructor joins its IO threads. A pending TCP close event processed during that window would call `handleConnectionClosed` → `unregister_connection` → `conns.find` on freed bucket memory. The fix is a file-scope `std::atomic<bool> g_shutdown_pending` in `src/kernel/ws/connection_registry.cpp`, flipped by a public static `ConnectionRegistry::initiate_shutdown()`. Every public method on the registry (`register_connection`, `unregister_connection`, `for_each`, `size`) checks the flag on entry (`memory_order_acquire`) and no-ops if set. The file-scope flag is zero-initialized before dynamic init and has trivial destruction, so its storage outlives the singleton. The test fixture's `atexit` handler calls `initiate_shutdown()` **before** `drogon::app().quit()`. Any future kernel singleton whose lifecycle overlaps Drogon's IO threads should adopt the same pattern.
 
 5. **`log::audit()` pulled forward from 0.1.7.** The canonical audit primitive referenced in DESIGN-logging-subsystem.md is shipped as part of this milestone (the audit_log helpers in auth/, groups/, and rbac/ were already duplicated and needed consolidation). The audit query endpoint and retention task stay in 0.1.7.
+
+### Malformed text frame policy
+
+The input boundary ignores non-object frames and missing or non-string message
+`type` fields. Numeric heartbeat timestamps and debounce overrides must be
+integers representable as signed 64-bit values; malformed values are ignored.
+A supplied `since_seq` must additionally be non-negative; invalid or out-of-range
+values receive `resubscribe.invalid_since_seq`. Invalid authentication tokens
+retain the `auth_failed` error and close behavior. JSON conversion exceptions
+are contained at the input boundary, and frame contents are not logged.

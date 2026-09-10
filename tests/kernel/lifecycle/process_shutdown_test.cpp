@@ -277,6 +277,45 @@ auto required_env(const char* name) -> std::optional<std::string> {
 
 // Owns only uniquely named credentials and a database on the disposable
 // PostgreSQL instance selected by the integration-test environment.
+auto drop_test_database(PGconn* admin, const std::string& database) -> void {
+  using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
+  const std::array<const char*, 1> parameters{database.c_str()};
+  Result roles{
+      PQexecParams(
+          admin,
+          "SELECT DISTINCT r.rolname FROM pg_roles r JOIN pg_shdepend d "
+          "ON d.refclassid='pg_authid'::regclass AND d.refobjid=r.oid "
+          "JOIN pg_database db ON db.oid=d.dbid WHERE db.datname=$1 "
+          "AND r.rolname ~ '^px_[0-9a-f]{60}$'",
+          1, nullptr, parameters.data(), nullptr, nullptr, 0),
+      PQclear};
+  CHECK(PQresultStatus(roles.get()) == PGRES_TUPLES_OK);
+  if (PQresultStatus(roles.get()) != PGRES_TUPLES_OK) {
+    return;
+  }
+  const auto drop = [admin](const std::string& prefix, const std::string& name,
+                            const std::string& suffix) {
+    std::unique_ptr<char, decltype(&PQfreemem)> identifier{
+        PQescapeIdentifier(admin, name.data(), name.size()), PQfreemem};
+    if (!identifier) {
+      return false;
+    }
+    const auto query = prefix + identifier.get() + suffix;
+    Result result{PQexec(admin, query.c_str()), PQclear};
+    return PQresultStatus(result.get()) == PGRES_COMMAND_OK;
+  };
+  const bool removed = drop("DROP DATABASE ", database, " WITH (FORCE)");
+  CHECK(removed);
+  if (!removed) {
+    return;
+  }
+  // Database-scoped runtime logins belong to this fixture. Cluster-wide
+  // historical aliases may be shared and must not be guessed or deleted.
+  for (int row = 0; row < PQntuples(roles.get()); ++row) {
+    CHECK(drop("DROP ROLE ", PQgetvalue(roles.get(), row, 0), ""));
+  }
+}
+
 class CredentialDatabase {
  public:
   CredentialDatabase() {
@@ -299,8 +338,7 @@ class CredentialDatabase {
 
   ~CredentialDatabase() {
     if (database_created) {
-      CHECK(
-          exec("DROP DATABASE " + quote(db.database, false) + " WITH (FORCE)"));
+      drop_test_database(admin.get(), db.database);
     }
     if (role_created) {
       CHECK(exec("DROP ROLE " + quote(db.user, false)));
@@ -380,11 +418,11 @@ auto emit_realtime_burst() -> void {
   REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
   using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
   Result result{PQexec(connection.get(),
-                       "SELECT pg_notify('plinth:realtime', json_build_object("
+                       "SELECT plinth.enqueue_realtime_event(json_build_object("
                        "'layer', 'data', "
                        "'channel', 'plinth:data:lifecycle.signal', "
                        "'emitted_at', clock_timestamp()::text, "
-                       "'test_sequence', series_value)::text) "
+                       "'test_sequence', series_value)::jsonb) "
                        "FROM generate_series(1, 200) AS series_value"),
                 PQclear};
   REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
@@ -502,12 +540,7 @@ class IsolatedDatabase {
              std::to_string(sequence++)) {
     sql(admin.get(), "CREATE DATABASE " + name);
   }
-  ~IsolatedDatabase() {
-    // The name is generated entirely from fixed text and unsigned integers.
-    PgResult result{PQexec(admin.get(),
-                           ("DROP DATABASE " + name + " WITH (FORCE)").c_str()),
-                    PQclear};
-  }
+  ~IsolatedDatabase() { drop_test_database(admin.get(), name); }
   IsolatedDatabase(const IsolatedDatabase&) = delete;
   auto operator=(const IsolatedDatabase&) -> IsolatedDatabase& = delete;
 
@@ -950,9 +983,10 @@ auto require_authenticated_listener(const plinth::Config::Database& db,
   const auto deadline = std::chrono::steady_clock::now() + 5s;
   while (std::chrono::steady_clock::now() < deadline) {
     using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
-    Result sent{PQexecParams(
-                    connection.get(), "SELECT pg_notify('plinth:realtime', $1)",
-                    1, nullptr, payload_params.data(), nullptr, nullptr, 0),
+    Result sent{PQexecParams(connection.get(),
+                             "SELECT plinth.enqueue_realtime_event($1::jsonb)",
+                             1, nullptr, payload_params.data(), nullptr,
+                             nullptr, 0),
                 PQclear};
     REQUIRE(PQresultStatus(sent.get()) == PGRES_TUPLES_OK);
     Result found{
@@ -1253,4 +1287,72 @@ TEST_CASE("shell status cancels a stalled PostgreSQL handshake",
     REQUIRE(WEXITSTATUS(*status) == 1);
     REQUIRE(read_text(log).contains("PostgreSQL startup operation cancelled"));
   }
+}
+
+TEST_CASE("production keeps serving after malformed WebSocket field types",
+          "[integration][subprocess][ws-input]") {
+  if (!required_env("PLINTH_PG_HOST")) {
+    SKIP("PostgreSQL environment is not configured");
+  }
+  IsolatedDatabase database;
+  TempTree tree;
+  auto port = test_port();
+  auto config = write_config(tree, port, true, database.name);
+  plinth::Config::Database child_database;
+  child_database.host = *required_env("PLINTH_PG_HOST");
+  child_database.port =
+      static_cast<std::uint16_t>(std::stoi(*required_env("PLINTH_PG_PORT")));
+  child_database.user = *required_env("PLINTH_PG_USER");
+  child_database.password = *required_env("PLINTH_PG_PASSWORD");
+  child_database.database = database.name;
+  ChildProcess child{{PLINTH_BINARY_PATH, "serve", "--config", config.string()},
+                     tree.path / "process.log",
+                     &child_database};
+  REQUIRE(wait_for_health(port, 30s));
+  auto connection = open_database(database.name);
+  const std::string token = "fake-ws-input-session-token";
+  sql(connection.get(),
+      "WITH u AS (INSERT INTO plinth.users (username, password_hash) "
+      "VALUES ('ws_input_owner', 'unused') RETURNING id) "
+      "INSERT INTO plinth.sessions (user_id, token_hash) SELECT id, $1 FROM u",
+      {plinth::auth::sha256_hex(token)});
+  auto socket = open_unauthenticated_websocket(port);
+  REQUIRE(socket.fd >= 0);
+  // Authentication behind each malformed type is a same-socket ordering
+  // barrier: an unrelated health response cannot race ahead of the bad frame.
+  for (const auto& invalid : std::vector<nlohmann::json>{
+           nullptr, true, 17, 1.5, nlohmann::json::object(),
+           nlohmann::json::array()}) {
+    send_frame(socket.fd, {{"type", invalid}});
+  }
+  send_frame(socket.fd, {{"type", "auth"}, {"token", token}});
+  REQUIRE(receive_frame(socket.fd).at("type") == "connected");
+  for (const auto& invalid : std::vector<nlohmann::json>{
+           nullptr, true, 1.5, "wrong", nlohmann::json::object(),
+           nlohmann::json::array(), 18446744073709551615ULL}) {
+    send_frame(socket.fd, {{"type", "pong"}, {"timestamp", invalid}});
+    send_frame(socket.fd, {{"type", "debounce_renegotiate"},
+                           {"channel", "plinth:system:test"},
+                           {"debounce_ms", invalid}});
+    send_frame(socket.fd, {{"type", "subscribe"},
+                           {"channels", nlohmann::json::array()},
+                           {"since_seq", invalid}});
+    REQUIRE(receive_frame(socket.fd).at("type") == "error");
+  }
+  send_frame(socket.fd,
+             {{"type", "subscribe"}, {"channels", nlohmann::json::array()}});
+  REQUIRE(receive_frame(socket.fd).at("type") == "subscribed");
+  // Invalid credentials retain the existing error/close policy and do not
+  // disturb the healthy authenticated connection.
+  auto bad_auth = open_unauthenticated_websocket(port);
+  REQUIRE(bad_auth.fd >= 0);
+  send_frame(bad_auth.fd,
+             {{"type", "auth"}, {"token", nlohmann::json::object()}});
+  REQUIRE(receive_frame(bad_auth.fd).at("error") == "auth_failed");
+  REQUIRE(health_is_ready(port));
+  child.send_signal(SIGTERM);
+  auto status = child.wait_for_exit(15s);
+  REQUIRE(status.has_value());
+  REQUIRE(WIFEXITED(*status));
+  REQUIRE(WEXITSTATUS(*status) == 0);
 }

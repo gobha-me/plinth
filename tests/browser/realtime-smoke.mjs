@@ -41,7 +41,7 @@ assert.equal(sql(`SELECT count(*) FROM plinth.group_members gm
 
 function publish(value) {
     const envelope = JSON.stringify({ layer: 'extension', channel, value });
-    sql(`SELECT pg_notify('plinth:realtime', ${literal(envelope)})`);
+    sql(`SELECT plinth.enqueue_realtime_event(${literal(envelope)}::jsonb)`);
 }
 const browser = await chromium.launch({
     executablePath: process.env.PLINTH_BROWSER || undefined,

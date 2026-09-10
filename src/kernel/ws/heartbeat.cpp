@@ -114,7 +114,11 @@ auto on_pong_message(const drogon::WebSocketConnectionPtr& conn,
   if (state == nullptr || !state->authenticated) {
     return;
   }
-  auto ts = msg["timestamp"].asInt64();
+  const auto& timestamp = msg["timestamp"];
+  if (!timestamp.isIntegral() || !timestamp.isInt64()) {
+    return;
+  }
+  auto ts = timestamp.asInt64();
   if (ts == state->pending_ping_ts) {
     state->pending_ping_ts = 0;
   }

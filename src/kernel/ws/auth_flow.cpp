@@ -1,6 +1,8 @@
 #include "kernel/ws/auth_flow.hpp"
+#include "kernel/ws/authority.hpp"
 
 #include "kernel/auth/middleware.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/ws/close_codes.hpp"
 #include "kernel/ws/conn_state.hpp"
@@ -91,6 +93,7 @@ auto finish_auth(const drogon::WebSocketConnectionPtr& conn, bool is_admin,
     state->auth_timer_id = trantor::InvalidTimerId;
   }
   state->is_admin = is_admin;
+  state->authenticated = true;
 
   auto displaced = ConnectionRegistry::instance().register_connection(
       make_key(state->auth), conn, state_ptr);
@@ -108,7 +111,7 @@ auto finish_auth(const drogon::WebSocketConnectionPtr& conn, bool is_admin,
                                      state->auth.session_id, state->auth.pat_id,
                                      node_id));
 
-  state->authenticated = true;
+  start_authority_monitor(conn);
   start_heartbeat(conn, state->heartbeat_interval_s,
                   state->heartbeat_timeout_s);
 
@@ -121,63 +124,6 @@ auto finish_auth(const drogon::WebSocketConnectionPtr& conn, bool is_admin,
                      {.user_id = state->auth.user_id,
                       .session_id = state->auth.session_id,
                       .ip_address = peer_ip(conn)});
-}
-
-// After token validation, query the full effective rule-set so the
-// per-channel subscribe gate (ICD-0.5.2 Phase 3) has a local snapshot
-// to check against on its loop. `is_admin` is derived from presence
-// of `kernel.admin` in the same result set — no second query needed.
-auto resolve_rbac_and_finish(const drogon::WebSocketConnectionPtr& conn,
-                             const std::string& node_id) -> void {
-  auto* state = conn->getContext<ConnState>().get();
-  if (state == nullptr) {
-    return;
-  }
-  auto user_id = state->auth.user_id;
-  trantor::EventLoop* loop = state->loop;
-  std::weak_ptr<drogon::WebSocketConnection> weak{conn};
-
-  auto db = drogon::app().getDbClient();
-  db->execSqlAsync(
-      "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
-      "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
-      "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
-      "WHERE gm.user_id = $1::uuid",
-      [weak, loop, node_id](const drogon::orm::Result& result) {
-        std::unordered_set<std::string> rules;
-        rules.reserve(result.size());
-        for (const auto& row : result) {
-          rules.insert(row["rule"].as<std::string>());
-        }
-        bool is_admin = rules.contains("kernel.admin");
-        loop->queueInLoop(
-            [weak, rules = std::move(rules), is_admin, node_id]() mutable {
-              auto strong = weak.lock();
-              if (!strong || !strong->connected()) {
-                return;
-              }
-              auto* st = strong->getContext<ConnState>().get();
-              if (st == nullptr || st->auth_failed || st->authenticated) {
-                return;
-              }
-              st->effective_rules = std::move(rules);
-              finish_auth(strong, is_admin, node_id);
-            });
-      },
-      [weak, loop, node_id](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("ws: effective-rules query failed: {}", e.base().what());
-        // Fail safe: treat as non-admin with an empty rule set so
-        // auth still completes — subscribe will silent-omit every
-        // non-admin request.
-        loop->queueInLoop([weak, node_id]() {
-          if (auto strong = weak.lock()) {
-            if (strong->connected()) {
-              finish_auth(strong, /*is_admin=*/false, node_id);
-            }
-          }
-        });
-      },
-      user_id);
 }
 
 } // namespace
@@ -225,32 +171,54 @@ auto authenticate_token(const drogon::WebSocketConnectionPtr& conn,
     return;
   }
 
+  auto task = plinth::lifecycle::async_tasks().try_acquire();
+  if (!task) {
+    on_auth_failure(conn, "server_shutting_down");
+    return;
+  }
+  auto task_owner =
+      std::make_shared<std::shared_ptr<plinth::lifecycle::AsyncTaskLease>>(
+          std::move(task));
+  auto completed = std::make_shared<std::atomic<bool>>(false);
   std::weak_ptr<drogon::WebSocketConnection> weak{conn};
   auto* loop = state->loop;
-  auto validated =
-      [weak, loop, node_id](const plinth::auth::TokenValidationResult& result) {
-        // Database callbacks never read or mutate connection context off-loop.
-        loop->queueInLoop([weak, node_id, result]() {
-          auto strong = weak.lock();
-          if (!strong || !strong->connected()) {
-            return;
+  auto validated = [weak, loop, node_id, task_owner, completed](
+                       const plinth::auth::TokenValidationResult& result) {
+    if (completed->exchange(true, std::memory_order_acq_rel)) {
+      return;
+    }
+    auto completion_task = std::exchange(*task_owner, {});
+    // Database callbacks never read or mutate connection context off-loop.
+    loop->queueInLoop([weak, node_id, result, completion_task]() {
+      auto strong = weak.lock();
+      if (!strong || !strong->connected()) {
+        return;
+      }
+      auto* st = strong->getContext<ConnState>().get();
+      if (st == nullptr || st->authenticated || st->auth_failed) {
+        return;
+      }
+      if (!result.ok) {
+        on_auth_failure(strong, result.error_code);
+        return;
+      }
+      st->auth = result.context;
+      establish_authority(strong, [weak, node_id]() {
+        if (auto ready = weak.lock()) {
+          auto ready_state = ready->getContext<ConnState>();
+          if (ready_state) {
+            finish_auth(ready, ready_state->is_admin, node_id);
           }
-          auto* st = strong->getContext<ConnState>().get();
-          if (st == nullptr || st->authenticated || st->auth_failed) {
-            return;
-          }
-          if (!result.ok) {
-            on_auth_failure(strong, result.error_code);
-            return;
-          }
-          st->auth = result.context;
-          resolve_rbac_and_finish(strong, node_id);
-        });
-      };
+        }
+      });
+    });
+  };
   if (session_only) {
-    plinth::auth::validate_session_token(token, std::move(validated));
+    plinth::auth::validate_session_token(
+        token, std::move(validated), drogon::app().getDbClient("ws_authority"));
   } else {
-    plinth::auth::validate_token(token, std::move(validated));
+    plinth::auth::validate_token(token, std::move(validated),
+                                 drogon::app().getDbClient("ws_authority"));
   }
 }
 

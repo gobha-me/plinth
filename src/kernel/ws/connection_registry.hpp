@@ -77,6 +77,9 @@ class ConnectionRegistry {
       const std::function<void(const drogon::WebSocketConnectionPtr&)>& fn)
       const -> void;
 
+  // Own immutable entry metadata without reading Drogon context off-loop.
+  [[nodiscard]] auto snapshot_entries() const -> std::vector<RegistryEntry>;
+
   // For tests.
   [[nodiscard]] auto size() const -> std::size_t;
 

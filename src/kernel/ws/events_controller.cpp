@@ -2,6 +2,7 @@
 
 #include "kernel/logging.hpp"
 #include "kernel/ws/auth_flow.hpp"
+#include "kernel/ws/authority.hpp"
 #include "kernel/ws/call_dispatch.hpp"
 #include "kernel/ws/close_codes.hpp"
 #include "kernel/ws/conn_state.hpp"
@@ -34,7 +35,7 @@ auto parse_json(std::string_view text) -> Json::Value {
   auto reader = std::unique_ptr<Json::CharReader>(builder.newCharReader());
   std::string errs;
   if (!reader->parse(text.data(), text.data() + text.size(), &root, &errs)) {
-    spdlog::debug("ws: malformed JSON frame: {}", errs);
+    spdlog::debug("ws: malformed JSON frame");
     return {};
   }
   return root;
@@ -82,42 +83,49 @@ auto EventsController::handleNewMessage(
     return;
   }
 
-  auto root = parse_json(message);
-  if (!root.isObject()) {
-    return;
-  }
+  try {
+    auto root = parse_json(message);
+    if (!root.isObject() || !root["type"].isString()) {
+      return;
+    }
 
-  auto msg_type = root["type"].asString();
-  if (msg_type == msg::AUTH) {
-    on_auth_message(conn, root, node_id);
-    return;
-  }
-  if (msg_type == msg::PONG) {
-    on_pong_message(conn, root);
-    return;
-  }
-  if (msg_type == msg::SUBSCRIBE) {
-    on_subscribe(conn, root);
-    return;
-  }
-  if (msg_type == msg::UNSUBSCRIBE) {
-    on_unsubscribe(conn, root);
-    return;
-  }
-  if (msg_type == msg::CALL) {
-    on_call(conn, root);
-    return;
-  }
-  if (msg_type == msg::DEBOUNCE_RENEGOTIATE) {
-    on_debounce_renegotiate(conn, root);
-    return;
-  }
+    auto msg_type = root["type"].asString();
+    if (msg_type == msg::AUTH) {
+      on_auth_message(conn, root, node_id);
+      return;
+    }
+    if (msg_type == msg::PONG) {
+      on_pong_message(conn, root);
+      return;
+    }
+    if (msg_type == msg::SUBSCRIBE) {
+      on_subscribe(conn, root);
+      return;
+    }
+    if (msg_type == msg::UNSUBSCRIBE) {
+      on_unsubscribe(conn, root);
+      return;
+    }
+    if (msg_type == msg::CALL) {
+      on_call(conn, root);
+      return;
+    }
+    if (msg_type == msg::DEBOUNCE_RENEGOTIATE) {
+      on_debounce_renegotiate(conn, root);
+      return;
+    }
 
-  spdlog::debug("ws: ignoring unhandled message type '{}'", msg_type);
+    spdlog::debug("ws: ignoring unhandled message type");
+  } catch (const Json::Exception&) {
+    // Conversion failures belong to the untrusted frame. Keep the owning
+    // event loop alive; never log the payload (it may contain credentials).
+    spdlog::debug("ws: ignoring malformed message fields");
+  }
 }
 
 auto EventsController::handleConnectionClosed(
     const drogon::WebSocketConnectionPtr& conn) -> void {
+  stop_authority_monitor(conn);
   auto* state = conn->getContext<ConnState>().get();
   if (state == nullptr) {
     return;

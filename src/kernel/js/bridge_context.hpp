@@ -71,6 +71,7 @@ struct ConfigProjection {
 };
 
 struct BridgeContext {
+  std::shared_ptr<ExtensionDatabaseClients> extension_database_clients;
   // --- QuickJS handles (owned by the RuntimePool, not by this struct) ---
   JSRuntime* rt = nullptr;
   JSContext* ctx = nullptr;

@@ -842,12 +842,11 @@ TEST_CASE("B.13: cross-extension batch — rejects + rolls back + audit fires",
   // same `batch` extension's batch must NOT trip the SC3 rule.
   // Re-acquire an isolated pool for the second batch.
   plinth::js::db::reset_cross_extension_audit_for_test();
-  auto r2 =
-      eval_as(pool, "batch",
-              "db.batch(async () => {"
-              "  await db.query(\"SELECT 1 FROM plinth.audit_log LIMIT 1\");"
-              "  await db.exec(\"INSERT INTO notes(body) VALUES('b')\");"
-              "}).then(() => 'ok', e => 'err:' + (e && e.code))");
+  auto r2 = eval_as(pool, "batch",
+                    "db.batch(async () => {"
+                    "  await db.query(\"SELECT id FROM plinth.users LIMIT 1\");"
+                    "  await db.exec(\"INSERT INTO notes(body) VALUES('b')\");"
+                    "}).then(() => 'ok', e => 'err:' + (e && e.code))");
   REQUIRE(r2.value.has_value());
   REQUIRE(r2.value->asString() == "ok");
   REQUIRE(pg.count_rows("ext_batch.notes") == 1);

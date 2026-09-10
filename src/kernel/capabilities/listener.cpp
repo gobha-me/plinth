@@ -237,12 +237,16 @@ auto drain_notifications(PGconn* conn, const Config::Database& db_cfg) -> void {
     spdlog::warn("listener: PQconsumeInput failed: {}", PQerrorMessage(conn));
     return;
   }
+  bool refresh_requested = false;
   while (auto* n = PQnotifies(conn)) {
-    std::string payload = n->extra == nullptr ? "" : n->extra;
     PQfreemem(n);
-    if (auto parsed = parse_payload(payload)) {
-      static_cast<void>(apply(db_cfg, *parsed));
-    }
+    refresh_requested = true;
+  }
+  if (refresh_requested) {
+    // PostgreSQL notification payloads have no producer authority: every
+    // database login can emit on every channel. Treat the notification only as
+    // a coalescible hint and rebuild from the protected canonical table.
+    static_cast<void>(reload_tier2_cache(db_cfg));
   }
 }
 

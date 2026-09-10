@@ -42,9 +42,8 @@ The coordinator executes these nodes in order:
 8. `flush_database_state`
    - Discard any remaining database batch scopes.
    - Flush coalescer windows and join its event loop.
-   - Send a unique internal notification on the existing realtime LISTEN
-     connection. PostgreSQL delivers notifications in transaction commit order;
-     acknowledgment on that same connection proves that every earlier envelope
+   - Scan the protected realtime outbox, then send a unique internal marker on
+     the existing LISTEN connection. Earlier locally committed outbox rows have
      reached the synchronous writer handler. The listener pauses dispatch at
      this boundary, retaining its connection and thread.
    - Drain and join the events writer, including its in-flight INSERT/COMMIT
@@ -92,12 +91,11 @@ coordinator itself remains retryable so tests can release a deliberately
 blocked worker and prove a later drain joins it.
 
 The realtime marker uses a separate internal PostgreSQL channel and never
-enters event storage or replay. A disconnected/reconnected listener cannot
-certify delivery from its previous session; marker errors and deadline expiry
-fail the drain. Realtime disabled or never started is an idempotent no-op.
-There is no sleep-based notification settling period. This graceful-drain
-barrier does not make PostgreSQL notifications a durable outbox across crashes
-or earlier connection outages.
+enters event storage or replay. Reconnect recovery scans authoritative rows
+after the listener's monotonic cursor; raw notifications carry no envelope
+authority. Marker errors and deadline expiry fail the drain. Realtime disabled
+or never started is an idempotent no-op. There is no sleep-based notification
+settling period.
 
 Partial startup uses the same graph through a stack owner in `main`. Every stop
 operation is idempotent and tolerates a component that never started, so an
@@ -152,3 +150,11 @@ handshake, a groups-bootstrap table lock, and a package-reconciliation row
 lock, then sends each shutdown signal. Lock tests retain the conflicting
 transaction until the cancelled backend disappears. Fresh boot, restart,
 ordinary active-work shutdown, and partial-startup tests remain applicable.
+
+
+WebSocket authority validation and renewal follow
+[the authority lifetime contract](websocket-authority.md). Their named database
+pool is owned by Drogon; each accepted completion holds an async task lease.
+Closing ingress cancels authority timers and invalidates their deadlines before
+async work drains. The one-second callback/statement timeouts bound blocked
+renewals without keeping the connection's event loop alive indefinitely.
