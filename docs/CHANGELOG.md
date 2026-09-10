@@ -11,6 +11,23 @@ tag list (`git tag -l`).
 
 ---
 
+## v0.6.5 — 2026-09-10 — coordinated security hardening
+
+- Reject malformed WebSocket message fields before controller conversion and
+  revalidate session and permission authority for active connections.
+- Reject existing sessions after their user is disabled and serialize the
+  first-user bootstrap so only one initial administrator can be committed.
+- Isolate extension database sessions behind per-extension roles, including
+  migration execution and deterministic ownership transfer.
+- Protect realtime and capability notification authority with canonical
+  database state and a kernel-owned durable outbox.
+- Expand PostgreSQL, authentication, WebSocket, migration, browser, and
+  lifecycle regression coverage for the corrected boundaries.
+
+This release contains the coordinated fixes for five security advisories.
+
+---
+
 ## v0.6.4 — 2026-09-04 — load-harness dependency maintenance
 
 - Updated the Go load harness from `github.com/lib/pq` 1.10.9 to 1.12.3.
