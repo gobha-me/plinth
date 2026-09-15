@@ -31,6 +31,7 @@ not present in this index is historical context, not unscheduled work.
 - Realtime source-sequence contract: [#42](https://github.com/gobha-me/plinth/issues/42)
 - Reconnect-under-storm load evidence: [#88](https://github.com/gobha-me/plinth/issues/88)
 - PostgreSQL SQLSTATE typing through Drogon batch aborts: [#92](https://github.com/gobha-me/plinth/issues/92)
+- Recurring Drogon event-loop join-self teardown abort: [#95](https://github.com/gobha-me/plinth/issues/95)
 
 The MEMORY_LIMIT classifier entry remains a watchlist with no scheduled action.
 All other resolved material below is retained only to explain prior decisions.
@@ -66,7 +67,12 @@ from their ICD tables rather than reuse that number.
 
 
 
-### 2026-04-30 — Kernel-side dispatch + teardown hardening (consolidated debt entry) [resolved in 0.6.3.N — shipped 2026-04-30]
+### 2026-04-30 — Kernel-side dispatch + teardown hardening (consolidated debt entry) [partial recurrence tracked in #95]
+
+**Status correction (2026-09-15):** the JS handler and fixture defects described
+below remain resolved, but candidate CI for PR #94 reproduced the Drogon
+`Resource deadlock avoided` join-self family in `db_search_path_test.cpp` under
+Clang 20. The active recurrence is [GitHub issue #95](https://github.com/gobha-me/plinth/issues/95); this entry must no longer be read as evidence that the entire family is closed.
 
 **Milestone:** v0.6.3 ship surfaced three kernel-side bugs that had
 been carried forward as "intermittent" / "out of scope for kernel

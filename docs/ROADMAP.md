@@ -121,6 +121,7 @@ are ready.
 - [#90 Fuzz every JavaScript-to-C++ bridge boundary](https://github.com/gobha-me/plinth/issues/90)
 - [#91 Add supported ThreadSanitizer CI for realtime and lifecycle concurrency](https://github.com/gobha-me/plinth/issues/91)
 - [#92 Preserve PostgreSQL SQLSTATE typing through Drogon batch aborts](https://github.com/gobha-me/plinth/issues/92)
+- [#95 Eliminate the recurring Drogon join-self teardown abort](https://github.com/gobha-me/plinth/issues/95)
 
 ## 1.0 Stable
 
@@ -135,3 +136,5 @@ are ready.
 - Browser/client backfill is #32; DAST is #40; reconnect stress is #88.
 - The source-code CSRF deferral is #33, and the previously unscheduled Drogon
   SQLSTATE limitation is #92.
+- PR #94 candidate CI reproduced the formerly resolved Drogon join-self teardown
+  abort; the active reliability defect is now #95.
