@@ -1,0 +1,1324 @@
+diff --git a/orm_lib/inc/drogon/orm/DbClient.h b/orm_lib/inc/drogon/orm/DbClient.h
+index 8df675e0..5f7208b0 100644
+--- a/orm_lib/inc/drogon/orm/DbClient.h
++++ b/orm_lib/inc/drogon/orm/DbClient.h
+@@ -22,6 +22,7 @@
+ #include <drogon/orm/Row.h>
+ #include <drogon/orm/RowIterator.h>
+ #include <drogon/orm/SqlBinder.h>
++#include <chrono>
+ #include <exception>
+ #include <functional>
+ #include <future>
+@@ -322,6 +323,17 @@ class DROGON_EXPORT DbClient : public trantor::NonCopyable
+      * */
+     virtual void closeAll() = 0;
+
++    /// Close all connections while consuming no more than timeout. The base
++    /// implementation only accepts an unbounded request; clients with owned
++    /// loops override this to provide a finite drain.
++    virtual bool closeAllFor(std::chrono::milliseconds timeout)
++    {
++        if (timeout != std::chrono::milliseconds::max())
++            return false;
++        closeAll();
++        return true;
++    }
++
+     /**
+      * @brief Enable auto-batch mode.
+      * This feature is available only for PostgreSQL 14+ version and the
+diff --git a/orm_lib/src/DbClientImpl.cc b/orm_lib/src/DbClientImpl.cc
+index 61fe2503..02201ea5 100644
+--- a/orm_lib/src/DbClientImpl.cc
++++ b/orm_lib/src/DbClientImpl.cc
+@@ -30,6 +30,7 @@
+ #include <drogon/drogon.h>
+ #include <drogon/orm/DbClient.h>
+ #include <drogon/orm/Exception.h>
++#include <future>
+ #include <iostream>
+ #include <memory>
+ #include <sstream>
+@@ -81,7 +82,16 @@ void DbClientImpl::init()
+         for (size_t i = 0; i < numberOfConnections_; ++i)
+         {
+             auto loop = loops_.getNextLoop();
+-            loop->runInLoop([this, loop]() { newConnection(loop); });
++            std::weak_ptr<DbClientImpl> weakThis = shared_from_this();
++            auto stopping = stopping_;
++            loop->runInLoop([weakThis, stopping, loop]() {
++                if (stopping->load(std::memory_order_acquire))
++                    return;
++                auto thisPtr = weakThis.lock();
++                if (!thisPtr)
++                    return;
++                thisPtr->newConnection(loop);
++            });
+         }
+     }
+     else if (type_ == ClientType::Sqlite3)
+@@ -98,22 +108,202 @@ void DbClientImpl::init()
+
+ DbClientImpl::~DbClientImpl() noexcept
+ {
++    destructing_ = true;
+     closeAll();
+ }
+
+ void DbClientImpl::closeAll()
+ {
+-    decltype(connections_) connections;
++    const bool shutdownAlreadyStarted =
++        type_ == ClientType::PostgreSQL &&
++        stopping_->load(std::memory_order_acquire);
++    if (!closeAllFor(std::chrono::milliseconds::max()))
++    {
++        if (!destructing_ && shutdownAlreadyStarted)
++        {
++            if (loops_.isCurrentThread())
++            {
++                LOG_DEBUG << "Database client shutdown is already owned by "
++                             "another thread";
++                return;
++            }
++        }
++        LOG_FATAL << "Failed to close database client";
++    }
++}
++
++bool DbClientImpl::closeAllFor(std::chrono::milliseconds timeout)
++{
++    const bool unbounded = timeout == std::chrono::milliseconds::max();
++    const auto deadline = unbounded
++                              ? std::chrono::steady_clock::time_point::max()
++                              : std::chrono::steady_clock::now() + timeout;
++    if (type_ == ClientType::PostgreSQL)
++    {
++        stopping_->store(true, std::memory_order_release);
++        if (loops_.isCurrentThread())
++        {
++            LOG_ERROR << "Refusing to initiate database client shutdown from "
++                         "its own event loop";
++            return false;
++        }
++    }
++    std::unique_lock<std::timed_mutex> shutdownLock(shutdownMutex_,
++                                                    std::defer_lock);
++    if (unbounded)
++        shutdownLock.lock();
++    else if (!shutdownLock.try_lock_until(deadline))
++        return false;
++    if (shutdownComplete_)
++        return true;
++
++    // This owned-loop drain addresses PostgreSQL clients. SQLite connections
++    // own a different per-connection loop, and MySQL keeps its established
++    // lifecycle contract; preserve their pre-existing synchronous close path.
++    if (type_ != ClientType::PostgreSQL)
++    {
++        if (!unbounded)
++            return false;
++        stopping_->store(true, std::memory_order_release);
++        decltype(connections_) connections;
++        {
++            std::lock_guard<std::mutex> lock(connectionsMutex_);
++            connections.swap(connections_);
++            readyConnections_.clear();
++            busyConnections_.clear();
++        }
++        for (auto const &conn : connections)
++            conn->disconnect();
++        shutdownComplete_ = true;
++        return true;
++    }
++
++    stopping_->store(true, std::memory_order_release);
++    std::unique_lock<std::shared_timed_mutex> admissionLock(*admissionMutex_,
++                                                            std::defer_lock);
++    if (unbounded)
++        admissionLock.lock();
++    else if (!admissionLock.try_lock_until(deadline))
++        return false;
++
++    auto remaining = [deadline, unbounded]() {
++        if (unbounded)
++            return std::chrono::milliseconds::max();
++        const auto now = std::chrono::steady_clock::now();
++        if (now >= deadline)
++            return std::chrono::milliseconds::zero();
++        return std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
++                                                                     now);
++    };
++    if (loopsStopRequested_)
++    {
++        admissionLock.unlock();
++        if (!loops_.stopFor(remaining()))
++            return false;
++        shutdownComplete_ = true;
++        return true;
++    }
++
++    auto drainLoops = [this, deadline, unbounded]() {
++        std::vector<std::future<void>> barriers;
++        for (auto *loop : loops_.getLoops())
++        {
++            if (loop->isInLoopThread())
++            {
++                LOG_ERROR << "Refusing to drain a database client from its "
++                             "own event loop";
++                return false;
++            }
++            auto barrier = std::make_shared<std::promise<void>>();
++            barriers.push_back(barrier->get_future());
++            loop->queueInLoop([barrier]() { barrier->set_value(); });
++        }
++        for (auto &barrier : barriers)
++        {
++            if (!unbounded &&
++                barrier.wait_until(deadline) != std::future_status::ready)
++                return false;
++            barrier.get();
++        }
++        return true;
++    };
++
++    // Callbacks which observed stopping_ == false before the transition are
++    // ahead of these barriers. Later callbacks reject before locking weakThis,
++    // so none can become the last DbClientImpl owner on a private DB loop.
++    admissionLock.unlock();
++    if (!drainLoops())
++        return false;
++
++    decltype(transCallbacks_) transCallbacks;
++    decltype(sqlCmdBuffer_) sqlCommands;
++    if (!connectionsClosed_)
+     {
+         std::lock_guard<std::mutex> lock(connectionsMutex_);
+-        connections.swap(connections_);
++        closingConnections_.swap(connections_);
+         readyConnections_.clear();
+         busyConnections_.clear();
++        transCallbacks.swap(transCallbacks_);
++        sqlCommands.swap(sqlCmdBuffer_);
++        connectionsClosed_ = true;
++    }
++    auto stopped =
++        std::make_exception_ptr(Failure("Database client is shutting down"));
++    auto callbackLoop = loops_.getNextLoop();
++    for (const auto &callback : transCallbacks)
++    {
++        callbackLoop->queueInLoop([callback]() {
++            try
++            {
++                (*callback)(nullptr);
++            }
++            catch (...)
++            {
++                LOG_ERROR << "Transaction shutdown callback threw";
++            }
++        });
++        callbackLoop = loops_.getNextLoop();
+     }
+-    for (auto const &conn : connections)
++    for (const auto &command : sqlCommands)
+     {
+-        conn->disconnect();
++        callbackLoop->queueInLoop([command, stopped]() {
++            try
++            {
++                command->exceptionCallback_(stopped);
++            }
++            catch (...)
++            {
++                LOG_ERROR << "SQL shutdown callback threw";
++            }
++        });
++        callbackLoop = loops_.getNextLoop();
+     }
++    if (!drainLoops())
++        return false;
++    if (!disconnectQueued_)
++    {
++        for (auto const &conn : closingConnections_)
++        {
++            auto *loop = conn->loop();
++            if (loop)
++                loop->queueInLoop([conn]() { conn->disconnect(); });
++            else
++                conn->disconnect();
++        }
++        disconnectQueued_ = true;
++    }
++    // disconnect() may enqueue close callbacks. Drain them while the caller
++    // still owns the client, then return ownership to the lifecycle thread.
++    if (!drainLoops())
++        return false;
++    closingConnections_.clear();
++    if (!drainLoops())
++        return false;
++    loopsStopRequested_ = true;
++    if (!loops_.stopFor(remaining()))
++        return false;
++    shutdownComplete_ = true;
++    return true;
+ }
+
+ void DbClientImpl::execSql(
+@@ -126,12 +316,21 @@ void DbClientImpl::execSql(
+     ResultCallback &&rcb,
+     std::function<void(const std::exception_ptr &)> &&exceptCallback)
+ {
++    std::shared_lock admissionLock(*admissionMutex_);
++    if (stopping_->load(std::memory_order_acquire))
++    {
++        admissionLock.unlock();
++        exceptCallback(std::make_exception_ptr(
++            Failure("Database client is shutting down")));
++        return;
++    }
+     assert(paraNum == parameters.size());
+     assert(paraNum == length.size());
+     assert(paraNum == format.size());
+     assert(rcb);
+     if (timeout_ > 0.0)
+     {
++        admissionLock.unlock();
+         execSqlWithTimeout(sql,
+                            sqlLength,
+                            paraNum,
+@@ -178,17 +377,34 @@ void DbClientImpl::execSql(
+     }
+     if (conn)
+     {
+-        conn->execSql({sql, sqlLength},
+-                      paraNum,
+-                      std::move(parameters),
+-                      std::move(length),
+-                      std::move(format),
+-                      std::move(rcb),
+-                      std::move(exceptCallback));
++        if (conn->loop()->isInLoopThread())
++        {
++            auto keepAlive = shared_from_this();
++            admissionLock.unlock();
++            conn->execSql({sql, sqlLength},
++                          paraNum,
++                          std::move(parameters),
++                          std::move(length),
++                          std::move(format),
++                          std::move(rcb),
++                          std::move(exceptCallback));
++            (void)keepAlive;
++        }
++        else
++        {
++            conn->execSql({sql, sqlLength},
++                          paraNum,
++                          std::move(parameters),
++                          std::move(length),
++                          std::move(format),
++                          std::move(rcb),
++                          std::move(exceptCallback));
++        }
+         return;
+     }
+     if (busy)
+     {
++        admissionLock.unlock();
+         auto exceptPtr =
+             std::make_exception_ptr(Failure("Too many queries in buffer"));
+         exceptCallback(exceptPtr);
+@@ -199,6 +415,13 @@ void DbClientImpl::execSql(
+ void DbClientImpl::newTransactionAsync(
+     const std::function<void(const std::shared_ptr<Transaction> &)> &callback)
+ {
++    std::shared_lock admissionLock(*admissionMutex_);
++    if (stopping_->load(std::memory_order_acquire))
++    {
++        admissionLock.unlock();
++        callback(nullptr);
++        return;
++    }
+     DbConnectionPtr conn;
+     {
+         std::lock_guard<std::mutex> lock(connectionsMutex_);
+@@ -222,22 +445,36 @@ void DbClientImpl::newTransactionAsync(
+                 auto timeoutFlagPtr = std::make_shared<TaskTimeoutFlag>(
+                     loops_.getNextLoop(),
+                     std::chrono::duration<double>(timeout_),
+-                    [newCallbackPtr, callbackPtr, this]() {
++                    [newCallbackPtr,
++                     callbackPtr,
++                     weakThis = weak_from_this(),
++                     stopping = stopping_]() {
++                        if (stopping->load(std::memory_order_acquire))
++                            return;
++                        auto thisPtr = weakThis.lock();
++                        if (!thisPtr)
++                            return;
++                        std::shared_lock admissionLock(
++                            *thisPtr->admissionMutex_);
++                        if (stopping->load(std::memory_order_acquire))
++                            return;
+                         auto cbPtr = (*newCallbackPtr).lock();
+                         if (cbPtr)
+                         {
+-                            std::lock_guard<std::mutex> lock(connectionsMutex_);
+-                            for (auto iter = transCallbacks_.begin();
+-                                 iter != transCallbacks_.end();
++                            std::lock_guard<std::mutex> lock(
++                                thisPtr->connectionsMutex_);
++                            for (auto iter = thisPtr->transCallbacks_.begin();
++                                 iter != thisPtr->transCallbacks_.end();
+                                  ++iter)
+                             {
+                                 if (cbPtr == *iter)
+                                 {
+-                                    transCallbacks_.erase(iter);
++                                    thisPtr->transCallbacks_.erase(iter);
+                                     break;
+                                 }
+                             }
+                         }
++                        admissionLock.unlock();
+                         (*callbackPtr)(nullptr);
+                     });
+                 callbackPtr = std::make_shared<
+@@ -267,11 +504,20 @@ void DbClientImpl::makeTrans(
+     std::function<void(const std::shared_ptr<Transaction> &)> &&callback)
+ {
+     std::weak_ptr<DbClientImpl> weakThis = shared_from_this();
++    auto stopping = stopping_;
+     auto trans = std::make_shared<TransactionImpl>(
+-        type_, conn, std::function<void(bool)>(), [weakThis, conn]() {
++        type_,
++        conn,
++        std::function<void(bool)>(),
++        [weakThis, stopping, conn]() {
++            if (stopping->load(std::memory_order_acquire))
++                return;
+             auto thisPtr = weakThis.lock();
+             if (!thisPtr)
+                 return;
++            std::shared_lock admissionLock(*thisPtr->admissionMutex_);
++            if (stopping->load(std::memory_order_acquire))
++                return;
+             if (conn->status() == ConnectStatus::Bad)
+             {
+                 return;
+@@ -290,12 +536,16 @@ void DbClientImpl::makeTrans(
+                     return;
+                 }
+             }
+-            conn->loop()->queueInLoop([weakThis, conn]() {
++            conn->loop()->queueInLoop([weakThis, stopping, conn]() {
++                if (stopping->load(std::memory_order_acquire))
++                    return;
+                 auto thisPtr = weakThis.lock();
+                 if (!thisPtr)
+                     return;
+                 std::weak_ptr<DbConnection> weakConn = conn;
+-                conn->setIdleCallback([weakThis, weakConn]() {
++                conn->setIdleCallback([weakThis, stopping, weakConn]() {
++                    if (stopping->load(std::memory_order_acquire))
++                        return;
+                     auto thisPtr = weakThis.lock();
+                     if (!thisPtr)
+                         return;
+@@ -306,7 +556,9 @@ void DbClientImpl::makeTrans(
+                 });
+                 thisPtr->handleNewTask(conn);
+             });
+-        });
++        },
++        stopping_,
++        admissionMutex_);
+     trans->doBegin();
+     if (timeout_ > 0.0)
+     {
+@@ -335,10 +587,17 @@ std::shared_ptr<Transaction> DbClientImpl::newTransaction(
+
+ void DbClientImpl::handleNewTask(const DbConnectionPtr &connPtr)
+ {
++    if (stopping_->load(std::memory_order_acquire))
++        return;
+     std::function<void(const std::shared_ptr<Transaction> &)> transCallback;
+     std::shared_ptr<SqlCmd> cmd;
+     {
+         std::lock_guard<std::mutex> guard(connectionsMutex_);
++        if (stopping_->load(std::memory_order_acquire))
++            return;
++        if (connections_.find(connPtr) == connections_.end())
++            return;
++        busyConnections_.insert(connPtr);
+         if (!transCallbacks_.empty())
+         {
+             transCallback = std::move(*(transCallbacks_.front()));
+@@ -376,6 +635,9 @@ void DbClientImpl::handleNewTask(const DbConnectionPtr &connPtr)
+
+ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
+ {
++    std::shared_lock admissionLock(*admissionMutex_);
++    if (stopping_->load(std::memory_order_acquire))
++        return nullptr;
+     DbConnectionPtr connPtr;
+     if (type_ == ClientType::PostgreSQL)
+     {
+@@ -414,46 +676,52 @@ DbConnectionPtr DbClientImpl::newConnection(trantor::EventLoop *loop)
+         (void)(loop);
+     }
+     std::weak_ptr<DbClientImpl> weakPtr = shared_from_this();
+-    connPtr->setCloseCallback([weakPtr](const DbConnectionPtr &closeConnPtr) {
+-        // Erase the connection
+-        auto thisPtr = weakPtr.lock();
+-        if (!thisPtr)
+-            return;
+-        {
+-            std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
+-            thisPtr->readyConnections_.erase(closeConnPtr);
+-            thisPtr->busyConnections_.erase(closeConnPtr);
+-            assert(thisPtr->connections_.find(closeConnPtr) !=
+-                   thisPtr->connections_.end());
+-            thisPtr->connections_.erase(closeConnPtr);
+-        }
+-        // Reconnect after 1 second
+-        auto loop = closeConnPtr->loop();
+-        // closeConnPtr may be not valid. Close the connection file descriptor.
+-        closeConnPtr->disconnect();
+-        loop->runAfter(1, [weakPtr, loop, closeConnPtr] {
++    auto stopping = stopping_;
++    connPtr->setCloseCallback(
++        [weakPtr, stopping](const DbConnectionPtr &closeConnPtr) {
++            if (stopping->load(std::memory_order_acquire))
++                return;
++            // Erase the connection
+             auto thisPtr = weakPtr.lock();
+             if (!thisPtr)
+                 return;
++            {
++                std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
++                thisPtr->readyConnections_.erase(closeConnPtr);
++                thisPtr->busyConnections_.erase(closeConnPtr);
++                assert(thisPtr->connections_.find(closeConnPtr) !=
++                       thisPtr->connections_.end());
++                thisPtr->connections_.erase(closeConnPtr);
++            }
++            // Reconnect after 1 second
++            auto loop = closeConnPtr->loop();
++            // closeConnPtr may be not valid. Close the connection file
++            // descriptor.
++            closeConnPtr->disconnect();
++            loop->runAfter(1, [weakPtr, stopping, loop, closeConnPtr] {
++                if (stopping->load(std::memory_order_acquire))
++                    return;
++                auto thisPtr = weakPtr.lock();
++                if (!thisPtr)
++                    return;
+
+-            thisPtr->newConnection(loop);
++                thisPtr->newConnection(loop);
++            });
++        });
++    connPtr->setOkCallback(
++        [weakPtr, stopping](const DbConnectionPtr &okConnPtr) {
++            LOG_TRACE << "connected!";
++            if (stopping->load(std::memory_order_acquire))
++                return;
++            auto thisPtr = weakPtr.lock();
++            if (!thisPtr)
++                return;
++            thisPtr->handleNewTask(okConnPtr);
+         });
+-    });
+-    connPtr->setOkCallback([weakPtr](const DbConnectionPtr &okConnPtr) {
+-        LOG_TRACE << "connected!";
+-        auto thisPtr = weakPtr.lock();
+-        if (!thisPtr)
+-            return;
+-        {
+-            std::lock_guard<std::mutex> guard(thisPtr->connectionsMutex_);
+-            thisPtr->busyConnections_.insert(
+-                okConnPtr);  // For new connections, this sentence is
+-                             // necessary
+-        }
+-        thisPtr->handleNewTask(okConnPtr);
+-    });
+     std::weak_ptr<DbConnection> weakConn = connPtr;
+-    connPtr->setIdleCallback([weakPtr, weakConn]() {
++    connPtr->setIdleCallback([weakPtr, stopping, weakConn]() {
++        if (stopping->load(std::memory_order_acquire))
++            return;
+         auto thisPtr = weakPtr.lock();
+         if (!thisPtr)
+             return;
+@@ -492,6 +760,14 @@ void DbClientImpl::execSqlWithTimeout(
+     ResultCallback &&rcb,
+     std::function<void(const std::exception_ptr &)> &&ecb)
+ {
++    std::shared_lock admissionLock(*admissionMutex_);
++    if (stopping_->load(std::memory_order_acquire))
++    {
++        admissionLock.unlock();
++        ecb(std::make_exception_ptr(
++            Failure("Database client is shutting down")));
++        return;
++    }
+     DbConnectionPtr conn;
+     assert(timeout_ > 0.0);
+     auto cmd = std::make_shared<std::weak_ptr<SqlCmd>>();
+@@ -502,7 +778,15 @@ void DbClientImpl::execSqlWithTimeout(
+     auto timeoutFlagPtr = std::make_shared<drogon::TaskTimeoutFlag>(
+         loops_.getNextLoop(),
+         std::chrono::duration<double>(timeout_),
+-        [cmd, ecpPtr, thisPtr = shared_from_this()]() {
++        [cmd, ecpPtr, weakThis = weak_from_this(), stopping = stopping_]() {
++            if (stopping->load(std::memory_order_acquire))
++                return;
++            auto thisPtr = weakThis.lock();
++            if (!thisPtr)
++                return;
++            std::shared_lock admissionLock(*thisPtr->admissionMutex_);
++            if (stopping->load(std::memory_order_acquire))
++                return;
+             auto cbPtr = (*cmd).lock();
+             if (cbPtr)
+             {
+@@ -518,6 +802,7 @@ void DbClientImpl::execSqlWithTimeout(
+                     }
+                 }
+             }
++            admissionLock.unlock();
+             (*ecpPtr)(
+                 std::make_exception_ptr(TimeoutError("SQL execution timeout")));
+         });
+@@ -570,19 +855,37 @@ void DbClientImpl::execSqlWithTimeout(
+     }
+     if (conn)
+     {
+-        conn->execSql(std::string_view{sql, sqlLength},
+-                      paraNum,
+-                      std::move(parameters),
+-                      std::move(length),
+-                      std::move(format),
+-                      std::move(resultCallback),
+-                      std::move(exceptionCallback));
+-        timeoutFlagPtr->runTimer();
++        if (conn->loop()->isInLoopThread())
++        {
++            auto keepAlive = shared_from_this();
++            timeoutFlagPtr->runTimer();
++            admissionLock.unlock();
++            conn->execSql(std::string_view{sql, sqlLength},
++                          paraNum,
++                          std::move(parameters),
++                          std::move(length),
++                          std::move(format),
++                          std::move(resultCallback),
++                          std::move(exceptionCallback));
++            (void)keepAlive;
++        }
++        else
++        {
++            conn->execSql(std::string_view{sql, sqlLength},
++                          paraNum,
++                          std::move(parameters),
++                          std::move(length),
++                          std::move(format),
++                          std::move(resultCallback),
++                          std::move(exceptionCallback));
++            timeoutFlagPtr->runTimer();
++        }
+         return;
+     }
+
+     if (busy)
+     {
++        admissionLock.unlock();
+         exceptionCallback(
+             std::make_exception_ptr(Failure("Too many queries in buffer")));
+         return;
+diff --git a/orm_lib/src/DbClientImpl.h b/orm_lib/src/DbClientImpl.h
+index 09ad0c99..036d1050 100644
+--- a/orm_lib/src/DbClientImpl.h
++++ b/orm_lib/src/DbClientImpl.h
+@@ -17,9 +17,11 @@
+ #include "DbConnection.h"
+ #include <drogon/orm/DbClient.h>
+ #include <trantor/net/EventLoopThreadPool.h>
++#include <atomic>
+ #include <functional>
+ #include <list>
+ #include <memory>
++#include <shared_mutex>
+ #include <string>
+ #include <thread>
+ #include <unordered_set>
+@@ -65,10 +67,21 @@ class DbClientImpl : public DbClient,
+
+     void init();
+     void closeAll() override;
++    bool closeAllFor(std::chrono::milliseconds timeout) override;
+
+   private:
+     size_t numberOfConnections_;
+     trantor::EventLoopThreadPool loops_;
++    std::shared_ptr<std::atomic<bool>> stopping_ =
++        std::make_shared<std::atomic<bool>>(false);
++    std::shared_ptr<std::shared_timed_mutex> admissionMutex_ =
++        std::make_shared<std::shared_timed_mutex>();
++    std::timed_mutex shutdownMutex_;
++    bool connectionsClosed_{false};
++    bool disconnectQueued_{false};
++    bool loopsStopRequested_{false};
++    bool shutdownComplete_{false};
++    bool destructing_{false};
+     std::shared_ptr<SharedMutex> sharedMutexPtr_;
+     double timeout_{-1.0};
+ #if LIBPQ_SUPPORTS_BATCH_MODE
+@@ -82,6 +95,7 @@ class DbClientImpl : public DbClient,
+
+     mutable std::mutex connectionsMutex_;
+     std::unordered_set<DbConnectionPtr> connections_;
++    std::unordered_set<DbConnectionPtr> closingConnections_;
+     std::unordered_set<DbConnectionPtr> readyConnections_;
+     std::unordered_set<DbConnectionPtr> busyConnections_;
+
+diff --git a/orm_lib/src/DbConnection.h b/orm_lib/src/DbConnection.h
+index 35e27e72..65507d65 100644
+--- a/orm_lib/src/DbConnection.h
++++ b/orm_lib/src/DbConnection.h
+@@ -88,7 +88,7 @@ class DbConnection : public trantor::NonCopyable
+     {
+     }
+
+-    virtual void init(){};
++    virtual void init() {};
+
+     void setOkCallback(const DbConnectionCallback &cb)
+     {
+@@ -105,6 +105,11 @@ class DbConnection : public trantor::NonCopyable
+         idleCb_ = cb;
+     }
+
++    void setShutdownCallback(std::function<void(const std::exception_ptr &)> cb)
++    {
++        shutdownCallback_ = std::move(cb);
++    }
++
+     virtual void execSql(
+         std::string_view &&sql,
+         size_t paraNum,
+@@ -142,6 +147,7 @@ class DbConnection : public trantor::NonCopyable
+     QueryCallback callback_;
+     trantor::EventLoop *loop_;
+     std::function<void()> idleCb_;
++    std::function<void(const std::exception_ptr &)> shutdownCallback_;
+     ConnectStatus status_{ConnectStatus::None};
+     DbConnectionCallback closeCallback_{[](const DbConnectionPtr &) {}};
+     DbConnectionCallback okCallback_{[](const DbConnectionPtr &) {}};
+diff --git a/orm_lib/src/TransactionImpl.cc b/orm_lib/src/TransactionImpl.cc
+index 0f551424..9c8cc5a7 100644
+--- a/orm_lib/src/TransactionImpl.cc
++++ b/orm_lib/src/TransactionImpl.cc
+@@ -24,10 +24,28 @@ TransactionImpl::TransactionImpl(ClientType type,
+                                  const DbConnectionPtr &connPtr,
+                                  std::function<void(bool)> commitCallback,
+                                  std::function<void()> usedUpCallback)
++    : TransactionImpl(type,
++                      connPtr,
++                      std::move(commitCallback),
++                      std::move(usedUpCallback),
++                      std::make_shared<std::atomic<bool>>(false),
++                      std::make_shared<std::shared_timed_mutex>())
++{
++}
++
++TransactionImpl::TransactionImpl(
++    ClientType type,
++    const DbConnectionPtr &connPtr,
++    std::function<void(bool)> commitCallback,
++    std::function<void()> usedUpCallback,
++    std::shared_ptr<std::atomic<bool>> clientStopping,
++    std::shared_ptr<std::shared_timed_mutex> clientAdmission)
+     : connectionPtr_(connPtr),
+       usedUpCallback_(std::move(usedUpCallback)),
+       loop_(connPtr->loop()),
+-      commitCallback_(std::move(commitCallback))
++      commitCallback_(std::move(commitCallback)),
++      clientStopping_(std::move(clientStopping)),
++      clientAdmission_(std::move(clientAdmission))
+ {
+     type_ = type;
+ }
+@@ -36,6 +54,9 @@ TransactionImpl::~TransactionImpl()
+ {
+     LOG_TRACE << "Destruct";
+     assert(sqlCmdBuffer_.empty());
++    std::shared_lock admissionLock(*clientAdmission_);
++    if (clientStopping_->load(std::memory_order_acquire))
++        return;
+     if (!isCommitedOrRolledback_)
+     {
+         auto loop = connectionPtr_->loop();
+@@ -121,7 +142,11 @@ void TransactionImpl::execSqlInLoop(
+                                     std::move(rcb),
+                                     [exceptCallback,
+                                      thisPtr](const std::exception_ptr &ePtr) {
+-                                        thisPtr->rollback();
++                                        if (thisPtr->connectionPtr_->status() ==
++                                            ConnectStatus::Bad)
++                                            thisPtr->abort(ePtr);
++                                        else
++                                            thisPtr->rollback();
+                                         if (exceptCallback)
+                                             exceptCallback(ePtr);
+                                     });
+@@ -152,11 +177,21 @@ void TransactionImpl::execSqlInLoop(
+
+ void TransactionImpl::rollback()
+ {
++    std::shared_lock admissionLock(*clientAdmission_);
++    if (clientStopping_->load(std::memory_order_acquire))
++        return;
+     auto thisPtr = shared_from_this();
++    if (loop_->isInLoopThread())
++        admissionLock.unlock();
+
+     loop_->runInLoop([thisPtr]() {
+         if (thisPtr->isCommitedOrRolledback_)
+             return;
++        if (thisPtr->connectionPtr_->status() == ConnectStatus::Bad)
++        {
++            thisPtr->abort(std::make_exception_ptr(BrokenConnection()));
++            return;
++        }
+         if (thisPtr->isWorking_)
+         {
+             // push sql cmd to buffer;
+@@ -199,6 +234,45 @@ void TransactionImpl::rollback()
+     });
+ }
+
++void TransactionImpl::abort(const std::exception_ptr &error)
++{
++    loop_->assertInLoopThread();
++    if (isCommitedOrRolledback_)
++        return;
++    isCommitedOrRolledback_ = true;
++    connectionPtr_->setShutdownCallback({});
++    isWorking_ = false;
++    thisPtr_.reset();
++    for (const auto &command : sqlCmdBuffer_)
++    {
++        if (command->exceptionCallback_)
++        {
++            try
++            {
++                command->exceptionCallback_(error);
++            }
++            catch (...)
++            {
++                LOG_ERROR << "Transaction shutdown callback threw";
++            }
++        }
++        command->thisPtr_.reset();
++    }
++    sqlCmdBuffer_.clear();
++    if (usedUpCallback_)
++    {
++        auto callback = std::move(usedUpCallback_);
++        try
++        {
++            callback();
++        }
++        catch (...)
++        {
++            LOG_ERROR << "Transaction release callback threw";
++        }
++    }
++}
++
+ void TransactionImpl::execNewTask()
+ {
+     loop_->assertInLoopThread();
+@@ -268,7 +342,20 @@ void TransactionImpl::execNewTask()
+ void TransactionImpl::doBegin()
+ {
+     loop_->queueInLoop([thisPtr = shared_from_this()]() {
++        std::shared_lock admissionLock(*thisPtr->clientAdmission_);
++        if (thisPtr->clientStopping_->load(std::memory_order_acquire))
++        {
++            admissionLock.unlock();
++            thisPtr->abort(std::make_exception_ptr(
++                Failure("Database client is shutting down")));
++            return;
++        }
+         std::weak_ptr<TransactionImpl> weakPtr = thisPtr;
++        thisPtr->connectionPtr_->setShutdownCallback(
++            [weakPtr](const std::exception_ptr &error) {
++                if (auto transaction = weakPtr.lock())
++                    transaction->abort(error);
++            });
+         thisPtr->connectionPtr_->setIdleCallback([weakPtr]() {
+             auto thisPtr = weakPtr.lock();
+             if (!thisPtr)
+@@ -279,6 +366,7 @@ void TransactionImpl::doBegin()
+         assert(!thisPtr->isCommitedOrRolledback_);
+         thisPtr->isWorking_ = true;
+         thisPtr->thisPtr_ = thisPtr;
++        admissionLock.unlock();
+         thisPtr->connectionPtr_->execSql(
+             "begin",
+             0,
+@@ -288,7 +376,7 @@ void TransactionImpl::doBegin()
+             [](const Result &) { LOG_TRACE << "Transaction begin!"; },
+             [thisPtr](const std::exception_ptr &) {
+                 LOG_ERROR << "Error occurred in transaction begin";
+-                thisPtr->isCommitedOrRolledback_ = true;
++                thisPtr->abort(std::make_exception_ptr(BrokenConnection()));
+             });
+     });
+ }
+@@ -346,22 +434,25 @@ void TransactionImpl::execSqlInLoopWithTimeout(
+     {
+         isWorking_ = true;
+         thisPtr_ = thisPtr;
+-        connectionPtr_->execSql(std::move(sql),
+-                                paraNum,
+-                                std::move(parameters),
+-                                std::move(length),
+-                                std::move(format),
+-                                std::move(resultCallback),
+-                                [ecpPtr, timeoutFlagPtr, thisPtr](
+-                                    const std::exception_ptr &ePtr) {
+-                                    thisPtr->rollback();
+-                                    if (timeoutFlagPtr->done())
+-                                        return;
+-                                    if (*ecpPtr)
+-                                    {
+-                                        (*ecpPtr)(ePtr);
+-                                    }
+-                                });
++        connectionPtr_->execSql(
++            std::move(sql),
++            paraNum,
++            std::move(parameters),
++            std::move(length),
++            std::move(format),
++            std::move(resultCallback),
++            [ecpPtr, timeoutFlagPtr, thisPtr](const std::exception_ptr &ePtr) {
++                if (thisPtr->connectionPtr_->status() == ConnectStatus::Bad)
++                    thisPtr->abort(ePtr);
++                else
++                    thisPtr->rollback();
++                if (timeoutFlagPtr->done())
++                    return;
++                if (*ecpPtr)
++                {
++                    (*ecpPtr)(ePtr);
++                }
++            });
+     }
+     else
+     {
+diff --git a/orm_lib/src/TransactionImpl.h b/orm_lib/src/TransactionImpl.h
+index 0be310f5..e06a053d 100644
+--- a/orm_lib/src/TransactionImpl.h
++++ b/orm_lib/src/TransactionImpl.h
+@@ -16,8 +16,10 @@
+
+ #include "DbConnection.h"
+ #include <drogon/orm/DbClient.h>
++#include <atomic>
+ #include <functional>
+ #include <list>
++#include <shared_mutex>
+
+ namespace drogon
+ {
+@@ -31,6 +33,12 @@ class TransactionImpl : public Transaction,
+                     const DbConnectionPtr &connPtr,
+                     std::function<void(bool)> commitCallback,
+                     std::function<void()> usedUpCallback);
++    TransactionImpl(ClientType type,
++                    const DbConnectionPtr &connPtr,
++                    std::function<void(bool)> commitCallback,
++                    std::function<void()> usedUpCallback,
++                    std::shared_ptr<std::atomic<bool>> clientStopping,
++                    std::shared_ptr<std::shared_timed_mutex> clientAdmission);
+     ~TransactionImpl() override;
+     void rollback() override;
+
+@@ -63,8 +71,17 @@ class TransactionImpl : public Transaction,
+                  std::function<void(const std::exception_ptr &)>
+                      &&exceptCallback) override
+     {
++        std::shared_lock admissionLock(*clientAdmission_);
++        if (clientStopping_->load(std::memory_order_acquire))
++        {
++            admissionLock.unlock();
++            exceptCallback(std::make_exception_ptr(
++                Failure("Database client is shutting down")));
++            return;
++        }
+         if (loop_->isInLoopThread())
+         {
++            admissionLock.unlock();
+             execSqlInLoop(std::string_view{sql, sqlLength},
+                           paraNum,
+                           std::move(parameters),
+@@ -129,6 +146,7 @@ class TransactionImpl : public Transaction,
+     bool isCommitedOrRolledback_{false};
+     bool isWorking_{false};
+     void execNewTask();
++    void abort(const std::exception_ptr &error);
+
+     struct SqlCmd
+     {
+@@ -152,6 +170,8 @@ class TransactionImpl : public Transaction,
+     trantor::EventLoop *loop_;
+     std::function<void(bool)> commitCallback_;
+     std::shared_ptr<TransactionImpl> thisPtr_;
++    std::shared_ptr<std::atomic<bool>> clientStopping_;
++    std::shared_ptr<std::shared_timed_mutex> clientAdmission_;
+     double timeout_{-1.0};
+ };
+ }  // namespace orm
+diff --git a/orm_lib/src/postgresql_impl/PgBatchConnection.cc b/orm_lib/src/postgresql_impl/PgBatchConnection.cc
+index 609df22d..1ea7f08e 100644
+--- a/orm_lib/src/postgresql_impl/PgBatchConnection.cc
++++ b/orm_lib/src/postgresql_impl/PgBatchConnection.cc
+@@ -165,20 +165,58 @@ void PgConnection::handleClosed()
+
+ void PgConnection::disconnect()
+ {
+-    std::promise<int> pro;
+-    auto f = pro.get_future();
+     auto thisPtr = shared_from_this();
+-    loop_->runInLoop([thisPtr, &pro]() {
++    auto disconnectInLoop = [thisPtr]() {
+         thisPtr->status_ = ConnectStatus::Bad;
++        thisPtr->isPreparingStatement_ = false;
++        thisPtr->isWorking_ = false;
+         if (thisPtr->channel_.fd() >= 0)
+         {
+             thisPtr->channel_.disableAll();
+             thisPtr->channel_.remove();
+         }
++        auto shutdownCallback = std::move(thisPtr->shutdownCallback_);
++        auto waiting = std::move(thisPtr->batchCommandsForWaitingResults_);
++        auto pending = std::move(thisPtr->batchSqlCommands_);
++        thisPtr->callback_ = nullptr;
++        thisPtr->exceptionCallback_ = nullptr;
++        thisPtr->idleCb_ = nullptr;
++        thisPtr->okCallback_ = [](const DbConnectionPtr &) {};
++        thisPtr->messageCallback_ = nullptr;
+         thisPtr->connectionPtr_.reset();
+-        pro.set_value(1);
+-    });
+-    f.get();
++        auto error = std::make_exception_ptr(BrokenConnection());
++        if (shutdownCallback)
++            shutdownCallback(error);
++        auto settle = [&error](const std::shared_ptr<SqlCmd> &command) {
++            if (!command->exceptionCallback_)
++                return;
++            try
++            {
++                command->exceptionCallback_(error);
++            }
++            catch (...)
++            {
++                LOG_ERROR << "PostgreSQL disconnect callback threw";
++            }
++        };
++        for (const auto &command : waiting)
++            settle(command);
++        for (const auto &command : pending)
++            settle(command);
++    };
++    if (loop_->isInLoopThread())
++    {
++        disconnectInLoop();
++        return;
++    }
++    auto completed = std::make_shared<std::promise<void>>();
++    auto future = completed->get_future();
++    loop_->queueInLoop(
++        [disconnectInLoop = std::move(disconnectInLoop), completed]() mutable {
++            disconnectInLoop();
++            completed->set_value();
++        });
++    future.get();
+ }
+
+ void PgConnection::pgPoll()
+diff --git a/orm_lib/src/postgresql_impl/PgConnection.cc b/orm_lib/src/postgresql_impl/PgConnection.cc
+index 623586c8..42328107 100644
+--- a/orm_lib/src/postgresql_impl/PgConnection.cc
++++ b/orm_lib/src/postgresql_impl/PgConnection.cc
+@@ -151,20 +151,51 @@ void PgConnection::handleClosed()
+
+ void PgConnection::disconnect()
+ {
+-    std::promise<int> pro;
+-    auto f = pro.get_future();
+     auto thisPtr = shared_from_this();
+-    loop_->runInLoop([thisPtr, &pro]() {
++    auto disconnectInLoop = [thisPtr]() {
+         thisPtr->status_ = ConnectStatus::Bad;
++        thisPtr->isPreparingStatement_ = false;
++        thisPtr->isWorking_ = false;
+         if (thisPtr->channel_.fd() >= 0)
+         {
+             thisPtr->channel_.disableAll();
+             thisPtr->channel_.remove();
+         }
++        auto shutdownCallback = std::move(thisPtr->shutdownCallback_);
++        auto exceptionCallback = std::move(thisPtr->exceptionCallback_);
++        thisPtr->callback_ = nullptr;
++        thisPtr->idleCb_ = nullptr;
++        thisPtr->okCallback_ = [](const DbConnectionPtr &) {};
++        thisPtr->messageCallback_ = nullptr;
+         thisPtr->connectionPtr_.reset();
+-        pro.set_value(1);
+-    });
+-    f.get();
++        auto error = std::make_exception_ptr(BrokenConnection());
++        if (shutdownCallback)
++            shutdownCallback(error);
++        if (exceptionCallback)
++        {
++            try
++            {
++                exceptionCallback(error);
++            }
++            catch (...)
++            {
++                LOG_ERROR << "PostgreSQL disconnect callback threw";
++            }
++        }
++    };
++    if (loop_->isInLoopThread())
++    {
++        disconnectInLoop();
++        return;
++    }
++    auto completed = std::make_shared<std::promise<void>>();
++    auto future = completed->get_future();
++    loop_->queueInLoop(
++        [disconnectInLoop = std::move(disconnectInLoop), completed]() mutable {
++            disconnectInLoop();
++            completed->set_value();
++        });
++    future.get();
+ }
+
+ void PgConnection::pgPoll()
+diff --git a/trantor/trantor/net/EventLoopThread.cc b/trantor/trantor/net/EventLoopThread.cc
+index c4170a6..c4b082e 100644
+--- a/trantor/trantor/net/EventLoopThread.cc
++++ b/trantor/trantor/net/EventLoopThread.cc
+@@ -19,16 +19,27 @@
+ #endif
+
+ using namespace trantor;
++
+ EventLoopThread::EventLoopThread(const std::string &threadName)
+     : loop_(nullptr),
+       loopThreadName_(threadName),
+-      thread_([this]() { loopFuncs(); })
++      thread_([this]() { loopFuncs(); }),
++      threadId_(thread_.get_id())
+ {
+     auto f = promiseForLoopPointer_.get_future();
+     loop_ = f.get();
+ }
+
+ EventLoopThread::~EventLoopThread()
++{
++    requestStop();
++    if (!waitFor(std::chrono::milliseconds::max()))
++    {
++        LOG_FATAL << "EventLoopThread cannot join its own thread";
++    }
++}
++
++void EventLoopThread::requestStop()
+ {
+     run();
+     std::shared_ptr<EventLoop> loop;
+@@ -40,15 +51,25 @@ EventLoopThread::~EventLoopThread()
+     {
+         loop->quit();
+     }
++}
++
++bool EventLoopThread::waitFor(std::chrono::milliseconds timeout)
++{
++    if (isCurrentThread())
++        return false;
++    if (timeout == std::chrono::milliseconds::max())
++        futureForExit_.wait();
++    else if (futureForExit_.wait_for(timeout) != std::future_status::ready)
++        return false;
+     if (thread_.joinable())
+-    {
+         thread_.join();
+-    }
++    return true;
+ }
+
+ void EventLoopThread::wait()
+ {
+-    thread_.join();
++    if (thread_.joinable())
++        thread_.join();
+ }
+
+ void EventLoopThread::loopFuncs()
+@@ -56,8 +77,7 @@ void EventLoopThread::loopFuncs()
+ #ifdef __linux__
+     ::prctl(PR_SET_NAME, loopThreadName_.c_str());
+ #endif
+-    thread_local static std::shared_ptr<EventLoop> loop =
+-        std::make_shared<EventLoop>();
++    auto loop = std::make_shared<EventLoop>();
+     loop->queueInLoop([this]() { promiseForLoop_.set_value(1); });
+     promiseForLoopPointer_.set_value(loop);
+     auto f = promiseForRun_.get_future();
+@@ -67,6 +87,12 @@ void EventLoopThread::loopFuncs()
+         std::unique_lock<std::mutex> lk(loopMutex_);
+         loop_ = nullptr;
+     }
++    // Complete EventLoop destruction before reporting that waitFor may join.
++    // A plain promise avoids process-exit ordering dependencies in the
++    // standard library's at-thread-exit registry.
++    loop.reset();
++    threadActive_.store(false, std::memory_order_release);
++    promiseForExit_.set_value();
+ }
+
+ void EventLoopThread::run()
+diff --git a/trantor/trantor/net/EventLoopThread.h b/trantor/trantor/net/EventLoopThread.h
+index 7a36383..08f541a 100644
+--- a/trantor/trantor/net/EventLoopThread.h
++++ b/trantor/trantor/net/EventLoopThread.h
+@@ -17,6 +17,8 @@
+ #include <trantor/net/EventLoop.h>
+ #include <trantor/utils/NonCopyable.h>
+ #include <trantor/exports.h>
++#include <atomic>
++#include <chrono>
+ #include <mutex>
+ #include <thread>
+ #include <memory>
+@@ -41,6 +43,19 @@ class TRANTOR_EXPORT EventLoopThread : NonCopyable
+      */
+     void wait();
+
++    /// Request loop termination without releasing the thread owner.
++    void requestStop();
++
++    /// Wait for loop termination and join the owned thread within timeout.
++    bool waitFor(std::chrono::milliseconds timeout);
++
++    /// True when called by this object's immutable worker thread.
++    bool isCurrentThread() const noexcept
++    {
++        return threadActive_.load(std::memory_order_acquire) &&
++               threadId_ == std::this_thread::get_id();
++    }
++
+     /**
+      * @brief Get the pointer of the event loop of the thread.
+      *
+@@ -68,8 +83,12 @@ class TRANTOR_EXPORT EventLoopThread : NonCopyable
+     std::promise<std::shared_ptr<EventLoop>> promiseForLoopPointer_;
+     std::promise<int> promiseForRun_;
+     std::promise<int> promiseForLoop_;
++    std::promise<void> promiseForExit_;
++    std::shared_future<void> futureForExit_{promiseForExit_.get_future()};
+     std::once_flag once_;
+     std::thread thread_;
++    const std::thread::id threadId_;
++    std::atomic<bool> threadActive_{true};
+ };
+
+ }  // namespace trantor
+diff --git a/trantor/trantor/net/EventLoopThreadPool.cc b/trantor/trantor/net/EventLoopThreadPool.cc
+index 33264d4..eb1861d 100644
+--- a/trantor/trantor/net/EventLoopThreadPool.cc
++++ b/trantor/trantor/net/EventLoopThreadPool.cc
+@@ -43,6 +43,37 @@ void EventLoopThreadPool::wait()
+         loopThreadVector_[i]->wait();
+     }
+ }
++bool EventLoopThreadPool::stopFor(std::chrono::milliseconds timeout)
++{
++    const bool unbounded = timeout == std::chrono::milliseconds::max();
++    const auto deadline = unbounded
++                              ? std::chrono::steady_clock::time_point::max()
++                              : std::chrono::steady_clock::now() + timeout;
++    for (const auto &loopThread : loopThreadVector_)
++        loopThread->requestStop();
++    for (const auto &loopThread : loopThreadVector_)
++    {
++        const auto now = std::chrono::steady_clock::now();
++        if (!unbounded && now >= deadline)
++            return false;
++        const auto remaining =
++            unbounded ? std::chrono::milliseconds::max()
++                      : std::chrono::duration_cast<std::chrono::milliseconds>(
++                            deadline - now);
++        if (!loopThread->waitFor(remaining))
++            return false;
++    }
++    return true;
++}
++bool EventLoopThreadPool::isCurrentThread() const noexcept
++{
++    for (const auto &loopThread : loopThreadVector_)
++    {
++        if (loopThread->isCurrentThread())
++            return true;
++    }
++    return false;
++}
+ EventLoop *EventLoopThreadPool::getNextLoop()
+ {
+     if (loopThreadVector_.size() > 0)
+@@ -68,4 +99,4 @@ std::vector<EventLoop *> EventLoopThreadPool::getLoops() const
+         ret.push_back(loopThread->getLoop());
+     }
+     return ret;
+-}
+\ No newline at end of file
++}
+diff --git a/trantor/trantor/net/EventLoopThreadPool.h b/trantor/trantor/net/EventLoopThreadPool.h
+index 8ca9776..8dac1b0 100644
+--- a/trantor/trantor/net/EventLoopThreadPool.h
++++ b/trantor/trantor/net/EventLoopThreadPool.h
+@@ -16,6 +16,7 @@
+
+ #include <trantor/net/EventLoopThread.h>
+ #include <trantor/exports.h>
++#include <chrono>
+ #include <vector>
+ #include <memory>
+ #include <atomic>
+@@ -53,6 +54,13 @@ class TRANTOR_EXPORT EventLoopThreadPool : NonCopyable
+      */
+     void wait();
+
++    /// Request every loop to stop, join each owner thread, and return false
++    /// if the shared timeout expires before all joins are ready.
++    bool stopFor(std::chrono::milliseconds timeout);
++
++    /// True when called by one of the pool's immutable worker threads.
++    bool isCurrentThread() const noexcept;
++
+     /**
+      * @brief Return the number of the event loop.
+      *

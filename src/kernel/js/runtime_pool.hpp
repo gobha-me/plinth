@@ -99,6 +99,13 @@ class RuntimePool {
   RuntimePool(RuntimePool&&) = delete;
   auto operator=(RuntimePool&&) -> RuntimePool& = delete;
 
+  // Stop extension database admission and destroy every owned JS context.
+  // Returns false without invalidating caller-held contexts if a lease remains;
+  // release/destroy routes such contexts to destruction before a retry. The
+  // lifecycle coordinator calls this after runtime leases drain; the destructor
+  // is an idempotent fallback for stack-owned test pools.
+  [[nodiscard]] auto shutdown(std::chrono::milliseconds timeout) -> bool;
+
   // Acquire a ready-to-use context. Returns a context from the free
   // list if one is available; otherwise creates a fresh context on
   // demand. When active_count() ≥ pool_size the on-demand context is
@@ -146,7 +153,10 @@ class RuntimePool {
   int capacity;
   std::shared_ptr<ExtensionDatabaseClients> extension_database_clients;
 
+  std::timed_mutex shutdown_mutex;
   mutable std::mutex mu;
+  enum class State { running, stopping, stopped };
+  State state = State::running;
   std::vector<EntryPtr> free_list;
   std::vector<EntryPtr> checked_out;
 };

@@ -31,7 +31,6 @@ not present in this index is historical context, not unscheduled work.
 - Realtime source-sequence contract: [#42](https://github.com/gobha-me/plinth/issues/42)
 - Reconnect-under-storm load evidence: [#88](https://github.com/gobha-me/plinth/issues/88)
 - PostgreSQL SQLSTATE typing through Drogon batch aborts: [#92](https://github.com/gobha-me/plinth/issues/92)
-- Recurring Drogon event-loop join-self teardown abort: [#95](https://github.com/gobha-me/plinth/issues/95)
 
 The MEMORY_LIMIT classifier entry remains a watchlist with no scheduled action.
 All other resolved material below is retained only to explain prior decisions.
@@ -67,12 +66,13 @@ from their ICD tables rather than reuse that number.
 
 
 
-### 2026-04-30 — Kernel-side dispatch + teardown hardening (consolidated debt entry) [partial recurrence tracked in #95]
+### 2026-04-30 — Kernel-side dispatch + teardown hardening (consolidated debt entry) [resolved by #95]
 
-**Status correction (2026-09-15):** the JS handler and fixture defects described
-below remain resolved, but candidate CI for PR #94 reproduced the Drogon
-`Resource deadlock avoided` join-self family in `db_search_path_test.cpp` under
-Clang 20. The active recurrence is [GitHub issue #95](https://github.com/gobha-me/plinth/issues/95); this entry must no longer be read as evidence that the entire family is closed.
+**Status correction (2026-09-15):** candidate CI for PR #94 reproduced the
+Drogon `Resource deadlock avoided` join-self family in
+`db_search_path_test.cpp` under Clang 20. [GitHub issue #95](https://github.com/gobha-me/plinth/issues/95)
+traced and resolved the remaining callback/client/thread ownership defect; the
+historical alternatives below are no longer active recommendations.
 
 **Milestone:** v0.6.3 ship surfaced three kernel-side bugs that had
 been carried forward as "intermittent" / "out of scope for kernel
@@ -179,7 +179,7 @@ Documented exemplars (per
 Flake rate: ~1/5 on `plinth_tests_pg` per the documented dataset.
 Each ship has been "re-run CI" + merge-anyway.
 
-**Fix path (architect picks at session start):**
+**Historical fix alternatives:**
 - (a) **Upstream patch + fork in `third_party/`.** Identify the
   exact Drogon commit that carries the bad join order; patch it;
   vendor under `third_party/drogon-patches/` with a CI-enforced
@@ -193,9 +193,18 @@ Each ship has been "re-run CI" + merge-anyway.
   upstream has). Cheapest if it works; depends on whether
   Drogon's main has the fix.
 
-Recommend (b) — it's where the pattern is already established
-and "fix the test fixture" doesn't require upstream coordination.
-Architect picks at session start.
+The former recommendation of (b), a process-lifetime fixture client, was
+rejected by #95 because it masked the production ownership defect.
+
+**Resolution (2026-09-15, #95):** `RuntimePool::shutdown()` now stops extension
+database admission and invokes the pinned Drogon client's explicit drain while
+the lifecycle thread retains the durable owner. The Drogon patch prevents new
+callback-local strong owners after shutdown begins and brackets disconnect
+with deadline-aware private-loop barriers and settles failed transaction
+callback cycles before connection destruction. A replaced pool's final lease
+hands destruction to Drogon's application loop; bounded-close failures stay
+coordinator-owned for retry. Production and the P.08 regression use the same
+idempotent path; no client is leaked to process exit.
 
 **Why all three together:** the three bugs share a kernel-side
 dispatch + teardown surface and a single fix session can attack
@@ -682,9 +691,8 @@ sub-paths the kernel teardown family had been surfacing through
 
 1. **`events_writer` `EventLoopThreadPool::~` join-self family
    closed at the test-fixture layer** via `g_inflight_inserts` /
-   `g_inflight_cv` tracking. The framework-layer race (drogon's
-   join-self pattern in `EventLoopThreadPool::~`) remains a Drogon
-   issue, but the `events_writer` callsite no longer reproduces.
+   `g_inflight_cv` tracking. At the time, the framework-layer race remained;
+   it was later closed at Plinth's ownership boundary by #95.
 2. **`bad_weak_ptr` from `drogon::async_run` in test-mode
    subprocesses** caught + suppressed via try/catch wrappers around
    both `runEvery` callbacks (drain + cleanup) — keeps it from
@@ -695,11 +703,9 @@ sub-paths the kernel teardown family had been surfacing through
    process-lifetime accessor — process-exit destructor handles
    teardown after Catch2 has reported.
 
-These closures retire the events_writer / ConnState / per-test
-PG-client sub-paths from this entry's scope. The entry now stays
-Active *only* for the residual `[js][async]` Catch2 subprocess race
-(below) and the framework-layer drogon `EventLoopThreadPool::~`
-join-self pattern.
+These closures retired the events_writer / ConnState / per-test PG-client
+sub-paths. The residual `[js][async]` refcount race was resolved below, and the
+framework-layer `EventLoopThreadPool::~` ownership path was resolved by #95.
 
 **Family expansion observed in `ci-build-and-test-12377` (first
 post-merge CI run on `main` after 0.5.5.1).** A new exemplar joined
@@ -774,9 +780,9 @@ for the full root-cause + fix discussion.
   5-second `cv.wait_for` timing flake under PG NOTIFY contention.
   NOT a refcount race. Tracked separately as a low-priority follow-
   up.
-- Framework-layer drogon `EventLoopThreadPool::~` join-self pattern
-  remains an upstream Drogon issue, surfacing on `plinth_tests_pg`
-  intermittently (~1/5). Out of scope for kernel work.
+- Framework-layer Drogon `EventLoopThreadPool::~` join-self pattern: resolved
+  by #95 with explicit kernel ownership and a pinned upstreamable Drogon drain
+  patch; it is no longer classified as out of scope.
 
 **Bonus: MEMORY_LIMIT classifier flake (closed by 0.5.5.2 part 3).**
 Surfaced during the verification of parts 1 + 2 — the

@@ -13,9 +13,11 @@
 #include <catch2/catch_test_macros.hpp>
 #include <plinth/version.hpp>
 
+#include "realtime/shared_pg_client.hpp"
 #include "test_process.hpp"
 
 #include <array>
+#include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -112,8 +114,19 @@ auto install_signal_handlers() noexcept -> void {
 auto main(int argc, char* argv[]) -> int {
   install_signal_handlers();
   int result = Catch::Session().run(argc, argv);
-  if (!plinth::test_process::run_shutdowns() && result == 0) {
-    result = 1;
+  if (!plinth::test_process::run_shutdowns()) {
+    std::fputs("plinth_tests: lifecycle coordinator shutdown failed\n", stderr);
+    std::fflush(stderr);
+    std::_Exit(EXIT_FAILURE);
+  }
+  if (!plinth::realtime_test::shutdown_shared_pg_clients(
+          std::chrono::seconds{30})) {
+    std::fputs("plinth_tests: shared PostgreSQL client shutdown timed out\n",
+               stderr);
+    std::fflush(stderr);
+    // Failed clients remain owned by a static registry. Do not continue into
+    // Drogon or C++ static teardown and release them on an arbitrary thread.
+    std::_Exit(EXIT_FAILURE);
   }
   return result;
 }

@@ -5,15 +5,22 @@
 
 #include "kernel/config.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace plinth::realtime_test {
 
 namespace {
+
+std::mutex clients_mutex;
+std::map<int, drogon::orm::DbClientPtr> clients_by_conn_num;
+std::vector<drogon::orm::DbClientPtr> retained_clients;
 
 auto pg_config_from_env() -> plinth::Config::Database {
   plinth::Config::Database db;
@@ -60,10 +67,8 @@ auto shared_pg_client(int connNum) -> drogon::orm::DbClientPtr& {
   // — the returned reference stays valid for the life of the static
   // map, i.e. until process exit.
   // function-local statics, see header
-  static std::mutex mu;
-  static std::map<int, drogon::orm::DbClientPtr> by_conn_num;
-  std::scoped_lock lock{mu};
-  auto& slot = by_conn_num[connNum];
+  std::scoped_lock lock{clients_mutex};
+  auto& slot = clients_by_conn_num[connNum];
   if (!slot) {
     // The `connNum` argument keys the pool slot but the pool size
     // is always POOL_SIZE — see comment above.
@@ -71,6 +76,40 @@ auto shared_pg_client(int connNum) -> drogon::orm::DbClientPtr& {
         build_conninfo(pg_config_from_env()), POOL_SIZE);
   }
   return slot;
+}
+
+auto shutdown_shared_pg_clients(std::chrono::milliseconds timeout) -> bool {
+  const bool unbounded = timeout == std::chrono::milliseconds::max();
+  const auto deadline = unbounded ? std::chrono::steady_clock::time_point::max()
+                                  : std::chrono::steady_clock::now() + timeout;
+  std::vector<drogon::orm::DbClientPtr> local;
+  {
+    std::scoped_lock lock{clients_mutex};
+    local.reserve(clients_by_conn_num.size() + retained_clients.size());
+    for (auto& [conn_num, client] : clients_by_conn_num) {
+      (void)conn_num;
+      local.push_back(std::move(client));
+    }
+    clients_by_conn_num.clear();
+    local.insert(local.end(), std::make_move_iterator(retained_clients.begin()),
+                 std::make_move_iterator(retained_clients.end()));
+    retained_clients.clear();
+  }
+  for (const auto& client : local) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining =
+        unbounded ? std::chrono::milliseconds::max()
+                  : std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - now);
+    if ((!unbounded && now >= deadline) || !client->closeAllFor(remaining)) {
+      std::scoped_lock lock{clients_mutex};
+      retained_clients.insert(retained_clients.end(),
+                              std::make_move_iterator(local.begin()),
+                              std::make_move_iterator(local.end()));
+      return false;
+    }
+  }
+  return true;
 }
 
 } // namespace plinth::realtime_test

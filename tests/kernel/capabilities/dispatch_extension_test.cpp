@@ -26,7 +26,9 @@
 #include <catch2/catch_test_macros.hpp>
 #include <drogon/utils/coroutine.h>
 #include <json/value.h>
+#include <libpq-fe.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -160,6 +162,21 @@ auto run_dispatch(std::string_view ext_name, std::string_view fn,
     -> std::expected<Json::Value, plinth::js::PromiseRejection> {
   return drogon::sync_wait(
       plinth::extensions::dispatch(ext_name, fn, args, admin_ctx(), 0));
+}
+
+[[nodiscard]] auto query_is_active(PGconn* connection, std::string_view marker)
+    -> bool {
+  const auto pattern = "%" + std::string{marker} + "%";
+  const std::array<const char*, 1> params{pattern.c_str()};
+  std::unique_ptr<PGresult, decltype(&PQclear)> result{
+      PQexecParams(connection,
+                   "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                   "WHERE pid <> pg_backend_pid() AND state = 'active' "
+                   "AND query LIKE $1)",
+                   1, nullptr, params.data(), nullptr, nullptr, 0),
+      &PQclear};
+  return PQresultStatus(result.get()) == PGRES_TUPLES_OK &&
+         std::string_view{PQgetvalue(result.get(), 0, 0)} == "t";
 }
 
 auto run_resolver(std::string_view signature, const Json::Value& args,
@@ -553,4 +570,112 @@ TEST_CASE("H.02: shutdown rejects new work and drains accepted dispatches",
   REQUIRE(result.has_value());
   REQUIRE((*result)["ok"].asBool());
   REQUIRE(plinth::extensions::shutdown_registry(1s));
+}
+
+TEST_CASE("H.03: final active lease retires a removed pool on the owner loop",
+          "[cap][res][ext][integration][lifecycle]") {
+  SKIP_WITHOUT_PG();
+  ExtScratch s;
+  const auto conninfo =
+      "host=" + s.cfg.db.host + " port=" + std::to_string(s.cfg.db.port) +
+      " dbname=" + s.cfg.db.database + " user=" + s.cfg.db.user +
+      " password=" + s.cfg.db.password;
+  std::unique_ptr<PGconn, decltype(&PQfinish)> control{
+      PQconnectdb(conninfo.c_str()), &PQfinish};
+  REQUIRE(PQstatus(control.get()) == CONNECTION_OK);
+  const auto lock_key = 950'000'000LL + static_cast<long long>(::getpid());
+  const auto lock_sql =
+      "SELECT pg_advisory_lock(" + std::to_string(lock_key) + ")";
+  const auto unlock_sql =
+      "SELECT pg_advisory_unlock(" + std::to_string(lock_key) + ")";
+  {
+    std::unique_ptr<PGresult, decltype(&PQclear)> locked{
+        PQexec(control.get(), lock_sql.c_str()), &PQclear};
+    REQUIRE(PQresultStatus(locked.get()) == PGRES_TUPLES_OK);
+  }
+  const auto handler = std::string{R"(
+            export default async function slow() {
+              await db.query('SELECT pg_advisory_xact_lock()"} +
+                       std::to_string(lock_key) +
+                       R"()');
+              return { ok: true };
+            }
+        )";
+  s.stage_extension("extdispatch", {
+                                       {"slow", handler},
+                                   });
+  REQUIRE(plinth::extensions::create_pool("extdispatch"));
+  const auto handoffs_before =
+      plinth::extensions::owner_loop_handoff_count_for_test();
+
+  auto dispatch = std::async(std::launch::async, [] {
+    return run_dispatch("extdispatch", "slow", Json::Value{});
+  });
+  struct UnlockGuard {
+    PGconn* connection;
+    const std::string* sql;
+    bool armed = true;
+    ~UnlockGuard() {
+      if (armed) {
+        PQclear(PQexec(connection, sql->c_str()));
+      }
+    }
+  } unlock_guard{control.get(), &unlock_sql};
+  auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (plinth::extensions::inflight_dispatch_count_for_test() == 0 &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(plinth::extensions::inflight_dispatch_count_for_test() == 1);
+  const auto query_marker =
+      "pg_advisory_xact_lock(" + std::to_string(lock_key) + ")";
+  deadline = std::chrono::steady_clock::now() + 2s;
+  while (!query_is_active(control.get(), query_marker) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(query_is_active(control.get(), query_marker));
+
+  plinth::extensions::destroy_pool("extdispatch");
+  auto rejected = run_dispatch("extdispatch", "slow", Json::Value{});
+  REQUIRE_FALSE(rejected.has_value());
+  REQUIRE(rejected.error().code == "cap.extension_not_loaded");
+
+  s.stage_extension("extdispatch", {
+                                       {"generation", R"(
+            export default function generation() {
+              return { generation: "replacement" };
+            }
+        )"},
+                                   });
+  REQUIRE(plinth::extensions::create_pool("extdispatch"));
+  auto replacement = run_dispatch("extdispatch", "generation", Json::Value{});
+  REQUIRE(replacement.has_value());
+  REQUIRE((*replacement)["generation"].asString() == "replacement");
+
+  {
+    std::unique_ptr<PGresult, decltype(&PQclear)> unlocked{
+        PQexec(control.get(), unlock_sql.c_str()), &PQclear};
+    REQUIRE(PQresultStatus(unlocked.get()) == PGRES_TUPLES_OK);
+  }
+  unlock_guard.armed = false;
+
+  REQUIRE(dispatch.wait_for(2s) == std::future_status::ready);
+  auto result = dispatch.get();
+  REQUIRE(result.has_value());
+  REQUIRE((*result)["ok"].asBool());
+  deadline = std::chrono::steady_clock::now() + 2s;
+  while ((plinth::extensions::inflight_dispatch_count_for_test() != 0 ||
+          plinth::extensions::owner_loop_handoff_count_for_test() ==
+              handoffs_before) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(plinth::extensions::inflight_dispatch_count_for_test() == 0);
+  REQUIRE(plinth::extensions::owner_loop_handoff_count_for_test() >
+          handoffs_before);
+  REQUIRE(plinth::extensions::failed_pool_count_for_test() == 0);
+  replacement = run_dispatch("extdispatch", "generation", Json::Value{});
+  REQUIRE(replacement.has_value());
+  REQUIRE((*replacement)["generation"].asString() == "replacement");
 }

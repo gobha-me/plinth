@@ -35,7 +35,10 @@ The coordinator executes these nodes in order:
      top-level runs and their timed capability invocations.
 6. `drain_extension_dispatches`
    - Close extension dispatch admission, drain every accepted shared runtime
-     lease, and destroy the extension pools.
+     lease, explicitly shut down each extension pool, and destroy it on the
+     coordinator thread. A replaced pool's final lease hands destruction to
+     Drogon's application loop; failed bounded closes remain coordinator-owned
+     for retry.
 7. `drain_js_stress_dispatches`
    - Close diagnostic JS admission, drain every accepted shared runtime lease,
      and destroy the diagnostic pool.
@@ -70,6 +73,43 @@ ingress -> capability listener -> owned workers -> runtime leases
   -> realtime listener/broker stop -> WS owner release on IO loops
   -> Drogon database/event loops -> logging sinks
 ```
+
+### Extension database ownership at node 6
+
+Each extension-isolated Drogon client owns private `DbLoop` threads; it is not
+part of Drogon's application database manager. Its complete ownership and
+callback graph is:
+
+```text
+RuntimeRegistry active/failed-close shared owner
+  -> RuntimePool lifecycle owner
+     -> ExtensionDatabaseClients durable client map
+        -> shared DbClientImpl
+           -> EventLoopThreadPool -> DbLoop thread(s)
+
+BridgeContext / AsyncOp --shared alias--> ExtensionDatabaseClients
+DbLoop callback --shutdown token--> weak DbClientImpl
+```
+
+Before issue #95, a DbLoop callback locked its weak client reference, the
+runtime owner could concurrently disappear, and callback return released the
+last `DbClientImpl` owner on that same DbLoop. Destruction then reached
+`EventLoopThread::~EventLoopThread` and attempted to join the current thread.
+
+The fixed boundary is: reject new runtime/database work; wait for all runtime
+leases; set the Drogon client's shared shutdown token; run a deadline-aware
+barrier on every private loop so callbacks admitted before the token drain;
+settle buffered and active transaction callbacks; disconnect connections; run
+barriers for disconnect and connection destruction; request loop termination;
+wait for controlled event-loop destruction inside the deadline; then join each
+thread and release the durable client and runtime owners on the coordinator
+thread. Standard `std::thread::join()` has no timed form, so the join after the
+published cleanup signal has only the process watchdog as an absolute bound.
+Callbacks inspect the independent token before locking their weak client
+reference. A timed-out drain retains its durable owners for a retry instead of
+allowing a late coroutine to perform final destruction. Replacement and disable
+hand a last-lease release to Drogon's application loop, so successful pools do
+not accumulate.
 
 ## Bounds and failure policy
 
