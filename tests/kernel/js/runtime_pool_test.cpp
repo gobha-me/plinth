@@ -10,6 +10,7 @@
 #include "kernel/js/eval.hpp"
 #include "kernel/js/runtime_pool.hpp"
 
+#include <drogon/config.h>
 #include <drogon/orm/DbClient.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
@@ -372,8 +373,12 @@ TEST_CASE("DbClient immediate shutdown drains queued initialization",
 
 TEST_CASE("finite owned-loop shutdown is fail-closed for SQLite",
           "[js][db][lifecycle][sqlite]") {
+#if USE_SQLITE3
   auto client = drogon::orm::DbClient::newSqlite3Client("filename=:memory:", 1);
 
   REQUIRE_FALSE(client->closeAllFor(5ms));
   client->closeAll();
+#else
+  SKIP("Drogon was built without SQLite support");
+#endif
 }

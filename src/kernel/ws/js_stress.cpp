@@ -117,7 +117,7 @@ auto shutdown_js_stress_pool(std::chrono::milliseconds timeout) -> bool {
       g_drained.wait_until(lock, deadline, [] { return g_inflight == 0; });
   auto remaining = g_inflight;
   if (!drained) {
-    g_pool = std::move(local);
+    g_pool = local;
   }
   lock.unlock();
   if (!drained) {
