@@ -16,6 +16,7 @@
 #include "kernel/db/extension_identity.hpp"
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/js/db_search_path.hpp"
+#include "kernel/js/extension_database.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
 #include "kernel/logging.hpp"
@@ -26,7 +27,9 @@
 #include <libpq-fe.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -49,6 +52,11 @@ auto drive(BridgeContext& bc, std::string_view source) -> EvalResult {
 
 auto make_pool(const plinth::Config& cfg) -> RuntimePool {
   return {/*ext=*/nullptr, default_runtime_limits(), cfg, 1};
+}
+
+auto acquire_transaction(const std::shared_ptr<drogon::orm::DbClient>& client)
+    -> drogon::Task<std::shared_ptr<drogon::orm::Transaction>> {
+  co_return co_await client->newTransactionCoro();
 }
 
 auto eval_as(RuntimePool& pool, std::string_view ext_name,
@@ -84,6 +92,21 @@ struct TestPg {
   auto exec(const std::string& sql) const -> void {
     PGresult* res = PQexec(conn, sql.c_str());
     PQclear(res);
+  }
+
+  [[nodiscard]] auto query_active(std::string_view marker) const -> bool {
+    const auto pattern = "%" + std::string{marker} + "%";
+    const std::array<const char*, 1> params{pattern.c_str()};
+    PGresult* res =
+        PQexecParams(conn,
+                     "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                     "WHERE pid <> pg_backend_pid() AND state = 'active' "
+                     "AND query LIKE $1)",
+                     1, nullptr, params.data(), nullptr, nullptr, 0);
+    const bool active = PQresultStatus(res) == PGRES_TUPLES_OK &&
+                        std::string_view{PQgetvalue(res, 0, 0)} == "t";
+    PQclear(res);
+    return active;
   }
 
   [[nodiscard]] auto count_rows(const std::string& qualified_table) const
@@ -365,6 +388,151 @@ TEST_CASE("P.08: disabling search_path never disables privilege isolation",
   // `notes` table leaks into `public`, and would false-positive on
   // this test's intentional fixture state if we didn't drop it.
   pg.exec("DROP TABLE IF EXISTS public.notes");
+
+  // Issue #95: P.08 used to leave a callback-local DbClientImpl owner behind.
+  // Its later release on DbLoop destroyed EventLoopThreadPool on its own
+  // thread, aborting the next security test with EDEADLK. Exercise the same
+  // production shutdown path explicitly and prove its admission/idempotence
+  // contract before the following test starts.
+  REQUIRE(pool.shutdown(std::chrono::seconds{5}));
+  REQUIRE(pool.acquire() == nullptr);
+  REQUIRE(pool.shutdown(std::chrono::milliseconds{0}));
+}
+
+TEST_CASE("extension client shutdown settles an active transaction",
+          "[js][async][db][lifecycle]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+
+  auto cfg = test_config();
+  reset_for_search_path_test(cfg);
+  TestPg control(cfg.db);
+  const auto lock_key = 959'000'000LL + static_cast<long long>(::getpid());
+  const auto lock_sql =
+      "SELECT pg_advisory_lock(" + std::to_string(lock_key) + ")";
+  const auto unlock_sql =
+      "SELECT pg_advisory_unlock(" + std::to_string(lock_key) + ")";
+  control.exec(lock_sql);
+
+  plinth::js::ExtensionDatabaseClients owners(cfg.db);
+  auto client = drogon::sync_wait(owners.get("shutdown_tx"));
+  auto transaction = drogon::sync_wait(acquire_transaction(client));
+  REQUIRE(transaction != nullptr);
+
+  auto settled = std::make_shared<std::promise<bool>>();
+  auto settled_once = std::make_shared<std::atomic<bool>>(false);
+  auto settled_future = settled->get_future();
+  auto reentered_close = std::make_shared<std::promise<bool>>();
+  auto reentered_close_future = reentered_close->get_future();
+  const auto query = "SELECT pg_advisory_xact_lock(" +
+                     std::to_string(lock_key) + ") /* issue95_active_tx */";
+  transaction->execSqlAsync(
+      query,
+      [settled, settled_once](const drogon::orm::Result&) {
+        if (!settled_once->exchange(true)) {
+          settled->set_value(false);
+        }
+      },
+      [client, settled, settled_once,
+       reentered_close](const std::exception_ptr&) {
+        reentered_close->set_value(
+            client->closeAllFor(std::chrono::milliseconds{100}));
+        if (!settled_once->exchange(true)) {
+          settled->set_value(true);
+        }
+      });
+  struct UnlockGuard {
+    TestPg* connection;
+    const std::string* sql;
+    bool armed = true;
+    ~UnlockGuard() {
+      if (armed) {
+        connection->exec(*sql);
+      }
+    }
+  } unlock_guard{&control, &unlock_sql};
+
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{2};
+  while (!control.query_active("issue95_active_tx") &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  REQUIRE(control.query_active("issue95_active_tx"));
+
+  // Leave the manager as the durable client owner and the transaction's
+  // in-flight callback/self-reference as the only transaction owner.
+  transaction.reset();
+  client.reset();
+  REQUIRE(owners.shutdown(std::chrono::seconds{5}));
+  REQUIRE(owners.shutdown(std::chrono::milliseconds{0}));
+  REQUIRE(settled_future.wait_for(std::chrono::seconds{1}) ==
+          std::future_status::ready);
+  REQUIRE(settled_future.get());
+  REQUIRE(reentered_close_future.wait_for(std::chrono::seconds{1}) ==
+          std::future_status::ready);
+  REQUIRE_FALSE(reentered_close_future.get());
+  control.exec(unlock_sql);
+  unlock_guard.armed = false;
+}
+
+TEST_CASE("extension client shutdown invalidates a caller-held transaction",
+          "[js][async][db][lifecycle]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+
+  auto cfg = test_config();
+  reset_for_search_path_test(cfg);
+  plinth::js::ExtensionDatabaseClients owners(cfg.db);
+  auto client = drogon::sync_wait(owners.get("shutdown_idle_tx"));
+  auto transaction = drogon::sync_wait(acquire_transaction(client));
+  REQUIRE(transaction != nullptr);
+
+  auto initial = std::make_shared<std::promise<bool>>();
+  auto initial_once = std::make_shared<std::atomic<bool>>(false);
+  auto initial_future = initial->get_future();
+  transaction->execSqlAsync(
+      "SELECT 1 /* issue95_idle_tx */",
+      [initial, initial_once](const drogon::orm::Result&) {
+        if (!initial_once->exchange(true)) {
+          initial->set_value(true);
+        }
+      },
+      [initial, initial_once](const std::exception_ptr&) {
+        if (!initial_once->exchange(true)) {
+          initial->set_value(false);
+        }
+      });
+  REQUIRE(initial_future.wait_for(std::chrono::seconds{2}) ==
+          std::future_status::ready);
+  REQUIRE(initial_future.get());
+
+  client.reset();
+  REQUIRE(owners.shutdown(std::chrono::seconds{5}));
+
+  auto rejected = std::make_shared<std::promise<bool>>();
+  auto rejected_once = std::make_shared<std::atomic<bool>>(false);
+  auto rejected_future = rejected->get_future();
+  transaction->execSqlAsync(
+      "SELECT 1",
+      [rejected, rejected_once](const drogon::orm::Result&) {
+        if (!rejected_once->exchange(true)) {
+          rejected->set_value(false);
+        }
+      },
+      [rejected, rejected_once](const std::exception_ptr&) {
+        if (!rejected_once->exchange(true)) {
+          rejected->set_value(true);
+        }
+      });
+  REQUIRE(rejected_future.wait_for(std::chrono::seconds{1}) ==
+          std::future_status::ready);
+  REQUIRE(rejected_future.get());
+  transaction.reset();
+  REQUIRE(owners.shutdown(std::chrono::milliseconds{0}));
 }
 
 // P.02 defers to phase 4 (B.02 single-SET-LOCAL-per-batch assertion

@@ -55,12 +55,10 @@ auto init_registry(const Config& cfg) -> void;
 
 // Deterministic teardown. Stops admission, removes every registered pool, and
 // waits up to `timeout` for accepted dispatches to release their owned pool
-// references. Returns false on timeout.
-// The process coordinator calls this after realtime listener shutdown and
-// before the database/audit/logging teardown:
-// pool destruction may emit final spdlog lines; realtime must already
-// be stopped so any in-flight `pubsub.publish` from a torn-down handler
-// doesn't race the listener.
+// references and for each pool's private database loops to drain. Returns
+// false on timeout and retains failed owners for retry.
+// The process coordinator calls this after ingress/workers stop and before
+// database state is flushed and realtime/database/logging are torn down.
 auto shutdown_registry(std::chrono::milliseconds timeout = std::chrono::seconds{
                            35}) -> bool;
 
@@ -87,6 +85,10 @@ auto destroy_pool(std::string_view extension_name) -> void;
 // Test-visible ownership diagnostic. Returns the number of dispatch leases
 // which shutdown must drain.
 [[nodiscard]] auto inflight_dispatch_count_for_test() -> std::size_t;
+// Monotonic count of final dispatch releases handed to Drogon's owner loop,
+// plus the number of pools retained after a bounded close failure.
+[[nodiscard]] auto owner_loop_handoff_count_for_test() -> std::size_t;
+[[nodiscard]] auto failed_pool_count_for_test() -> std::size_t;
 
 // The Tier 2 extension dispatch entry — invoked from
 // `capabilities::call_capability_async` after resolve + RBAC for an

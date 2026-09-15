@@ -471,16 +471,62 @@ RuntimePool::RuntimePool(const Extension* ext, RuntimeLimits runtime_limits,
 }
 
 RuntimePool::~RuntimePool() {
-  // Destroy whatever's still in our custody. Callers that leak
-  // checked-out contexts get a warning and cleanup — not a leak.
+  if (!shutdown(std::chrono::milliseconds::max())) {
+    std::terminate();
+  }
+}
+
+auto RuntimePool::shutdown(std::chrono::milliseconds timeout) -> bool {
+  const bool unbounded = timeout == std::chrono::milliseconds::max();
+  const auto deadline = unbounded ? std::chrono::steady_clock::time_point::max()
+                                  : std::chrono::steady_clock::now() + timeout;
+  std::unique_lock shutdown_lock(shutdown_mutex, std::defer_lock);
+  if (unbounded) {
+    shutdown_lock.lock();
+  } else if (!shutdown_lock.try_lock_until(deadline)) {
+    return false;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    if (state == State::stopped) {
+      return true;
+    }
+    state = State::stopping;
+    // A checked-out BridgeContext is a raw pointer held by its caller. Never
+    // close its database clients or invalidate it concurrently; require the
+    // lifecycle owner to drain/release leases before retrying shutdown.
+    if (!checked_out.empty()) {
+      plinth::log::warn(
+          "RuntimePool shutdown deferred with {} context(s) still checked out",
+          checked_out.size());
+      return false;
+    }
+  }
+
+  // RuntimePool is the lifecycle owner for all extension-isolated clients.
+  // Close their private Drogon loops while this owner is still durable and
+  // before BridgeContext aliases are destroyed.
+  const auto now = std::chrono::steady_clock::now();
+  const auto remaining =
+      unbounded ? std::chrono::milliseconds::max()
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      deadline - now);
+  if ((!unbounded && now >= deadline) ||
+      !extension_database_clients->shutdown(remaining)) {
+    return false;
+  }
+
   std::lock_guard<std::mutex> lock(mu);
-  if (!checked_out.empty()) {
-    plinth::log::warn(
-        "RuntimePool destroyed with {} context(s) still checked out; "
-        "destroying them",
-        checked_out.size());
-  }
-  for (auto& e : free_list) {
+  auto expired = [deadline, unbounded] {
+    return !unbounded && std::chrono::steady_clock::now() >= deadline;
+  };
+  while (!free_list.empty()) {
+    if (expired()) {
+      return false;
+    }
+    auto e = std::move(free_list.back());
+    free_list.pop_back();
     drain_pending_jobs(e->bc.ctx, e->bc.rt);
     if (e->bc.ctx != nullptr) {
       JS_FreeContext(e->bc.ctx);
@@ -489,22 +535,8 @@ RuntimePool::~RuntimePool() {
       JS_FreeRuntime(e->bc.rt);
     }
   }
-  for (auto& e : checked_out) {
-    for (auto& [id, cbs] : e->bc.callbacks) {
-      JS_FreeValue(e->bc.ctx, cbs.resolve);
-      JS_FreeValue(e->bc.ctx, cbs.reject);
-    }
-    e->bc.callbacks.clear();
-    drain_pending_jobs(e->bc.ctx, e->bc.rt);
-    if (e->bc.ctx != nullptr) {
-      JS_FreeContext(e->bc.ctx);
-    }
-    if (e->bc.rt != nullptr) {
-      JS_FreeRuntime(e->bc.rt);
-    }
-  }
-  free_list.clear();
-  checked_out.clear();
+  state = State::stopped;
+  return true;
 }
 
 // ─── Entry factory ───────────────────────────────────────────────────
@@ -563,6 +595,9 @@ auto RuntimePool::create_entry(bool transient) -> EntryPtr {
 
 auto RuntimePool::acquire() -> BridgeContext* {
   std::lock_guard<std::mutex> lock(mu);
+  if (state != State::running) {
+    return nullptr;
+  }
   EntryPtr entry;
   if (!free_list.empty()) {
     entry = std::move(free_list.back());
@@ -612,8 +647,9 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
   // JSValue refs.
   bool async_dirty =
       !entry->bc.callbacks.empty() || !entry->bc.pending_ops.empty();
-  bool must_destroy = entry->transient || was_cancelled || cpu_tripped ||
-                      wall_tripped || async_dirty;
+  const bool shutdown_pending = state != State::running;
+  bool must_destroy = shutdown_pending || entry->transient || was_cancelled ||
+                      cpu_tripped || wall_tripped || async_dirty;
 
   if (must_destroy) {
     if (async_dirty && !entry->transient) {
@@ -623,7 +659,7 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
                         entry->bc.callbacks.size(),
                         entry->bc.pending_ops.size());
     }
-    if (!entry->transient && !async_dirty) {
+    if (!shutdown_pending && !entry->transient && !async_dirty) {
       plinth::log::warn(
           "RuntimePool::release on a context whose last execution "
           "failed (cancelled={}, cpu={}, wall={}); routing to "
@@ -728,6 +764,10 @@ auto RuntimePool::destroy(BridgeContext* bc) -> void {
 
 auto RuntimePool::rebuild() -> void {
   std::lock_guard<std::mutex> lock(mu);
+  if (state != State::running) {
+    plinth::log::warn("RuntimePool::rebuild ignored after shutdown began");
+    return;
+  }
   if (!checked_out.empty()) {
     plinth::log::warn("RuntimePool::rebuild called while {} context(s) are "
                       "checked out; pooled contexts rebuilt, checked-out ones "

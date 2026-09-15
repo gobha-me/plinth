@@ -27,17 +27,20 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <ranges>
 #include <shared_mutex>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -224,6 +227,9 @@ std::shared_mutex registry_mutex;
 // process-lifetime pool registry; populated by create_pool / listener /
 // bootstrap.
 std::unordered_map<std::string, std::shared_ptr<plinth::js::RuntimePool>> pools;
+// A pool whose bounded close could not finish stays owned for the coordinator
+// to retry. Successful replacement/disable never accumulates pools here.
+std::vector<std::shared_ptr<plinth::js::RuntimePool>> failed_pools;
 // Pointer — the Config owned by main is longer-lived than this registry.
 // Null outside init/shutdown; readers check before use.
 // process-lifetime config pointer; set once in init_registry.
@@ -232,6 +238,74 @@ bool accepting_dispatches = false;
 std::mutex drain_mutex;
 std::condition_variable drain_cv;
 std::size_t inflight_dispatches = 0;
+std::size_t retirements_in_progress = 0;
+std::atomic<std::size_t> owner_loop_handoffs = 0;
+
+constexpr auto POOL_RETIRE_TIMEOUT = std::chrono::seconds{5};
+
+auto retain_failed_pool(std::shared_ptr<plinth::js::RuntimePool> pool) -> void {
+  std::unique_lock lock(registry_mutex);
+  failed_pools.push_back(std::move(pool));
+}
+
+// Every shared RuntimePool owner transition is serialized by registry_mutex.
+// A sole owner is moved into an explicit claim; a non-final owner is reset
+// while still holding the lock, so exactly one caller can own retirement.
+auto claim_retirement_locked(std::shared_ptr<plinth::js::RuntimePool>& owner)
+    -> std::shared_ptr<plinth::js::RuntimePool> {
+  if (!owner) {
+    return {};
+  }
+  if (owner.use_count() != 1) {
+    owner.reset();
+    return {};
+  }
+  auto claim = std::move(owner);
+  {
+    std::lock_guard lock(drain_mutex);
+    ++retirements_in_progress;
+  }
+  return claim;
+}
+
+auto finish_retirement(std::shared_ptr<plinth::js::RuntimePool> claim,
+                       bool may_shutdown_here) noexcept -> void {
+  bool closed = false;
+  if (may_shutdown_here) {
+    try {
+      closed = claim->shutdown(POOL_RETIRE_TIMEOUT);
+    } catch (...) {
+      spdlog::error("RuntimePool retirement threw");
+    }
+  }
+  if (!closed) {
+    retain_failed_pool(std::move(claim));
+  } else {
+    claim.reset();
+  }
+  {
+    std::lock_guard lock(drain_mutex);
+    --retirements_in_progress;
+  }
+  drain_cv.notify_all();
+}
+
+auto complete_dispatch_release(std::shared_ptr<plinth::js::RuntimePool> pool,
+                               bool may_shutdown_here) -> void {
+  std::shared_ptr<plinth::js::RuntimePool> claim;
+  {
+    std::unique_lock lock(registry_mutex);
+    claim = claim_retirement_locked(pool);
+  }
+  if (claim) {
+    finish_retirement(std::move(claim), may_shutdown_here);
+  }
+  {
+    std::lock_guard lock(drain_mutex);
+    --inflight_dispatches;
+  }
+  drain_cv.notify_all();
+}
 
 class DispatchLease {
  public:
@@ -245,12 +319,17 @@ class DispatchLease {
   auto operator=(const DispatchLease&) -> DispatchLease& = delete;
   auto operator=(DispatchLease&&) -> DispatchLease& = delete;
   ~DispatchLease() {
-    pool.reset();
-    {
-      std::lock_guard lock(drain_mutex);
-      --inflight_dispatches;
+    auto* owner_loop = drogon::app().getLoop();
+    if (owner_loop != nullptr) {
+      owner_loop_handoffs.fetch_add(1, std::memory_order_relaxed);
+      owner_loop->queueInLoop([owned = std::move(pool)]() mutable {
+        complete_dispatch_release(std::move(owned), true);
+      });
+      return;
     }
-    drain_cv.notify_all();
+    // Without the application loop, preserve the final owner for the
+    // coordinator instead of running shutdown on an arbitrary callback thread.
+    complete_dispatch_release(std::move(pool), false);
   }
 
   std::shared_ptr<plinth::js::RuntimePool> pool;
@@ -758,8 +837,14 @@ auto connect_and_list_active_extensions(const Config::Database& db_cfg,
 auto init_registry(const Config& cfg) -> void {
   {
     std::unique_lock lock(registry_mutex);
+    std::lock_guard drain_lock(drain_mutex);
+    if (cfg_ptr != nullptr || accepting_dispatches || !pools.empty() ||
+        !failed_pools.empty() || inflight_dispatches != 0 ||
+        retirements_in_progress != 0) {
+      throw std::logic_error(
+          "extensions::init_registry requires a fully stopped registry");
+    }
     cfg_ptr = &cfg;
-    pools.clear();
     accepting_dispatches = true;
   }
   std::vector<std::string> active_names;
@@ -781,28 +866,88 @@ auto init_registry(const Config& cfg) -> void {
 }
 
 auto shutdown_registry(std::chrono::milliseconds timeout) -> bool {
-  decltype(pools) local;
+  decltype(pools) local_pools;
+  decltype(failed_pools) local_failed;
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
   {
     std::unique_lock lock(registry_mutex);
     accepting_dispatches = false;
     cfg_ptr = nullptr;
-    local.swap(pools);
+    local_pools.swap(pools);
+    local_failed.swap(failed_pools);
   }
-  // Destroy idle pools outside registry_mutex. Active dispatches retain their
-  // exact pool through DispatchLease and publish completion after releasing it.
-  local.clear();
 
   std::unique_lock drain_lock(drain_mutex);
-  bool drained = drain_cv.wait_for(drain_lock, timeout,
-                                   [] { return inflight_dispatches == 0; });
+  bool drained = drain_cv.wait_for(drain_lock, timeout, [] {
+    return inflight_dispatches == 0 && retirements_in_progress == 0;
+  });
   auto remaining = inflight_dispatches;
+  auto retiring = retirements_in_progress;
   drain_lock.unlock();
   if (!drained) {
     spdlog::error(
-        "extensions::shutdown_registry timed out with {} dispatch(es)",
-        remaining);
+        "extensions::shutdown_registry timed out with {} dispatch(es) and {} "
+        "pool retirement(s)",
+        remaining, retiring);
+    // Fail closed without abandoning the durable owners. A later coordinator
+    // retry takes them back and may release them after the leases drain.
+    std::unique_lock lock(registry_mutex);
+    pools.merge(local_pools);
+    failed_pools.insert(failed_pools.end(),
+                        std::make_move_iterator(local_failed.begin()),
+                        std::make_move_iterator(local_failed.end()));
+    for (auto& [name, pool] : local_pools) {
+      (void)name;
+      failed_pools.push_back(std::move(pool));
+    }
+    local_pools.clear();
+    return false;
   }
-  return drained;
+  // A final lease can fail its owner-loop retirement immediately before it
+  // decrements inflight_dispatches to zero. That failure lands in the global
+  // vector after our initial snapshot, so take it into this same attempt
+  // before deciding that shutdown succeeded.
+  {
+    std::unique_lock lock(registry_mutex);
+    local_failed.insert(local_failed.end(),
+                        std::make_move_iterator(failed_pools.begin()),
+                        std::make_move_iterator(failed_pools.end()));
+    failed_pools.clear();
+  }
+  // DispatchLease has released all aliases. Shut down every active or
+  // previously failed pool here, on the coordinator thread, within the
+  // original deadline.
+  for (auto& [name, pool] : local_pools) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    if (now >= deadline || !pool->shutdown(remaining)) {
+      spdlog::error("extensions::shutdown_registry could not stop pool {}",
+                    name);
+      local_failed.push_back(std::move(pool));
+    }
+  }
+  for (auto& pool : local_failed) {
+    if (!pool) {
+      continue;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+    if (now < deadline && pool->shutdown(remaining)) {
+      pool.reset();
+    }
+  }
+  local_pools.clear();
+  std::erase(local_failed, nullptr);
+  if (!local_failed.empty()) {
+    std::unique_lock lock(registry_mutex);
+    failed_pools.insert(failed_pools.end(),
+                        std::make_move_iterator(local_failed.begin()),
+                        std::make_move_iterator(local_failed.end()));
+    return false;
+  }
+  return true;
 }
 
 auto create_pool(std::string_view extension_name) -> bool {
@@ -826,37 +971,59 @@ auto create_pool(std::string_view extension_name) -> bool {
   // Destroy any existing pool first — idempotent semantics, and the
   // UPGRADE-to-ACTIVE call site needs the destroy-then-rebuild
   // ordering to route dispatches to the new version's handlers.
-  pools.erase(name_copy);
+  auto old = pools.extract(name_copy);
 
+  bool created = false;
   try {
     auto pool = std::make_shared<plinth::js::RuntimePool>(
         /*ext=*/nullptr, plinth::js::default_runtime_limits(), *cfg_ptr,
         /*pool_size=*/-1,
         /*user=*/nullptr, name_copy);
     pools.emplace(std::move(name_copy), std::move(pool));
-    return true;
+    created = true;
   } catch (const std::exception& e) {
     spdlog::error("extensions::create_pool({}): RuntimePool ctor threw: {}",
                   extension_name, e.what());
-    return false;
   }
+  std::shared_ptr<plinth::js::RuntimePool> retirement;
+  if (!old.empty()) {
+    auto previous = std::move(old.mapped());
+    retirement = claim_retirement_locked(previous);
+  }
+  lock.unlock();
+  if (retirement) {
+    finish_retirement(std::move(retirement), true);
+  }
+  return created;
 }
 
 auto destroy_pool(std::string_view extension_name) -> void {
-  std::shared_ptr<plinth::js::RuntimePool> local;
+  std::shared_ptr<plinth::js::RuntimePool> retirement;
   {
     std::unique_lock lock(registry_mutex);
     auto node = pools.extract(std::string{extension_name});
     if (!node.empty()) {
-      local = std::move(node.mapped());
+      auto local = std::move(node.mapped());
+      retirement = claim_retirement_locked(local);
     }
   }
-  local.reset();
+  if (retirement) {
+    finish_retirement(std::move(retirement), true);
+  }
 }
 
 auto inflight_dispatch_count_for_test() -> std::size_t {
   std::lock_guard lock(drain_mutex);
   return inflight_dispatches;
+}
+
+auto owner_loop_handoff_count_for_test() -> std::size_t {
+  return owner_loop_handoffs.load(std::memory_order_relaxed);
+}
+
+auto failed_pool_count_for_test() -> std::size_t {
+  std::shared_lock lock(registry_mutex);
+  return failed_pools.size();
 }
 
 // header docstring: the resolver holds args + caller on its coroutine frame

@@ -26,6 +26,9 @@ auto ExtensionDatabaseClients::get(std::string extension_name)
   }
   {
     std::lock_guard lock(mutex);
+    if (state != State::running) {
+      throw std::runtime_error("extension database clients are stopping");
+    }
     if (auto found = clients.find(extension_name); found != clients.end()) {
       co_return found->second;
     }
@@ -60,6 +63,9 @@ auto ExtensionDatabaseClients::get(std::string extension_name)
     throw std::runtime_error("extension database identity is invalid");
   }
   std::lock_guard lock(mutex);
+  if (state != State::running) {
+    throw std::runtime_error("extension database clients are stopping");
+  }
   auto [entry, inserted] = clients.try_emplace(extension_name);
   if (inserted) {
     entry->second = drogon::orm::DbClient::newPgClient(
@@ -68,6 +74,56 @@ auto ExtensionDatabaseClients::get(std::string extension_name)
     entry->second->setTimeout(5.0);
   }
   co_return entry->second;
+}
+
+auto ExtensionDatabaseClients::shutdown(std::chrono::milliseconds timeout)
+    -> bool {
+  const bool unbounded = timeout == std::chrono::milliseconds::max();
+  const auto deadline = unbounded ? std::chrono::steady_clock::time_point::max()
+                                  : std::chrono::steady_clock::now() + timeout;
+  std::unique_lock shutdown_lock(shutdown_mutex, std::defer_lock);
+  if (unbounded) {
+    shutdown_lock.lock();
+  } else if (!shutdown_lock.try_lock_until(deadline)) {
+    return false;
+  }
+
+  decltype(clients) local;
+  {
+    std::lock_guard lock(mutex);
+    if (state == State::stopped) {
+      return true;
+    }
+    state = State::stopping;
+    local.swap(clients);
+  }
+  bool drained = true;
+  for (const auto& [name, client] : local) {
+    (void)name;
+    const auto now = std::chrono::steady_clock::now();
+    const auto remaining =
+        unbounded ? std::chrono::milliseconds::max()
+                  : std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - now);
+    if ((!unbounded && now >= deadline) || !client->closeAllFor(remaining)) {
+      drained = false;
+      break;
+    }
+  }
+  if (!drained) {
+    std::lock_guard lock(mutex);
+    clients.merge(local);
+    return false;
+  }
+  // Keep every client alive through every closeAll() call. The patched Drogon
+  // implementation drains callbacks which may have transient shared owners;
+  // only this lifecycle-owner thread may release the durable owners.
+  local.clear();
+  {
+    std::lock_guard lock(mutex);
+    state = State::stopped;
+  }
+  return true;
 }
 
 } // namespace plinth::js

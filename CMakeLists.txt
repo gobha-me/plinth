@@ -104,6 +104,8 @@ set(PLINTH_DROGON_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/ftype-accessor.patch)
 set(PLINTH_DROGON_CONNINFO_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/connection-whitespace.patch)
+set(PLINTH_DROGON_SHUTDOWN_PATCH
+    ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/db-client-owned-shutdown.patch)
 FetchContent_Declare(
   drogon
   GIT_REPOSITORY https://github.com/drogonframework/drogon.git
@@ -114,6 +116,9 @@ FetchContent_Declare(
   COMMAND sh -c
     "git apply --reverse --check '${PLINTH_DROGON_CONNINFO_PATCH}' 2>/dev/null \
      || git apply --whitespace=nowarn '${PLINTH_DROGON_CONNINFO_PATCH}'"
+  COMMAND sh -c
+    "git apply --reverse --check '${PLINTH_DROGON_SHUTDOWN_PATCH}' 2>/dev/null \
+     || git apply --whitespace=nowarn '${PLINTH_DROGON_SHUTDOWN_PATCH}'"
 )
 FetchContent_MakeAvailable(drogon)
 set(DROGON_TARGET drogon)

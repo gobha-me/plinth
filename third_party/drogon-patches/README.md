@@ -44,3 +44,28 @@ frontend queries, and runtime pool authentication with whitespace, quotes,
 and backslashes. The upstream version, source SHA, and MIT license remain
 unchanged; builds include this documented local modification. The patch
 has not been submitted upstream and must be reviewed when updating Drogon.
+
+### `db-client-owned-shutdown.patch`
+
+Applied against the pinned Drogon commit for Plinth issue #95. Drogon's
+thread-pool `DbClientImpl` callbacks previously locked a weak client reference
+before doing work. If a callback held the final strong reference, callback
+return destroyed `EventLoopThreadPool` on its own `DbLoop` and
+`std::thread::join()` aborted with `Resource deadlock avoided`.
+
+The patch gives callbacks an independent shared shutdown token, replaces the
+queued raw-`this` connection initializer and timeout captures with guarded weak
+references, and adds an idempotent deadline-aware drain around connection
+disconnect and destruction. Both PostgreSQL pipeline and non-pipeline
+implementations settle buffered and active transaction operations with an
+explicit shutdown failure, invalidate caller-held idle transactions, and clear
+callback cycles before releasing the connection. SQLite and MySQL retain their
+existing unbounded `closeAll()` behavior; finite `closeAllFor()` is fail-closed
+outside PostgreSQL. A small Trantor extension requests private-loop stop, waits
+within the same deadline, and joins each thread before the client reports success.
+Plinth retains a durable client owner and calls the bounded drain from its
+lifecycle owner before releasing that owner, so destruction remains off-loop.
+The controlled loop cleanup signal is deadline-aware; the immediately following
+standard `std::thread::join()` has no timed form and relies on the process
+watchdog for its absolute bound. The patch must be reviewed and replayed when
+updating Drogon; current upstream still has the same callback ownership shape.

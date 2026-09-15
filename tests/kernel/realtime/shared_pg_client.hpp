@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 //
-// Process-lifetime PG client shared across realtime test TUs.
+// Test-process-owned PG client shared across realtime test TUs.
 //
 // 0.6.3.N — generalises the seq_generation_test.cpp:118-126 pattern
 // across the realtime test TUs that previously each constructed their
@@ -10,12 +10,10 @@
 // last `shared_ptr<DbClient>` drops on a coroutine running on that
 // pool's IO thread.
 //
-// Sharing the client at function-local-static lifetime moves the
-// destructor outside any coroutine context: per Itanium ABI, function-
-// local statics' destructors run AFTER `std::atexit` chains have
-// completed (Drogon's loop has already stopped), on the main thread,
-// after all test threads have exited. The race is unreachable from the
-// harness.
+// Sharing clients removes per-case owner races. The custom Catch2 main first
+// drains the production-equivalent fixture coordinator, then closes these
+// independent private-loop clients on its owner thread, so static destruction
+// never performs database or event-loop teardown.
 //
 // Tests that need `db.* set_db_client_for_test(shared_pg_client())`
 // keep using the same hook surface (events_writer.hpp) — only the
@@ -30,9 +28,11 @@
 
 #include <drogon/orm/DbClient.h>
 
+#include <chrono>
+
 namespace plinth::realtime_test {
 
-// Returns a process-lifetime shared `DbClient`. Multiple distinct
+// Returns a test-process-owned shared `DbClient`. Multiple distinct
 // `connNum` values get independent pools. Lazy on first use; PG must
 // be available (caller's responsibility — check `PLINTH_PG_HOST` /
 // the TU's local `pg_available()` first or the underlying connect
@@ -41,7 +41,13 @@ namespace plinth::realtime_test {
 // `connNum` mirrors the existing test convention: most realtime TUs
 // use 1 (single conn pool), some use 2 (one writer pool + one reader
 // pool to avoid serialising fixture-side reads behind in-flight
-// writes). Map-keyed so both keep their own static slot.
+// writes). Map-keyed so both keep their own slot until explicit shutdown.
 auto shared_pg_client(int connNum = 1) -> drogon::orm::DbClientPtr&;
+
+// Close and release every shared client before Drogon's test server stops and
+// before static destruction. Returns false without releasing failed owners;
+// the test-process coordinator reports the failure and exits without running
+// unsafe C++ static teardown.
+auto shutdown_shared_pg_clients(std::chrono::milliseconds timeout) -> bool;
 
 } // namespace plinth::realtime_test

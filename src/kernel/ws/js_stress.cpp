@@ -105,30 +105,40 @@ auto init_js_stress_pool(const plinth::Config& cfg) -> void {
 }
 
 auto shutdown_js_stress_pool(std::chrono::milliseconds timeout) -> bool {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
   std::shared_ptr<plinth::js::RuntimePool> local;
   {
     std::lock_guard<std::mutex> g{g_mu};
     g_accepting = false;
     local = std::move(g_pool);
   }
-  // Destroy outside the lock — pool teardown pumps pending JS jobs
-  // which may reenter Drogon callbacks; keeping the mutex free
-  // avoids any deadlock if a racing dispatch observes null g_pool
-  // and returns before we finish destroying.
-  local.reset();
-
   std::unique_lock lock(g_mu);
   bool drained =
-      g_drained.wait_for(lock, timeout, [] { return g_inflight == 0; });
+      g_drained.wait_until(lock, deadline, [] { return g_inflight == 0; });
   auto remaining = g_inflight;
+  if (!drained) {
+    g_pool = std::move(local);
+  }
   lock.unlock();
-  if (drained) {
-    spdlog::info("ws::js_stress: pool shut down");
-  } else {
+  if (!drained) {
     spdlog::error("ws::js_stress: shutdown timed out with {} dispatch(es)",
                   remaining);
+    return false;
   }
-  return drained;
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto close_budget =
+      now < deadline ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - now)
+                     : std::chrono::milliseconds::zero();
+  if (local && !local->shutdown(close_budget)) {
+    std::lock_guard restore_lock(g_mu);
+    g_pool = std::move(local);
+    spdlog::error("ws::js_stress: pool teardown timed out");
+    return false;
+  }
+  spdlog::info("ws::js_stress: pool shut down");
+  return true;
 }
 
 auto js_stress_inflight_count_for_test() -> std::size_t {

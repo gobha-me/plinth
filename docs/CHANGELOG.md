@@ -11,6 +11,25 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-15 — deterministic extension database client shutdown
+
+- Added an explicit, idempotent `RuntimePool` shutdown path that stops
+  extension database admission before destroying QuickJS contexts.
+- Handed last-lease destruction for replaced pools to Drogon's application
+  loop and retained only failed bounded closes for coordinator retry.
+- Patched the pinned Drogon `DbClientImpl` and both PostgreSQL implementations
+  to prevent post-stop callback-local owners, settle active transaction cycles,
+  reject buffered work, and stop/join private loops inside the shared deadline.
+- Added focused coverage for immediate initialization teardown, an active
+  advisory-lock-gated transaction with re-entrant close, caller-held runtime
+  and transaction leases, removed-pool owner-loop retirement, and the P.08-to-
+  security-test boundary that exposed the Clang 20 join-self abort.
+
+This resolves [GitHub issue #95](https://github.com/gobha-me/plinth/issues/95)
+without sleeps, detached cleanup, process-lifetime leaks, or weaker tests.
+
+---
+
 ## v0.6.5 — 2026-09-10 — coordinated security hardening
 
 - Reject malformed WebSocket message fields before controller conversion and

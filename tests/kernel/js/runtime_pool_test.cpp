@@ -10,6 +10,7 @@
 #include "kernel/js/eval.hpp"
 #include "kernel/js/runtime_pool.hpp"
 
+#include <drogon/orm/DbClient.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/spdlog.h>
 
@@ -29,6 +30,8 @@ using plinth::js::eval_on_context;
 using plinth::js::EvalErrorKind;
 using plinth::js::RuntimeLimits;
 using plinth::js::RuntimePool;
+
+using namespace std::chrono_literals;
 
 #ifdef PLINTH_JS_TEST_SHIMS
 // Registered by tests/kernel/js/test_host_sleep.cpp. Installs
@@ -272,6 +275,27 @@ TEST_CASE("RuntimePool::rebuild replaces pooled contexts", "[js][pool]") {
   pool.rebuild();
   REQUIRE(pool.free_count() == 2);
   REQUIRE(pool.active_count() == 0);
+
+  REQUIRE(pool.shutdown(5s));
+  pool.rebuild();
+  REQUIRE(pool.free_count() == 0);
+  REQUIRE(pool.acquire() == nullptr);
+  REQUIRE(pool.shutdown(0ms));
+}
+
+TEST_CASE("RuntimePool shutdown retains caller-held contexts for retry",
+          "[js][pool][lifecycle]") {
+  auto cfg = test_config();
+  RuntimePool pool(/*ext=*/nullptr, test_limits(), cfg, /*pool_size=*/1);
+  BridgeContext* checked_out = pool.acquire();
+  REQUIRE(checked_out != nullptr);
+
+  REQUIRE_FALSE(pool.shutdown(100ms));
+  REQUIRE(pool.active_count() == 1);
+  pool.release(checked_out);
+  REQUIRE(pool.active_count() == 0);
+  REQUIRE(pool.shutdown(5s));
+  REQUIRE(pool.shutdown(0ms));
 }
 
 // [0.3.3.3] ICD-0.3.1 §Security Constraint 4 — `release()` on a
@@ -333,4 +357,23 @@ TEST_CASE("RuntimePool release clears globalThis own props", "[js][pool]") {
   REQUIRE_FALSE(r2.has_value());
   REQUIRE(r2.error().kind == EvalErrorKind::RUNTIME_ERROR);
   pool.release(b);
+}
+
+TEST_CASE("DbClient immediate shutdown drains queued initialization",
+          "[js][db][lifecycle]") {
+  auto client = drogon::orm::DbClient::newPgClient(
+      "host=127.0.0.1 port=1 dbname=unreachable user=unreachable "
+      "connect_timeout=1",
+      4);
+
+  REQUIRE(client->closeAllFor(5s));
+  REQUIRE(client->closeAllFor(0ms));
+}
+
+TEST_CASE("finite owned-loop shutdown is fail-closed for SQLite",
+          "[js][db][lifecycle][sqlite]") {
+  auto client = drogon::orm::DbClient::newSqlite3Client("filename=:memory:", 1);
+
+  REQUIRE_FALSE(client->closeAllFor(5ms));
+  client->closeAll();
 }
