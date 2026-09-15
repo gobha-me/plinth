@@ -159,7 +159,7 @@ struct AsyncOp {
   // outcome helpers can route through this client without reaching
   // back into bc. Mirrors the existing bc_extension_name /
   // cap_user snapshot pattern. Non-null iff `batch_scope_id != 0`.
-  std::shared_ptr<drogon::orm::DbClient> batch_pinned_conn;
+  std::shared_ptr<drogon::orm::Transaction> batch_pinned_conn;
 };
 
 } // namespace plinth::js
