@@ -6,10 +6,9 @@ needs to know. Replaces ad-hoc CHANGELOG mentions of deferred work,
 which are too easily lost in release-notes scanning.
 
 Each entry is dated and tagged with the milestone where the deferral
-landed. Entries stay in this file until the deferred work is shipped
-(at which point the entry is moved to a "Resolved" section at the
-bottom — historical context preserved, but the active list stays
-short).
+landed. GitHub Issues, not prose in this file, are authoritative for work
+status. Entries stay here as design evidence after resolution; the active issue
+index below is the complete actionable set.
 
 Cross-referenced from:
 - `docs/ROADMAP.md` — the actual work item carrying a band label.
@@ -19,9 +18,28 @@ Cross-referenced from:
 
 ---
 
-## Active
+## Active issue index
+
+Reconciled against current source, tests, CHANGELOG, and GitHub on 2026-09-15.
+The detailed legacy entries below intentionally retain their original analysis,
+including partial-resolution narratives. A heading marked `resolved` or a topic
+not present in this index is historical context, not unscheduled work.
+
+- Browser/client runtime coverage: [#32](https://github.com/gobha-me/plinth/issues/32)
+- Extension HTTP contract and implementation: [#47](https://github.com/gobha-me/plinth/issues/47), [#48](https://github.com/gobha-me/plinth/issues/48)
+- Upgrade/realtime process-death injection: [#34](https://github.com/gobha-me/plinth/issues/34)
+- Realtime source-sequence contract: [#42](https://github.com/gobha-me/plinth/issues/42)
+- Reconnect-under-storm load evidence: [#88](https://github.com/gobha-me/plinth/issues/88)
+- PostgreSQL SQLSTATE typing through Drogon batch aborts: [#92](https://github.com/gobha-me/plinth/issues/92)
+
+The MEMORY_LIMIT classifier entry remains a watchlist with no scheduled action.
+All other resolved material below is retained only to explain prior decisions.
+
+## Legacy detail
 
 ### 2026-09-03 — Browser/client portion of the 0.6.3.N JS-dispatch backfill
+
+**Tracking:** [GitHub issue #32](https://github.com/gobha-me/plinth/issues/32).
 
 The executable server/kernel slice is complete: 32 bundled-shell cases now
 cover ICD-0.6.1 P.01-P.14, ICD-0.6.2 T.01-T.08 and S.01-S.08, and
@@ -213,6 +231,8 @@ on advisory-lock interference), and verification posture.
 
 ### 2026-04-29 — Extension HTTP surface §6.10 sub-questions — multi-tenant host scoping, per-prefix handler_mode overrides, final performance threshold, drain-timeout default and bounds [deferred from 0.6.0.N architecture session 2026-04-29]
 
+**Tracking:** specification is [GitHub issue #47](https://github.com/gobha-me/plinth/issues/47), followed by implementation in [#48](https://github.com/gobha-me/plinth/issues/48).
+
 **Milestone:** the 2026-04-29 paper architecture session ratifying the
 extension HTTP surface primitive (now normative at
 [`architecture/05-extensions.md §6`](architecture/05-extensions.md))
@@ -268,6 +288,8 @@ if a real workload demands.
   Risks-and-Unknowns section frames the original questions.
 
 ### 2026-04-26 — ICD-0.5.4 I.02 / I.03 + ICD-0.5.5 S.06 / S.07 / L.03 / L.04 / L.05 / W.06 / I.01 / I.02 / I.03 / I.04 — realtime test coverage + W.06 design defer [deferred from v0.5.4 / v0.5.5 ship; ICD-0.5.4 I.02 closed in 0.6.0.N session 3; ICD-0.5.4 I.03 discharged via L.03 in session 6; ICD-0.5.5 L.03 / L.04 / L.05 closed in 0.6.0.N session 6; ICD-0.5.5 S.06 closed in 0.6.0.N session 8]
+
+**Tracking:** S.07 process-death coverage is [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34), W.06 source-sequence design is [#42](https://github.com/gobha-me/plinth/issues/42), and the production reconnect load tier is [#88](https://github.com/gobha-me/plinth/issues/88). All other cases in this entry are resolved or absorbed as described below.
 
 **Milestone:** v0.5.4 enumerated 41 ICD test cases and shipped 38
 (D.08 absorbed into ICD-0.5.5 as L.03; **I.02 multi-process advisory-
@@ -390,6 +412,8 @@ Cases`; `docs/icd/ICD-0.5.5-sequence-numbers-client-debounce.md
 
 ### 2026-04-23 — ICD-0.5.0.3 R.02 / R.03 / E.07 / P.01 / P.04 / P.05 / H.02 / H.03 / C.01 / C.02 — extension-dispatch test coverage [deferred from 0.5.0.4 ship]
 
+**Tracking:** the remaining client/browser portion is consolidated in [GitHub issue #32](https://github.com/gobha-me/plinth/issues/32); the executable server/kernel slice is complete.
+
 **Milestone:** ICD-0.5.0.3 enumerates ~20 integration test cases
 across Groups R, E, P, H, C. 0.5.0.4 shipped R.01 (echo happy path),
 E.01–E.06 (error taxonomy: handler throw / unknown signature /
@@ -451,6 +475,8 @@ fixture extends with the second-install-fixture helper.
 ---
 
 ### 2026-04-22 — ICD-0.4.5 X.05 / X.06 / X.07 / X.08 / X.09 / X.10 / X.11 / X.12 / X.13 + G.03 — extended upgrade and GC test coverage [deferred from v0.4.5 ship; G.03 closed in 0.6.0.N session 3; X.05 / X.06 / X.07 (partial) / X.10 / X.11 / X.13 closed in 0.6.0.N session 4; X.07 missing+changed sub-cases / X.08 / X.09 closed in 0.6.0.N session 9]
+
+**Tracking:** only X.12 remains, consolidated with realtime S.07 in [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34).
 
 **Milestone:** ICD-0.4.5 enumerates ~25 test cases across the
 D.* / U.* / X.* / G.* prefixes. v0.4.5 Slice B shipped X.01 (happy-path
@@ -879,11 +905,12 @@ peak-tracking classifier). `RE-EVAL-0.3.x-arc-closeout §5.2`.
 
 ### 2026-04-18 — Drogon `PgBatchConnection` loses `SqlError` typing on batch abort (ICD-0.3.3) [pattern-match fallback in 0.3.3]
 
+**Tracking:** [GitHub issue #92](https://github.com/gobha-me/plinth/issues/92).
+
 **Milestone:** 0.3.3 ships a message-pattern fallback in
 `pg_exception_to_rejection` that recovers the canonical `db.*` `code`
-from common SQL error text. Tracked as a Drogon-upstream-fix or
-local-patch follow-up (no ROADMAP slot yet — small enough to land
-ad-hoc when next touched).
+from common SQL error text. GitHub issue #92 now owns the upstream-fix or
+minimal-local-patch follow-up.
 
 **Why deferred:** When a `db.query`/`db.exec` runs through Drogon's
 PgBatchConnection path (the default for the kernel DbClient pool) and
