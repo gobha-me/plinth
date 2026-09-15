@@ -450,6 +450,13 @@ auto enqueue_batch_op(JSContext* ctx, AsyncOp::Type type,
   op.bc_extension_name = bc->extension_name;
   op.extension_database_clients = bc->extension_database_clients;
   op.batch_scope_id = scope_id;
+  if (type == AsyncOp::Type::DB_BATCH_COMMIT ||
+      type == AsyncOp::Type::DB_BATCH_ROLLBACK) {
+    // Transfer the main-loop owner to the detached terminal arm. This makes
+    // its commit/rollback lifetime explicit and prevents BridgeContext from
+    // retaining the transaction while the arm waits for database completion.
+    op.batch_pinned_conn = std::move(bc->batch_state.pinned_conn);
+  }
   if (rollback_err.has_value()) {
     op.rollback_error = std::move(*rollback_err);
   }

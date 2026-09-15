@@ -326,6 +326,36 @@ struct SqlBinderAwaiter : public drogon::CallbackAwaiter<drogon::orm::Result> {
   std::vector<Json::Value> params;
 };
 
+// Drogon commits a Transaction when its final shared_ptr is released. Sending
+// SQL "COMMIT" through the Transaction executes that statement but does not
+// update Drogon's transaction state; its destructor then submits a second
+// commit and may outlive the owning extension database client. Await the
+// canonical destructor-driven commit so the async operation owns the
+// transaction through PostgreSQL's acknowledgement.
+struct TransactionCommitAwaiter : public drogon::CallbackAwaiter<bool> {
+  explicit TransactionCommitAwaiter(
+      std::shared_ptr<drogon::orm::Transaction> transaction_in)
+      : transaction(std::move(transaction_in)) {}
+
+  auto await_suspend(std::coroutine_handle<> handle) -> void {
+    transaction->setCommitCallback([this, handle](bool committed) {
+      setValue(committed);
+      handle.resume();
+    });
+    transaction.reset();
+  }
+
+ private:
+  std::shared_ptr<drogon::orm::Transaction> transaction;
+};
+
+auto commit_transaction(std::shared_ptr<drogon::orm::Transaction> transaction)
+    -> drogon::Task<> {
+  if (!(co_await TransactionCommitAwaiter{std::move(transaction)})) {
+    throw std::runtime_error("database transaction commit failed");
+  }
+}
+
 // ── Outcome-producing per-type helpers ───────────────────────────────
 //
 // 0.3.3.1 refactor: the per-type arms no longer touch bc.resolve /
@@ -437,11 +467,12 @@ auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
     } else {
       r = co_await SqlBinderAwaiter{exec_target, op.sql, op.sql_params};
     }
-    // Per-op search_path wrapper explicit COMMIT (phase 3). Batch
-    // ops skip this — DB_BATCH_COMMIT owns the single commit at
-    // batch end.
+    // Release the execution-target copy before moving the sole remaining
+    // transaction owner into the canonical commit awaiter. Batch ops skip
+    // this — DB_BATCH_COMMIT owns the single commit at batch end.
     if (wrap.tx) {
-      co_await wrap.tx->execSqlCoro("COMMIT");
+      exec_target.reset();
+      co_await commit_transaction(std::move(wrap.tx));
     }
     co_return db::result_to_json(r);
   } catch (const drogon::orm::DrogonDbException& e) {
@@ -494,10 +525,12 @@ auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
     } else {
       r = co_await SqlBinderAwaiter{exec_target, op.sql, op.sql_params};
     }
-    // Per-op wrapper's explicit COMMIT (phase 3). In-batch ops
-    // skip — DB_BATCH_COMMIT owns the batch-scope commit.
+    // Release the execution-target copy before moving the sole remaining
+    // transaction owner into the canonical commit awaiter. In-batch ops skip
+    // this — DB_BATCH_COMMIT owns the batch-scope commit.
     if (wrap.tx) {
-      co_await wrap.tx->execSqlCoro("COMMIT");
+      exec_target.reset();
+      co_await commit_transaction(std::move(wrap.tx));
     }
     Json::Value out{Json::objectValue};
     out["row_count"] = static_cast<Json::Int>(r.affectedRows());
@@ -678,7 +711,8 @@ auto run_audit_write_outcome(const AsyncOp& op) -> OpOutcome {
 //   BEGIN — open TransactionPtr, run SET LOCAL search_path on the
 //           pinned conn, store the tx on bc.batch_state.pinned_conn,
 //           resolve P_begin with {}.
-//   COMMIT — run COMMIT on the pinned conn, flush the coalescer
+//   COMMIT — release the pinned transaction and await Drogon's commit,
+//            flush the coalescer
 //            scope (emits one envelope per accumulated schema/table
 //            tuple with window_ms=0), fire db.batch.committed audit,
 //            clear bc.batch_state, resolve P_outer with {}. The JS
@@ -838,7 +872,7 @@ auto handle_db_batch_begin(BridgeContext& bc, AsyncOp op,
 auto handle_db_batch_commit(BridgeContext& bc, AsyncOp op,
                             trantor::EventLoop* main_loop) -> drogon::Task<> {
   try {
-    auto tx = bc.batch_state.pinned_conn;
+    auto tx = std::move(op.batch_pinned_conn);
     if (!tx) {
       finalize_batch(
           bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop, nullptr,
@@ -847,9 +881,17 @@ auto handle_db_batch_commit(BridgeContext& bc, AsyncOp op,
                            .sqlstate = std::nullopt});
       co_return;
     }
-    co_await tx->execSqlCoro("COMMIT");
+    bool committed = co_await TransactionCommitAwaiter{std::move(tx)};
+    if (!committed) {
+      finalize_batch(
+          bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop, nullptr,
+          PromiseRejection{.code = "db.internal",
+                           .message = "database transaction commit failed",
+                           .sqlstate = std::nullopt});
+      co_return;
+    }
     finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
-                   std::move(tx), std::nullopt);
+                   nullptr, std::nullopt);
   } catch (const drogon::orm::DrogonDbException& e) {
     finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
                    nullptr, pg_exception_to_rejection(e));
@@ -865,7 +907,7 @@ auto handle_db_batch_commit(BridgeContext& bc, AsyncOp op,
 auto handle_db_batch_rollback(BridgeContext& bc, AsyncOp op,
                               trantor::EventLoop* main_loop) -> drogon::Task<> {
   try {
-    auto tx = bc.batch_state.pinned_conn;
+    auto tx = std::move(op.batch_pinned_conn);
     if (tx) {
       // Issue ROLLBACK explicitly; Drogon's tx destructor would
       // auto-commit otherwise (see phase 3 note). The rollback()
