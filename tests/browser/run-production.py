@@ -21,6 +21,7 @@ import zipfile
 
 from process_cleanup import run_browser, start_browser, stop_browser
 from cache_transition import CacheTransition
+from kernel_runtime import add_runtime_arguments, runtime_from_args
 
 
 def package_cache_probe(repo, root, version, *, legacy_document=False):
@@ -59,12 +60,11 @@ def stop_kernel(child):
         raise RuntimeError(f"kernel shutdown failed: {child.returncode}")
 
 
-def start_kernel(binary, config_path, root, child_env, output_path):
+def start_kernel(runtime, config_path, root, child_env, output_path):
     with output_path.open("w") as output:
-        child = subprocess.Popen(
-            [str(binary), "serve", "--config", str(config_path)],
-            cwd=root, env=child_env, stdin=subprocess.DEVNULL,
-            stdout=output, stderr=subprocess.STDOUT)
+        child = runtime.start(
+            ["serve", "--config", runtime.path(root, config_path)],
+            root=root, env=child_env, output=output)
     try:
         deadline = time.monotonic() + 30
         while True:
@@ -74,6 +74,8 @@ def start_kernel(binary, config_path, root, child_env, output_path):
                 with urllib.request.urlopen(child_env["PLINTH_BASE_URL"] + "/healthz",
                                             timeout=1) as response:
                     if response.status == 200:
+                        if runtime.is_container:
+                            child.assert_plinth_is_pid1()
                         return child
             except (urllib.error.URLError, TimeoutError):
                 pass
@@ -90,7 +92,7 @@ def start_kernel(binary, config_path, root, child_env, output_path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
+    add_runtime_arguments(parser)
     parser.add_argument("--upgrade-cache", action="store_true",
                         help="replace two packaged frontend versions with one cached browser profile")
     parser.add_argument("--realtime", action="store_true",
@@ -102,7 +104,7 @@ def main():
         parser.error("--legacy-cache-negative-control requires --upgrade-cache")
     if args.realtime and args.upgrade_cache:
         parser.error("--realtime and --upgrade-cache use separate owned kernel runs")
-    binary = args.binary.resolve(strict=True)
+    runtime = runtime_from_args(args)
     repo = Path(__file__).resolve().parents[2]
     database = "plinth_browser_" + uuid.uuid4().hex
     pg_env = os.environ.copy()
@@ -120,7 +122,8 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="plinth-browser-server-") as temporary, ExitStack() as resources:
             root = Path(temporary)
-            bundle_path = binary.parent / "share/plinth/bundled"
+            runtime.prepare_root(root)
+            bundle_path = runtime.default_bundle_path()
             replacement = None
             if args.upgrade_cache:
                 bundle_path = root / "bundled"
@@ -134,13 +137,16 @@ def main():
                 port = probe.getsockname()[1]
             config = {
                 "database": {"pool_size": 4},
-                "migrations_dir": str(repo / "migrations"),
+                "migrations_dir": runtime.migrations_dir(repo),
                 "listen_host": "127.0.0.1", "listen_port": port,
                 "dev_mode": False, "registration_enabled": False,
-                "packages": {"data_dir": str(root / "data"),
-                             "staging_dir": str(root / "staging")},
-                "shell": {"bundle_path": str(bundle_path)},
+                "packages": {"data_dir": runtime.path(root, root / "data"),
+                             "staging_dir": runtime.path(
+                                 root, root / "data" / "staging")},
             }
+            if bundle_path is not None:
+                config["shell"] = {"bundle_path": runtime.path(root, bundle_path)
+                                   if runtime.is_container else str(bundle_path)}
             if args.realtime:
                 config["ws_heartbeat_interval_s"] = 0.2
                 config["ws_heartbeat_timeout_s"] = 1.0
@@ -152,19 +158,19 @@ def main():
             child_env["PLINTH_PG_DATABASE"] = database
             child_env["PLINTH_PG_POOL_SIZE"] = "4"
             child_env["PLINTH_DEV_MODE"] = "false"
-            child_env["PLINTH_MIGRATIONS_DIR"] = str(repo / "migrations")
+            child_env["PLINTH_MIGRATIONS_DIR"] = runtime.migrations_dir(repo)
             child_env["PLINTH_BASE_URL"] = f"http://127.0.0.1:{port}"
             transition = None
             if args.upgrade_cache:
                 transition = resources.enter_context(CacheTransition(port))
                 child_env["PLINTH_BASE_URL"] = transition.origin
             child_env["PLINTH_BROWSER_PROFILE_DIR"] = str(root / "browser-profile")
-            child_env["PLINTH_TEST_BUILD_DIR"] = str(binary.parent)
+            child_env["PLINTH_TEST_BUILD_DIR"] = str(runtime.test_build_dir(repo, root))
             browser_tmp = root / "browser-tmp"
             browser_tmp.mkdir()
             child_env["TMPDIR"] = str(browser_tmp)
             output_path = root / "kernel.log"
-            child = start_kernel(binary, config_path, root, child_env, output_path)
+            child = start_kernel(runtime, config_path, root, child_env, output_path)
             browser = None
             try:
                 if args.upgrade_cache:
@@ -199,7 +205,7 @@ def main():
                         "IF NOT FOUND THEN RAISE EXCEPTION 'missing first frontend'; END IF; END $$;"],
                         env=install_env, check=True, timeout=15, stdout=subprocess.DEVNULL)
                     output_path = root / "restarted.log"
-                    child = start_kernel(binary, config_path, root, child_env, output_path)
+                    child = start_kernel(runtime, config_path, root, child_env, output_path)
                     browser.stdin.write("continue\n")
                     browser.stdin.flush()
                     stdout, _ = browser.communicate(timeout=60)

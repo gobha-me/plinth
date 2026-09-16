@@ -35,7 +35,8 @@ services:
       # documented first-admin bootstrap. Disable it after registration.
       PLINTH_REGISTRATION_ENABLED: "true"
     volumes:
-      - plinth_data:/opt/plinth/data
+      - plinth_data:/var/lib/plinth/data
+      - plinth_logs:/var/lib/plinth/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -61,4 +62,5 @@ services:
 
 volumes:
   plinth_data:
+  plinth_logs:
   pgdata:

@@ -49,8 +49,8 @@ and codifies decisions that worked while discarding what didn't.
 | CLI | argparse (p-ranav) | Header-only, C++17+, subcommand support, MIT |
 | Testing | Catch2 | C++ standard, header-only option, well-documented |
 | Build | CMake | Industry standard for C++ |
-| Allocator | Development container preloads jemalloc; production undecided | The kernel target does not link jemalloc directly. #35 owns allocator evidence and the production image decision. |
-| Deployment | Development Docker Compose today; production OCI/Kubernetes planned | [#35](https://github.com/gobha-me/plinth/issues/35) owns the production image and [#36](https://github.com/gobha-me/plinth/issues/36) owns Kubernetes/Traefik support. |
+| Allocator | System allocator in the supported runtime image | The kernel target and production image do not preload or link jemalloc. |
+| Deployment | Native development, Docker Compose, and a supported OCI runtime | The OCI image begins with v0.6.6; [#36](https://github.com/gobha-me/plinth/issues/36) owns Kubernetes/Traefik support. |
 | CI | GitHub Actions | GCC, Clang 20/21, ASan/UBSan, formatting/static analysis, CodeQL, and full image validation |
 
 ---
@@ -91,18 +91,31 @@ contradict its upward architecture contract.
 
 ### 4.1 Single Binary
 
-The kernel compiles to a single binary (or binary + assets directory).
+The kernel compiles to a single binary plus installed assets.
 Direct native dependencies include libc/libstdc++, Drogon, libpq, OpenSSL,
-Argon2, and libzip; the supported production-image work in #35 owns the final
-runtime closure, allocator decision, and provenance. QuickJS is linked into the
-binary. The shell ZIP is a separately staged and installed companion asset.
+Argon2, and libzip. QuickJS is linked into the binary. The shell ZIP,
+migrations, licenses, notices, and SBOM are installed companion assets.
 
 ### 4.2 Docker
 
-The repository ships a development Dockerfile, a CI image, and a disposable
-Docker Compose PostgreSQL service. It does not yet publish a supported
-production image. [Issue #35](https://github.com/gobha-me/plinth/issues/35)
-owns that deliverable, including the final base-image and allocator evidence.
+`docker/Dockerfile` is a reproducible multi-stage build with separate
+`server-tests` and minimal `runtime` targets. Its Debian base and packages are
+pinned, and its release inputs bind the binary and OCI labels to the source
+version, full revision, and commit timestamp. The final image contains no
+compiler, build system, VCS client, source tree, or embedded credentials. It
+runs as UID/GID 10001 with writable data and log volumes under
+`/var/lib/plinth`; installed runtime assets live under `/usr/local`.
+
+The CI builder remains a separate image and is never published. Pull requests
+and `main` build both native runtime architectures, run the full server test
+surface, inspect the constructed image, and run production browser journeys
+without registry write permission. Starting at v0.6.6, an exact version tag
+whose commit is reachable from `main` may enter the release job. That job
+refuses an existing registry tag, pushes a multi-architecture artifact by
+digest, tests the digest, records SBOM and provenance attestations, verifies
+them, and only then attaches the exact `vMAJOR.MINOR.PATCH` tag. Mutable aliases
+are not part of the image contract; deployments use the digest from the
+release evidence.
 
 ### 4.3 Kubernetes
 
@@ -265,8 +278,8 @@ bounded issue. It must not be inferred as scheduled from this document.
   (`architecture/01-identity.md §2`.)
 - ~~Database vs storage~~ → Separate. DB = PG. Storage = file/blob.
   (`architecture/03-data.md §1`, `architecture/03-data.md §2`.)
-- ~~Alpine vs Debian~~ → the current development container is Debian-based and
-  preloads jemalloc; #35 owns the production base and allocator decision.
+- ~~Alpine vs Debian~~ → the supported runtime is Debian-based and uses the
+  system allocator; the separately owned CI image remains an Ubuntu builder.
 - ~~PG abstraction layer~~ → Killed. Commit to PG.
 - ~~Extension isolation~~ → PG schema per extension.
 - ~~Example packages~~ → No. Documentation instead. (§6 above.)

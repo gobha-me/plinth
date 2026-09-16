@@ -6,7 +6,7 @@ Plinth is an early-stage, self-hosted application kernel written in C++23. Its
 implemented kernel provides identity, authorization, groups, local capability
 dispatch, PostgreSQL-backed extension data, realtime pub/sub, audit logging,
 and a sandboxed QuickJS extension runtime. File storage, general metrics,
-sidecars, multi-node coordination, and supported production deployment remain
+sidecars, multi-node coordination, and supported orchestrated deployment remain
 roadmap work; see the [roadmap](docs/ROADMAP.md) for their owning issues.
 
 Plinth is pre-1.0 software. Its interfaces and storage contracts can change,
@@ -46,6 +46,36 @@ To stop the development database and keep its volume:
 ```bash
 docker compose -f docker/docker-compose.yml down
 ```
+
+## Production container image
+
+Supported runtime images begin with Plinth v0.6.6. Releases v0.6.5 and older
+do not have a supported image. A release publishes only its exact immutable
+version tag, for example `ghcr.io/gobha-me/plinth:v0.6.6`; there is no
+`latest`, major, or minor alias. Prefer the `name@sha256:digest` reference
+recorded by the release workflow over even the exact version tag.
+
+The image supports `linux/amd64` and `linux/arm64`, runs as UID and GID 10001,
+and contains the kernel, migrations, bundled shell, licenses, and SBOM without
+the build toolchain. It expects PostgreSQL and persistent data to be supplied
+by the operator. After replacing the example digest with the one recorded for
+the release:
+
+```bash
+image='ghcr.io/gobha-me/plinth@sha256:REPLACE_WITH_RELEASE_DIGEST'
+docker pull "$image"
+gh attestation verify "oci://$image" \
+  --repo gobha-me/plinth \
+  --signer-workflow gobha-me/plinth/.github/workflows/runtime-image.yml
+docker run --rm "$image" --version
+```
+
+The exact digest, its signed provenance, and its SBOM are the release identity;
+do not substitute an unversioned or locally rebuilt image. See
+[Configuration](docs/CONFIGURATION.md) for the runtime paths, persistence, and
+network boundary. GHCR package visibility is maintained separately from the
+repository; a release is supported only after its recorded digest is available
+to an unauthenticated pull.
 
 ## Development
 

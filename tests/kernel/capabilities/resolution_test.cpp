@@ -700,12 +700,20 @@ TEST_CASE("call_capability_async composes inside a coroutine context",
   // of scope, so the by-ref captures are safe for the full coroutine
   // lifetime.
   auto driver = [&]() -> drogon::Task<> {
-    r1 = co_await plinth::capabilities::call_capability_async(
-        CapabilityCall{.signature = "kernel:1:alpha"}, ctx);
-    r2 = co_await plinth::capabilities::call_capability_async(
-        CapabilityCall{.signature = "kernel:1:beta"}, ctx);
-    r3 = co_await plinth::capabilities::call_capability_async(
-        CapabilityCall{.signature = "kernel:1:gamma"}, ctx);
+    // GCC 12 miscompiles inline aggregate temporaries containing SSO strings
+    // when they cross a coroutine call boundary (GCC PR 107288): it copies
+    // the string representation without rebasing the SSO pointer, then frees
+    // the caller frame address. Construct named objects in place before each
+    // move. GCC 13 contains the upstream temporary-promotion fix.
+    CapabilityCall alpha{.signature = "kernel:1:alpha"};
+    r1 = co_await plinth::capabilities::call_capability_async(std::move(alpha),
+                                                              ctx);
+    CapabilityCall beta{.signature = "kernel:1:beta"};
+    r2 = co_await plinth::capabilities::call_capability_async(std::move(beta),
+                                                              ctx);
+    CapabilityCall gamma{.signature = "kernel:1:gamma"};
+    r3 = co_await plinth::capabilities::call_capability_async(std::move(gamma),
+                                                              ctx);
     co_return;
   };
   drogon::sync_wait(driver());

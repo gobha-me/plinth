@@ -173,11 +173,11 @@ auto call_capability(const CapabilityCall& call, const UserContext& ctx)
 // callers without flattening the taxonomy. Callers that don't need
 // the detail may pass nullptr (or omit — the defaults are nullptr).
 //
-// reference arguments are read-only and outlive the coroutine by caller
-// contract (`run_cap_call_outcome` owns the moved op; WS handlers own ctx on
-// the dispatch frame). Copying CapabilityCall would defeat the "no behavior
-// change" guarantee for the sync lane.
-auto call_capability_async(const CapabilityCall& call, const UserContext& ctx,
+// The call and user context are frame-owned values. Drogon tasks are lazy, so
+// reference parameters could dangle before the coroutine's first resume when
+// a caller supplied temporaries or retained the returned task. Callers that
+// already own these inputs should move them into the coroutine.
+auto call_capability_async(CapabilityCall call, UserContext ctx,
                            std::string* ext_detail_code_out = nullptr,
                            std::string* ext_detail_message_out = nullptr)
     -> drogon::Task<ResolveResult>;
