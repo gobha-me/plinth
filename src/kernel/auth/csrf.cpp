@@ -104,7 +104,7 @@ auto csrf_token_for_session(std::string_view raw_session_token) -> std::string {
 
 auto request_expected_csrf_token(const drogon::HttpRequestPtr& request)
     -> std::optional<std::string> {
-  const auto value = request->attributes()->get<std::string>(ATTR_CSRF_TOKEN);
+  auto value = request->attributes()->get<std::string>(ATTR_CSRF_TOKEN);
   if (value.empty()) {
     return std::nullopt;
   }
