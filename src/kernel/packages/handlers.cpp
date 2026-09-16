@@ -528,6 +528,7 @@ auto handle_delete_package(
 
 auto register_package_routes(const PackageRoutesConfig& cfg) -> void {
   constexpr auto SF = "plinth::auth::SessionFilter";
+  constexpr auto CF = "plinth::auth::CsrfFilter";
   constexpr auto RF = "plinth::rbac::RbacFilter";
 
   drogon::app().registerHandler(
@@ -536,7 +537,7 @@ auto register_package_routes(const PackageRoutesConfig& cfg) -> void {
             std::function<void(const drogon::HttpResponsePtr&)>&& cb) {
         handle_post_packages(req, std::move(cb), cfg);
       },
-      {drogon::Post, SF, RF});
+      {drogon::Post, SF, CF, RF});
   rbac::register_rule_requirement(drogon::Post, "/api/packages",
                                   {"packages.install"});
 
@@ -568,7 +569,7 @@ auto register_package_routes(const PackageRoutesConfig& cfg) -> void {
             const std::string& id) {
         handle_patch_package(req, std::move(cb), cfg, id);
       },
-      {drogon::Patch, SF, RF});
+      {drogon::Patch, SF, CF, RF});
   rbac::register_rule_requirement(drogon::Patch, "/api/packages/{id}",
                                   {"packages.install"});
 
@@ -579,7 +580,7 @@ auto register_package_routes(const PackageRoutesConfig& cfg) -> void {
             const std::string& id) {
         handle_delete_package(req, std::move(cb), cfg, id);
       },
-      {drogon::Delete, SF, RF});
+      {drogon::Delete, SF, CF, RF});
   rbac::register_rule_requirement(drogon::Delete, "/api/packages/{id}",
                                   {"packages.install"});
 

@@ -1018,7 +1018,7 @@ auto register_group_routes() -> void {
           handle_create_group(req, std::move(callback));
         },
         {drogon::Post, "plinth::auth::SessionFilter",
-         "plinth::rbac::RbacFilter"});
+         "plinth::auth::CsrfFilter", "plinth::rbac::RbacFilter"});
 
     drogon::app().registerHandler(
         "/api/groups",
@@ -1046,7 +1046,7 @@ auto register_group_routes() -> void {
            const std::string& group_id) {
           handle_update_group(req, std::move(callback), group_id);
         },
-        {drogon::Put, "plinth::auth::SessionFilter",
+        {drogon::Put, "plinth::auth::SessionFilter", "plinth::auth::CsrfFilter",
          "plinth::rbac::RbacFilter"});
 
     drogon::app().registerHandler(
@@ -1057,7 +1057,7 @@ auto register_group_routes() -> void {
           handle_delete_group(req, std::move(callback), group_id);
         },
         {drogon::Delete, "plinth::auth::SessionFilter",
-         "plinth::rbac::RbacFilter"});
+         "plinth::auth::CsrfFilter", "plinth::rbac::RbacFilter"});
 
     // ── Membership ────────────────────────────────────────────
     drogon::app().registerHandler(
@@ -1068,7 +1068,7 @@ auto register_group_routes() -> void {
           handle_add_member(req, std::move(callback), group_id);
         },
         {drogon::Post, "plinth::auth::SessionFilter",
-         "plinth::rbac::RbacFilter"});
+         "plinth::auth::CsrfFilter", "plinth::rbac::RbacFilter"});
 
     drogon::app().registerHandler(
         "/api/groups/{id}/members/{user_id}",
@@ -1079,7 +1079,7 @@ auto register_group_routes() -> void {
                                target_user_id);
         },
         {drogon::Delete, "plinth::auth::SessionFilter",
-         "plinth::rbac::RbacFilter"});
+         "plinth::auth::CsrfFilter", "plinth::rbac::RbacFilter"});
 
     // ── Rule grant/revoke ─────────────────────────────────────
     drogon::app().registerHandler(
@@ -1090,7 +1090,7 @@ auto register_group_routes() -> void {
           handle_grant_rule(req, std::move(callback), group_id);
         },
         {drogon::Post, "plinth::auth::SessionFilter",
-         "plinth::rbac::RbacFilter"});
+         "plinth::auth::CsrfFilter", "plinth::rbac::RbacFilter"});
 
     drogon::app().registerHandler(
         "/api/groups/{id}/rules/{rule}",
@@ -1100,7 +1100,7 @@ auto register_group_routes() -> void {
           handle_revoke_rule(req, std::move(callback), group_id, rule_name);
         },
         {drogon::Delete, "plinth::auth::SessionFilter",
-         "plinth::rbac::RbacFilter"});
+         "plinth::auth::CsrfFilter", "plinth::rbac::RbacFilter"});
 
     spdlog::info("group and RBAC routes registered");
   });

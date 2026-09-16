@@ -1,6 +1,6 @@
 #include "kernel/config.hpp"
+#include "kernel/browser_origin.hpp"
 
-#include <arpa/inet.h>
 #include <cstdlib>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -57,36 +57,25 @@ auto apply_database(Config& cfg, const nlohmann::json& db) -> void {
   }
 }
 
-auto valid_browser_origin(const std::string& origin) -> bool {
-  if (origin.empty()) {
-    return true;
-  }
-  // Browser Origin serialization is lowercase and has no credentials, path,
-  // query, fragment or trailing slash. IPv6 authorities require brackets.
-  static const std::regex ORIGIN(
-      R"(^https?://(\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*)(?::([1-9][0-9]{0,4}))?$)");
-  std::smatch match;
-  if (!std::regex_match(origin, match, ORIGIN)) {
-    return false;
-  }
-  auto host = match[1].str();
-  if (host.front() == '[') {
-    in6_addr address{};
-    auto ip = host.substr(1, host.size() - 2);
-    if (inet_pton(AF_INET6, ip.c_str(), &address) != 1) {
-      return false;
-    }
-  }
-  return !match[2].matched || std::stoi(match[2].str()) <= 65535;
-}
-
 auto apply_ws(Config& cfg, const nlohmann::json& j) -> void {
-  if (j.contains("ws_browser_origin")) {
-    cfg.ws_browser_origin = j["ws_browser_origin"].get<std::string>();
-    if (!valid_browser_origin(cfg.ws_browser_origin)) {
-      throw std::runtime_error("config.ws_browser_origin_invalid");
-    }
+  const bool has_browser_origin = j.contains("browser_origin");
+  const bool has_legacy_origin = j.contains("ws_browser_origin");
+  const auto browser_origin =
+      has_browser_origin ? j["browser_origin"].get<std::string>() : "";
+  const auto legacy_origin =
+      has_legacy_origin ? j["ws_browser_origin"].get<std::string>() : "";
+  if (has_browser_origin && !valid_browser_origin(browser_origin)) {
+    throw std::runtime_error("config.browser_origin_invalid");
   }
+  if (has_legacy_origin && !valid_browser_origin(legacy_origin)) {
+    throw std::runtime_error("config.ws_browser_origin_invalid");
+  }
+  if (has_browser_origin && has_legacy_origin &&
+      browser_origin != legacy_origin) {
+    throw std::runtime_error("config.browser_origin_conflict");
+  }
+  cfg.browser_origin = has_browser_origin ? browser_origin : legacy_origin;
+  cfg.ws_browser_origin = cfg.browser_origin;
   if (j.contains("ws_auth_timeout_s")) {
     cfg.ws_auth_timeout_s = j["ws_auth_timeout_s"].get<double>();
   }

@@ -88,6 +88,9 @@ the descendant-owning supervisor described above.
 
 `npm run test:transport --prefix tests/browser` evaluates the packaged SDK
 module with linked test imports and deterministic sockets/timers. It covers
+fresh session-bound CSRF cookie propagation for unsafe same-origin capability
+requests, omission before login and for cross-origin requests, token rotation,
+both pre-dispatch and capability error envelopes, and
 authentication gating, granted/denied acknowledgements, removal during auth or
 an outstanding subscribe, duplicate error/close signals, timer cancellation,
 terminal auth failure/displacement, explicit retry, and per-connection-epoch

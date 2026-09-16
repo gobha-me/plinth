@@ -4,6 +4,7 @@
 #include <spdlog/spdlog.h>
 
 #include "kernel/audit/handlers.hpp"
+#include "kernel/auth/csrf.hpp"
 #include "kernel/auth/handlers.hpp"
 #include "kernel/cap/api_cap.hpp"
 #include "kernel/capabilities/bootstrap.hpp"
@@ -659,6 +660,7 @@ auto main(int argc, char* argv[]) -> int {
         // TODO: QuickJS runtime pool init
 
         register_healthz();
+        plinth::auth::configure_browser_origin(cfg.browser_origin);
         plinth::auth::register_auth_routes(cfg.dev_mode,
                                            cfg.registration_enabled);
         plinth::auth::register_pat_routes();

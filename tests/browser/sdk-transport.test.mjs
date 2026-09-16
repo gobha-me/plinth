@@ -4,9 +4,10 @@ import test from 'node:test';
 import vm from 'node:vm';
 
 const source = await readFile(new URL('../../client/shell/client/sdk.js', import.meta.url), 'utf8');
-async function fixture() {
+async function fixture(options = {}) {
     const sockets = [];
     const timers = new Map();
+    const document = { cookie: options.cookie || '' };
     let nextTimer = 0;
     class Socket {
         static OPEN = 1;
@@ -33,7 +34,14 @@ async function fixture() {
         finishClose() { this.readyState = 3; this.emit('close', { code: 1000, reason: '' }); }
     }
     const context = vm.createContext({
-        window: { location: { protocol: 'https:', host: 'plinth.test' } },
+        window: { location: {
+            protocol: 'https:',
+            host: 'plinth.test',
+            origin: 'https://plinth.test',
+            href: 'https://plinth.test/app/',
+        } },
+        document, URL, Headers,
+        fetch: options.fetch || (() => { throw new Error('unexpected fetch'); }),
         WebSocket: Socket, console: { error() {} }, queueMicrotask,
         setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
         clearTimeout(id) { timers.delete(id); },
@@ -48,7 +56,7 @@ async function fixture() {
         }, { context });
     });
     await module.evaluate();
-    return { sdk: module.namespace, sockets, timers,
+    return { sdk: module.namespace, sockets, timers, document,
         runTimer() {
             assert.equal(timers.size, 1);
             const [id, { fn }] = [...timers][0];
@@ -57,6 +65,69 @@ async function fixture() {
         },
     };
 }
+
+test('unsafe same-origin requests read the current CSRF cookie without forwarding it cross-origin', async () => {
+    const { sdk, document } = await fixture({ cookie: 'other=x; plinth_csrf=first%2Dtoken' });
+    const first = sdk.withCsrf('/api/auth/logout', { method: 'post', headers: { Accept: 'x' } });
+    assert.equal(first.headers.get('X-Plinth-CSRF'), 'first-token');
+    assert.equal(first.headers.get('Accept'), 'x');
+
+    document.cookie = 'plinth_csrf=rotated-token';
+    const rotated = sdk.withCsrf('/api/auth/logout', { method: 'POST' });
+    assert.equal(rotated.headers.get('X-Plinth-CSRF'), 'rotated-token');
+    assert.equal(sdk.withCsrf('/api/auth/session').headers, undefined);
+    const crossOrigin = sdk.withCsrf('https://attacker.test/api', {
+        method: 'POST', headers: { 'X-Plinth-CSRF': 'must-not-leak', Accept: 'x' },
+    });
+    assert.equal(crossOrigin.headers.get('X-Plinth-CSRF'), null);
+    assert.equal(crossOrigin.headers.get('Accept'), 'x');
+
+    document.cookie = 'plinth_csrf=%not-valid';
+    assert.equal(sdk.withCsrf('/api/auth/logout', { method: 'DELETE' }).headers, undefined);
+    document.cookie = '';
+    const noCookie = sdk.withCsrf('/api/auth/login', {
+        method: 'POST', headers: { 'X-Plinth-CSRF': 'stale' },
+    });
+    assert.equal(noCookie.headers.get('X-Plinth-CSRF'), null);
+});
+
+test('capability calls attach the fresh CSRF token after session rotation', async () => {
+    const requests = [];
+    const { sdk, document } = await fixture({
+        cookie: 'plinth_csrf=before-login',
+        fetch: async (url, options) => {
+            requests.push({ url, options });
+            return { ok: true, json: async () => ({ ok: true, value: requests.length }) };
+        },
+    });
+    assert.equal(await sdk.call('shell.preferences.set', { key: 'x' }), 1);
+    document.cookie = 'plinth_csrf=after-relogin';
+    assert.equal(await sdk.call('shell.preferences.set', { key: 'y' }), 2);
+    assert.equal(requests[0].options.headers.get('X-Plinth-CSRF'), 'before-login');
+    assert.equal(requests[1].options.headers.get('X-Plinth-CSRF'), 'after-relogin');
+    assert.equal(requests[1].options.headers.get('Content-Type'), 'application/json');
+});
+
+test('capability calls normalize pre-dispatch and capability error envelopes', async () => {
+    const responses = [
+        { error: 'csrf_failed', message: 'Request validation failed' },
+        { ok: false, error: { code: 'rbac_denied', message: 'Denied' } },
+    ];
+    const { sdk } = await fixture({
+        cookie: 'plinth_csrf=token',
+        fetch: async () => ({
+            ok: false,
+            statusText: 'Forbidden',
+            json: async () => responses.shift(),
+        }),
+    });
+    await assert.rejects(sdk.call('shell.preferences.set', {}), error =>
+        error.name === 'CapabilityError' && error.code === 'csrf_failed' &&
+        error.message === 'Request validation failed');
+    await assert.rejects(sdk.call('shell.preferences.set', {}), error =>
+        error.name === 'CapabilityError' && error.code === 'rbac_denied' &&
+        error.message === 'Denied');
+});
 
 test('wait for authentication, multiplex once, acknowledge grants, unsubscribe arrays', async () => {
     const { sdk, sockets } = await fixture();

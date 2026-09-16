@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 #include "kernel/auth/crypto.hpp"
+#include "kernel/auth/csrf.hpp"
 #include "kernel/config.hpp"
 #include <catch2/catch_test_macros.hpp>
 
@@ -617,12 +618,13 @@ auto delete_preference(std::uint16_t port, const std::string& token,
   auto socket = connect_to(port);
   REQUIRE(socket.fd >= 0);
   const auto body = nlohmann::json{{"args", {{"key", key}}}}.dump();
+  const auto csrf = plinth::auth::csrf_token_for_session(token);
   const auto request =
       "POST /api/cap/shell.preferences.set HTTP/1.1\r\nHost: 127.0.0.1\r\n"
-      "Connection: close\r\nContent-Type: application/json\r\nCookie: "
-      "plinth_session=" +
-      token + "\r\nContent-Length: " + std::to_string(body.size()) +
-      "\r\n\r\n" + body;
+      "Origin: http://127.0.0.1\r\nConnection: close\r\nContent-Type: "
+      "application/json\r\nCookie: plinth_session=" +
+      token + "; plinth_csrf=" + csrf + "\r\nX-Plinth-CSRF: " + csrf +
+      "\r\nContent-Length: " + std::to_string(body.size()) + "\r\n\r\n" + body;
   REQUIRE(send_all(socket.fd, request));
   std::string response;
   std::array<char, 4096> buffer{};

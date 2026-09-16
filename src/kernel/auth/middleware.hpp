@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstdint>
 #include <drogon/HttpFilter.h>
 #include <drogon/orm/DbClient.h>
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace plinth::auth {
 
@@ -15,6 +17,12 @@ inline constexpr auto ATTR_AUTH_TYPE = "plinth.auth_type";
 inline constexpr auto ATTR_SESSION_ID = "plinth.session_id";
 inline constexpr auto ATTR_PAT_ID = "plinth.pat_id";
 inline constexpr auto ATTR_TOKEN_HASH = "plinth.token_hash";
+inline constexpr auto ATTR_CREDENTIAL_SOURCE = "plinth.credential_source";
+inline constexpr auto ATTR_CSRF_TOKEN = "plinth.csrf_token";
+
+enum class CredentialSource : std::uint8_t { UNKNOWN, COOKIE, BEARER };
+
+auto credential_source_name(CredentialSource source) -> std::string_view;
 
 struct AuthContext {
   std::string user_id;
@@ -23,6 +31,7 @@ struct AuthContext {
   std::string session_id; // empty for PAT auth
   std::string pat_id;     // empty for session auth
   std::string token_hash;
+  CredentialSource credential_source{CredentialSource::UNKNOWN};
 };
 
 // Backward-compat alias
@@ -32,6 +41,11 @@ using SessionContext = AuthContext;
 // Returns nullopt if the middleware has not run or authentication failed.
 auto get_auth_context(const drogon::HttpRequestPtr& req)
     -> std::optional<AuthContext>;
+
+// Authentication/session responses must never be retained by browser or
+// shared caches. Origin-sensitive mutations also vary on Origin.
+auto harden_auth_response(drogon::HttpResponsePtr& response,
+                          bool origin_sensitive = false) -> void;
 
 // Backward-compat alias
 inline auto get_session_context(const drogon::HttpRequestPtr& req)
@@ -53,6 +67,15 @@ class SessionFilter : public drogon::HttpFilter<SessionFilter, false> {
 
 // Extract raw token from request (cookie or bearer header).
 // Exported for testing.
+struct RequestCredential {
+  std::string raw_token;
+  CredentialSource source{CredentialSource::UNKNOWN};
+};
+
+auto extract_credential(const drogon::HttpRequestPtr& req)
+    -> std::optional<RequestCredential>;
+
+// Backward-compatible raw-token projection.
 auto extract_token(const drogon::HttpRequestPtr& req)
     -> std::optional<std::string>;
 
@@ -76,8 +99,8 @@ namespace test_seam {
 // Drive the production SessionFilter decision path with a deterministic token
 // validator. This keeps response/status/header tests hermetic while database
 // error mapping in the real validator can be covered independently.
-using TokenValidator =
-    std::function<void(const std::string&, TokenValidationCallback)>;
+using TokenValidator = std::function<void(const std::string&, CredentialSource,
+                                          TokenValidationCallback)>;
 
 auto dispatch_session_filter(const drogon::HttpRequestPtr& req,
                              drogon::FilterCallback&& fcb,

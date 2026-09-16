@@ -61,3 +61,20 @@ network-policy layer.
 
 The sample Compose file publishes Plinth on host loopback even though the
 process listens on all interfaces inside its container network.
+
+### Browser origin behind TLS
+
+When TLS terminates at a reverse proxy, set `browser_origin` to the browser's
+exact public serialized origin, for example `https://plinth.example` or
+`https://plinth.example:8443`. Preserve that public authority in the upstream
+`Host` header. Plinth uses this one authority for cookie-authenticated unsafe
+HTTP requests, login/registration browser checks, and WebSocket upgrades.
+`Forwarded` and `X-Forwarded-*` headers never establish browser authority.
+
+The origin must be lowercase absolute HTTP(S), with no credentials, trailing
+slash, path, query, or fragment. An invalid value prevents startup. The legacy
+`ws_browser_origin` key remains an alias for compatibility; if both keys are
+present they must be identical or startup fails. Leaving `browser_origin`
+empty is correct only when the scheme seen by Plinth plus the exact `Host`
+header is also the browser-visible origin. In particular, an HTTPS browser in
+front of an HTTP upstream must configure the public HTTPS origin.

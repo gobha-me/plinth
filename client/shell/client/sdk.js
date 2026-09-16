@@ -8,10 +8,6 @@
 // modules via the import-map specifier `@plinth/frontend/sdk`
 // declared in shell/client/index.html.
 //
-// Implementation deviations recorded in ICD-0.6.3 §17:
-//   - No CSRF header today (no kernel-side CSRF infrastructure;
-//     deferred to a follow-up).
-
 import { h } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 
@@ -55,6 +51,47 @@ export class PanelUnboundError extends Error {
     }
 }
 
+// Cookie-authenticated mutations use a session-bound double-submit token. Read
+// the cookie for every request so logout/login rotation cannot leave a cached
+// token in the shell or in long-lived panel modules. Never forward it to a
+// different origin, even if a future caller passes an absolute URL.
+export function withCsrf(url, options = {}) {
+    const withoutCsrf = () => {
+        const headers = new Headers(options.headers || {});
+        if (!headers.has('X-Plinth-CSRF')) return { ...options };
+        headers.delete('X-Plinth-CSRF');
+        return { ...options, headers };
+    };
+    const method = String(options.method || 'GET').toUpperCase();
+    if (['GET', 'HEAD', 'OPTIONS'].includes(method)) return withoutCsrf();
+
+    let target;
+    try {
+        target = new URL(url, window.location.href);
+    } catch (_) {
+        return withoutCsrf();
+    }
+    if (target.origin !== window.location.origin || typeof document === 'undefined') {
+        return withoutCsrf();
+    }
+
+    const csrfCookie = document.cookie.split(';').map(part => part.trim()).find(part =>
+        part.startsWith('plinth_csrf='));
+    if (!csrfCookie) return withoutCsrf();
+
+    let token;
+    try {
+        token = decodeURIComponent(csrfCookie.slice('plinth_csrf='.length));
+    } catch (_) {
+        return withoutCsrf();
+    }
+    if (!token) return withoutCsrf();
+
+    const headers = new Headers(options.headers || {});
+    headers.set('X-Plinth-CSRF', token);
+    return { ...options, headers };
+}
+
 // ── plinth.call: HTTP cap-dispatch ──────────────────────────────────
 //
 // POSTs `{args: [...]}` to /api/cap/{capability}. Returns a Promise
@@ -73,12 +110,13 @@ export async function call(capability, args) {
     let resp;
     try {
         const body = (args === undefined) ? { args: null } : { args };
-        resp = await fetch(`/api/cap/${encodeURIComponent(capability)}`, {
+        const url = `/api/cap/${encodeURIComponent(capability)}`;
+        resp = await fetch(url, withCsrf(url, {
             method:      'POST',
             credentials: 'include',
             headers:     { 'Content-Type': 'application/json' },
             body:        JSON.stringify(body),
-        });
+        }));
     } catch (e) {
         throw new NetworkError(`fetch failed for ${capability}`, e);
     }
@@ -91,7 +129,13 @@ export async function call(capability, args) {
     if (resp.ok && body && body.ok === true) {
         return body.value;
     }
-    const err = (body && body.error) || {};
+    // CSRF rejections happen before capability dispatch and therefore use the
+    // kernel's top-level HTTP error shape. Preserve the ordinary capability
+    // envelope while exposing either response as one typed SDK error.
+    const rawError = body && body.error;
+    const err = typeof rawError === 'string'
+        ? { code: rawError, message: body.message }
+        : (rawError || {});
     throw new CapabilityError(
         err.code || 'unknown',
         err.message || resp.statusText,

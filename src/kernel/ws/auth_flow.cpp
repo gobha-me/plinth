@@ -1,4 +1,6 @@
 #include "kernel/ws/auth_flow.hpp"
+
+#include "kernel/browser_origin.hpp"
 #include "kernel/ws/authority.hpp"
 
 #include "kernel/auth/middleware.hpp"
@@ -233,16 +235,7 @@ auto on_session_upgrade(const drogon::HttpRequestPtr& req,
   if (cookie.empty() && origin.empty()) {
     return; // Native clients authenticate explicitly with a token frame.
   }
-  const auto& host = req->getHeader("host");
-  const std::string scheme =
-      req->isOnSecureConnection() ? "https://" : "http://";
-  // The configured origin is validated at config loading. A proxy must
-  // preserve Host; neither Forwarded nor X-Forwarded-* conveys authority.
-  const auto expected = browser_origin.empty() ? scheme + host : browser_origin;
-  const auto separator = expected.find("://");
-  const bool host_matches =
-      separator != std::string::npos && expected.substr(separator + 3) == host;
-  if (host.empty() || !host_matches || origin != expected) {
+  if (!plinth::browser_origin_matches(req, browser_origin)) {
     on_auth_failure(conn, "origin_mismatch");
     return;
   }

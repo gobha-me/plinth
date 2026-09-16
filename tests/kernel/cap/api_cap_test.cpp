@@ -12,6 +12,7 @@
 // P.* / I.* and v0.6.2's T.* / S.* / I.* (blocked on the `init_registry`
 // teardown bug from test-fixture-buildout session 9).
 
+#include "kernel/auth/csrf.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/types.hpp"
 
@@ -68,6 +69,12 @@ auto build_cap_post(std::string_view capability, const Json::Value& args,
   w["indentation"] = "";
   req->setBody(Json::writeString(w, body));
   req->addCookie("plinth_session", std::string{session_token});
+  const auto csrf = plinth::auth::csrf_token_for_session(session_token);
+  req->addCookie(std::string{plinth::auth::CSRF_COOKIE}, csrf);
+  req->addHeader(std::string{plinth::auth::CSRF_HEADER}, csrf);
+  req->addHeader("Origin",
+                 "http://127.0.0.1:" +
+                     std::to_string(plinth::ws_test::test_server_port()));
   return req;
 }
 
@@ -85,6 +92,27 @@ auto parse_body(const drogon::HttpResponsePtr& resp) -> Json::Value {
 }
 
 } // namespace
+
+TEST_CASE(
+    "cookie capability POST rejects a missing CSRF header before dispatch",
+    "[ws][api_cap][csrf]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PLINTH_PG_HOST not set");
+  }
+  plinth::http_test::HttpTestFixture fix;
+  CapHandlerScratch handlers;
+
+  const auto token = fix.seed_admin();
+  auto request =
+      build_cap_post("test.echo", Json::Value(Json::arrayValue), token);
+  request->removeHeader(std::string{plinth::auth::CSRF_HEADER});
+  const auto response = fix.dispatch(request);
+
+  REQUIRE(response->statusCode() == drogon::k403Forbidden);
+  const auto body = parse_body(response);
+  REQUIRE(body["error"].asString() == "csrf_failed");
+  REQUIRE(body["message"].asString() == "Request validation failed");
+}
 
 // ── B.01 — happy path: admin dispatches kernel.admin-gated Tier 1 ────
 

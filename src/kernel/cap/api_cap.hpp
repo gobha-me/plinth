@@ -16,9 +16,9 @@
 //      step 3 from the capability's `rbac_rule` (per ICD-0.2.4 / 0.5.0.4).
 //      Wiring RbacFilter would require per-capability rule registration,
 //      which doesn't match the per-route static-table pattern.
-//   2. CSRF check deferred — Plinth has no CSRF infrastructure today.
-//      Lands cohesively across all `/api/*` mutating routes in a
-//      follow-up.
+//   2. Every cookie-authenticated capability POST requires CSRF. Capability
+//      metadata has no audited read-only marker, so names never bypass the
+//      filter; explicit bearer sessions and PATs remain native-client paths.
 //   3. URL `/api/cap/{capability}` accepts the bare dotted name
 //      (e.g. `shell.preferences.set`); the handler synthesises the
 //      resolver's full triple `<namespace>:1:<function>` by splitting on
@@ -46,8 +46,8 @@ namespace plinth::cap {
 // within one process; call exactly once at bootstrap. Slot in main.cpp
 // after the kernel `/api/*` route registrations and before
 // `frontend::register_api_frontend_routes` — preserves the catch-all
-// ordering rule from ICD-0.6.0 §8.1. The route attaches SessionFilter
-// only (not RbacFilter — see deviation #1 in this header).
+// ordering rule from ICD-0.6.0 §8.1. The route attaches SessionFilter then
+// CsrfFilter (not RbacFilter — see deviation #1 in this header).
 auto register_cap_routes(const Config::Database& db) -> void;
 
 // ── Test seam ────────────────────────────────────────────────────

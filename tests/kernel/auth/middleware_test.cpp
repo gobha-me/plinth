@@ -1,3 +1,4 @@
+#include "kernel/auth/csrf.hpp"
 #include "kernel/auth/middleware.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -21,7 +22,8 @@ struct FilterResult {
 auto dispatch(
     const drogon::HttpRequestPtr& request,
     plinth::auth::test_seam::TokenValidator validator =
-        [](const std::string&, plinth::auth::TokenValidationCallback) {
+        [](const std::string&, plinth::auth::CredentialSource,
+           plinth::auth::TokenValidationCallback) {
           FAIL("token validator must not run without a token");
         }) -> FilterResult {
   FilterResult result;
@@ -64,8 +66,10 @@ TEST_CASE("SessionFilter sanitizes an invalid-token response",
 
   auto result =
       dispatch(request, [](const std::string& raw_token,
+                           plinth::auth::CredentialSource source,
                            plinth::auth::TokenValidationCallback callback) {
         REQUIRE(raw_token == "invalid-session-token");
+        REQUIRE(source == plinth::auth::CredentialSource::COOKIE);
         callback(
             {.ok = false, .context = {}, .error_code = "not_authenticated"});
       });
@@ -83,8 +87,10 @@ TEST_CASE("SessionFilter sanitizes authentication database failures",
 
   auto result =
       dispatch(request, [](const std::string& raw_token,
+                           plinth::auth::CredentialSource source,
                            plinth::auth::TokenValidationCallback callback) {
         REQUIRE(raw_token == "opaque-session-token");
+        REQUIRE(source == plinth::auth::CredentialSource::BEARER);
         callback(
             {.ok = false, .context = {}, .error_code = "service_unavailable"});
       });
@@ -94,6 +100,66 @@ TEST_CASE("SessionFilter sanitizes authentication database failures",
       nlohmann::json{
           {"error", "service_unavailable"},
           {"message", "Authentication service is temporarily unavailable"}});
+}
+
+TEST_CASE("SessionFilter records cookie precedence and its bound CSRF token",
+          "[auth][middleware][csrf]") {
+  auto request = drogon::HttpRequest::newHttpRequest();
+  request->addCookie("plinth_session", "cookie-session");
+  request->addHeader("Authorization", "Bearer plinth_pat-must-not-win");
+
+  auto result =
+      dispatch(request, [](const std::string& raw_token,
+                           plinth::auth::CredentialSource source,
+                           plinth::auth::TokenValidationCallback callback) {
+        REQUIRE(raw_token == "cookie-session");
+        REQUIRE(source == plinth::auth::CredentialSource::COOKIE);
+        callback({.ok = true,
+                  .context = {.user_id = "user-id",
+                              .username = "user",
+                              .auth_type = "session",
+                              .session_id = "session-id",
+                              .pat_id = "",
+                              .token_hash = "hash"},
+                  .error_code = ""});
+      });
+
+  REQUIRE(result.continued);
+  REQUIRE_FALSE(result.response);
+  const auto context = plinth::auth::get_auth_context(request);
+  REQUIRE(context.has_value());
+  REQUIRE(context->credential_source == plinth::auth::CredentialSource::COOKIE);
+  REQUIRE(
+      request->attributes()->get<std::string>(plinth::auth::ATTR_CSRF_TOKEN) ==
+      plinth::auth::csrf_token_for_session("cookie-session"));
+}
+
+TEST_CASE("SessionFilter bearer auth has no CSRF expectation",
+          "[auth][middleware][csrf]") {
+  auto request = drogon::HttpRequest::newHttpRequest();
+  request->addHeader("Authorization", "Bearer bearer-session");
+
+  auto result =
+      dispatch(request, [](const std::string& raw_token,
+                           plinth::auth::CredentialSource source,
+                           plinth::auth::TokenValidationCallback callback) {
+        REQUIRE(raw_token == "bearer-session");
+        REQUIRE(source == plinth::auth::CredentialSource::BEARER);
+        callback({.ok = true,
+                  .context = {.user_id = "user-id",
+                              .username = "user",
+                              .auth_type = "session",
+                              .session_id = "session-id",
+                              .pat_id = "",
+                              .token_hash = "hash"},
+                  .error_code = ""});
+      });
+
+  REQUIRE(result.continued);
+  const auto context = plinth::auth::get_auth_context(request);
+  REQUIRE(context.has_value());
+  REQUIRE(context->credential_source == plinth::auth::CredentialSource::BEARER);
+  REQUIRE_FALSE(plinth::auth::request_expected_csrf_token(request).has_value());
 }
 
 TEST_CASE("session validation maps database errors to service unavailable",

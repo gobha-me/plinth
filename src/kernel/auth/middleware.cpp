@@ -1,5 +1,6 @@
 #include "kernel/auth/middleware.hpp"
 #include "kernel/auth/crypto.hpp"
+#include "kernel/auth/csrf.hpp"
 
 #include <drogon/drogon.h>
 #include <memory>
@@ -43,6 +44,8 @@ auto set_auth_attributes(const drogon::HttpRequestPtr& req,
   attrs->insert(ATTR_SESSION_ID, ctx.session_id);
   attrs->insert(ATTR_PAT_ID, ctx.pat_id);
   attrs->insert(ATTR_TOKEN_HASH, ctx.token_hash);
+  attrs->insert(ATTR_CREDENTIAL_SOURCE,
+                std::string{credential_source_name(ctx.credential_source)});
 }
 
 // Map HTTP-friendly messages to error codes for the 401 path.
@@ -58,6 +61,22 @@ auto error_message(const std::string& code) -> std::string {
 
 } // namespace
 
+auto credential_source_name(CredentialSource source) -> std::string_view {
+  switch (source) {
+    case CredentialSource::COOKIE: return "cookie";
+    case CredentialSource::BEARER: return "bearer";
+    case CredentialSource::UNKNOWN: return "unknown";
+  }
+  return "unknown";
+}
+
+auto harden_auth_response(drogon::HttpResponsePtr& response,
+                          bool origin_sensitive) -> void {
+  response->addHeader("Cache-Control", "no-store");
+  response->addHeader("Vary", origin_sensitive ? "Origin, Cookie, Authorization"
+                                               : "Cookie, Authorization");
+}
+
 auto get_auth_context(const drogon::HttpRequestPtr& req)
     -> std::optional<AuthContext> {
   const auto& attrs = req->attributes();
@@ -65,6 +84,7 @@ auto get_auth_context(const drogon::HttpRequestPtr& req)
   if (user_id.empty()) {
     return std::nullopt;
   }
+  const auto source = attrs->get<std::string>(ATTR_CREDENTIAL_SOURCE);
   return AuthContext{
       .user_id = user_id,
       .username = attrs->get<std::string>(ATTR_USERNAME),
@@ -72,15 +92,19 @@ auto get_auth_context(const drogon::HttpRequestPtr& req)
       .session_id = attrs->get<std::string>(ATTR_SESSION_ID),
       .pat_id = attrs->get<std::string>(ATTR_PAT_ID),
       .token_hash = attrs->get<std::string>(ATTR_TOKEN_HASH),
+      .credential_source = source == "cookie"   ? CredentialSource::COOKIE
+                           : source == "bearer" ? CredentialSource::BEARER
+                                                : CredentialSource::UNKNOWN,
   };
 }
 
-auto extract_token(const drogon::HttpRequestPtr& req)
-    -> std::optional<std::string> {
+auto extract_credential(const drogon::HttpRequestPtr& req)
+    -> std::optional<RequestCredential> {
   // Cookie takes precedence per ICD
   auto cookie = req->getCookie("plinth_session");
   if (!cookie.empty()) {
-    return cookie;
+    return RequestCredential{.raw_token = std::move(cookie),
+                             .source = CredentialSource::COOKIE};
   }
 
   // Fall back to Authorization: Bearer ...
@@ -88,11 +112,21 @@ auto extract_token(const drogon::HttpRequestPtr& req)
   if (auth_header.starts_with("Bearer ") && auth_header.size() > 7) {
     auto token = auth_header.substr(7);
     if (!token.empty()) {
-      return token;
+      return RequestCredential{.raw_token = std::move(token),
+                               .source = CredentialSource::BEARER};
     }
   }
 
   return std::nullopt;
+}
+
+auto extract_token(const drogon::HttpRequestPtr& req)
+    -> std::optional<std::string> {
+  auto credential = extract_credential(req);
+  if (!credential.has_value()) {
+    return std::nullopt;
+  }
+  return std::move(credential->raw_token);
 }
 
 auto validate_session_token(const std::string& raw_token,
@@ -249,8 +283,8 @@ auto dispatch_session_filter(const drogon::HttpRequestPtr& req,
                              drogon::FilterCallback&& fcb,
                              drogon::FilterChainCallback&& fccb,
                              test_seam::TokenValidator validator) -> void {
-  auto raw_token = extract_token(req);
-  if (!raw_token.has_value()) {
+  auto credential = extract_credential(req);
+  if (!credential.has_value()) {
     fcb(make_401("not_authenticated", "No authentication token provided"));
     return;
   }
@@ -259,20 +293,36 @@ auto dispatch_session_filter(const drogon::HttpRequestPtr& req,
   auto shared_fccb =
       std::make_shared<drogon::FilterChainCallback>(std::move(fccb));
 
-  validator(raw_token.value(), [req, shared_fcb, shared_fccb](
-                                   const TokenValidationResult& result) {
-    if (!result.ok) {
-      if (result.error_code == "service_unavailable") {
-        (*shared_fcb)(make_auth_503());
-        return;
-      }
-      (*shared_fcb)(
-          make_401(result.error_code, error_message(result.error_code)));
-      return;
-    }
-    set_auth_attributes(req, result.context);
-    (*shared_fccb)();
-  });
+  const auto raw_token = credential->raw_token;
+  const auto source = credential->source;
+  validator(raw_token, source,
+            [req, raw_token, source, shared_fcb,
+             shared_fccb](TokenValidationResult result) {
+              if (!result.ok) {
+                if (result.error_code == "service_unavailable") {
+                  (*shared_fcb)(make_auth_503());
+                  return;
+                }
+                (*shared_fcb)(make_401(result.error_code,
+                                       error_message(result.error_code)));
+                return;
+              }
+              result.context.credential_source = source;
+              set_auth_attributes(req, result.context);
+              if (source == CredentialSource::COOKIE &&
+                  result.context.auth_type == "session") {
+                try {
+                  req->attributes()->insert(ATTR_CSRF_TOKEN,
+                                            csrf_token_for_session(raw_token));
+                } catch (const std::exception& error) {
+                  spdlog::error("CSRF token derivation failed: {}",
+                                error.what());
+                  (*shared_fcb)(make_auth_503());
+                  return;
+                }
+              }
+              (*shared_fccb)();
+            });
 }
 
 } // namespace
@@ -280,11 +330,16 @@ auto dispatch_session_filter(const drogon::HttpRequestPtr& req,
 auto SessionFilter::doFilter(const drogon::HttpRequestPtr& req,
                              drogon::FilterCallback&& fcb,
                              drogon::FilterChainCallback&& fccb) -> void {
-  dispatch_session_filter(
-      req, std::move(fcb), std::move(fccb),
-      [](const std::string& raw_token, TokenValidationCallback cb) {
-        validate_token(raw_token, std::move(cb));
-      });
+  dispatch_session_filter(req, std::move(fcb), std::move(fccb),
+                          [](const std::string& raw_token,
+                             CredentialSource source,
+                             TokenValidationCallback cb) {
+                            if (source == CredentialSource::COOKIE) {
+                              validate_session_token(raw_token, std::move(cb));
+                              return;
+                            }
+                            validate_token(raw_token, std::move(cb));
+                          });
 }
 
 auto test_seam::dispatch_session_filter(const drogon::HttpRequestPtr& req,

@@ -58,6 +58,27 @@ auto parse_json_body(const drogon::HttpResponsePtr& resp) -> Json::Value {
 
 } // namespace
 
+TEST_CASE("cookie package POST rejects a missing CSRF header before mutation",
+          "[integration][packages][http][ws][csrf]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+
+  plinth::http_test::HttpTestFixture fixture;
+  const auto token = fixture.seed_admin();
+  const auto zip = plinth::http_test::HttpTestFixture::read_valid_install_zip();
+  auto request = fixture.build_post(zip, token);
+  request->removeHeader("X-Plinth-CSRF");
+  const auto response = fixture.dispatch(request);
+
+  REQUIRE(response->statusCode() == drogon::k403Forbidden);
+  const auto body = parse_json_body(response);
+  REQUIRE(body["error"].asString() == "csrf_failed");
+  plinth::ws_test::TestPg observer{plinth::ws_test::test_config().db};
+  const auto count = observer.exec("SELECT count(*) FROM plinth.packages");
+  REQUIRE(std::string{PQgetvalue(count.get(), 0, 0)} == "0");
+}
+
 TEST_CASE("I.18: concurrent POSTs for same package name produce 201 + 409 "
           "advisory-lock-held",
           "[integration][packages][http][ws][I.18]") {

@@ -1,10 +1,12 @@
 #include "kernel/auth/handlers.hpp"
 #include "kernel/auth/crypto.hpp"
+#include "kernel/auth/csrf.hpp"
 #include "kernel/auth/middleware.hpp"
 #include "kernel/auth/rate_limiter.hpp"
 #include "kernel/logging.hpp"
 
 #include <drogon/drogon.h>
+#include <exception>
 #include <memory>
 #include <spdlog/spdlog.h>
 
@@ -30,6 +32,7 @@ auto json_error(drogon::HttpStatusCode status, const std::string& error_code,
   json["message"] = message;
   auto resp = drogon::HttpResponse::newHttpJsonResponse(json);
   resp->setStatusCode(status);
+  harden_auth_response(resp, true);
   return resp;
 }
 
@@ -69,6 +72,7 @@ auto respond_registered(const std::string& user_id, const std::string& username,
   body["created_at"] = created_at;
   auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
   resp->setStatusCode(drogon::k201Created);
+  harden_auth_response(resp, true);
   return resp;
 }
 
@@ -365,14 +369,23 @@ auto handle_login(const drogon::HttpRequestPtr& req, Callback&& callback,
         // Generate session token
         auto raw_token = generate_token();
         auto token_hash = sha256_hex(raw_token);
+        std::string csrf_token;
+        try {
+          csrf_token = csrf_token_for_session(raw_token);
+        } catch (const std::exception& error) {
+          spdlog::error("login CSRF token derivation failed: {}", error.what());
+          (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                           "Login failed"));
+          return;
+        }
 
         db->execSqlAsync(
             "INSERT INTO plinth.sessions "
             "(user_id, token_hash, user_agent, ip_address) "
             "VALUES ($1::uuid, $2, $3, $4::inet) "
             "RETURNING id, expires_at",
-            [user_id, username, raw_token, ip, dev_mode,
-             cb](const drogon::orm::Result& sess_result) {
+            [user_id, username, raw_token, csrf_token = std::move(csrf_token),
+             ip, dev_mode, cb](const drogon::orm::Result& sess_result) {
               auto sess_row = sess_result[0];
               auto session_id = sess_row["id"].as<std::string>();
               auto expires_at = sess_row["expires_at"].as<std::string>();
@@ -393,6 +406,8 @@ auto handle_login(const drogon::HttpRequestPtr& req, Callback&& callback,
               auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
               resp->setStatusCode(drogon::k200OK);
               set_session_cookie(resp, raw_token, dev_mode);
+              add_csrf_cookie(resp, csrf_token, dev_mode);
+              harden_auth_response(resp, true);
               (*cb)(resp);
             },
             [cb](const drogon::orm::DrogonDbException& e) {
@@ -418,6 +433,11 @@ auto handle_logout(const drogon::HttpRequestPtr& req, Callback&& callback)
                                    "not_authenticated", "Not authenticated"));
     return;
   }
+  if (ctx->auth_type != "session") {
+    std::move(callback)(json_error(drogon::k403Forbidden, "session_required",
+                                   "A session is required"));
+    return;
+  }
 
   auto db = drogon::app().getDbClient();
   auto ip = get_client_ip(req);
@@ -438,6 +458,8 @@ auto handle_logout(const drogon::HttpRequestPtr& req, Callback&& callback)
         body["status"] = "logged_out";
         auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
         clear_session_cookie(resp);
+        clear_csrf_cookie(resp);
+        harden_auth_response(resp, true);
         (*cb)(resp);
       },
       [cb](const drogon::orm::DrogonDbException& e) {
@@ -448,12 +470,26 @@ auto handle_logout(const drogon::HttpRequestPtr& req, Callback&& callback)
       ctx.value().session_id);
 }
 
-auto handle_get_session(const drogon::HttpRequestPtr& req, Callback&& callback)
-    -> void {
+auto handle_get_session(const drogon::HttpRequestPtr& req, Callback&& callback,
+                        bool dev_mode) -> void {
   auto ctx = get_auth_context(req);
   if (!ctx.has_value()) {
     std::move(callback)(json_error(drogon::k401Unauthorized,
                                    "not_authenticated", "Not authenticated"));
+    return;
+  }
+  if (ctx->auth_type != "session") {
+    std::move(callback)(json_error(drogon::k403Forbidden, "session_required",
+                                   "A session is required"));
+    return;
+  }
+
+  auto expected_csrf = request_expected_csrf_token(req);
+  if (ctx->credential_source == CredentialSource::COOKIE &&
+      !expected_csrf.has_value()) {
+    std::move(callback)(json_error(drogon::k500InternalServerError,
+                                   "internal_error",
+                                   "Failed to retrieve session"));
     return;
   }
 
@@ -467,7 +503,8 @@ auto handle_get_session(const drogon::HttpRequestPtr& req, Callback&& callback)
       "FROM plinth.users u "
       "JOIN plinth.sessions s ON s.user_id = u.id "
       "WHERE s.id = $1::uuid",
-      [cb](const drogon::orm::Result& result) {
+      [cb, expected_csrf = std::move(expected_csrf),
+       dev_mode](const drogon::orm::Result& result) {
         if (result.empty()) {
           (*cb)(json_error(drogon::k401Unauthorized, "not_authenticated",
                            "Session not found"));
@@ -490,7 +527,12 @@ auto handle_get_session(const drogon::HttpRequestPtr& req, Callback&& callback)
           body["session"]["ip_address"] = row["ip_address"].as<std::string>();
         }
 
-        (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
+        if (expected_csrf.has_value()) {
+          add_csrf_cookie(resp, expected_csrf.value(), dev_mode);
+        }
+        harden_auth_response(resp);
+        (*cb)(resp);
       },
       [cb](const drogon::orm::DrogonDbException& e) {
         spdlog::error("session query failed: {}", e.base().what());
@@ -554,7 +596,14 @@ auto handle_delete_session(const drogon::HttpRequestPtr& req,
 
               Json::Value body;
               body["status"] = "revoked";
-              (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+              auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
+              if (ctx_val.credential_source == CredentialSource::COOKIE &&
+                  target_session_id == ctx_val.session_id) {
+                clear_session_cookie(resp);
+                clear_csrf_cookie(resp);
+              }
+              harden_auth_response(resp, true);
+              (*cb)(resp);
             },
             [cb](const drogon::orm::DrogonDbException& e) {
               spdlog::error("session revoke failed: {}", e.base().what());
@@ -609,7 +658,9 @@ auto handle_list_sessions(const drogon::HttpRequestPtr& req,
 
         Json::Value body;
         body["sessions"] = sessions;
-        (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
+        harden_auth_response(resp);
+        (*cb)(resp);
       },
       [cb](const drogon::orm::DrogonDbException& e) {
         spdlog::error("sessions list failed: {}", e.base().what());
@@ -631,7 +682,7 @@ auto register_auth_routes(bool dev_mode, bool registration_enabled) -> void {
           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
         handle_register(req, std::move(callback), registration_enabled);
       },
-      {drogon::Post});
+      {drogon::Post, "plinth::auth::PublicOriginFilter"});
 
   drogon::app().registerHandler(
       "/api/auth/login",
@@ -640,7 +691,7 @@ auto register_auth_routes(bool dev_mode, bool registration_enabled) -> void {
           std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
         handle_login(req, std::move(callback), dev_mode);
       },
-      {drogon::Post});
+      {drogon::Post, "plinth::auth::PublicOriginFilter"});
 
   drogon::app().registerHandler(
       "/api/auth/logout",
@@ -648,13 +699,15 @@ auto register_auth_routes(bool dev_mode, bool registration_enabled) -> void {
          std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
         handle_logout(req, std::move(callback));
       },
-      {drogon::Post, "plinth::auth::SessionFilter"});
+      {drogon::Post, "plinth::auth::SessionFilter",
+       "plinth::auth::CsrfFilter"});
 
   drogon::app().registerHandler(
       "/api/auth/session",
-      [](const drogon::HttpRequestPtr& req,
-         std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
-        handle_get_session(req, std::move(callback));
+      [dev_mode](
+          const drogon::HttpRequestPtr& req,
+          std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
+        handle_get_session(req, std::move(callback), dev_mode);
       },
       {drogon::Get, "plinth::auth::SessionFilter"});
 
@@ -665,7 +718,8 @@ auto register_auth_routes(bool dev_mode, bool registration_enabled) -> void {
          const std::string& target_session_id) {
         handle_delete_session(req, std::move(callback), target_session_id);
       },
-      {drogon::Delete, "plinth::auth::SessionFilter"});
+      {drogon::Delete, "plinth::auth::SessionFilter",
+       "plinth::auth::CsrfFilter"});
 
   drogon::app().registerHandler(
       "/api/auth/sessions",

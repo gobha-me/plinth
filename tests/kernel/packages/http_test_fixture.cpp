@@ -1,5 +1,7 @@
 #include "http_test_fixture.hpp"
 
+#include "kernel/auth/csrf.hpp"
+
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -44,6 +46,17 @@ auto clear_packages_dir() -> void {
   std::error_code ec;
   fs::remove_all(extensions_dir, ec);
   fs::create_directories(extensions_dir, ec);
+}
+
+auto add_cookie_auth(const drogon::HttpRequestPtr& request,
+                     std::string_view session_token) -> void {
+  const auto csrf = plinth::auth::csrf_token_for_session(session_token);
+  request->addCookie("plinth_session", std::string{session_token});
+  request->addCookie(std::string{plinth::auth::CSRF_COOKIE}, csrf);
+  request->addHeader(std::string{plinth::auth::CSRF_HEADER}, csrf);
+  request->addHeader("Origin",
+                     "http://127.0.0.1:" +
+                         std::to_string(plinth::ws_test::test_server_port()));
 }
 
 } // namespace
@@ -127,7 +140,7 @@ auto HttpTestFixture::build_post(std::span<const std::byte> bytes,
     path += std::string{query};
   }
   req->setPath(path);
-  req->addCookie("plinth_session", std::string{session_token});
+  add_cookie_auth(req, session_token);
   return req;
 }
 
@@ -139,7 +152,7 @@ auto HttpTestFixture::build_patch(std::string_view id, std::string_view action,
   req->setPath("/api/packages/" + std::string{id});
   req->setContentTypeCode(drogon::CT_APPLICATION_JSON);
   req->setBody(R"({"action":")" + std::string{action} + R"("})");
-  req->addCookie("plinth_session", std::string{session_token});
+  add_cookie_auth(req, session_token);
   return req;
 }
 
@@ -153,7 +166,7 @@ auto HttpTestFixture::build_delete(std::string_view id, bool confirm,
     path += "?confirm=true";
   }
   req->setPath(path);
-  req->addCookie("plinth_session", std::string{session_token});
+  add_cookie_auth(req, session_token);
   return req;
 }
 
