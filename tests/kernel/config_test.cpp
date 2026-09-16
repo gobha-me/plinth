@@ -550,11 +550,13 @@ TEST_CASE(
     auto path = write_temp_config({{"ws_browser_origin", origin}});
     auto cfg = plinth::load_config(path);
     remove_file(path);
+    REQUIRE(cfg.browser_origin == origin);
     REQUIRE(cfg.ws_browser_origin == origin);
   }
   for (const auto* origin :
        {"null", "//plinth.example", "ftp://plinth.example",
         "https://user@plinth.example", "https://plinth.example/",
+        "http://plinth.example:80", "https://plinth.example:443",
         "https://plinth.example/path", "https://plinth.example?x=1",
         "https://plinth.example#fragment", "https://plinth.example:0",
         "https://plinth.example:65536", "http://[:::1]", "https://a..example",
@@ -565,4 +567,39 @@ TEST_CASE(
                         "config.ws_browser_origin_invalid");
     remove_file(path);
   }
+}
+
+TEST_CASE("Browser origin canonical key preserves the WebSocket alias",
+          "[config][unit][browser-origin]") {
+  EnvGuard guard;
+  auto path = write_temp_config({{"browser_origin", "https://plinth.example"}});
+  auto cfg = plinth::load_config(path);
+  remove_file(path);
+  REQUIRE(cfg.browser_origin == "https://plinth.example");
+  REQUIRE(cfg.ws_browser_origin == "https://plinth.example");
+}
+
+TEST_CASE("Browser origin canonical key rejects non-serialized origins",
+          "[config][unit][browser-origin]") {
+  EnvGuard guard;
+  for (const auto* origin :
+       {"http://plinth.example:80", "https://plinth.example:443",
+        "http://[0:0:0:0:0:0:0:1]:8080"}) {
+    INFO(origin);
+    auto path = write_temp_config({{"browser_origin", origin}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.browser_origin_invalid");
+    remove_file(path);
+  }
+}
+
+TEST_CASE("Browser origin aliases must not disagree",
+          "[config][unit][browser-origin]") {
+  EnvGuard guard;
+  auto path =
+      write_temp_config({{"browser_origin", "https://plinth.example"},
+                         {"ws_browser_origin", "https://other.example"}});
+  REQUIRE_THROWS_WITH(plinth::load_config(path),
+                      "config.browser_origin_conflict");
+  remove_file(path);
 }

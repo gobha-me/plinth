@@ -24,3 +24,9 @@ description = "ICD dependency label misclassified as a credential"
 condition = "AND"
 paths = ['''^docs/icd/ICD-0\.1\.4-groups-rbac\.md$''']
 regexes = ['''ICD-0\.1\.3-pats''']
+
+[[allowlists]]
+description = "Deterministic CSRF HMAC test vector, not a credential"
+condition = "AND"
+paths = ['''^tests/kernel/auth/csrf_test\.cpp$''']
+regexes = ['''4QiLXgHg5DvZWCPXHWwVyPE0YuvaKX67CSLnZh72wFs''']

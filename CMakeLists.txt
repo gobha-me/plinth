@@ -394,6 +394,7 @@ find_package(OpenSSL REQUIRED)
 # ─── Kernel ───────────────────────────────────────────────────
 add_executable(plinth
   src/kernel/main.cpp
+  src/kernel/browser_origin.cpp
   src/kernel/lifecycle/async_task_registry.cpp
   src/kernel/lifecycle/shutdown_coordinator.cpp
   src/kernel/config.cpp
@@ -401,6 +402,7 @@ add_executable(plinth
   src/kernel/db/bootstrap.cpp
   src/kernel/audit/handlers.cpp
   src/kernel/auth/crypto.cpp
+  src/kernel/auth/csrf.cpp
   src/kernel/auth/rate_limiter.cpp
   src/kernel/auth/middleware.cpp
   src/kernel/auth/handlers.cpp
@@ -511,11 +513,14 @@ add_executable(plinth_tests
   tests/kernel/lifecycle/shutdown_coordinator_test.cpp
   tests/kernel/lifecycle/process_shutdown_test.cpp
   tests/kernel/config_test.cpp
+  tests/kernel/browser_origin_test.cpp
   tests/kernel/db/bootstrap_test.cpp
   tests/kernel/db/connection_info_test.cpp
   tests/kernel/audit/audit_test.cpp
   tests/kernel/audit/audit_teardown_test.cpp
   tests/kernel/auth/crypto_test.cpp
+  tests/kernel/auth/csrf_test.cpp
+  tests/kernel/auth/csrf_route_inventory_test.cpp
   tests/kernel/auth/rate_limiter_test.cpp
   tests/kernel/auth/middleware_test.cpp
   tests/kernel/auth/auth_integration_test.cpp
@@ -611,12 +616,14 @@ add_executable(plinth_tests
   tests/kernel/frontend/applications_test.cpp
   tests/kernel/cap/api_cap_test.cpp
   src/kernel/config.cpp
+  src/kernel/browser_origin.cpp
   src/kernel/lifecycle/async_task_registry.cpp
   src/kernel/lifecycle/shutdown_coordinator.cpp
   src/kernel/logging.cpp
   src/kernel/db/bootstrap.cpp
   src/kernel/audit/handlers.cpp
   src/kernel/auth/crypto.cpp
+  src/kernel/auth/csrf.cpp
   src/kernel/auth/rate_limiter.cpp
   src/kernel/auth/middleware.cpp
   src/kernel/auth/handlers.cpp
@@ -824,7 +831,7 @@ add_test(NAME plinth_tests_auth_http
     --binary $<TARGET_FILE:plinth> --scenario disabled-session)
 set_tests_properties(plinth_tests_auth_http PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS needs_pg TIMEOUT 180 SKIP_RETURN_CODE 77)
-foreach(auth_scenario bootstrap-disabled bootstrap-enabled bootstrap-rollback)
+foreach(auth_scenario bootstrap-disabled bootstrap-enabled bootstrap-rollback csrf)
   add_test(NAME plinth_tests_auth_${auth_scenario}
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/auth_http.py
       --binary $<TARGET_FILE:plinth> --scenario ${auth_scenario})

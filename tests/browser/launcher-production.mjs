@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -23,19 +23,25 @@ const user = randomUUID();
 const session = randomUUID();
 const token = randomBytes(32).toString('base64url');
 const hash = createHash('sha256').update(token).digest('hex');
+const csrf = createHmac('sha256', token).update('plinth.csrf.v1').digest('base64url');
 sql(`INSERT INTO plinth.users(id,username,password_hash) VALUES
     ('${user}','launcher-${user}','not-a-password-hash');
     INSERT INTO plinth.sessions(id,user_id,token_hash) VALUES ('${session}','${user}','${hash}');
     INSERT INTO plinth.group_members(group_id,user_id)
     SELECT id,'${user}' FROM plinth.groups WHERE name='admin';`);
-const cookie = { Cookie: `plinth_session=${token}` };
+const browserOrigin = new URL(baseURL).origin;
+const mutationHeaders = {
+    Cookie: `plinth_session=${token}; plinth_csrf=${csrf}`,
+    Origin: browserOrigin,
+    'X-Plinth-CSRF': csrf,
+};
 
 async function lifecycle(path, init, expected) {
     const deadline = Date.now() + 15000;
     while (true) {
         const response = await fetch(baseURL + path, {
             ...init,
-            headers: { ...cookie, ...(init?.headers || {}) },
+            headers: { ...mutationHeaders, ...(init?.headers || {}) },
         });
         if (expected.includes(response.status)) return response;
         if (response.status !== 409 || Date.now() >= deadline) {
@@ -51,8 +57,12 @@ const browser = await chromium.launch({
 });
 try {
     const context = await browser.newContext();
-    await context.addCookies([{ name: 'plinth_session', value: token, url: baseURL,
-        httpOnly: true, sameSite: 'Strict', secure: baseURL.startsWith('https:') }]);
+    await context.addCookies([
+        { name: 'plinth_session', value: token, url: baseURL,
+            httpOnly: true, sameSite: 'Strict', secure: baseURL.startsWith('https:') },
+        { name: 'plinth_csrf', value: csrf, url: baseURL,
+            httpOnly: false, sameSite: 'Strict', secure: baseURL.startsWith('https:') },
+    ]);
     const page = await context.newPage();
     const errors = [];
     const realtimeFrames = [];
@@ -63,6 +73,43 @@ try {
     await page.goto(baseURL + '/app/');
     await page.getByRole('heading', { name: 'Home', exact: true }).waitFor();
     await page.getByText('No applications are available.', { exact: true }).waitFor();
+
+    const csrfControls = await page.evaluate(async () => {
+        const request = {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ args: { key: 'shell.launcher' } }),
+        };
+        const missing = await fetch('/api/cap/shell.preferences.get', request);
+        const missingBody = await missing.json();
+        const csrfPart = document.cookie.split(';').map(part => part.trim())
+            .find(part => part.startsWith('plinth_csrf='));
+        const csrf = csrfPart && decodeURIComponent(csrfPart.slice('plinth_csrf='.length));
+        const valid = await fetch('/api/cap/shell.preferences.get', {
+            ...request,
+            headers: { ...request.headers, 'X-Plinth-CSRF': csrf },
+        });
+        const validBody = await valid.json();
+        return {
+            hasToken: Boolean(csrf),
+            missingStatus: missing.status,
+            missingError: missingBody.error,
+            missingMessage: missingBody.message,
+            validStatus: valid.status,
+            validOk: validBody.ok,
+            tokenReflected: JSON.stringify(missingBody).includes(csrf),
+        };
+    });
+    assert.deepEqual(csrfControls, {
+        hasToken: true,
+        missingStatus: 403,
+        missingError: 'csrf_failed',
+        missingMessage: 'Request validation failed',
+        validStatus: 200,
+        validOk: true,
+        tokenReflected: false,
+    });
 
     const archive = await readFile(join(buildDir, 'fixtures', 'valid-install.zip'));
     const form = new FormData();

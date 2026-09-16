@@ -25,6 +25,7 @@ auto json_error(drogon::HttpStatusCode status, const std::string& error_code,
   json["message"] = message;
   auto resp = drogon::HttpResponse::newHttpJsonResponse(json);
   resp->setStatusCode(status);
+  harden_auth_response(resp, true);
   return resp;
 }
 
@@ -122,6 +123,7 @@ auto handle_create_pat(const drogon::HttpRequestPtr& req, Callback&& callback)
 
       auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
       resp->setStatusCode(drogon::k201Created);
+      harden_auth_response(resp, true);
       (*cb)(resp);
     };
 
@@ -208,7 +210,9 @@ auto handle_list_pats(const drogon::HttpRequestPtr& req, Callback&& callback)
 
         Json::Value body;
         body["pats"] = pats;
-        (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+        auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
+        harden_auth_response(resp);
+        (*cb)(resp);
       },
       [cb](const drogon::orm::DrogonDbException& e) {
         spdlog::error("PAT list failed: {}", e.base().what());
@@ -271,7 +275,9 @@ auto handle_revoke_pat(const drogon::HttpRequestPtr& req, Callback&& callback,
 
               Json::Value body;
               body["status"] = "pat_revoked";
-              (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+              auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
+              harden_auth_response(resp, true);
+              (*cb)(resp);
             },
             [cb](const drogon::orm::DrogonDbException& e) {
               spdlog::error("PAT revoke failed: {}", e.base().what());
@@ -299,7 +305,8 @@ auto register_pat_routes() -> void {
          std::function<void(const drogon::HttpResponsePtr&)>&& callback) {
         handle_create_pat(req, std::move(callback));
       },
-      {drogon::Post, "plinth::auth::SessionFilter"});
+      {drogon::Post, "plinth::auth::SessionFilter",
+       "plinth::auth::CsrfFilter"});
 
   drogon::app().registerHandler(
       "/api/auth/pats",
@@ -316,7 +323,8 @@ auto register_pat_routes() -> void {
          const std::string& target_pat_id) {
         handle_revoke_pat(req, std::move(callback), target_pat_id);
       },
-      {drogon::Delete, "plinth::auth::SessionFilter"});
+      {drogon::Delete, "plinth::auth::SessionFilter",
+       "plinth::auth::CsrfFilter"});
 
   spdlog::info("PAT routes registered");
 }

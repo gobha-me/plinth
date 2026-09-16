@@ -165,8 +165,6 @@ TEST_CASE("S.01: writer stamps envelope.seq before broker dispatch",
     SKIP("PG not available");
   }
   reset_schema(pg_config());
-  Harness h;
-  TestPg pg{pg_config()};
 
   // The pre-broker hook captures the envelope at the precise
   // instant after the writer has stamped seq from the RETURNING
@@ -175,6 +173,8 @@ TEST_CASE("S.01: writer stamps envelope.seq before broker dispatch",
   // point — that is the writer-first invariant L.08 pins.
   std::int64_t observed_seq = -1;
   bool seq_present = false;
+  Harness h;
+  TestPg pg{pg_config()};
   ew::set_pre_broker_hook_for_test(
       [&](const plinth::realtime::DispatchedEvent& ev) {
         if (ev.envelope.isMember("seq")) {
@@ -206,12 +206,12 @@ TEST_CASE("S.02: INSERT failure leaves envelope.seq absent + skips broker",
           "[realtime][events][writer][seq][unit]") {
   plinth::Config::Realtime::Events cfg; // enabled=true; no DbClient
   cfg.enabled = false;                  // suppress the production arm
+  bool pre_broker_fired = false;
   Harness h{cfg};
 
   // Force the writer to use the test arm via an INSERT hook that
   // synthesizes a PG-side failure. The pre-broker hook is wired but
   // MUST not fire on the failure path (S.02 acceptance).
-  bool pre_broker_fired = false;
   ew::set_pre_broker_hook_for_test(
       [&](const plinth::realtime::DispatchedEvent&) {
         pre_broker_fired = true;
@@ -241,12 +241,12 @@ TEST_CASE("S.02: INSERT failure leaves envelope.seq absent + skips broker",
 
 TEST_CASE("S.03: advisory-lock loss silently skips broker + cursor",
           "[realtime][events][writer][seq][unit]") {
+  bool pre_broker_fired = false;
   Harness h;
 
   // The lock hook returns false → §HA losers skip silently.
   ew::set_advisory_lock_hook_for_test([](const std::string&) { return false; });
 
-  bool pre_broker_fired = false;
   ew::set_pre_broker_hook_for_test(
       [&](const plinth::realtime::DispatchedEvent&) {
         pre_broker_fired = true;
@@ -371,10 +371,10 @@ TEST_CASE("S.08: events.enabled=false emits no seq + no INSERT",
 
   plinth::Config::Realtime::Events cfg;
   cfg.enabled = false;
+  bool pre_broker_fired = false;
   Harness h{cfg};
   TestPg pg{pg_config()};
 
-  bool pre_broker_fired = false;
   ew::set_pre_broker_hook_for_test(
       [&](const plinth::realtime::DispatchedEvent&) {
         pre_broker_fired = true;

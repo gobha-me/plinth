@@ -196,6 +196,77 @@ try {
         await context.close();
         console.log(`PASS boundary stack redaction: production=${production}`);
     }
+
+    // Exercise the shipping shell's cookie-to-header path and logout state
+    // transition. A rejected or interrupted mutation must not claim that a
+    // still-valid server session was ended.
+    for (const outcome of ['success', 'terminal', 'csrf-rejected', 'network-failed']) {
+        const context = await browser.newContext();
+        await context.addCookies([{
+            name: 'plinth_csrf', value: `csrf-${outcome}`, url: baseURL,
+        }]);
+        const page = await context.newPage();
+        const csrfHeaders = [];
+        await page.route('**/api/auth/session', route => route.fulfill({
+            json: { user: { id: 'test-user', username: 'admin' } },
+        }));
+        await page.route('**/api/cap/shell.preferences.get', route => {
+            csrfHeaders.push(route.request().headers()['x-plinth-csrf']);
+            return route.fulfill({ json: { ok: true, value: { value: null } } });
+        });
+        await page.route('**/api/frontend/applications', route => route.fulfill({
+            json: { schema_version: 1, applications: [] },
+        }));
+        await page.route('**/api/auth/logout', route => {
+            csrfHeaders.push(route.request().headers()['x-plinth-csrf']);
+            if (outcome === 'success') return route.fulfill({ json: { ok: true } });
+            if (outcome === 'terminal') {
+                return route.fulfill({ status: 401, json: { error: 'session_revoked' } });
+            }
+            if (outcome === 'csrf-rejected') {
+                return route.fulfill({
+                    status: 403,
+                    json: { error: 'csrf_failed', message: 'Request validation failed' },
+                });
+            }
+            return route.abort('connectionfailed');
+        });
+        await page.routeWebSocket(/\/ws(?:\/events)?$/, socket => {
+            socket.onMessage(message => {
+                const frame = JSON.parse(message);
+                if (frame.type === 'subscribe' || frame.type === 'unsubscribe') {
+                    socket.send(JSON.stringify({ type: frame.type + 'd', channels: frame.channels }));
+                }
+            });
+            socket.send(JSON.stringify({ type: 'connected' }));
+        });
+
+        await page.goto(baseURL + '/app/');
+        const avatar = page.locator('.zone-avatar > button');
+        await avatar.waitFor();
+        await avatar.click();
+        const signOut = page.getByRole('menuitem', { name: 'Sign Out', exact: true });
+        const logoutRequest = page.waitForRequest('**/api/auth/logout');
+        // Launcher state can update underneath the popover as its initial
+        // catalog and realtime requests settle. Dispatch on the exact menu
+        // element so actionability retries cannot chase a replaced node.
+        await signOut.dispatchEvent('click');
+        await logoutRequest;
+
+        if (outcome === 'success' || outcome === 'terminal') {
+            await page.getByRole('heading', { name: 'Sign in to Plinth', exact: true }).waitFor();
+        } else {
+            await avatar.waitFor();
+            assert.equal(await page.getByRole('heading', {
+                name: 'Sign in to Plinth', exact: true,
+            }).count(), 0);
+        }
+        assert(csrfHeaders.length >= 2, 'capability and logout requests must both be observed');
+        assert(csrfHeaders.every(value => value === `csrf-${outcome}`));
+        assert.equal((await page.locator('body').textContent()).includes(`csrf-${outcome}`), false);
+        await context.close();
+        console.log(`PASS CSRF header and logout state: ${outcome}`);
+    }
 } finally {
     await browser?.close();
     if (server) await new Promise(resolve => server.close(resolve));

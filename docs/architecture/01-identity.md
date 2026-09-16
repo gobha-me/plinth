@@ -191,10 +191,53 @@ extensions #50-#55; no admin package is currently bundled.
 
 ## 3. Anonymous Identity
 
-`SessionFilter` accepts either the HttpOnly session cookie or a PAT and attaches
-an `AuthContext`; `RbacFilter` attaches the route's `RbacContext`. Capability
-handlers combine authenticated identity and effective rules into the
-`UserContext` passed to resolution.
+`SessionFilter` accepts the HttpOnly session cookie or an explicit bearer
+session/PAT and attaches an `AuthContext`, including the selected credential
+transport. Cookie credentials take precedence when both transports are
+present. A `plinth_` value in the cookie is always validated as a session, so
+the PAT prefix cannot change the ambient-cookie policy. `RbacFilter` attaches
+the route's `RbacContext`. Capability handlers combine authenticated identity
+and effective rules into the `UserContext` passed to resolution.
+
+All cookie-authenticated `POST`, `PUT`, `PATCH`, and `DELETE` API routes run
+`CsrfFilter` after `SessionFilter` and before RBAC or the handler. This includes
+auth logout/session revocation/PAT mutation, group and rule mutation, package
+mutation, and every `POST /api/cap/*` call. Capability metadata does not yet
+carry an audited read-only bit, so capability names never bypass the filter.
+Explicit bearer sessions and PATs are non-ambient credentials and do not use
+the browser CSRF contract.
+
+The current unsafe-route inventory is:
+
+- public exact-origin only: `POST /api/auth/register`,
+  `POST /api/auth/login`;
+- authenticated CSRF: `POST /api/auth/logout`,
+  `DELETE /api/auth/session/{id}`, `POST /api/auth/pats`, and
+  `DELETE /api/auth/pats/{id}`;
+- administrator CSRF plus RBAC: `POST /api/groups`, `PUT` and `DELETE`
+  `/api/groups/{id}`, and `POST`/`DELETE` membership and rule subresources;
+- package CSRF plus RBAC: `POST /api/packages` and `PATCH`/`DELETE`
+  `/api/packages/{id}`;
+- capability CSRF: `POST /api/cap/{capability}`, followed by the resolver's
+  capability-specific RBAC check.
+
+An executable source inventory test fails when an unsafe `/api/*` registration
+is added, removed, or ordered without its required origin/session/CSRF filters.
+
+Login issues a readable, host-only `plinth_csrf` cookie alongside the HttpOnly
+session cookie. The value is a versioned HMAC derived from the raw session
+token, is never persisted or logged, and therefore binds naturally to exactly
+one session. Unsafe browser requests must present that value both as the cookie
+and as `X-Plinth-CSRF`, plus an exact trusted `Origin`. `GET /api/auth/session`
+reasserts the value for an authenticated cookie session; logout and revoking
+the current cookie session clear both cookies. A new login rotates both values.
+Missing, malformed, cross-session, and cross-origin requests share one generic
+non-cacheable `403 csrf_failed` response.
+
+Login and registration cannot require a pre-session token. They accept a
+missing Origin only from a request with no browser fetch/cookie signals and
+otherwise require the same exact-origin check. They never enable credentialed
+CORS.
 Login, registration, health, and frontend assets are intentionally public and
 do not synthesize authority. `UserContext::anonymous()` is the reserved context
 for a future explicitly public RBAC-gated surface:

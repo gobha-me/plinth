@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <title>Login walkthrough — I.01–I.02 + L.01–L.06 (manual)</title>
+    <title>Login walkthrough — I.01–I.02 + L.01–L.07 (manual)</title>
     <style>
       body { font: 14px/1.5 -apple-system, system-ui, sans-serif;
              max-width: 760px; margin: 24px auto; padding: 0 16px; }
@@ -19,7 +19,7 @@
   </head>
   <body>
     <h1>Shell login walkthrough — manual smoke
-        (ICD-0.6.0 §13 I.01–I.02 + L.01–L.06)</h1>
+        (ICD-0.6.0 §13 I.01–I.02 + L.01–L.07)</h1>
     <p>End-to-end: redirect, login form, authenticated frame, sign-out.
        L.\* wire-contract cases are <span class="deferred">deferred to
        0.6.0.N</span> per architect sign-off; they remain documented
@@ -51,7 +51,8 @@
         <li>Observe Network: <code>POST /api/auth/login</code> →
             <code>200</code> with <code>Set-Cookie:
             plinth_session=…; HttpOnly; SameSite=Strict</code> (Secure
-            in production builds; absent in dev_mode).</li>
+            in production builds; absent in dev_mode), plus a readable
+            session-bound <code>plinth_csrf</code> cookie.</li>
         <li>Observe DOM: four <code>.zone</code> divs in the topbar +
             <code>main</code> with <code>Hello, admin</code>.</li>
         <li class="expected">Expected: every step transitions in order;
@@ -65,10 +66,11 @@
       <ol>
         <li>From the I.01 authenticated state, click avatar → Sign Out.</li>
         <li>Observe Network: <code>POST /api/auth/logout</code> →
-            <code>200</code> with <code>Set-Cookie: plinth_session=;
-            Max-Age=0</code>.</li>
-        <li>Observe Application → Cookies: no <code>plinth_session</code>
-            cookie remains for the origin.</li>
+            <code>200</code>; the request has <code>X-Plinth-CSRF</code>
+            equal to the current <code>plinth_csrf</code> cookie, and the
+            response expires both auth cookies.</li>
+        <li>Observe Application → Cookies: neither <code>plinth_session</code>
+            nor <code>plinth_csrf</code> remains for the origin.</li>
         <li>Observe DOM: login form renders again under <code>#root</code>.</li>
         <li class="expected">Expected: cookie gone; login form re-renders;
             no Console errors.</li>
@@ -157,7 +159,9 @@
       <ol>
         <li>From authenticated state, click Sign Out.</li>
         <li>Network: <code>POST /api/auth/logout</code> 200 with
-            <code>Set-Cookie: plinth_session=; Max-Age=0</code>.</li>
+            <code>X-Plinth-CSRF</code> matching the current cookie and
+            <code>Set-Cookie</code> expiring both <code>plinth_session</code>
+            and <code>plinth_csrf</code>.</li>
         <li>In Console run <code>fetch('/api/auth/session', {
             credentials: 'include' }).then(r =&gt; r.status)</code>;
             expect <code>401</code>.</li>
@@ -166,9 +170,21 @@
       </ol>
     </div>
 
+    <div class="case l">
+      <strong>L.07</strong> A rejected or interrupted logout does not claim
+      that the browser signed out.
+      <ol>
+        <li>Repeat Sign Out with DevTools request blocking, then with a stale
+            <code>plinth_csrf</code> cookie that produces <code>403</code>.</li>
+        <li class="expected">Expected: the authenticated frame remains. A
+            successful response or terminal <code>401</code> returns to login;
+            network failure and <code>403</code> do not.</li>
+      </ol>
+    </div>
+
     <h2>Ship gate</h2>
     <p>I.01 + I.02 must hold for 0.6.0 release.
-       L.01–L.06 are <span class="deferred">deferred to 0.6.0.N</span>
+       L.01–L.07 are <span class="deferred">deferred to 0.6.0.N</span>
        and not on the 0.6.0 ship gate, but the manual checklist above
        must run clean before claiming the wire-contract is intact.</p>
   </body>

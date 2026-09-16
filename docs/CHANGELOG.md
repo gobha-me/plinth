@@ -11,6 +11,23 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-16 — browser mutation CSRF boundary
+
+- Bound a readable double-submit token to each HttpOnly session and required
+  it, together with the exact trusted browser origin, on every
+  cookie-authenticated mutating API route.
+- Kept bearer sessions and PATs compatible with native clients, constrained
+  pre-session login and registration by browser origin, and made logout and
+  current-session revocation clear both cookies.
+- Added fresh-token propagation to the shell and capability SDK, a shared
+  HTTP/WebSocket reverse-proxy origin authority, and fail-closed unit, HTTP,
+  and real-browser controls for missing, malformed, cross-session, and
+  cross-origin requests.
+
+This resolves [GitHub issue #33](https://github.com/gobha-me/plinth/issues/33).
+
+---
+
 ## 2026-09-16 — application discovery and launcher contract
 
 - Defined one package as one launcher application and its ordered primary

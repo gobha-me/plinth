@@ -266,6 +266,7 @@ auto handle_post_cap(const drogon::HttpRequestPtr& req,
 
 auto register_cap_routes(const Config::Database& db) -> void {
   constexpr auto SF = "plinth::auth::SessionFilter";
+  constexpr auto CF = "plinth::auth::CsrfFilter";
   drogon::app().registerHandler(
       "/api/cap/{capability}",
       [db](const drogon::HttpRequestPtr& req,
@@ -273,7 +274,7 @@ auto register_cap_routes(const Config::Database& db) -> void {
            const std::string& capability) {
         handle_post_cap(req, std::move(cb), db, capability);
       },
-      {drogon::Post, SF});
+      {drogon::Post, SF, CF});
   spdlog::info("cap: registered POST /api/cap/{{capability}}");
 }
 

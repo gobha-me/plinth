@@ -407,13 +407,14 @@ mode. The browser smoke exercises both explicit configurations.
 
 The browser SDK connects to `/ws/events`. Its HttpOnly `plinth_session`
 cookie accompanies the upgrade automatically; the token is never exposed to
-JavaScript, placed in a URL, or returned in a login body. Cookie upgrades
-require an exact browser `Origin` match. With `ws_browser_origin` unset, the
-expected origin is the connection's actual HTTP/HTTPS scheme plus `Host`.
+JavaScript, placed in a URL, or returned in a login body. Cookie-authenticated
+unsafe HTTP requests and WebSocket upgrades require the same exact browser
+`Origin` authority. With `browser_origin` unset, the expected origin is the
+connection's actual HTTP/HTTPS scheme plus `Host`.
 A native client without a cookie or Origin continues to send an explicit
 `{"type":"auth","token":"..."}` frame.
 
-For TLS termination at a reverse proxy, configure `ws_browser_origin` to the
+For TLS termination at a reverse proxy, configure `browser_origin` to the
 exact public origin, for example `https://plinth.example`, and preserve that
 origin's authority in the upstream `Host` header. The setting accepts only an
 absolute lowercase HTTP(S) origin with an optional valid port and no trailing
@@ -422,6 +423,8 @@ origin (omit default ports). The configured authority must still equal
 `Host`; `Forwarded` and `X-Forwarded-*` headers do not establish trust. An
 invalid configured origin prevents startup. Restrict direct access to a
 proxied listener as part of the deployment's existing network boundary.
+The legacy `ws_browser_origin` key remains an alias; specifying both keys with
+different values prevents startup.
 
 Authentication and RBAC loading complete with the server's `connected` frame.
 The SDK then sends `subscribe` and `unsubscribe` frames with `channels`

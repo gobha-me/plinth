@@ -20,7 +20,8 @@ import uuid
 
 
 class Kernel:
-    def __init__(self, binary, root, database, pg_env, registration_enabled):
+    def __init__(self, binary, root, database, pg_env, registration_enabled,
+                 configured_https_origin=False):
         self.database = database
         self.pg_env = pg_env | {"PGDATABASE": database}
         self.binary = binary
@@ -31,24 +32,30 @@ class Kernel:
             self.port = probe.getsockname()[1]
         repo = Path(__file__).resolve().parents[2]
         self.config = root / "config.json"
-        self.config.write_text(json.dumps({
+        config = {
             "listen_host": "127.0.0.1", "listen_port": self.port,
             "dev_mode": False, "registration_enabled": registration_enabled,
             "database": {"pool_size": 8},
             "shell": {"enabled": False},
             "migrations_dir": str(repo / "migrations"),
             "packages": {"data_dir": str(root / "data"),
-                         "staging_dir": str(root / "staging")}}))
+                         "staging_dir": str(root / "staging")}}
+        if configured_https_origin:
+            config["browser_origin"] = f"https://127.0.0.1:{self.port}"
+        self.config.write_text(json.dumps(config))
 
     def sql(self, statement):
         return sql(self.pg_env, statement)
 
-    def request(self, method, path, body=None, token=None):
-        headers = {}
+    def request(self, method, path, body=None, token=None, cookie=None,
+                extra_headers=None):
+        headers = dict(extra_headers or {})
         if body is not None:
             headers["Content-Type"] = "application/json"
         if token is not None:
             headers["Authorization"] = "Bearer " + token
+        if cookie is not None:
+            headers["Cookie"] = cookie
         with contextlib.closing(http.client.HTTPConnection(
                 "127.0.0.1", self.port, timeout=10)) as connection:
             connection.request(method, path, None if body is None else json.dumps(body), headers)
@@ -100,12 +107,14 @@ def sql(env, statement):
 
 
 @contextlib.contextmanager
-def running_kernel(binary, pg_env, registration_enabled):
+def running_kernel(binary, pg_env, registration_enabled,
+                   configured_https_origin=False):
     database = "plinth_auth_" + uuid.uuid4().hex
     sql(pg_env, f'CREATE DATABASE "{database}"')
     try:
         with tempfile.TemporaryDirectory(prefix="plinth-auth-http-") as temporary:
-            kernel = Kernel(binary, Path(temporary), database, pg_env, registration_enabled)
+            kernel = Kernel(binary, Path(temporary), database, pg_env,
+                            registration_enabled, configured_https_origin)
             try:
                 kernel.start()
                 yield kernel
@@ -166,6 +175,151 @@ def websocket_auth(kernel, token):
         else:
             assert length != 127, "unbounded WebSocket frame"
         return json.loads(receive(length))
+
+
+def response_cookies(headers):
+    cookies = SimpleCookie()
+    for name, value in headers:
+        if name.lower() == "set-cookie":
+            cookies.load(value)
+    return cookies
+
+
+def response_header(headers, expected_name):
+    for name, value in headers:
+        if name.lower() == expected_name.lower():
+            return value
+    return ""
+
+
+def csrf_contract(binary, pg_env):
+    with running_kernel(binary, pg_env, True) as kernel:
+        origin = f"http://127.0.0.1:{kernel.port}"
+        credentials = {
+            "username": "csrf-primary",
+            "password": "fake-password-for-csrf-test",
+        }
+
+        status, _, _ = kernel.request("POST", "/api/auth/register", credentials)
+        assert status == 201, f"native registration returned {status}"
+
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/login", credentials,
+            extra_headers={"Origin": "https://cross-origin.invalid"})
+        assert status == 403 and body == {
+            "error": "csrf_failed", "message": "Request validation failed"
+        }, f"cross-origin login did not fail closed: {status}"
+
+        status, _, headers = kernel.request(
+            "POST", "/api/auth/login", credentials,
+            extra_headers={"Origin": origin})
+        assert status == 200, f"same-origin login returned {status}"
+        cookies = response_cookies(headers)
+        assert response_header(headers, "Cache-Control") == "no-store"
+        assert response_header(headers, "Vary") == \
+            "Origin, Cookie, Authorization"
+        assert "plinth_session" in cookies and "plinth_csrf" in cookies
+        session = cookies["plinth_session"].value
+        csrf = cookies["plinth_csrf"].value
+        assert len(csrf) == 43 and cookies["plinth_csrf"]["httponly"] == "", \
+            "CSRF cookie did not use the public 43-character token contract"
+        cookie = f"plinth_session={session}; plinth_csrf={csrf}"
+
+        status, _, headers = kernel.request(
+            "GET", "/api/auth/session", cookie=cookie)
+        assert status == 200, f"cookie session bootstrap returned {status}"
+        refreshed = response_cookies(headers)
+        assert response_header(headers, "Cache-Control") == "no-store"
+        assert response_header(headers, "Vary") == "Cookie, Authorization"
+        assert refreshed["plinth_csrf"].value == csrf, \
+            "session bootstrap did not reassert the bound CSRF cookie"
+
+        def create_pat(bound_cookie, supplied_csrf=None, supplied_origin=origin):
+            request_headers = {}
+            if supplied_csrf is not None:
+                request_headers["X-Plinth-CSRF"] = supplied_csrf
+            if supplied_origin is not None:
+                request_headers["Origin"] = supplied_origin
+            return kernel.request("POST", "/api/auth/pats", {"name": "csrf-fixture"},
+                                  cookie=bound_cookie,
+                                  extra_headers=request_headers)
+
+        for label, candidate, candidate_origin in (
+                ("missing", None, origin),
+                ("malformed", "not-a-token", origin),
+                ("wrong-origin", csrf, "https://cross-origin.invalid"),
+                ("missing-origin", csrf, None)):
+            status, body, rejected_headers = create_pat(
+                cookie, candidate, candidate_origin)
+            assert status == 403 and body == {
+                "error": "csrf_failed", "message": "Request validation failed"
+            }, f"{label} CSRF request did not fail closed: {status}"
+            assert response_header(rejected_headers, "Cache-Control") == "no-store"
+
+        status, pat, pat_headers = create_pat(cookie, csrf)
+        assert status == 201, f"valid cookie mutation returned {status}"
+        assert response_header(pat_headers, "Cache-Control") == "no-store"
+
+        other_credentials = {
+            "username": "csrf-secondary",
+            "password": "fake-password-for-csrf-test",
+        }
+        assert kernel.request("POST", "/api/auth/register", other_credentials)[0] == 201
+        status, _, other_headers = kernel.request(
+            "POST", "/api/auth/login", other_credentials)
+        assert status == 200
+        other_cookies = response_cookies(other_headers)
+        other_cookie = (f"plinth_session={other_cookies['plinth_session'].value}; "
+                        f"plinth_csrf={other_cookies['plinth_csrf'].value}")
+        status, body, _ = create_pat(other_cookie, csrf)
+        assert status == 403 and body["error"] == "csrf_failed", \
+            "a CSRF token was accepted across sessions"
+
+        # Explicit bearer credentials are not ambient browser authority.
+        status, bearer_pat, _ = kernel.request(
+            "POST", "/api/auth/pats", {"name": "bearer-session"}, token=session)
+        assert status == 201, f"bearer session mutation returned {status}"
+        status, _, _ = kernel.request(
+            "DELETE", f"/api/auth/pats/{bearer_pat['id']}", token=pat["token"])
+        assert status == 200, f"PAT bearer mutation returned {status}"
+
+        status, _, logout_headers = kernel.request(
+            "POST", "/api/auth/logout", cookie=cookie,
+            extra_headers={"Origin": origin, "X-Plinth-CSRF": csrf})
+        assert status == 200, f"valid logout returned {status}"
+        cleared = response_cookies(logout_headers)
+        assert response_header(logout_headers, "Cache-Control") == "no-store"
+        assert cleared["plinth_session"]["max-age"] == "0"
+        assert cleared["plinth_csrf"]["max-age"] == "0"
+
+        status, _, rotated_headers = kernel.request(
+            "POST", "/api/auth/login", credentials)
+        assert status == 200, f"native relogin returned {status}"
+        rotated = response_cookies(rotated_headers)
+        assert rotated["plinth_session"].value != session
+        assert rotated["plinth_csrf"].value != csrf
+
+    # TLS termination is represented only by the configured public origin;
+    # forwarded headers never become authority.
+    with running_kernel(binary, pg_env, True,
+                        configured_https_origin=True) as kernel:
+        public_origin = f"https://127.0.0.1:{kernel.port}"
+        credentials = {
+            "username": "csrf-proxy",
+            "password": "fake-password-for-csrf-proxy-test",
+        }
+        status, _, _ = kernel.request(
+            "POST", "/api/auth/register", credentials,
+            extra_headers={"Origin": public_origin})
+        assert status == 201, f"configured HTTPS origin returned {status}"
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/login", credentials,
+            extra_headers={"Origin": f"http://127.0.0.1:{kernel.port}",
+                           "X-Forwarded-Proto": "https"})
+        assert status == 403 and body["error"] == "csrf_failed", \
+            "forwarded scheme improperly established browser authority"
+    print("CSRF cookie, origin, bearer, rotation, logout, and proxy checks passed",
+          flush=True)
 
 
 def disabled_session(binary, pg_env):
@@ -336,7 +490,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--scenario", choices=["disabled-session", "bootstrap-disabled",
-                                               "bootstrap-enabled", "bootstrap-rollback"], required=True)
+                                               "bootstrap-enabled", "bootstrap-rollback",
+                                               "csrf"], required=True)
     args = parser.parse_args()
     if not os.environ.get("PLINTH_PG_HOST"):
         print("PostgreSQL fixture is not configured")
@@ -347,6 +502,8 @@ def main():
     binary = args.binary.resolve()
     if args.scenario == "disabled-session":
         disabled_session(binary, pg_env)
+    elif args.scenario == "csrf":
+        csrf_contract(binary, pg_env)
     elif args.scenario == "bootstrap-rollback":
         bootstrap_rollback(binary, pg_env)
     else:

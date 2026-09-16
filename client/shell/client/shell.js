@@ -5,7 +5,11 @@
 
 import { h, render, Component } from 'preact';
 import htm from 'htm';
-import { call as plinthCall, reconnectRealtime } from '@plinth/frontend/sdk';
+import {
+  call as plinthCall,
+  reconnectRealtime,
+  withCsrf,
+} from '@plinth/frontend/sdk';
 import { Launcher } from './launcher/launcher.js';
 const html = htm.bind(h);
 
@@ -142,7 +146,10 @@ function subscribe(fn) {
 
 // ── Fetch wrapper (ICD-0.6.0 §5.3 + §5.6 redirect-on-401) ───────────
 async function plinthFetch(url, opts) {
-  const r = await fetch(url, { ...(opts ?? {}), credentials: 'include' });
+  const r = await fetch(url, withCsrf(url, {
+    ...(opts ?? {}),
+    credentials: 'include',
+  }));
   if (r.status === 401 && url !== '/api/auth/login') {
     let code = 'session_expired';
     try {
@@ -323,9 +330,16 @@ class AuthFrame extends Component {
   componentWillUnmount() { document.removeEventListener('click', this.onDocClick); }
   async signOut() {
     try {
-      await plinthFetch('/api/auth/logout', { method: 'POST' });
-    } catch (_) { /* surfaces in boundary if it throws */ }
-    setState({ route: 'login', user: null, errorCode: null });
+      const response = await plinthFetch('/api/auth/logout', { method: 'POST' });
+      if (response.ok) {
+        setState({ route: 'login', user: null, errorCode: null });
+      }
+    } catch (_) {
+      // A terminal 401 already moved the shell to login in plinthFetch. Keep
+      // the authenticated frame for CSRF rejection and transport failure: the
+      // server may still own a valid session and must not be misrepresented as
+      // signed out.
+    }
   }
   sessionEnded(code) {
     setState({ route: 'login', user: null, errorCode: code, retryAfter: 0 });
