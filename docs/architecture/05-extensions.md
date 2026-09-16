@@ -144,19 +144,15 @@ primitive — see §Deferred below.
 }
 ```
 
-### 1.4 Bundled Packages (shell, admin)
+### 1.4 Bundled Packages
 
-Two extensions ship as bundled blobs inside the kernel binary and
-install themselves on first boot through the **standard** package
-lifecycle:
-
-- **Shell** (`DESIGN-shell-v06x.md`) — the reference frontend.
-- **Admin** (`DESIGN-admin-v06x.md`) — the built-in admin UI extension
-  (groups, package management, RBAC).
-
-There is no kernel-privileged code path for either. They consume the
-same APIs any extension consumes. See `DESIGN-packages-v04x.md §0.4.4`
-for the first-boot install mechanism and `architecture/06-frontend.md §1`
+The **shell** is the only extension currently shipped as a trusted bundled
+companion asset and installed on first boot through the package lifecycle.
+It is not embedded in the kernel binary. There is no
+bundled admin package today. `DESIGN-admin-v06x.md` remains design input for
+the issue-owned administration panels #50-#55, which must use ordinary package
+and capability contracts if they land. See `DESIGN-packages-v04x.md §0.4.4`
+for the shipped shell install mechanism and `architecture/06-frontend.md §1`
 for why this packaging model matters.
 
 ---
@@ -169,18 +165,18 @@ time (see `DESIGN-packages-v04x.md §0.4.2`).
 
 | Prefix | Owner | Purpose |
 |--------|-------|---------|
-| `/api/*` | Kernel | Kernel API surface (auth, groups, RBAC, capabilities, packages, storage, frontend-tokens, etc.) |
+| `/api/*` | Kernel | Kernel API surface, including current auth, groups, RBAC, capabilities, packages, and frontend-token routes plus reserved future subpaths |
 | `/ext/{name}/{version}/*` | Kernel | Static asset serving for installed extensions (`architecture/06-frontend.md §3`) |
 | `/s/*` | Kernel | Public share dispatcher (deferred; see §Deferred below) |
 | `/healthz` | Kernel | Liveness probe |
 | `/metrics` | Kernel | Prometheus exposition (`architecture/04-services-ha.md §3`) |
-| `/docs/*` | Kernel | Markdown help reader (`reserved (planned)` — not yet implemented). In-kernel renderer of human-readable kernel + extension documentation. |
 | `/ws` | Kernel | WebSocket upgrade endpoint (`architecture/03-data.md §3`) |
-| `/app/*` | Shell extension (kernel-stub in 0.6.0; package-mediated from 0.6.1) | SPA-fallback handler serving the bundled shell's `client/` from disk per ICD-0.6.0 §8. 0.6.1 replaces the kernel-stub with manifest-driven `frontend.mount` dispatch (`architecture/06-frontend.md §2`). |
+| `/app/*` | Active frontend | Manifest-driven `frontend.mount` dispatch serving the bundled shell by default (`architecture/06-frontend.md §2`) |
 | `/` | Configurable | Redirects to `shell.root_redirect` (default `/app/`) per ICD-0.6.0 §4.5; the configurable mount-target form documented in `architecture/06-frontend.md §2`. |
 
-Every other path is extension territory, claimed via `frontend.mount`
-in an extension's `manifest.json` (see `architecture/06-frontend.md §2`).
+Frontend packages may claim non-reserved mount paths through
+`frontend.mount` (see `architecture/06-frontend.md §2`). General extension
+HTTP-prefix claims are not implemented; #47/#48 own that future surface.
 
 **Sub-prefixes of `/api/*` owned by the kernel (non-exhaustive):**
 
@@ -190,11 +186,15 @@ in an extension's `manifest.json` (see `architecture/06-frontend.md §2`).
 - `/api/capabilities/*` — capability registry (ICD-0.2.0)
 - `/api/packages/*` — package management (`DESIGN-packages-v04x.md`)
 - `/api/storage/{extension}/*` — storage HTTP surface
-  (`architecture/03-data.md §2.3`)
+  (planned by #78; `architecture/03-data.md §2.3`)
 - `/api/frontend/*` — frontend asset indirection layer
   (`architecture/06-frontend.md §4`)
 - `/api/docs/*` — dynamic API discovery surface (OpenAPI / Swagger;
-  `reserved (planned)` — not yet implemented).
+  conditional and not implemented; already protected by `/api/*`).
+
+`/docs/*` is not currently reserved by the installer. A future help reader or
+documentation host must first be owned and specify compatibility with #87; it
+cannot be inferred as protected today.
 
 **Why this list is load-bearing.** Changing any reserved prefix after
 1.0 breaks every installed deployment. Every extension manifest, every
@@ -204,21 +204,17 @@ depends on these paths being stable. This list is the contract.
 **Additions to this list** require an architecture session and a
 revision of this document. Removals are effectively impossible post-1.0.
 
-**Extensions outside the reserved set.** Anything not listed in this
-table or as a sub-prefix above is available to extensions via the
-**§6 Extension HTTP Surface** primitive (ratified 2026-04-29):
-extensions declare `http_prefixes` in their `manifest.json`; the
-kernel performs install-time conflict checking against this table
-(including `reserved (planned)` rows) and against every already-
-installed extension. The `reserved (planned)` rows are load-bearing
-today: they prevent third-party extensions from claiming prefixes the
-kernel has staked but not yet implemented.
+**Future extension HTTP surface.** The ratified §6 design proposes
+manifest-declared prefixes outside the reserved set, but no current parser,
+conflict index, or runtime route table implements it. #47 must finalize the
+contract and #48 must implement it before an extension may claim a general
+HTTP prefix.
 
 ### 2.1 Extension HTTP Surface (no arbitrary routes; manifest-declared, conflict-checked prefixes only)
 
-Extensions cannot register *arbitrary* URL paths at runtime. They can
-claim **manifest-declared, install-time-conflict-checked** prefixes
-via the §6 Extension HTTP Surface primitive.
+Extensions cannot register arbitrary URL paths at runtime. The future §6
+surface is limited to manifest-declared, install-time-conflict-checked
+prefixes, but that surface is not implemented.
 
 The distinction matters:
 
@@ -227,16 +223,16 @@ The distinction matters:
   previous registrations. Conflict resolution moves to runtime, the
   trust boundary diffuses, and the kernel cannot validate before
   dispatch. Re-introducing it defeats the capability-model guarantees.
-- **Manifest-declared, conflict-checked prefixes (supported via §6).**
+- **Manifest-declared, conflict-checked prefixes (planned via #47/#48).**
   An extension declares `http_prefixes` in its `manifest.json`; the
   kernel validates at install time against the §2 reserved set and
   against every already-installed extension's claims. Conflicts fail
   the install. The runtime route table is read-only between
   install/uninstall transitions.
 
-The §6 primitive supports the latter and the latter only. See §6 for
-the full contract: shape, schema, claim semantics, drain on uninstall,
-privilege model, audit, performance, milestone slot.
+The planned §6 primitive permits the latter and the latter only. See §6 for
+the design input: shape, schema, claim semantics, drain on uninstall,
+privilege model, audit, and performance questions.
 
 ---
 
@@ -251,7 +247,12 @@ Each script execution gets an isolated `JSRuntime`:
 
 ### 3.1 Runtime Limits
 
-**Configurable per extension:**
+**Current status:** every production extension pool uses the fixed
+`default_runtime_limits()` values: 16 MiB memory, 100 ms CPU, 30 s wall time,
+256 stack frames, call depth 8, eight concurrent async operations, and a
+16 MiB async-result ceiling. The manifest parser preserves the following
+positive-integer override shape for compatibility, but runtime registry does
+not apply it and there is no admin override surface:
 
 ```json
 {
@@ -263,9 +264,8 @@ Each script execution gets an isolated `JSRuntime`:
 }
 ```
 
-Kernel provides defaults. Admin can override per-extension. The kernel
-enforces the **lowest** of: extension request, admin override, kernel
-maximum.
+Applying extension/admin overrides is not a current commitment. It requires a
+bounded issue defining who may relax or tighten each security ceiling.
 
 **Maximum package size:** configurable, default 50MB. Enforced at
 install time before extraction.
@@ -280,6 +280,11 @@ runtime limit on this list.
 
 ### 3.2 Extension Supervision and Failure Recovery
 
+**Current status:** per-call runtime failures are contained and returned to the
+caller; pool retirement is coordinated and bounded. Persistent-failure
+counters, automatic package disablement, and admin notifications described
+below are design inputs without an implementation or scheduled owner.
+
 Extensions fail. The kernel must handle this without operator
 intervention for transient failures and with clear escalation for
 persistent ones.
@@ -291,8 +296,7 @@ persistent ones.
    ICD-0.3.1). The extension's `RuntimePool` itself persists.
 2. Pending C++ coroutines associated with that context are cancelled.
 3. An error is returned to the caller.
-4. The failure is logged to `plinth.audit_log`.
-5. The extension's failure counter increments.
+4. The failure is classified and logged/audited by the owning path.
 
 **Restart with backoff:**
 
@@ -303,10 +307,8 @@ persistent ones.
   lifecycle). The pool is torn down only on
   DISABLED / UPGRADING / UNINSTALL transitions or kernel shutdown —
   not on per-call failures.
-- If an extension fails **N times in M minutes** (configurable,
-  default: 5 in 5), the kernel **auto-disables** the extension.
-- Admin is notified. Auto-disabled extensions can be re-enabled.
-- The failure counter resets on re-enable.
+- A future supervision contract may count persistent failures, disable a
+  package, and notify an administrator, but those behaviors are not shipped.
 
 **What is NOT affected by an extension failure:**
 
@@ -317,15 +319,14 @@ persistent ones.
 
 ### 3.3 Extension Hot-Reload
 
-QuickJS runtimes are cheap to create/destroy. The kernel supports
-live-reload of extension code: when extension files change, the kernel
-creates a new runtime, migrates active subscriptions, and tears down
-the old runtime. No kernel restart needed.
+**Status: planned by [#83](https://github.com/gobha-me/plinth/issues/83).**
+The runtime has a tested internal rebuild primitive, but production does not
+watch extension files, migrate subscriptions, or publish a safe live reload.
 
 **What is NOT available in the runtime:**
 
-- Direct filesystem access (use `storage.*` API).
-- Direct network access (use `http.*` API, RBAC-gated).
+- Direct filesystem access (`storage.*` is planned by #78/#79).
+- Direct network access (`http.*` is planned by #82).
 - Process spawning.
 - `eval()` of arbitrary code strings (disabled by default).
 - Access to other extensions' data or runtimes.
@@ -342,20 +343,22 @@ The host extension doesn't know about the augmenter; the augmenter
 doesn't know about specific hosts. They rendezvous through the registry
 on a common vocabulary: **traits**.
 
-This section reserves the architectural framework — the manifest
-fields, the registry extensibility, and the three composition modes —
-without designing the full system. The full composition mechanism is a
-Scale-2 arc (targeted at ~0.9.x) that depends on real extensions
-existing to test against; designing it in the abstract now produces
-abstractions no real extension can adopt.
+This section sketches room for a future architectural framework — candidate
+manifest fields, registry extensibility, and three composition modes — without
+reserving their semantics or designing the full system. Any future composition mechanism depends on
+real extensions existing to test against; designing it in the abstract now
+produces abstractions no real extension can adopt.
 
-### 4.1 Reserved Manifest Fields
+### 4.1 Candidate Manifest Fields
 
-Extensions declare capability **shape** via three manifest fields. All
-three are parsed and stored in 0.4 (when the manifest schema lands)
-but **not interpreted** until the composition arc lands. Code and
-design sessions in 0.4.x–0.8.x validate these fields structurally and
-store them verbatim; no semantic validation until the arc.
+**Status: conditional design sketch, not scheduled.** No current outcome issue
+commits Plinth to a composition framework. These names are candidates, not
+parser-reserved semantics, and do not imply that augmenter behavior will ship.
+
+The sketches below use three candidate manifest fields. Current parsers do not
+recognize or structurally validate them; they only preserve unknown JSON during
+round trips. Activating these names or shapes requires a future architecture
+decision and owning issue. There is no runtime behavior.
 
 **In `panels.json` entries:**
 
@@ -366,28 +369,25 @@ store them verbatim; no semantic validation until the arc.
   on ecosystem adoption of their names.
 - **`slots`** — object mapping slot names to slot definitions. Slots
   are named injection points where augmenters insert components.
-  Canonical slot names (reserved, should be preferred): `toolbar`,
-  `status-bar`, `context-menu`, `overlay`. Additional slot names
-  permitted.
+  Illustrative slot names: `toolbar`, `status-bar`, `context-menu`, and
+  `overlay`. No vocabulary is reserved today.
 
-**At manifest level** (exact location — `capabilities.json` vs. a new
-`augmenters.json` — deferred to the composition arc; reserve in both
-parsers):
+**Candidate manifest-level shape** (exact location would be decided by a future
+composition issue):
 
 - **`augments_traits`** — array of strings. Traits this extension
   augments. An extension with `"augments_traits": ["text-editor"]`
   declares it wants to operate on any panel exposing the `text-editor`
   trait.
 
-This pre-reservation is the entire purpose of the 0.4 manifest schema
-being permanent. Extensions built in 0.4.x–0.8.x may declare traits
-even though no augmenter machinery exists yet. When the composition
-arc lands, those declarations retroactively become meaningful.
+Unknown-field preservation does not reserve these semantics or promise that
+today's declarations will be activated retroactively. A future issue must
+choose the schema, compatibility policy, and migration behavior deliberately.
 
 ### 4.2 Three Composition Modes (framework, not design)
 
-The composition arc will cover three mechanisms. Their relative scope
-is sketched here to keep the eventual design doc grounded.
+A future composition arc could cover three mechanisms. Their relative scope is
+sketched here only to keep any eventual design grounded.
 
 **Mode 1 — Slot Injection (primary, ~60% of cases).**
 Host panels declare named slots. Augmenters inject components.
@@ -452,8 +452,8 @@ Flagging this now so that:
 The composition arc depends on real extensions existing to pressure-test
 the abstraction:
 
-- **Files extension** (Scale 2, targets ~0.10.x–0.11.x).
-- **Notes extension** (Scale 2, targets ~0.11.x).
+- **A real file-backed extension** after storage #78/#79.
+- **A real structured-content extension.**
 - **At least one augmenter extension** (even a toy grammar checker)
   for design pressure-testing.
 
@@ -461,11 +461,10 @@ Real extensions provide the abstraction pressure. Designing composition
 against hypothetical panels produces abstractions no real extension can
 adopt.
 
-**Infrastructure prerequisite.** By the time the composition arc
-starts, extension design docs should live in a separate Gitea project
-(docs-only, isolated from kernel code). The composition arc needs a
-place for extension authors to declare and document their surface
-traits. See `ARCHITECTURE.md §8` open question #9.
+**Documentation prerequisite.** If the composition arc becomes executable,
+[#87](https://github.com/gobha-me/plinth/issues/87) decides where stable
+extension-author material lives. A separate repository is an option, not a
+scheduled infrastructure promise.
 
 ### 4.6 What This Framework Does NOT Design
 
@@ -559,11 +558,9 @@ once rather than in every extension.
 }
 ```
 
-**Roadmap position if picked up:** new milestone ~0.11, Scale-2 design
-doc required (`DESIGN-sharing-v011x.md` — outline exists).
-
-**Dependencies:** 0.2.x (capability registry), 0.3.x (QuickJS bridge),
-0.10.0–0.10.1 (storage, since Files is the first consumer).
+**Scheduling if picked up:** create a bounded issue and revisit the existing
+`DESIGN-sharing-v011x.md` outline. A file-backed consumer would depend on the
+storage outcomes #78/#79.
 
 **What this does not cover:**
 
@@ -624,7 +621,7 @@ fundamental revision of the architecture, not an additive patch:
 - **Extensions registering arbitrary HTTP routes at runtime.**
   Runtime-mutable, unconstrained-by-manifest registration was
   rejected; manifest-declared, install-time-conflict-checked prefixes
-  ARE supported via §6 Extension HTTP Surface (ratified 2026-04-29).
+  are the only planned alternative via #47/#48 and §6.
   The "arbitrary" framing of this bullet refers strictly to runtime-
   mutable / unconstrained-by-manifest registration. See §2.1 + §6.
 - **Authenticated HTML-returning endpoints outside the frontend.**
@@ -652,12 +649,12 @@ This section is **normative**. Design history lives in
 the architecture session of 2026-04-29 ratified the proposal with the
 nine commitments below.
 
-**Status:** ratified, not yet implemented. Implementation milestone:
-**0.6.7 Extension HTTP surface — catch-all primitive + manifest
-prefixes + runtime route table** (see `ROADMAP.md §0.6`). ICD-authoring
-slot is `0.6.6.N ICD-0.6.7-extension-http-surface authoring`. No
-schema, code, or test changes land from this section alone — only the
-contract.
+**Status:** ratified, not yet implemented.
+[#47](https://github.com/gobha-me/plinth/issues/47) owns the final
+specification and [#48](https://github.com/gobha-me/plinth/issues/48) owns
+implementation. Historical `0.6.6.N`/`0.6.7` names are traceability aliases,
+not release promises. No schema, code, or test behavior is implied by this
+section alone.
 
 ### 6.1 Principle
 
@@ -833,12 +830,12 @@ degrades those workloads. ≤ 100 μs is well below the millisecond-
 scale latency of any realistic upstream operation, so the primitive
 does not become the bottleneck.
 
-### 6.9 Implementation milestone
+### 6.9 Delivery owners
 
-**0.6.7 Extension HTTP surface — catch-all primitive + manifest
-prefixes + runtime route table.** Slot lands after 0.6.6 closes the
-shell SDK arc (tray + content-type + navigation); before any 0.7
-schema-freeze work. ICD-authoring slot at `0.6.6.N`.
+#47 specifies the catch-all, manifest prefixes, route table, authority,
+lifecycle, and measurable performance contract. #48 implements that accepted
+specification. Their explicit dependencies and labels, not legacy release
+numbers, determine scheduling.
 
 The Files-Nextcloud-compat arc (post-1.0 candidate) depends on this
 primitive having landed; CalDAV / CardDAV / S3-compat / ActivityPub

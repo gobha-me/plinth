@@ -3,11 +3,20 @@
 **Traces to:** architecture/03-data.md §3 (Realtime), architecture/01-identity.md §2 (Groups and RBAC), DESIGN-rbac-philosophy.md  
 **Depends on:** ICD-0.1.2-auth-sessions, ICD-0.1.3-pats, ICD-0.1.4-groups-rbac, ICD-0.1.5-rbac-enforcement (shared auth middleware, user context, rule checking)  
 **Milestone:** 0.1.6 — WebSocket: connection lifecycle, subscribe/publish, delta sync  
-**Status:** Ready for implementation (post-review v2)  
+**Status:** Historical implementation contract; shipped, with current-state correction below
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)  
 **Related:** DESIGN-logging-subsystem.md, DESIGN-rbac-philosophy.md
 
 ---
+
+## Current implementation note (reconciled 2026-09-16)
+
+The token-frame flow below is current for native clients. Browser connections
+authenticate during upgrade with the HttpOnly `plinth_session` cookie and an
+exact `Origin`/`Host` authority check; forwarded headers are not trusted. The
+connection then revalidates its session and permission authority through a
+bounded database lease. [architecture/websocket-authority.md](../architecture/websocket-authority.md)
+is authoritative for the shipped browser and lifetime contract.
 
 ## Overview
 
@@ -235,7 +244,10 @@ All extensions to the realtime protocol must go through an architecture session 
 
 ---
 
-**This document is the permanent authority on the Plinth WebSocket realtime protocol.** Any code session implementing 0.1.6 or working on realtime, the frontend SDK, or extension event publishing **must** read this ICD, architecture/03-data.md §3, DESIGN-rbac-philosophy.md, and DESIGN-logging-subsystem.md before beginning work. Changes to this contract require a new architecture session.
+**Historical authority:** this document records the 0.1.6 WebSocket delivery
+contract. Current work starts from `architecture/03-data.md §3` and
+`architecture/websocket-authority.md`, then consults this ICD,
+`DESIGN-rbac-philosophy.md`, and `DESIGN-logging-subsystem.md` for history.
 
 ---
 

@@ -35,6 +35,19 @@ secrets. OIDC remains a stretch goal; safe local registration is required first.
 
 This is the current critical path.
 
+The dependency-ready execution waves are:
+
+1. **Wave 0:** #29 (this architecture reconciliation).
+2. **Wave 1, parallel:** #30, #33, #34, and #35.
+3. **Wave 2, parallel:** #31 after #30; #36 after #33 and #35; #37 after
+   #29 and #33.
+4. **Wave 3, parallel:** #32 after #31; #38 after #34, #35, and #36.
+5. **Wave 4, parallel:** #39 after #31, #32, #38, and its downstream
+   application is ready; #40 after #33, #36, and #37.
+
+GitHub issue dependencies remain authoritative if this summary and live issue
+state diverge.
+
 - [#28 Track every remaining Plinth deliverable in GitHub Issues](https://github.com/gobha-me/plinth/issues/28)
 - [#29 Re-evaluate the post-0.6.3 architecture against current main](https://github.com/gobha-me/plinth/issues/29)
 - [#30 Specify application discovery, tabs, and the home launcher](https://github.com/gobha-me/plinth/issues/30)
@@ -110,6 +123,7 @@ This is the current critical path.
 - [#85 Re-evaluate the polished pre-1.0 platform](https://github.com/gobha-me/plinth/issues/85)
 - [#86 Complete the pre-1.0 security assessment and remediation gate](https://github.com/gobha-me/plinth/issues/86)
 - [#87 Finalize the extension author guide](https://github.com/gobha-me/plinth/issues/87)
+- [#97 Implement extension user-deletion cleanup contract](https://github.com/gobha-me/plinth/issues/97)
 
 ## Continuous Quality
 
@@ -136,5 +150,10 @@ are ready.
 - Browser/client backfill is #32; DAST is #40; reconnect stress is #88.
 - The source-code CSRF deferral is #33, and the previously unscheduled Drogon
   SQLSTATE limitation is #92.
-- PR #94 candidate CI reproduced the formerly resolved Drogon join-self teardown
-  abort; the active reliability defect is now #95.
+- PR #94 candidate CI reproduced the Drogon join-self teardown abort; #95 and
+  PR #96 subsequently resolved that reliability defect.
+- The historical `users.deleted` / `users.list` contract had no implementation
+  or issue; #97 now owns that work.
+- Metrics persistence follows #57's partitioned PostgreSQL outcome. The older
+  in-memory-only architecture sketch is historical, and load issue #62 is
+  fuzzy until #57 and #61 establish the surface it must cross-validate.

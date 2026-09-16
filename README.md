@@ -2,10 +2,12 @@
 
 **The kernel ships empty. Extensions are the product.**
 
-Plinth is an early-stage, self-hosted application kernel written in C++23. It
-provides identity, authorization, groups, capability dispatch, PostgreSQL-backed
-storage, realtime pub/sub, audit logging, metrics, high-availability
-coordination, and a sandboxed QuickJS extension runtime.
+Plinth is an early-stage, self-hosted application kernel written in C++23. Its
+implemented kernel provides identity, authorization, groups, local capability
+dispatch, PostgreSQL-backed extension data, realtime pub/sub, audit logging,
+and a sandboxed QuickJS extension runtime. File storage, general metrics,
+sidecars, multi-node coordination, and supported production deployment remain
+roadmap work; see the [roadmap](docs/ROADMAP.md) for their owning issues.
 
 Plinth is pre-1.0 software. Its interfaces and storage contracts can change,
 and it has not yet received an independent security review. Keep development

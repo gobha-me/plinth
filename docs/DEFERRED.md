@@ -20,7 +20,7 @@ Cross-referenced from:
 
 ## Active issue index
 
-Reconciled against current source, tests, CHANGELOG, and GitHub on 2026-09-15.
+Reconciled against current source, tests, CHANGELOG, and GitHub on 2026-09-16.
 The detailed legacy entries below intentionally retain their original analysis,
 including partial-resolution narratives. A heading marked `resolved` or a topic
 not present in this index is historical context, not unscheduled work.
@@ -31,6 +31,7 @@ not present in this index is historical context, not unscheduled work.
 - Realtime source-sequence contract: [#42](https://github.com/gobha-me/plinth/issues/42)
 - Reconnect-under-storm load evidence: [#88](https://github.com/gobha-me/plinth/issues/88)
 - PostgreSQL SQLSTATE typing through Drogon batch aborts: [#92](https://github.com/gobha-me/plinth/issues/92)
+- Extension user deletion and bounded cleanup: [#97](https://github.com/gobha-me/plinth/issues/97)
 
 The MEMORY_LIMIT classifier entry remains a watchlist with no scheduled action.
 All other resolved material below is retained only to explain prior decisions.

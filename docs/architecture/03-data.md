@@ -15,6 +15,9 @@ surface for file upload/download, and the realtime event model.
   schema lives there).
 - ICD-0.1.6 (WebSocket connection management; realtime protocol full
   specification lands in 0.5.x ICDs).
+- `architecture/extension-database-isolation.md` (current restricted-login,
+  provisioning, grant, migration-guard, and notification-authority contract).
+- `architecture/shutdown.md` (database/realtime flush and teardown order).
 
 ---
 
@@ -38,7 +41,8 @@ If someone wants SQLite later, that's a fork, not an implementation.
 ### 1.1 Schema Layout
 
 Every component gets its own PG schema. This is real isolation, not
-application-level name-prefix checking.
+application-level name-prefix checking. The sketch below mixes current and
+planned tables; planned rows are annotated with their issue owner.
 
 ```sql
 -- Kernel schema
@@ -55,11 +59,12 @@ plinth.packages
 plinth.panels
 plinth.migrations
 plinth.audit_log
-plinth.node_registry     -- UNLOGGED
-plinth.notifications
-plinth.scheduled_tasks
-plinth.sidecar_registry
+plinth.node_registry     -- planned: #71
+plinth.notifications     -- planned: #81
+plinth.scheduled_tasks   -- planned: #58
+plinth.sidecar_registry  -- planned: #63
 plinth.events            -- realtime event log for delta sync
+plinth.realtime_outbox   -- authoritative realtime ingress
 
 -- Each extension gets its own schema
 CREATE SCHEMA ext_terminal_core;
@@ -69,23 +74,18 @@ CREATE SCHEMA ext_shell;
 
 ### 1.2 Extension Database Isolation
 
-Each extension gets its own PG schema. When the kernel executes an
-extension's database query, it sets `search_path` to the extension's
-schema:
+Each extension gets its own schema and a distinct restricted PostgreSQL login.
+`search_path` provides name resolution, not the authorization boundary:
 
 ```sql
 SET search_path TO ext_terminal_core, plinth;
 ```
 
-This means:
-
-- Extensions can only see their own tables by default.
-- Cross-schema references require explicit `schema.table` syntax.
-- The kernel **rejects** any extension query containing a schema
-  qualifier that isn't the extension's own.
-- PG's own permission system enforces isolation at the database level.
-- Extensions CAN read from `plinth.*` tables that the kernel exposes
-  (e.g., `plinth.users` for user lookup) — controlled by PG `GRANT`.
+The restricted login owns only its extension schema, has narrowly enumerated
+shared grants, and cannot fall back to the kernel account. Provisioning,
+credential storage, DDL guards, migration execution, notification authority,
+and legacy-role compatibility are defined in
+`architecture/extension-database-isolation.md`.
 
 ### 1.3 Extension Migration Tracking
 
@@ -114,6 +114,12 @@ On extension install/upgrade:
 ---
 
 ## 2. Storage (File/Blob)
+
+**Status: planned, not implemented.**
+[#78](https://github.com/gobha-me/plinth/issues/78) owns extension-scoped
+storage and [#79](https://github.com/gobha-me/plinth/issues/79) owns the
+QuickJS surface. The remainder of §2 is architecture input to those issues,
+not a current product claim.
 
 **Separate from the database layer.** Storage is for files, blobs,
 uploads, and large binary data.
@@ -253,8 +259,7 @@ This section establishes the **architectural contract**: endpoints,
 headers, RBAC model, quota model. The exact ICD for this surface —
 chunk-size negotiation, Tus protocol selection, pre-signed URLs,
 progress-reporting channel, multipart field names, storage-metadata
-schema — is written when the storage milestone begins (currently
-scheduled in the 0.10.x arc). Code sessions implementing storage must
+schema — is written when #78/#79 begin. Code sessions implementing storage must
 not exceed this architectural contract without an architecture session.
 
 ### 2.6 Rejected Alternatives
@@ -285,7 +290,7 @@ Instead, the storage layer emits **debounced change summaries:**
 1. First write to table X starts a coalescing window (configurable,
    default 50ms).
 2. Subsequent writes within the window are accumulated.
-3. At window expiry, emit ONE PG NOTIFY:
+3. At window expiry, assemble one JSON envelope:
 
    ```json
    {
@@ -302,26 +307,30 @@ Instead, the storage layer emits **debounced change summaries:**
    }
    ```
 
+   The kernel validates the serialized envelope, inserts it through
+   `plinth.enqueue_realtime_event(...)`, and commits it to
+   `plinth.realtime_outbox`. PostgreSQL `NOTIFY` carries only the resulting row
+   id as an untrusted wake hint; the listener reads the authoritative row in
+   monotonic order.
+
    Notes on envelope fields: `layer` and `channel` are required
    (ICD-0.5.0 §Payload Envelope Contract). The `ops` array carries
-   all three CRUD kinds always (`insert`/`update`/`delete`, even when
-   count is zero — ICD-0.5.1 §OQ7). `ids` is intentionally absent in
-   the v0.5.1 ship — 0.5.5 may reintroduce per-op ID arrays via
-   `RETURNING id` wrapping (see ICD-0.5.1 §OQ4). `seq` is reserved
-   for 0.5.5. `emitted_at` is reserved for 0.5.4 persistence.
+   all three CRUD kinds (`insert`/`update`/`delete`, including zero
+   counts). The durable writer stamps `seq` from `plinth.events`; the
+   protected outbox, not a raw notification payload, is authoritative.
 
 4. For single writes (the common case), the window expires with one
    event — effectively immediate.
 
-**PG NOTIFY payload limit: 8000 bytes.** If the accumulated change
-summary exceeds this, the truncation heuristic drops `ids` (no-op in
-v0.5.1 since IDs are already absent) and, if still oversize, drops
-the envelope entirely and audits `realtime.coalescer.flush_failed`
-with `reason="payload_too_large"`. Clients subscribed to a dropped
-envelope's channel see no event and must re-query on their own
-timer; the `truncated:true` counts-only fallback shape is reserved
-for the future case where `ids` population lands (0.5.5) and
-truncation trims them rather than dropping the envelope:
+**Serialized-envelope limit: 8000 bytes by default.** The retained configurable
+ceiling still bounds broker/client work even though the PG wire notification is
+now only a row id. If a change summary exceeds the ceiling, the truncation
+heuristic drops `ids` when present and, if still oversize, drops the envelope
+before outbox insertion and audits `realtime.coalescer.flush_failed` with
+`reason="payload_too_large"`. Clients subscribed to a dropped envelope's
+channel see no event and must re-query on their own timer; the
+`truncated:true` counts-only fallback shape is reserved for a future design
+that populates and then trims IDs:
 
 ```json
 {
@@ -355,8 +364,9 @@ and calls `emit_notify_async` on drogon's DbClient pool.
 **Lifecycle drain.** DISABLE / UPGRADING / UNINSTALL transitions
 synchronously flush every open window owned by the affected
 extension before proceeding, so final Layer-1 envelopes land while
-the listener consumer chain is still intact. Process shutdown
-flushes every open window via the atexit chain.
+the listener consumer chain is still intact. Process shutdown uses the shared
+coordinator order in `architecture/shutdown.md`: flush coalescer windows,
+cross the listener marker, drain durable writes, then stop realtime.
 
 See `docs/icd/ICD-0.5.1-pg-auto-event-coalescer.md` for the full
 contract (classifier shape, per-extension identity snapshot on
@@ -391,13 +401,21 @@ explicitly when they know it's appropriate (`batch()` or `silent`).
 | Layer | Mechanism | Purpose |
 |-------|-----------|---------|
 | **1. DB events** | Protected outbox + PG wake hint, auto-emitted (debounced) | CRUD reactivity — default behavior, zero code |
-| **2. Kernel events** | Protected outbox + PG wake hint, kernel-emitted | System events: user login, package install, node join/leave, `users.deleted` |
+| **2. Kernel events** | Protected outbox + PG wake hint, kernel-emitted | Shipped producers plus planned system events such as #97 `users.deleted` |
 | **3. Extension events** | Kernel `pubsub.publish` → protected outbox | Custom events: `pubsub.publish("chat:typing", ...)` |
-| **4. Sidecar events** | Sidecar → kernel HTTP → protected outbox | Sidecar status, long-running task progress |
+| **4. Sidecar events** | Planned sidecar ingress → protected outbox | Future sidecar status and task progress (#63-#70) |
 
-### 3.4 Frontend SDK — Debounced Smart Re-Query
+### 3.4 Frontend SDK — Smart Re-Query Design
 
-The client SDK handles realtime events intelligently:
+**Status: planned/reconciliation required.** The shipped SDK shares one owned
+connection, forwards live envelopes to subscribers, and lets `useData()` take
+an initial snapshot then replace data from its event mapper. It does not yet
+implement the debounce, re-query, ID filtering, sequence tracking, or jitter
+behaviors below. [#32](https://github.com/gobha-me/plinth/issues/32) owns the
+client-runtime reconciliation and executable coverage; source-sequence policy
+remains [#42](https://github.com/gobha-me/plinth/issues/42).
+
+The design inputs are:
 
 1. **Client-side debounce.** `useData()` has a built-in debounce
    (default 100ms). Multiple events within the window trigger ONE
@@ -409,9 +427,9 @@ The client SDK handles realtime events intelligently:
 2. **Optimistic local updates.** If the event payload includes changed
    IDs and the operation is `insert` or `delete`, the SDK can update
    its local state without re-querying.
-3. **Sequence numbers.** Every event includes a monotonic sequence
-   number (`seq`). The SDK tracks the last-seen sequence.
-   _Implemented 2026-04-26 (v0.5.5)_ via writer-first topology in
+3. **Sequence numbers.** Every persisted server event includes a monotonic
+   sequence number (`seq`); the shipped SDK does not track it.
+   _Server implementation 2026-04-26 (v0.5.5):_ writer-first topology in
    [`ICD-0.5.5 §5`](../icd/ICD-0.5.5-sequence-numbers-client-debounce.md):
    `envelope["seq"] == plinth.events.seq` BIGSERIAL by construction
    on both live and replay paths; per-PG-instance strictly monotonic.
@@ -429,7 +447,8 @@ The client SDK handles realtime events intelligently:
 
 ### 3.5 Delta Sync on Reconnect
 
-When a WebSocket connection drops and reconnects:
+**Server protocol shipped; browser resume integration is not shipped.** A
+native or future client may reconnect as follows:
 
 1. Client sends its last-seen sequence number.
 2. Server queries `plinth.events` for events since that sequence.
@@ -441,7 +460,10 @@ than the retention window are dropped. If the client's last-seen
 sequence is older than the retention window, the server sends a "full
 resync" signal and the client re-queries all subscribed data.
 
-> Implemented 2026-04-25 (v0.5.4). Normative contract pinned in
+> Server support implemented 2026-04-25 (v0.5.4). The bundled browser SDK
+> currently subscribes with channels only; #32 owns client integration and
+> coverage, subject to #42's sequence-policy decision. Historical server
+> contract pinned in
 > [ICD-0.5.4-events-table-delta-sync.md](../icd/ICD-0.5.4-events-table-delta-sync.md).
 > The wire-format extension to the `subscribe` frame is the optional
 > `since_seq` field; the server emits new frame types `replay`,
@@ -513,7 +535,8 @@ Kernel DB Layer (within ext_notes schema)
               ▼
          Each node's WS Broker checks client subscriptions
               │
-              ├── Subscribed client → jitter → debounce → re-query or optimistic update
+              ├── Subscribed client → shipped SDK forwards live envelope
+              │                         (smart handling planned in #32)
               └── Unsubscribed → skip
 ```
 
@@ -543,7 +566,7 @@ CREATE TABLE plinth.packages ( ... );
 CREATE TABLE plinth.panels ( ... );          -- 0.4.4, see DESIGN-packages-v04x.md §4.3
 CREATE TABLE plinth.migrations ( ... );
 
--- HA (0.9.0)
+-- Planned HA/sidecars (#63, #71)
 CREATE UNLOGGED TABLE plinth.node_registry ( ... );
 CREATE TABLE plinth.sidecar_registry ( ... );
 
@@ -554,17 +577,18 @@ CREATE TABLE plinth.events (
   payload    JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE TABLE plinth.realtime_outbox ( ... );
 
 -- Audit (0.1.7)
 CREATE TABLE plinth.audit_log ( ... );
 
--- Notifications (0.11 / 0.10.x)
+-- Planned notifications (#81)
 CREATE TABLE plinth.notifications ( ... );
 
--- Scheduled Tasks (0.7)
+-- Planned scheduled tasks (#58)
 CREATE TABLE plinth.scheduled_tasks ( ... );
 
--- Metrics: NOT stored in PG. In-memory + GET /metrics (Prometheus).
+-- Planned retained metrics (#57): partitioned PG schema; exact shape pending.
 
 -- Extension schemas created at package install:
 -- CREATE SCHEMA ext_terminal_core;

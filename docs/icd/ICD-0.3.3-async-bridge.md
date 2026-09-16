@@ -3,11 +3,21 @@
 **Traces to:** DESIGN-quickjs-bridge.md §§3 (Execution Model), 4 (Resource Limits), 5 (Error Propagation), 6 (Cancellation and Cleanup), 7 (Concurrency Within an Extension), 8.1 (Capability Dispatch — DB path), 9.3 (Implementation Sequence: Async Bridge), 10 (Data Structures); architecture/05-extensions.md §3 (QuickJS Runtime and Extension Supervision)
 **Depends on:** ICD-0.3.1-runtime-lifecycle (`BridgeContext` field shape, `RuntimePool`, `EvalErrorKind`, interrupt handler), ICD-0.3.2-kernel-stdlib-sync (`inject_kernel_stdlib` seam, `JS_SetContextOpaque` convention, `ConfigProjection`), ICD-0.2.6-async-dispatch (coroutine dispatch wrapper — the first caller lives here), ICD-0.1.7-audit (`plinth::log::audit` writer + `g_audit_ready` gate, canonical audit event catalog), ICD-0.2.4-capability-rbac (`g_audit_ready` gating precedent)
 **Milestone:** 0.3.3 — Async bridge: C++20 coroutines ↔ JS promises, plus `db.*` and `audit.*` JS bindings
-**Status:** Ready for implementation
+**Status:** Historical implementation contract; shipped, with current-state correction below
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)
 **Related:** DESIGN-logging-subsystem.md (spdlog async audit path this ICD's `audit.log` reuses), DESIGN-quickjs-bridge.md §11 (open questions 2 and 4 — PG pool sizing and thread affinity — deferred to implementation per the 0.2.2 precedent), DISCUSSION-streaming-and-media.md §0 (must preserve `plinth.call()` return-value opacity — `db.query` MUST NOT introduce a narrowed envelope that forecloses later streaming shapes; this ICD does NOT place anything on a JS-visible `plinth` or `cap` global — those are 0.3.4 scope)
 
 ---
+
+## Current implementation note (reconciled 2026-09-16)
+
+The `search_path` mechanism described below is historical and is not the
+current security boundary. Extension database clients authenticate with
+restricted per-extension roles, and migration/execute paths use the transient
+guard documented in
+[architecture/extension-database-isolation.md](../architecture/extension-database-isolation.md).
+The bridge still sets an extension-local path for name resolution, but access
+control must remain correct if that path is changed by extension SQL.
 
 ## Overview
 

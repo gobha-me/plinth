@@ -16,9 +16,12 @@ lives in the files under `architecture/`.
 A self-hosted, extensible platform built on a kernel-first philosophy:
 **the kernel ships empty; extensions are the product.**
 
-The kernel provides identity, auth, groups, capability registry, database,
-file storage, realtime pub/sub, audit logging, notifications, scheduled
-tasks, metrics, and HA coordination. Everything else is an extension.
+The implemented kernel provides identity, auth, groups, capability registry,
+extension-scoped database access, realtime pub/sub, audit logging, package
+lifecycle, and a sandboxed extension runtime. File storage, notifications,
+general scheduled tasks, metrics, sidecars, and HA coordination are planned
+contracts owned by linked GitHub issues, not current product claims. Everything
+else is an extension.
 
 This is a from-scratch rewrite. The architecture is informed by lessons
 learned from three prior iterations (ArcadeCtl, Chat Switchboard, Armature)
@@ -36,7 +39,7 @@ and codifies decisions that worked while discarding what didn't.
 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
-| Language | C++20 (targeting C++23 where supported) | Architect proficiency (3.8/5), direct system access, catches LLM mistakes earlier |
+| Language | C++23 | Required by CMake and the supported toolchain matrix |
 | HTTP/WS | Drogon | Async, PG built-in, WebSocket, filter chains, actively maintained, MIT |
 | Database | PostgreSQL (committed, no abstraction) | HA coordination, LISTEN/NOTIFY, schemas, advisory locks, JSONB, partitioning. See `architecture/03-data.md`. |
 | JSON | nlohmann/json | Header-only, proven, architect has used in 3-4 projects |
@@ -46,9 +49,9 @@ and codifies decisions that worked while discarding what didn't.
 | CLI | argparse (p-ranav) | Header-only, C++17+, subcommand support, MIT |
 | Testing | Catch2 | C++ standard, header-only option, well-documented |
 | Build | CMake | Industry standard for C++ |
-| Allocator | jemalloc (production) | Avoids musl/Alpine malloc performance issues under QuickJS allocation patterns. Benchmark musl vs glibc vs jemalloc during metrics work. |
-| Deployment | Docker/Helm/K8s | Same homelab infrastructure. Debian slim base image (not Alpine — allocator concerns). |
-| CI | Gitea CI (DinD runners) | Existing infrastructure |
+| Allocator | Development container preloads jemalloc; production undecided | The kernel target does not link jemalloc directly. #35 owns allocator evidence and the production image decision. |
+| Deployment | Development Docker Compose today; production OCI/Kubernetes planned | [#35](https://github.com/gobha-me/plinth/issues/35) owns the production image and [#36](https://github.com/gobha-me/plinth/issues/36) owns Kubernetes/Traefik support. |
+| CI | GitHub Actions | GCC, Clang 20/21, ASan/UBSan, formatting/static analysis, CodeQL, and full image validation |
 
 ---
 
@@ -66,18 +69,21 @@ the specific sub-document and section, not this index.
 | `architecture/04-services-ha.md` | Audit logging (§3.7), scheduled tasks (§3.10), notifications (§3.11), metrics (§3.12), sidecar contract (§4.3), high availability (§5), security model (§6). |
 | `architecture/05-extensions.md` | Package structure (§4.1), QuickJS runtime (§4.2), reserved URL prefixes (§3.13), cross-cutting composition framework (traits/slots/augments), deferred public HTTP options. |
 | `architecture/06-frontend.md` | Frontend architecture (§7), shell-as-extension, `frontend.mount`, extension asset serving, design token serving, BYO frontend stance, panel-system summary. |
+| `architecture/shutdown.md` | Production/test lifecycle ownership, dependency order, bounds, partial-startup unwind, and database/event-loop shutdown. |
+| `architecture/extension-database-isolation.md` | Restricted runtime identities, provisioning, grants, migration guards, notification authority, and extension database ownership. |
+| `architecture/websocket-authority.md` | WebSocket credential/RBAC lease, renewal, fail-closed delivery, and shutdown ownership. |
 
-Section numbers in the right column refer to the pre-decomposition monolith
-(`ARCHITECTURE-plinth-v3.md`) for migration-period orientation. After the
-decomposition lands, cite new sections by document-name + local section
-number: e.g. `architecture/01-identity.md §2.1` rather than `§3.1`.
+Parenthetical legacy section numbers in the right column are orientation only;
+the pre-decomposition monolith is not retained in this repository. Cite current
+sections by document name and local number, for example
+`architecture/01-identity.md §2.1`.
 
-Subsystems with their own design documents (`DESIGN-rbac-philosophy.md`,
-`DESIGN-capability-registry.md`, `DESIGN-quickjs-bridge.md`,
-`DESIGN-logging-subsystem.md`, `DESIGN-packages-v04x.md`,
-`DESIGN-shell-v06x.md`, `DESIGN-admin-v06x.md`, `DESIGN-sharing-v011x.md`)
-continue to own their own authoritative content; the architecture files
-define the contract, the design docs define the mechanism.
+The current architecture files and dedicated authority documents in the table
+own present intent and shipped/planned classification. Design documents and
+ICDs preserve the mechanism proposed for their delivery arc; they are
+historical where a current architecture note, source owner, or regression test
+records a superseding implementation. A still-active design detail must not
+contradict its upward architecture contract.
 
 ---
 
@@ -86,30 +92,35 @@ define the contract, the design docs define the mechanism.
 ### 4.1 Single Binary
 
 The kernel compiles to a single binary (or binary + assets directory).
-Runtime dependencies: libc, libpq, jemalloc.
+Direct native dependencies include libc/libstdc++, Drogon, libpq, OpenSSL,
+Argon2, and libzip; the supported production-image work in #35 owns the final
+runtime closure, allocator decision, and provenance. QuickJS is linked into the
+binary. The shell ZIP is a separately staged and installed companion asset.
 
 ### 4.2 Docker
 
-Official Docker image. **Debian slim** base (avoids musl allocator
-performance issues). jemalloc compiled in.
+The repository ships a development Dockerfile, a CI image, and a disposable
+Docker Compose PostgreSQL service. It does not yet publish a supported
+production image. [Issue #35](https://github.com/gobha-me/plinth/issues/35)
+owns that deliverable, including the final base-image and allocator evidence.
 
 ### 4.3 Kubernetes
 
-Helm chart. Horizontal scaling via replicas (HA model — see
-`architecture/04-services-ha.md §5`). PG can be in-cluster or external.
+No supported Helm chart or Kubernetes deployment exists yet.
+[Issue #36](https://github.com/gobha-me/plinth/issues/36) owns the supported
+Kubernetes and Traefik contract after the production image and browser-origin
+security boundary are ready. The HA topology in
+`architecture/04-services-ha.md §6` is a planned contract, not a claim that
+multi-node operation is currently supported.
 
 ---
 
 ## 5. Source Tree Layout
 
-The layout below has two passes: (a) *current* — directories that
-actually exist as of the most recently shipped milestone — and (b)
-*forward-looking* — directories expected by later milestones. Code
-sessions write into (a); new milestones expand (a) by pulling
-directories from (b) as they land. The forward-looking layout is a
-commitment to naming, not a commitment to populate on any schedule.
+The current layout is descriptive. Names for unimplemented subsystems are not
+frozen before their outcome issue defines them.
 
-### 5.1 Current (through 0.2.5)
+### 5.1 Current
 
 ```
 src/
@@ -124,73 +135,48 @@ src/
       pat_handlers.cpp
       rate_limiter.hpp/.cpp
     audit/
-      handlers.hpp/.cpp
+    cap/
     capabilities/
-      batch.hpp/.cpp
-      bootstrap.hpp/.cpp
-      listener.hpp/.cpp
-      parser.hpp/.cpp
-      registration.hpp/.cpp
-      resolution.hpp/.cpp
-      types.hpp
-      validation.hpp/.cpp
     db/
-      bootstrap.hpp/.cpp
+    extensions/
+    frontend/
     groups/
-      handlers.hpp/.cpp
+    js/
+    lifecycle/
+    packages/
     rbac/
-      enforcement.hpp/.cpp
+    realtime/
+    scheduled_tasks/
+    security/
+    shell/
     ws/
-      auth_flow.hpp/.cpp
-      close_codes.hpp
-      conn_state.hpp
-      connection_registry.hpp/.cpp
-      events_controller.hpp/.cpp
-      heartbeat.hpp/.cpp
-      messages.hpp
-      publish.hpp/.cpp
-      registration.hpp/.cpp
-      subscriptions.hpp/.cpp
 
 tests/kernel/   (mirrors src/kernel/ subdirectories)
+tests/browser/  (production browser and retained-upgrade journeys)
+tests/integration/
+client/shell/
+load-harness/
 migrations/
 cmake/
 docker/
-helm/
 docs/
 ```
 
-### 5.2 Forward-looking (milestone additions)
+### 5.2 Planned additions
 
-As each milestone lands, new directories appear under `src/kernel/`.
-Expected names and the milestone that introduces each:
+| Candidate area | Outcome owner |
+|----------------|---------------|
+| File/blob storage | [#78](https://github.com/gobha-me/plinth/issues/78), [#79](https://github.com/gobha-me/plinth/issues/79) |
+| General scheduler and maintenance tasks | [#58](https://github.com/gobha-me/plinth/issues/58), [#59](https://github.com/gobha-me/plinth/issues/59) |
+| Retained metrics and extension metrics | [#57](https://github.com/gobha-me/plinth/issues/57), [#61](https://github.com/gobha-me/plinth/issues/61) |
+| Notification bus | [#81](https://github.com/gobha-me/plinth/issues/81) |
+| Sidecar registration and remote dispatch | [#63](https://github.com/gobha-me/plinth/issues/63) through [#70](https://github.com/gobha-me/plinth/issues/70) |
+| Multi-node HA | [#71](https://github.com/gobha-me/plinth/issues/71) through [#77](https://github.com/gobha-me/plinth/issues/77) |
 
-| Directory | Contents (summary) | Introduced by |
-|-----------|--------------------|---------------|
-| `scripting/` | QuickJS runtime pool, C++↔JS bridge, kernel standard library injection | 0.3.0–0.3.2 |
-| `packages/` | Package validation, manifest parsing, install/enable/disable lifecycle | 0.4.x |
-| `realtime/` (see open question below) | Debounced coalescer, delta-sync, `plinth.events` writer | 0.5.x |
-| `storage/` | Filesystem backend + quotas + the HTTP surface in `architecture/03-data.md §2.3` | 0.10.0–0.10.1 |
-| `scheduler/` | Cron parser, PG advisory-lock scheduler, default tasks | 0.7.x |
-| `metrics/` | In-memory counters + histograms + `/metrics` Prometheus endpoint | 0.7.x |
-| `notifications/` | In-app notification bus over WebSocket | 0.10.2 |
-| `ha/` | `plinth.node_registry`, heartbeat writer, stale-node sweep | 0.9.x |
-| `api/` | Top-level HTTP route registration aggregator (if the `register_*_routes()` fan-out outgrows `main.cpp`) | when needed |
-
-A forthcoming `dispatch/` directory — the 0.8 remote-proxy path for
-Tier 3 resolution plus the sidecar HTTP client — is also anticipated.
-Whether remote-proxy code lives there, under `capabilities/`, or
-under `sidecar/` is an implementation decision for 0.8.
-
-### 5.3 Open question — `ws/` vs `realtime/` naming
-
-The 0.1.6 WebSocket work landed in `src/kernel/ws/`. The pre-existing
-§5 sketch named the same space `realtime/`. 0.5.x lands the
-debounced coalescer, sequence numbers, and `plinth.events` writer —
-the work that makes "realtime" the more accurate name. At 0.5.0,
-the architect will either rename `ws/` → `realtime/` (and collapse
-0.1.6's ten files into a coalescer-sibling layout) or keep `ws/`
-and update this section plus §8. Decided at 0.5.0; tracked in §8.
+`ws/` and `realtime/` are intentionally separate siblings. `ws/` owns the
+transport, connection authority, and subscriptions; `realtime/` owns durable
+outbox consumption, coalescing, replay, and broker behavior. The former naming
+question is resolved.
 
 ---
 
@@ -221,7 +207,8 @@ extension from scratch. If it can't, the docs are insufficient.
 
 - Package manifest (split files, versioned capability-based deps)
 - RBAC (simplified: groups only, extension-registered rules, two-phase testing)
-- Metrics (in-memory + Prometheus, not PG-stored)
+- Metrics (concept retained, mechanism reopened; fuzzy #57/#61 now own
+  PostgreSQL retention, extension recording, and export decisions)
 - Frontend (same Preact/htm, `plinth.*` SDK namespace)
 - Realtime (first-class, debounced change streams, delta sync)
 - Database isolation (PG schemas instead of table prefix checking)
@@ -243,48 +230,26 @@ extension from scratch. If it can't, the docs are insufficient.
 
 ---
 
-## 8. Open Questions
+## 8. Issue-owned follow-ups and observations
 
-Tracked here as a backlog. When resolved, the resolution lives in the
-relevant sub-document and the line is deleted from here (or moved to §8.1
-with a one-line pointer). Rejected proposals are recorded where they would
-have belonged, as short "rejected" notes, per the conventions in §9.
+GitHub Issues are the executable backlog. This section is a navigation aid,
+not a second task list:
 
-1. **Domain.** `plinth.dev`? `plinth.run`? Check availability and register.
-2. **QuickJS memory/time defaults.** Current hypothesis: 64MB memory,
-   5000ms CPU, 1000 stack depth. Needs benchmarking.
-   (`architecture/05-extensions.md §2`.)
-3. **Realtime delta sync retention.** Default 1h for `plinth.events`.
-   Is that sufficient? (`architecture/03-data.md §3`.)
-4. **Package registry.** `plinth.dev` (or wherever) as a registry? Or
-   just git-based distribution for now? (`architecture/05-extensions.md §1`.)
-5. **Capability type system depth.** Current: type strings. Sufficient
-   for v1. Shake out in 0.2.x testing.
-   (`architecture/02-capabilities.md §1`.)
-6. **Exact kernel rule set.** Granularity and naming of kernel-level
-   rules (`kernel.admin`, `system.backup.run`, `packages.manage`, etc.).
-   To be refined during 0.1.7–0.7 while respecting
-   `DESIGN-rbac-philosophy.md`.
-7. **Admin rule mechanism.** Whether `admin` receives a single powerful
-   rule or is granted a curated set of high-privilege rules.
-   (`architecture/01-identity.md §2`.)
-8. **Shell SDK versioning mechanism.** How an extension declares "built
-   against shell SDK version X." Additive manifest field, probably 0.7+.
-   (`architecture/06-frontend.md`.)
-9. **Extension-design-docs repository.** By ~0.8.0, extension design
-   docs should live in a separate Gitea project (docs-only, isolated
-   from kernel code) so the cross-cutting composition arc has a home
-   for extension authors to declare surface traits. Project-infrastructure
-   decision, not architecture. (`architecture/05-extensions.md §3`.)
-10. **`ws/` vs `realtime/` kernel directory name.** 0.1.6 landed the
-    WebSocket code in `src/kernel/ws/`; §5's original sketch named
-    the same space `realtime/`. 0.5.x lands the coalescer + sequence
-    numbers + `plinth.events` writer that make "realtime" the more
-    accurate umbrella. Decide at 0.5.0 whether to rename `ws/` →
-    `realtime/` (and collapse existing files into a coalescer-sibling
-    layout) or keep `ws/` and update §5 accordingly. Surfaced by
-    RE-EVAL following 0.2.x; deferred until 0.5.0 has real design
-    pressure. (§5.3.)
+- Production hostname, TLS, proxy, and deployment choices belong to
+  [#36](https://github.com/gobha-me/plinth/issues/36).
+- Realtime retention adequacy is measured by reconnect-under-storm work in
+  [#88](https://github.com/gobha-me/plinth/issues/88).
+- Capability type compatibility and shell SDK versioning are release-contract
+  questions for [#93](https://github.com/gobha-me/plinth/issues/93).
+- Kernel rule presentation belongs to the RBAC administration surface in
+  [#52](https://github.com/gobha-me/plinth/issues/52); compatibility freezes in
+  #93.
+- Extension documentation placement and publication belong to
+  [#87](https://github.com/gobha-me/plinth/issues/87).
+
+A central package registry remains an observation, not a committed deliverable.
+Git-based distribution is sufficient until real ecosystem demand produces a
+bounded issue. It must not be inferred as scheduled from this document.
 
 ### 8.1 Resolved (pointer)
 
@@ -300,7 +265,8 @@ have belonged, as short "rejected" notes, per the conventions in §9.
   (`architecture/01-identity.md §2`.)
 - ~~Database vs storage~~ → Separate. DB = PG. Storage = file/blob.
   (`architecture/03-data.md §1`, `architecture/03-data.md §2`.)
-- ~~Alpine vs Debian~~ → Debian slim. jemalloc. (§2 above.)
+- ~~Alpine vs Debian~~ → the current development container is Debian-based and
+  preloads jemalloc; #35 owns the production base and allocator decision.
 - ~~PG abstraction layer~~ → Killed. Commit to PG.
 - ~~Extension isolation~~ → PG schema per extension.
 - ~~Example packages~~ → No. Documentation instead. (§6 above.)
@@ -309,14 +275,22 @@ have belonged, as short "rejected" notes, per the conventions in §9.
   (`architecture/03-data.md §3`.)
 - ~~Capability call overhead~~ → Three-tier resolution with caching.
   (`architecture/02-capabilities.md §1`.)
-- ~~Metrics storage~~ → No PG. In-memory + Prometheus endpoint.
-  (`architecture/04-services-ha.md §3`.)
+- ~~Metrics storage~~ → the former no-PG/in-memory-only decision is
+  superseded. Fuzzy #57/#61 own retained storage, extension recording, and
+  export behavior. (`architecture/04-services-ha.md §3`.)
 - ~~URL space ownership~~ → Kernel owns a fixed list of prefixes.
   (`architecture/05-extensions.md §2`.)
 - ~~Shell privilege model~~ → Shell is a built-in extension. No
   kernel-privileged shell code path. (`architecture/06-frontend.md §1`.)
 - ~~Anonymous identity~~ → `UserContext::anonymous()` is first-class;
   member of `everyone` only. (`architecture/01-identity.md §3`.)
+- ~~QuickJS default limits~~ → 16 MiB memory, 100 ms CPU, 30 s wall
+  time, 256 stack frames, and call depth 8 in `default_runtime_limits()`.
+- ~~Admin rule mechanism~~ → the built-in admin group receives the explicit
+  kernel-owned bootstrap rules; manifests can opt extension rules into its
+  defaults, and `kernel.admin` remains the capability universal match.
+- ~~`ws/` vs `realtime/` naming~~ → retain the two sibling trees with the
+  ownership split described in §5.
 
 ---
 
@@ -388,10 +362,10 @@ renumber §3.1 in the capabilities doc.
 
 ### 9.7 Authority stands
 
-All architecture docs inherit the authority of the original monolith.
-Deviations from any of them require a new architecture session and a
-revision of the relevant document. Design docs and ICDs trace upward
-through the document tree, not horizontally.
+The current files in `docs/architecture/` own the architecture contract.
+Deviations require a reviewed revision of the relevant current document.
+Design docs and ICDs trace upward through that tree and do not override a
+newer current-state correction.
 
 ---
 
@@ -402,17 +376,17 @@ in `architecture/02-capabilities.md`, `architecture/03-data.md`, and the
 HTTP surfaces in `architecture/05-extensions.md §2`). Everything above
 that line — the shell, the admin extension, application extensions — is
 extension territory, governed by the package system and the panel SDK,
-not by kernel-privileged code paths. The single exception is the
-kernel's own bootstrap of the bundled shell and admin packages on first
-boot; that bootstrap runs the packages through the **standard** install
-lifecycle and is indistinguishable afterward from any other install.
+not by kernel-privileged code paths. The single exception is the kernel's own
+bootstrap of the bundled shell package on first boot. The install uses the
+package lifecycle, but the canonical name, bundled provenance, and explicit
+kernel-owned upgrade path remain protected from ordinary HTTP/admin callers. A
+bundled admin package is planned design, not current behavior.
 See `architecture/06-frontend.md §1` and
 `architecture/05-extensions.md §1.4`.
 
 ---
 
-**This document tree is the permanent source of truth.** All ICDs,
-design documents, and implementation sessions must conform to the RBAC
-philosophy defined in `DESIGN-rbac-philosophy.md` and the contracts
-established in the ICDs. Any deviation requires a new architecture
-session and revision of the relevant architecture document.
+**This architecture tree is the current source of truth.** Design documents
+and ICDs trace upward to it and remain valuable historical delivery evidence.
+When shipped source/tests differ from a current contract, the mismatch must be
+resolved explicitly rather than silently treating either layer as current.

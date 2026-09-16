@@ -1,6 +1,6 @@
 # DESIGN-capability-registry
 
-**Status:** Approved v1  
+**Status:** Historical 0.2.x design; current-state corrections below
 **Scale:** 3 — Architecture Arc (foundational for all extension and sidecar work)  
 **Traces to:** architecture/02-capabilities.md §1 (Capability Registry), DESIGN-rbac-philosophy.md, ICD-0.1.4-groups-rbac, ICD-0.1.5-rbac-enforcement, DESIGN-logging-subsystem.md, DESIGN-quickjs-bridge.md  
 **Milestone:** 0.2.0–0.2.5 (Capability Registry)  
@@ -10,6 +10,15 @@
 
 ---
 
+## Current-state correction (reconciled 2026-09-16)
+
+`architecture/02-capabilities.md` is authoritative for current behavior. In
+particular, extension providers (including same-extension calls) use Tier 2
+asynchronous `RuntimeRegistry` dispatch; Tier 3 is unavailable; user scope is
+rejected; and `cap.batch` composes independent calls rather than providing an
+atomic or tier-grouped unit. Conflicting mechanism text below is retained as
+historical design evidence, not a shipped contract.
+
 ## Decision
 
 The capability registry is the central dispatch and authorization mechanism of Plinth. It replaces all package-level dependency declarations. Extensions declare what capabilities they **provide** and what they **require**. The kernel resolves every `cap.call()` through a three-tier system and enforces RBAC on every call using the least-privilege, additive union model defined in DESIGN-rbac-philosophy.md.
@@ -18,7 +27,9 @@ Capability-to-rule mapping is **explicit and non-version-aware**. A capability s
 
 All permission denials must be audited via the canonical `log::audit()` path from DESIGN-logging-subsystem.md.
 
-This design document is the permanent authority for all 0.2.x implementation sessions. No structural decisions about resolution, scoping, caching, or RBAC integration may be made outside this document.
+This document was the implementation authority for the 0.2.x delivery arc.
+The current-state correction above and `architecture/02-capabilities.md`
+supersede conflicting resolution, scoping, caching, and dispatch mechanisms.
 
 ---
 
@@ -166,4 +177,7 @@ All future changes to capability resolution, scoping, or authorization must go t
 
 ---
 
-**This document is the permanent authority on the Plinth capability registry.** Any code session working on 0.2.x or any future capability, extension, or sidecar code **must** read this document, DESIGN-rbac-philosophy.md, and all relevant 0.1 ICDs before beginning work. Changes to resolution strategy, mapping rules, or contracts require a new architecture session and revision of this document.
+**Historical authority:** this document records the 0.2.x design rationale.
+Current capability, extension, or sidecar work must start from
+`architecture/02-capabilities.md`, then consult this design and relevant ICDs
+for history. Contract changes require review in the current architecture.

@@ -33,7 +33,8 @@ points this ICD consumes).
 session authoring this contract; code session follows as 0.5.0.4.
 Both are four-part follow-ups, untagged per `feedback_tagging_rule.md`
 — prior-arc tech debt, not a new product milestone.
-**Status:** Ready for implementation
+**Status:** Historical implementation contract; shipped, with current-state
+corrections below
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)
 **Related:**
 [src/kernel/capabilities/resolution.cpp:313–344](../../src/kernel/capabilities/resolution.cpp)
@@ -81,6 +82,17 @@ convention — promoted here to a contract);
 (the blocked caller that gates on this ICD's implementation landing).
 
 ---
+
+## Current implementation note (reconciled 2026-09-16)
+
+This ICD remains the historical delivery contract, not a description of
+current shutdown ownership. Runtime registry entries and in-flight dispatches
+now hold shared `RuntimePool` leases. Removal closes admission, lets the last
+lease retire on an allowed owner path, and retains bounded-close failures for
+the explicit shutdown coordinator to retry. Normal teardown is not performed
+from `atexit`, and no raw pool pointer may cross a coroutine suspension. The
+current authority is [architecture/shutdown.md](../architecture/shutdown.md)
+and the implementation in `src/kernel/extensions/runtime_registry.*`.
 
 ## Overview
 
