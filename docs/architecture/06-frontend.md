@@ -19,6 +19,9 @@ alternative frontends.
   the root redirect).
 
 **Related:**
+- `../icd/ICD-application-discovery-launcher.md` (the authoritative
+  application-discovery, primary-panel tab, launcher, lifecycle, realtime,
+  preference, accessibility, and implementation-verification contract).
 - `DESIGN-shell-v06x.md` (the 0.6.x shell arc: bootstrap, schema, the
   panel SDK, the tab/launcher model, floating panels, the system
   tray, content-type negotiation, and intents).
@@ -63,9 +66,10 @@ top-level Preact error boundary, first-boot shell companion package, strict-CSP 
 handler, active-frontend lookup, manifest-declared mount, versioned asset
 base, design-token redirect, and SDK redirect are implemented and covered by
 kernel and browser tests. The bundled shell is intentionally still minimal:
-application discovery, launcher navigation, tabs, and complete panel
-lifecycle are the next Dogfood deliverables [#30](https://github.com/gobha-me/plinth/issues/30),
-[#31](https://github.com/gobha-me/plinth/issues/31), and
+the application-discovery and launcher contract is now fixed by
+`ICD-application-discovery-launcher.md`, but launcher navigation, tabs, and the
+complete panel lifecycle are not shipped behavior. Implementation and proof
+remain [#31](https://github.com/gobha-me/plinth/issues/31) and
 [#32](https://github.com/gobha-me/plinth/issues/32), not shipped behavior.
 
 ---
@@ -187,7 +191,7 @@ does not support an "unversioned alias" mode.
 
 ---
 
-## 4. Design Token Serving (`/api/frontend/*`)
+## 4. Frontend Serving and Discovery (`/api/frontend/*`)
 
 **Status (2026-04-30, v0.6.3): `tokens.css` + `sdk.js` endpoints
 implemented.** Per ICD-0.6.2 §6.1 / §6.7 and ICD-0.6.3 §5.2. Other
@@ -201,8 +205,10 @@ because the version segment in that path changes on every shell
 upgrade, and the extension has no reliable way to discover the
 current version.
 
-The kernel exposes a stable indirection layer under `/api/frontend/*`
-that resolves to the active frontend's currently-installed version.
+The kernel exposes frontend-owned kernel resources under `/api/frontend/*`.
+The token and SDK routes are stable indirections to the active frontend's
+currently-installed version. The authenticated applications route is a
+user-filtered JSON resource, not an asset redirect.
 
 ### 4.1 Endpoint Table
 
@@ -210,15 +216,17 @@ that resolves to the active frontend's currently-installed version.
 |----------|----------|
 | `/api/frontend/tokens.css` | ✓ implemented v0.6.2 — 302 → `/ext/{active-frontend}/{version}/css/tokens.css` |
 | `/api/frontend/sdk.js` | ✓ implemented v0.6.3 — 302 → `/ext/{active-frontend}/{version}/client/sdk.js` |
+| `/api/frontend/applications` | Contract fixed by `ICD-application-discovery-launcher.md`; #31 implements authenticated, server-side RBAC-filtered JSON discovery |
 | `/api/frontend/fonts/{name}` | Conditional follow-up; no current endpoint or scheduled issue |
 | `/api/frontend/icons/{name}` | Conditional follow-up; no current endpoint or scheduled issue |
-| `/api/frontend/manifest.json` | Discovery shape to be settled by [#30](https://github.com/gobha-me/plinth/issues/30); no current endpoint |
 
 ### 4.2 Cache Semantics
 
-The redirect responses are served with `Cache-Control: no-cache` — the
-browser must revalidate the redirect target on every navigation so
-that a shell upgrade is picked up without requiring a hard reload.
+The redirect responses are served with `Cache-Control: no-cache` — the browser
+must revalidate the redirect target on every navigation so that a shell upgrade
+is picked up without requiring a hard reload. The applications resource is not
+a redirect and uses `Cache-Control: no-store` plus
+`Vary: Cookie, Authorization`.
 
 The targets (`/ext/{active-frontend}/{version}/...`) are served with
 the standard immutable caching from §3. The indirection is cheap (302
@@ -282,25 +290,27 @@ chase a moving target.
 
 ## 5. Panel System (Summary)
 
-**Status (reconciled 2026-09-16): primitives shipped; application shell
-journey not yet operational.** Per ICD-0.6.3 §3 (Panel SDK API surface) and
-§4 (Panel module loading), the repository contains a `panels.json` parser,
-panel-module loader, design-token endpoint, SDK endpoint, and focused fixture
-coverage. The production shell does not yet discover installed applications
-or provide the launcher/tab navigation needed to reach those panels. [#30](https://github.com/gobha-me/plinth/issues/30)
-owns the current contract, [#31](https://github.com/gobha-me/plinth/issues/31)
+**Status (reconciled 2026-09-16): contract fixed; primitives shipped;
+application shell journey not yet operational.** Per ICD-0.6.3 §3 (Panel SDK
+API surface) and §4 (Panel module loading), the repository contains a
+`panels.json` parser, panel-module loader, design-token endpoint, SDK endpoint,
+and focused fixture coverage. `ICD-application-discovery-launcher.md` now owns
+the discovery, navigation, replacement, realtime invalidation, preference,
+accessibility, and responsive contract. The production shell does not yet
+implement that contract. [#31](https://github.com/gobha-me/plinth/issues/31)
 owns implementation, and [#32](https://github.com/gobha-me/plinth/issues/32)
-owns deferred browser/client-runtime coverage.
+owns the remaining historical browser/client-runtime coverage.
 
 Extensions register UI panels via `panels.json`. The active frontend design
 calls for:
 
-- **Panel container (planned in #30/#31).** Topbar navigation, content area,
-  tab strip, and launcher, bounded by `DESIGN-shell-v06x.md` and the refreshed
-  issue contract.
-- **Panel lifecycle (partially implemented).** The loader exposes activate,
-  deactivate, and destroy primitives; production discovery and navigation
-  integration remain #31 work.
+- **Panel container (planned in #31).** Topbar navigation, content area,
+  primary-panel tab strip, and launcher, bounded by
+  `ICD-application-discovery-launcher.md`.
+- **Panel lifecycle (partially implemented).** The loader exposes activation,
+  deactivation, component unmount, and SDK unbinding primitives; it has no
+  public destroy callback. Production discovery, retained navigation, bounded
+  replacement, and failure containment remain #31 work.
 - **Inter-panel communication.** Through the kernel realtime event
   system (`architecture/03-data.md §3`), not a frontend-specific bus.
   Panels talk to each other the same way services talk to each other.
@@ -312,7 +322,10 @@ The panel SDK is a **frontend-ecosystem contract**, not a kernel
 contract. A `client/` directory in an extension assumes the shell's
 SDK and design tokens. This distinction matters for §6.
 
-Authoritative panel-system design lives in `DESIGN-shell-v06x.md`.
+The current application-discovery and launcher contract lives in
+`ICD-application-discovery-launcher.md`. Broader historical panel-system design
+lives in `DESIGN-shell-v06x.md`; where the two differ, the issue-scoped ICD
+controls the #31 implementation.
 The kernel's side of the contract — asset serving, token
 indirection, realtime substrate — is defined here and in the
 referenced cross-doc sections.

@@ -11,6 +11,27 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-16 — application discovery and launcher contract
+
+- Defined one package as one launcher application and its ordered primary
+  panels as the shell-owned tab set, without reviving top-level extension tabs
+  or inventing a second nested panel lifecycle.
+- Fixed the user-filtered discovery API, fail-closed RBAC visibility,
+  deterministic navigation and replacement states, opaque realtime
+  invalidation, retained preferences, data-ipoint vocabulary, and responsive
+  accessibility requirements.
+- Amended the permanent auth, RBAC, and package-lifecycle contracts for generic
+  authentication-backend failures, virtual `everyone` membership, and
+  fail-closed launcher quiesce before upgrade mutation.
+- Assigned executable parser, API, browser, realtime, upgrade, and security
+  acceptance cases to #31 while retaining deeper historical client-runtime and
+  sequence-policy coverage in #32 and #42.
+
+This closes [GitHub issue #30](https://github.com/gobha-me/plinth/issues/30)
+without changing runtime behavior.
+
+---
+
 ## 2026-09-16 — post-v0.6.3 architecture re-evaluation
 
 - Reconciled the architecture set with current identity, WebSocket authority,

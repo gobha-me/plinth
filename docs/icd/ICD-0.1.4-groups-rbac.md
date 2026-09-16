@@ -7,6 +7,14 @@
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)  
 **Related:** DESIGN-logging-subsystem.md, DESIGN-rbac-philosophy.md
 
+**Current contract amendment (2026-09-16):** `everyone` is a virtual built-in
+membership for every identity, authenticated or anonymous. It is not stored in
+`plinth.group_members`; that table contains explicit memberships only. Member
+add/remove requests targeting `everyone` fail with `immutable_membership`, and
+#31 removes/ignores any historical stored rows while updating all effective-rule
+loaders. `admin` and custom-group membership remain explicit. This amendment is
+authoritative over membership-only language below.
+
 ---
 
 ## Overview
@@ -55,7 +63,7 @@ All error responses in this ICD use:
 
 | Column     | Type        | Constraints                          | Notes |
 |------------|-------------|--------------------------------------|-------|
-| `group_id` | UUID        | FK → `plinth.groups.id`, NOT NULL    | |
+| `group_id` | UUID        | FK → `plinth.groups.id`, NOT NULL    | Explicit groups only; never `everyone` |
 | `user_id`  | UUID        | FK → `plinth.users.id`, NOT NULL     | |
 | `added_at` | TIMESTAMPTZ | NOT NULL, default `NOW()`            | |
 | **PK**     | `(group_id, user_id)` | Composite key                      | Prevents duplicates |
@@ -99,7 +107,9 @@ All error responses in this ICD use:
 ### POST /api/groups/{id}/members, DELETE /api/groups/{id}/members/{user_id}
 (Membership management — requires appropriate rules or `kernel.admin`.)
 
-**Error codes:** `missing_user_id`, `already_member`, `not_a_member`, `group_not_found`, `user_not_found`, `permission_denied`, `not_authenticated`
+**Error codes:** `missing_user_id`, `already_member`, `not_a_member`,
+`immutable_membership`, `group_not_found`, `user_not_found`,
+`permission_denied`, `not_authenticated`
 
 ### POST /api/rbac/rules
 **Internal only.** Called by the kernel/package system (0.4.x) when processing `rbac.json` or during kernel bootstrap. Must not be exposed as a public API.

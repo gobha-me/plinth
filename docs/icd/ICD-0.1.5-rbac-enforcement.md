@@ -7,6 +7,14 @@
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)  
 **Related:** DESIGN-logging-subsystem.md, DESIGN-rbac-philosophy.md
 
+**Current contract amendment (2026-09-16):** Effective rules for every identity
+are the union of non-orphaned rules granted to the virtual built-in `everyone`
+group and rules granted through explicit `plinth.group_members` rows.
+`everyone` requires no stored membership. This remains additive, explicit-rule
+RBAC; it does not make authenticated routes public or create a bypass. Issue #31
+implements the currently missing shared-loader behavior. This amendment is
+authoritative over membership-join-only wording below.
+
 ---
 
 ## Overview
@@ -62,7 +70,7 @@ The request context is built incrementally by the middleware chain. This is the 
 
 | Field | Type | Source | Notes |
 |-------|------|--------|-------|
-| `effective_rules` | std::vector\<std::string\> | Union of all rules from all groups the user belongs to | Computed once per request via group membership + group_rules join |
+| `effective_rules` | std::vector\<std::string\> | Union of `everyone` rules plus rules from explicit groups | Computed once per request from the virtual built-in grant set plus the membership/group-rules join |
 | `permission_granted` | bool | RBAC check result | `true` if any required rule matched |
 | `granting_rule` | std::string | The specific rule that granted access | Empty if denied |
 
@@ -171,7 +179,8 @@ Every permission denial **must** be logged using the canonical path from DESIGN-
 
 1. **Fail closed.** Any error during evaluation results in denial.
 2. **Explicit rules only.** No inference from paths, methods, or ownership.
-3. **Additive union model.** Permissions are the strict union of rules across all groups the user belongs to.
+3. **Additive union model.** Permissions are the strict union of rules granted
+   to virtual `everyone` and all explicitly joined groups.
 4. **kernel.admin rule.** The `admin` group is granted this rule by default. It is not an absolute bypass outside the rule system.
 5. **Middleware ordering invariant.** RBAC filter must run after authentication and before business logic.
 6. All rule checks must respect the philosophy in DESIGN-rbac-philosophy.md.

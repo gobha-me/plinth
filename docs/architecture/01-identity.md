@@ -72,10 +72,19 @@ Two default groups:
 - `admin` — granted the `kernel.admin` rule by default (full control)
 - `everyone` — no permissions by default
 
-Users belong to one or more groups. Permissions are **additive** (union
-across all groups a user belongs to). A user may belong to both
-`backup-operators` and `package-managers` and receive the combined
-permissions of both.
+Every identity is a virtual member of `everyone`; this implicit membership is
+not represented by a `plinth.group_members` row. Authenticated users may also
+belong to one or more explicit groups. Permissions are **additive**: effective
+rules are the union of non-orphaned rules granted to `everyone` and rules from
+all explicit memberships. A user may belong to both `backup-operators` and
+`package-managers` and receive the combined permissions of both.
+
+All effective-rule loaders must apply that same union, including HTTP route
+and capability authorization, WebSocket authority snapshots, and application
+discovery. The current loaders still derive authenticated authority only from
+stored `group_members`; [#31](https://github.com/gobha-me/plinth/issues/31)
+owns correction and regression coverage before the launcher ships. Code must
+not compensate by materializing an `everyone` row per user.
 
 ### 2.1 RBAC Rules
 

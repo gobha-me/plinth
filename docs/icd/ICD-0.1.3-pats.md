@@ -7,6 +7,12 @@
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)  
 **Related:** DESIGN-logging-subsystem.md
 
+**Current contract amendment (2026-09-16):** PAT validation uses the shared
+authentication-backend failure contract in `ICD-0.1.2-auth-sessions.md`: an
+unavailable database is `503 service_unavailable`, not
+`401 not_authenticated`. Issue #31 implements the currently missing distinction
+without changing invalid-token behavior.
+
 ---
 
 ## Overview
