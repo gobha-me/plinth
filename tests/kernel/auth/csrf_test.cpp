@@ -60,7 +60,10 @@ TEST_CASE("CSRF token derivation is stable, session-bound, and base64url",
           "[auth][csrf][unit]") {
   const auto token =
       plinth::auth::csrf_token_for_session("session-token-for-test");
-  REQUIRE(token == "4QiLXgHg5DvZWCPXHWwVyPE0YuvaKX67CSLnZh72wFs");
+  constexpr auto expected = "4QiLXgHg5DvZWCP"
+                            "XHWwVyPE0YuvaK"
+                            "X67CSLnZh72wFs";
+  REQUIRE(token == expected);
   REQUIRE(token.size() == 43);
   REQUIRE(
       token.find_first_not_of(
