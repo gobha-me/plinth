@@ -560,12 +560,17 @@ auto handle_add_member(const drogon::HttpRequestPtr& req, Callback&& callback,
 
   // Verify group exists, then user exists, then insert
   db->execSqlAsync(
-      "SELECT id FROM plinth.groups WHERE id = $1::uuid",
+      "SELECT id, name FROM plinth.groups WHERE id = $1::uuid",
       [db, ctx_val, group_id, user_id_to_add, ip,
        cb](const drogon::orm::Result& grp_result) {
         if (grp_result.empty()) {
           (*cb)(json_error(drogon::k404NotFound, "group_not_found",
                            "Group not found"));
+          return;
+        }
+        if (grp_result[0]["name"].as<std::string>() == "everyone") {
+          (*cb)(json_error(drogon::k409Conflict, "immutable_membership",
+                           "The everyone group has implicit membership"));
           return;
         }
         db->execSqlAsync(
@@ -608,34 +613,54 @@ auto handle_remove_member(const drogon::HttpRequestPtr& req,
   const auto& ctx_val = ctx.value();
 
   db->execSqlAsync(
-      "DELETE FROM plinth.group_members "
-      "WHERE group_id = $1::uuid AND user_id = $2::uuid",
-      [ctx_val, group_id, target_user_id, ip,
-       cb](const drogon::orm::Result& result) {
-        if (result.affectedRows() == 0) {
-          (*cb)(json_error(drogon::k404NotFound, "not_a_member",
-                           "User is not a member of this group"));
+      "SELECT name FROM plinth.groups WHERE id = $1::uuid",
+      [db, ctx_val, group_id, target_user_id, ip,
+       cb](const drogon::orm::Result& group_result) {
+        if (group_result.empty()) {
+          (*cb)(json_error(drogon::k404NotFound, "group_not_found",
+                           "Group not found"));
           return;
         }
+        if (group_result[0]["name"].as<std::string>() == "everyone") {
+          (*cb)(json_error(drogon::k409Conflict, "immutable_membership",
+                           "The everyone group has implicit membership"));
+          return;
+        }
+        db->execSqlAsync(
+            "DELETE FROM plinth.group_members "
+            "WHERE group_id = $1::uuid AND user_id = $2::uuid",
+            [ctx_val, group_id, target_user_id, ip,
+             cb](const drogon::orm::Result& result) {
+              if (result.affectedRows() == 0) {
+                (*cb)(json_error(drogon::k404NotFound, "not_a_member",
+                                 "User is not a member of this group"));
+                return;
+              }
 
-        Json::Value detail;
-        detail["group_id"] = group_id;
-        detail["target_user_id"] = target_user_id;
-        plinth::log::audit("group.member_removed", detail,
-                           {.user_id = ctx_val.user_id,
-                            .session_id = ctx_val.session_id,
-                            .ip_address = ip});
+              Json::Value detail;
+              detail["group_id"] = group_id;
+              detail["target_user_id"] = target_user_id;
+              plinth::log::audit("group.member_removed", detail,
+                                 {.user_id = ctx_val.user_id,
+                                  .session_id = ctx_val.session_id,
+                                  .ip_address = ip});
 
-        Json::Value body;
-        body["status"] = "removed";
-        (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+              Json::Value body;
+              body["status"] = "removed";
+              (*cb)(drogon::HttpResponse::newHttpJsonResponse(body));
+            },
+            [cb](const drogon::orm::DrogonDbException& e) {
+              spdlog::error("member remove failed: {}", e.base().what());
+              (*cb)(json_error(drogon::k500InternalServerError,
+                               "internal_error", "Failed to remove member"));
+            },
+            group_id, target_user_id);
       },
       [cb](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("member remove failed: {}", e.base().what());
-        (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
-                         "Failed to remove member"));
+        handle_uuid_lookup_error(cb, e, "group_not_found", "Group not found",
+                                 "remove member");
       },
-      group_id, target_user_id);
+      group_id);
 }
 
 // ── Rule grant/revoke handlers ──────────────────────────────────────
@@ -858,18 +883,36 @@ auto bootstrap_groups(const Config::Database& db_cfg) -> void {
                 "VALUES ('everyone', 'All authenticated users', true) "
                 "ON CONFLICT (name) DO NOTHING");
 
+  // Membership in `everyone` is virtual. Remove historical materialized rows
+  // so membership listings and mutation APIs cannot imply otherwise.
+  pg_exec(conn, "DELETE FROM plinth.group_members "
+                "WHERE group_id = (SELECT id FROM plinth.groups "
+                "                  WHERE name = 'everyone')");
+
   // 2. kernel.admin rule
   pg_exec(conn, "INSERT INTO plinth.rbac_rules (rule, namespace, description, "
                 "extension_name) "
                 "VALUES ('kernel.admin', 'kernel', 'Full administrative "
                 "access', 'kernel') "
                 "ON CONFLICT (rule) DO NOTHING");
+  pg_exec(conn, "INSERT INTO plinth.rbac_rules (rule, namespace, description, "
+                "extension_name) "
+                "VALUES ('kernel.realtime.subscribe.applications.changed', "
+                "'kernel', 'Subscribe to application catalog invalidations', "
+                "'kernel') ON CONFLICT (rule) DO NOTHING");
 
   // 3. Grant kernel.admin → admin group
   pg_exec(conn, "INSERT INTO plinth.group_rules (group_id, rule_id) "
                 "SELECT g.id, r.id "
                 "FROM plinth.groups g, plinth.rbac_rules r "
                 "WHERE g.name = 'admin' AND r.rule = 'kernel.admin' "
+                "ON CONFLICT DO NOTHING");
+  pg_exec(conn, "INSERT INTO plinth.group_rules (group_id, rule_id) "
+                "SELECT g.id, r.id "
+                "FROM plinth.groups g, plinth.rbac_rules r "
+                "WHERE g.name = 'everyone' "
+                "  AND r.rule = "
+                "'kernel.realtime.subscribe.applications.changed' "
                 "ON CONFLICT DO NOTHING");
 
   // 4. Emit rbac.rule_registered audit event for the seeded kernel.admin
@@ -909,7 +952,8 @@ auto bootstrap_groups(const Config::Database& db_cfg) -> void {
                 "  AND r.rule IN ('packages.install', 'packages.read') "
                 "ON CONFLICT DO NOTHING");
 
-  for (const auto* rule : {"packages.install", "packages.read"}) {
+  for (const auto* rule : {"packages.install", "packages.read",
+                           "kernel.realtime.subscribe.applications.changed"}) {
     std::string sql = std::string("SELECT 1 FROM plinth.audit_log "
                                   "WHERE action = 'rbac.rule_registered' "
                                   "  AND detail->>'rule' = '") +

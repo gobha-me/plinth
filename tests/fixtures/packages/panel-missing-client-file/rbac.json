@@ -1,5 +1,5 @@
 {
   "rules": [
-    {"namespace": "notes", "description": "Read access"}
+    {"rule": "notes.read", "namespace": "notes", "description": "Read access"}
   ]
 }

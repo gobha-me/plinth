@@ -1,5 +1,5 @@
 {
   "panels": [
-    {"id": "ghost", "client_path": "ghost.js"}
+    {"id": "ghost", "client_path": "ghost.js", "rbac_rule": "notes.read"}
   ]
 }

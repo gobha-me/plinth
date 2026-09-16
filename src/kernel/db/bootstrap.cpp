@@ -202,6 +202,39 @@ auto bootstrap_schema(const Config::Database& db_cfg,
       spdlog::info("schema created");
     }
   }
+
+  // Kernel-owned, idempotent upgrade for the #31 launcher visibility marker.
+  // Existing installations skip schema.sql, so additive kernel schema changes
+  // must be applied before any startup reconciler or route queries the column.
+  const bool launcher_schema_complete = pg.has_rows(
+      "SELECT 1 WHERE EXISTS (SELECT 1 FROM information_schema.columns "
+      "WHERE table_schema='plinth' AND table_name='packages' "
+      "AND column_name='application_ready') "
+      "AND to_regclass('plinth.uniq_packages_name_application_ready') "
+      "IS NOT NULL AND EXISTS (SELECT 1 FROM pg_constraint "
+      "WHERE conrelid='plinth.packages'::regclass "
+      "AND conname='chk_packages_application_ready_state')");
+  if (!launcher_schema_complete) {
+    pg.exec("BEGIN");
+    pg.exec("ALTER TABLE plinth.packages ADD COLUMN IF NOT EXISTS "
+            "application_ready BOOLEAN NOT NULL DEFAULT FALSE");
+    pg.exec("UPDATE plinth.packages SET application_ready = FALSE "
+            "WHERE application_ready AND state NOT IN "
+            "('ACTIVE','ACTIVE_FLAGGED')");
+    pg.exec("CREATE UNIQUE INDEX IF NOT EXISTS "
+            "uniq_packages_name_application_ready ON plinth.packages(name) "
+            "WHERE application_ready");
+    pg.exec("DO $upgrade$ BEGIN "
+            "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+            "WHERE conrelid='plinth.packages'::regclass "
+            "AND conname='chk_packages_application_ready_state') THEN "
+            "ALTER TABLE plinth.packages ADD CONSTRAINT "
+            "chk_packages_application_ready_state CHECK "
+            "(NOT application_ready OR state IN "
+            "('ACTIVE','ACTIVE_FLAGGED')); END IF; END $upgrade$");
+    pg.exec("COMMIT");
+  }
+
   std::ifstream isolation_file(migrations_dir + "/extension_database.sql");
   if (!isolation_file.is_open()) {
     throw std::runtime_error(

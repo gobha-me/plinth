@@ -6,6 +6,7 @@
 import { h, render, Component } from 'preact';
 import htm from 'htm';
 import { call as plinthCall, reconnectRealtime } from '@plinth/frontend/sdk';
+import { Launcher } from './launcher/launcher.js';
 const html = htm.bind(h);
 
 // ICD-0.6.3 §6.5 — sanitize boundary detail before audit emission.
@@ -326,6 +327,9 @@ class AuthFrame extends Component {
     } catch (_) { /* surfaces in boundary if it throws */ }
     setState({ route: 'login', user: null, errorCode: null });
   }
+  sessionEnded(code) {
+    setState({ route: 'login', user: null, errorCode: code, retryAfter: 0 });
+  }
   setTheme(value) {
     if (value !== 'light' && value !== 'dark' && value !== 'system') return;
     setPref(PREF_KEYS.THEME, value);
@@ -351,26 +355,10 @@ class AuthFrame extends Component {
                    && prefs[PREF_KEYS.SCALE] >= 80
                    && prefs[PREF_KEYS.SCALE] <= 175)
                   ? prefs[PREF_KEYS.SCALE] : 100;
-    return html`
-      <header class="topbar">
-        <div class="zone zone-home" aria-label="Home">
-          <svg class="chev" viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M2 8 L8 2 L14 8 V14 H10 V10 H6 V14 H2 Z"
-                  fill="none" stroke="currentColor" stroke-width="1.4"/>
-          </svg>
-        </div>
-        <div class="zone zone-app-name">
-          <span class="mark" aria-hidden="true"></span>
-          <span>Plinth</span>
-          <svg class="chev" viewBox="0 0 16 16" aria-hidden="true">
-            <path d="M4 6 L8 10 L12 6" fill="none"
-                  stroke="currentColor" stroke-width="1.4"/>
-          </svg>
-        </div>
-        <div class="zone zone-tray"></div>
-        <div class="zone zone-avatar"
-             ref=${(el) => { this.avatarRef = el; }}
-             style="position: relative;">
+    const userControls = html`
+      <div class="zone zone-avatar"
+           ref=${(el) => { this.avatarRef = el; }}
+           style="position: relative;">
           <button onClick=${() => this.setState({ popoverOpen: !this.state.popoverOpen })}>
             <span class="avatar-circle">${initial}</span>
             <svg class="chev" viewBox="0 0 16 16" aria-hidden="true">
@@ -402,9 +390,11 @@ class AuthFrame extends Component {
               <hr class="popover-sep" />
               <button role="menuitem" onClick=${() => this.signOut()}>Sign Out</button>
             </div>` : null}
-        </div>
-      </header>
-      <main>Hello, ${username}</main>`;
+      </div>`;
+    return html`<${Launcher}
+      user=${props.user}
+      userControls=${userControls}
+      onSessionEnd=${(code) => this.sessionEnded(code)} />`;
   }
 }
 
@@ -430,8 +420,10 @@ class App extends Component {
                      user: sessionBody.user ?? sessionBody,
                      errorCode: null });
         } else if (r.status === 401) {
+          await r.text();
           setState({ route: 'login', user: null, errorCode: null });
         } else {
+          await r.text();
           setState({ route: 'login', user: null, errorCode: 'server_unreachable' });
         }
       })

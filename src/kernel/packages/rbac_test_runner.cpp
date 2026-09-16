@@ -212,15 +212,16 @@ auto effective_rules_for(PGconn* conn, std::string_view user_id)
     -> std::vector<std::string> {
   std::string id_s{user_id};
   std::array<const char*, 1> values = {id_s.c_str()};
-  PgResultPtr res(
-      plinth::db::exec_params(
-          conn,
-          "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
-          "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
-          "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
-          "WHERE gm.user_id = $1::uuid",
-          1, nullptr, values.data(), nullptr, nullptr, 0),
-      PQclear);
+  PgResultPtr res(plinth::db::exec_params(
+                      conn,
+                      "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
+                      "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
+                      "JOIN plinth.groups g ON g.id = gr.group_id "
+                      "LEFT JOIN plinth.group_members gm ON gm.group_id = g.id "
+                      "WHERE r.orphaned_at IS NULL "
+                      "AND (gm.user_id = $1::uuid OR g.name = 'everyone')",
+                      1, nullptr, values.data(), nullptr, nullptr, 0),
+                  PQclear);
   std::vector<std::string> out;
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     return out;

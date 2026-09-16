@@ -43,7 +43,8 @@ inline auto get_session_context(const drogon::HttpRequestPtr& req)
 // Extracts token from Cookie: plinth_session=... or Authorization: Bearer ...
 // Bearer tokens starting with "plinth_" are routed to the PAT validation path.
 // On success: attaches AuthContext attributes to the request.
-// On failure: returns 401 JSON response.
+// On credential failure: returns 401 JSON. Authentication-backend failures
+// return a generic 503 so an outage is never misreported as an invalid token.
 class SessionFilter : public drogon::HttpFilter<SessionFilter, false> {
  public:
   auto doFilter(const drogon::HttpRequestPtr& req, drogon::FilterCallback&& fcb,
@@ -59,8 +60,8 @@ auto extract_token(const drogon::HttpRequestPtr& req)
 //
 // Used by both the HTTP SessionFilter and the WebSocket auth flow. The
 // validators do the DB lookup, build an AuthContext on success, or return
-// an error_code string on failure. Errors map to the existing 401 codes:
-//   "not_authenticated", "session_revoked", "session_expired"
+// an error_code string on failure. Credential errors map to the existing 401
+// codes; database failures use "service_unavailable".
 
 struct TokenValidationResult {
   bool ok{false};
@@ -69,6 +70,21 @@ struct TokenValidationResult {
 };
 
 using TokenValidationCallback = std::function<void(TokenValidationResult)>;
+
+namespace test_seam {
+
+// Drive the production SessionFilter decision path with a deterministic token
+// validator. This keeps response/status/header tests hermetic while database
+// error mapping in the real validator can be covered independently.
+using TokenValidator =
+    std::function<void(const std::string&, TokenValidationCallback)>;
+
+auto dispatch_session_filter(const drogon::HttpRequestPtr& req,
+                             drogon::FilterCallback&& fcb,
+                             drogon::FilterChainCallback&& fccb,
+                             TokenValidator validator) -> void;
+
+} // namespace test_seam
 
 // Validate a session token (raw, not yet hashed). Async DB call.
 auto validate_session_token(const std::string& raw_token,

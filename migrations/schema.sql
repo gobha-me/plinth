@@ -157,12 +157,15 @@ CREATE TABLE plinth.packages (
     last_rbac_test_run_at  TIMESTAMPTZ,
     last_rbac_test_result  JSONB,
     installed_by_user_id UUID REFERENCES plinth.users(id),
+    application_ready    BOOLEAN     NOT NULL DEFAULT FALSE,
     UNIQUE (name, version),
     -- ICD-0.6.1 §4.3: frontend_mount and frontend_entry are NULL together
     -- (headless extension) or non-NULL together (frontend extension). The
     -- pair invariant prevents half-populated frontend rows reaching ACTIVE.
     CONSTRAINT chk_frontend_pair
-        CHECK ((frontend_mount IS NULL) = (frontend_entry IS NULL))
+        CHECK ((frontend_mount IS NULL) = (frontend_entry IS NULL)),
+    CONSTRAINT chk_packages_application_ready_state
+        CHECK (NOT application_ready OR state IN ('ACTIVE', 'ACTIVE_FLAGGED'))
 );
 
 -- At most one installed version per package name at a time. SUPERSEDED
@@ -171,6 +174,10 @@ CREATE TABLE plinth.packages (
 CREATE UNIQUE INDEX uniq_packages_name_active
     ON plinth.packages(name)
     WHERE state IN ('ACTIVE', 'ACTIVE_FLAGGED', 'DISABLED');
+
+CREATE UNIQUE INDEX uniq_packages_name_application_ready
+    ON plinth.packages(name)
+    WHERE application_ready;
 
 CREATE UNIQUE INDEX uniq_packages_mount_active
     ON plinth.packages(frontend_mount)

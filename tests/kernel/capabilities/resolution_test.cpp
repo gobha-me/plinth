@@ -276,6 +276,48 @@ TEST_CASE("erase_tier2_entry removes the matching signature",
   REQUIRE(plinth::capabilities::tier2_cache_size() == 0);
 }
 
+TEST_CASE("failed Tier 2 reload retains the admitted snapshot",
+          "[capabilities][resolution][unit]") {
+  fresh_resolver();
+  plinth::capabilities::seed_tier2_cache_for_test(
+      make_instance_entry("llm:1:complete", "sidecar"));
+
+  plinth::Config::Database unreachable;
+  // A nonexistent Unix-domain socket directory fails immediately and cannot
+  // accidentally reach a developer's PostgreSQL listener.
+  unreachable.host = "/tmp/plinth-no-such-postgres-socket";
+  unreachable.port = 1;
+
+  auto reloaded = plinth::capabilities::reload_tier2_cache(unreachable);
+  REQUIRE_FALSE(reloaded.has_value());
+  REQUIRE(reloaded.error() ==
+          plinth::capabilities::Tier2ReloadError::DATABASE_UNAVAILABLE);
+  REQUIRE(plinth::capabilities::tier2_cache_size() == 1);
+
+  auto retained = plinth::capabilities::call_capability(
+      CapabilityCall{.signature = "llm:1:complete"}, default_ctx());
+  REQUIRE_FALSE(retained.has_value());
+  REQUIRE(plinth::capabilities::error_code(retained.error()) ==
+          "tier3_not_available");
+}
+
+TEST_CASE("failed resolver initialization is an explicit startup error",
+          "[capabilities][resolution][unit]") {
+  fresh_resolver();
+  plinth::capabilities::seed_tier2_cache_for_test(
+      make_instance_entry("llm:1:complete", "sidecar"));
+
+  plinth::Config::Database unreachable;
+  unreachable.host = "/tmp/plinth-no-such-postgres-socket";
+  unreachable.port = 1;
+
+  auto initialized = plinth::capabilities::init_resolver(unreachable);
+  REQUIRE_FALSE(initialized.has_value());
+  REQUIRE(initialized.error() ==
+          plinth::capabilities::Tier2ReloadError::DATABASE_UNAVAILABLE);
+  REQUIRE(plinth::capabilities::tier2_cache_size() == 0);
+}
+
 TEST_CASE("set_enabled_by_extension_in_cache flips matching entries only",
           "[capabilities][resolution][unit]") {
   fresh_resolver();

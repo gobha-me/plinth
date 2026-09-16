@@ -1,5 +1,5 @@
 {
   "rules": [
-    {"namespace": "full", "description": "Allow reading records"}
+    {"rule": "full.read", "namespace": "full", "description": "Allow reading records"}
   ]
 }

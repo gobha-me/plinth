@@ -307,6 +307,12 @@ auto unregister_routes(std::string_view name, std::string_view version)
   g_routes.erase(compose_key(name, version));
 }
 
+auto has_registered_route(std::string_view name, std::string_view version)
+    -> bool {
+  std::shared_lock lk(g_mu);
+  return g_routes.contains(compose_key(name, version));
+}
+
 auto dispatch_for_test(const drogon::HttpRequestPtr& req,
                        std::function<void(const drogon::HttpResponsePtr&)> cb,
                        const std::string& name, const std::string& version,

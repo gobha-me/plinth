@@ -1,5 +1,5 @@
 {
   "panels": [
-    {"id": "main", "client_path": "main.js"}
+    {"id": "main", "client_path": "main.js", "rbac_rule": "full.read"}
   ]
 }

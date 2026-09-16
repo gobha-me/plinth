@@ -156,9 +156,19 @@ auto refresh_authority(const drogon::WebSocketConnectionPtr& conn,
                   "FROM plinth."} +
       (session ? "sessions" : "pats") +
       " c JOIN plinth.users u ON u.id = c.user_id "
-      "LEFT JOIN plinth.group_members gm ON gm.user_id = u.id "
-      "LEFT JOIN plinth.group_rules gr ON gr.group_id = gm.group_id "
-      "LEFT JOIN plinth.rbac_rules r ON r.id = gr.rule_id "
+      "LEFT JOIN LATERAL ("
+      "  SELECT rule FROM ("
+      "    SELECT r.rule FROM plinth.group_members gm "
+      "    JOIN plinth.group_rules gr ON gr.group_id = gm.group_id "
+      "    JOIN plinth.rbac_rules r ON r.id = gr.rule_id "
+      "    WHERE gm.user_id = u.id AND r.orphaned_at IS NULL "
+      "    UNION "
+      "    SELECT r.rule FROM plinth.groups g "
+      "    JOIN plinth.group_rules gr ON gr.group_id = g.id "
+      "    JOIN plinth.rbac_rules r ON r.id = gr.rule_id "
+      "    WHERE g.name = 'everyone' AND r.orphaned_at IS NULL"
+      "  ) effective"
+      ") r ON TRUE "
       "WHERE c.id = $1::uuid AND c.user_id = $2::uuid AND c.token_hash = $3 "
       "AND c.revoked_at IS NULL AND u.disabled_at IS NULL "
       "AND (c.expires_at IS NULL OR c.expires_at > statement_timestamp())";

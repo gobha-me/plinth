@@ -127,6 +127,11 @@ TEST_CASE("schema.sql declares the partial unique indexes + state index",
   REQUIRE(sql.find("uniq_packages_mount_active") != std::string::npos);
   REQUIRE(sql.find("idx_packages_state") != std::string::npos);
   REQUIRE(sql.find("idx_packages_supersedes") != std::string::npos);
+  REQUIRE(sql.find("uniq_packages_name_application_ready") !=
+          std::string::npos);
+  REQUIRE(sql.find("chk_packages_application_ready_state") !=
+          std::string::npos);
+  REQUIRE(sql.find("NOT NULL DEFAULT FALSE") != std::string::npos);
 }
 
 // ── Integration: bootstrap_schema creates tables + constraints hold ──
@@ -234,6 +239,77 @@ TEST_CASE("uniq_packages_name_active blocks a second ACTIVE row with same name",
   // covers {ACTIVE, ACTIVE_FLAGGED, DISABLED}.
   REQUIRE(insert("44444444-4444-4444-4444-444444444444", "1.0.2",
                  "INSTALL_FAILED"));
+
+  PQfinish(conn);
+  drop_plinth_schema(db);
+}
+
+TEST_CASE(
+    "application_ready is false by default and constrained to active states",
+    "[packages_schema][integration]") {
+  if (!pg_available()) {
+    SKIP("PG not available (set PLINTH_PG_HOST to enable)");
+  }
+  auto db = pg_config();
+  drop_plinth_schema(db);
+  auto migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
+  plinth::db::bootstrap_schema(db, migrations_dir, true);
+
+  PGconn* conn = PQconnectdb(conninfo_of(db).c_str());
+  REQUIRE(PQstatus(conn) == CONNECTION_OK);
+  REQUIRE(exec_ok(conn,
+                  "INSERT INTO plinth.packages "
+                  "(id, name, version, state, provenance, manifest_json, "
+                  "entry_point, manifest_checksum) VALUES "
+                  "('77777777-7777-7777-7777-777777777777', 'ready-test', "
+                  "'1.0.0', 'VALIDATING', 'user', '{}'::jsonb, 'x', 'y')"));
+
+  PGresult* default_value =
+      PQexec(conn, "SELECT application_ready FROM plinth.packages WHERE "
+                   "id='77777777-7777-7777-7777-777777777777'");
+  REQUIRE(PQresultStatus(default_value) == PGRES_TUPLES_OK);
+  REQUIRE(std::string{PQgetvalue(default_value, 0, 0)} == "f");
+  PQclear(default_value);
+
+  REQUIRE_FALSE(
+      exec_ok(conn, "UPDATE plinth.packages SET application_ready=true WHERE "
+                    "id='77777777-7777-7777-7777-777777777777'"));
+  REQUIRE(exec_ok(conn, "UPDATE plinth.packages SET state='ACTIVE', "
+                        "application_ready=true WHERE "
+                        "id='77777777-7777-7777-7777-777777777777'"));
+
+  PQfinish(conn);
+  drop_plinth_schema(db);
+}
+
+TEST_CASE("application_ready unique index prevents split-brain package names",
+          "[packages_schema][integration]") {
+  if (!pg_available()) {
+    SKIP("PG not available (set PLINTH_PG_HOST to enable)");
+  }
+  auto db = pg_config();
+  drop_plinth_schema(db);
+  auto migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
+  plinth::db::bootstrap_schema(db, migrations_dir, true);
+
+  PGconn* conn = PQconnectdb(conninfo_of(db).c_str());
+  REQUIRE(PQstatus(conn) == CONNECTION_OK);
+  REQUIRE(exec_ok(conn, "DROP INDEX plinth.uniq_packages_name_active"));
+  auto insert = [&](std::string_view id, std::string_view version, bool ready) {
+    return exec_ok(conn, "INSERT INTO plinth.packages "
+                         "(id, name, version, state, provenance, "
+                         "manifest_json, entry_point, manifest_checksum, "
+                         "application_ready) VALUES ('" +
+                             std::string{id} + "', 'split-test', '" +
+                             std::string{version} +
+                             "', 'ACTIVE', 'user', '{}'::jsonb, 'x', 'y', " +
+                             (ready ? "true" : "false") + ")");
+  };
+  REQUIRE(insert("88888888-8888-8888-8888-888888888888", "1.0.0", true));
+  REQUIRE(insert("99999999-9999-9999-9999-999999999999", "1.1.0", false));
+  REQUIRE_FALSE(
+      exec_ok(conn, "UPDATE plinth.packages SET application_ready=true WHERE "
+                    "id='99999999-9999-9999-9999-999999999999'"));
 
   PQfinish(conn);
   drop_plinth_schema(db);

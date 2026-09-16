@@ -14,6 +14,7 @@
 #include "kernel/db/operations.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/frontend/api_frontend.hpp"
+#include "kernel/frontend/applications.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/js/db_batch_audit.hpp"
 #include "kernel/js/db_search_path.hpp"
@@ -563,7 +564,12 @@ auto main(int argc, char* argv[]) -> int {
         // Load the Tier 2 cache and register Tier 1 stub handlers
         // (per ICD-0.2.2 §Resolution Algorithm).
         database_operations.checkpoint();
-        plinth::capabilities::init_resolver(cfg.db);
+        if (auto resolver = plinth::capabilities::init_resolver(cfg.db);
+            !resolver.has_value()) {
+          spdlog::critical(
+              "bootstrap: capability resolver could not load authority");
+          return 1;
+        }
 
         // ICD-0.5.0.3 §Lifecycle — spin up one RuntimePool per
         // installed-ACTIVE extension. Must run AFTER init_resolver
@@ -697,6 +703,7 @@ auto main(int argc, char* argv[]) -> int {
             .upgrade_drain_timeout_ms =
                 std::chrono::milliseconds{
                     cfg.packages_upgrade_drain_timeout_ms},
+            .schedule_rbac_tests = false,
         };
         if (!plinth::packages::rbac_test::start_async_workers()) {
           throw std::runtime_error(
@@ -715,7 +722,15 @@ auto main(int argc, char* argv[]) -> int {
           return 1;
         }
         database_operations.checkpoint();
-        plinth::packages::reconcile_in_flight_installs(bootstrap_ctx);
+        if (auto recovered =
+                plinth::packages::reconcile_in_flight_installs(bootstrap_ctx);
+            !recovered.has_value()) {
+          database_operations.checkpoint();
+          spdlog::critical(
+              "bootstrap: in-flight package reconciliation failed: {}",
+              recovered.error());
+          return 1;
+        }
         if (auto fb = plinth::shell::ensure_bundled_shell_installed(
                 cfg, bootstrap_ctx,
                 serve_cmd.get<bool>("--upgrade-bundled-shell"));
@@ -733,6 +748,20 @@ auto main(int argc, char* argv[]) -> int {
         database_operations.checkpoint();
         plinth::packages::asset_server::restore_routes(cfg.db,
                                                        cfg.packages_data_dir);
+        if (auto reconciled = plinth::packages::reconcile_application_readiness(
+                bootstrap_ctx);
+            !reconciled.has_value()) {
+          spdlog::critical("application readiness reconciliation failed: {}",
+                           reconciled.error());
+          return 1;
+        }
+        if (auto scheduled =
+                plinth::packages::schedule_pending_rbac_tests(bootstrap_ctx);
+            !scheduled.has_value()) {
+          spdlog::critical("bootstrap: RBAC handoff scheduling failed: {}",
+                           scheduled.error());
+          return 1;
+        }
 
         // ICD-0.6.3 §5 — `POST /api/cap/{capability}` HTTP cap-
         // dispatch route. Browser-side `plinth.call(cap, args)`
@@ -752,6 +781,7 @@ auto main(int argc, char* argv[]) -> int {
         // 302 target) and BEFORE the active-frontend catch-all
         // (so the catch-all does not shadow `/api/frontend/*`).
         plinth::frontend::register_api_frontend_routes(cfg.db);
+        plinth::frontend::register_application_routes();
 
         // ICD-0.6.1 §4.4 / §4.6 — register the active frontend's
         // `/` redirect + `<mount>(.*)` SPA-fallback handler AFTER

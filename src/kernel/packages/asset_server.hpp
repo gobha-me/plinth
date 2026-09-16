@@ -51,6 +51,12 @@ auto register_routes(std::string_view name, std::string_view version,
 // uninstall path. Safe to call with no matching entry.
 auto unregister_routes(std::string_view name, std::string_view version) -> void;
 
+// Return whether the exact package generation currently has an admitted
+// client route. Used by startup readiness reconciliation before HTTP ingress
+// opens; this does not probe the filesystem a second time.
+[[nodiscard]] auto has_registered_route(std::string_view name,
+                                        std::string_view version) -> bool;
+
 // Replay every ACTIVE or ACTIVE_FLAGGED package's route entry from
 // `plinth.packages`. Called once from main.cpp after bootstrap but
 // before `drogon::app().run()` so ACTIVE packages survive kernel

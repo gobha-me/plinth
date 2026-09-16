@@ -118,7 +118,14 @@ try {
     }
     const hasGrant = connection => connection.received.some(frame =>
         frame.type === 'subscribed' && frame.channels.includes(channel));
-    await waitFor(() => connections.length === 1 && hasGrant(connections[0]), 'no non-admin channel grant');
+    try {
+        await waitFor(() => connections.length === 1 && hasGrant(connections[0]),
+            'no non-admin channel grant');
+    } catch (error) {
+        error.message += `: ${JSON.stringify({ connections,
+            subscriptionErrors: await page.evaluate(() => window.__subscriptionErrors) })}`;
+        throw error;
+    }
     publish('live-one');
     await page.getByText('live-one', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.__events.length), 1);

@@ -89,23 +89,6 @@ auto create_run_users(std::string_view run_id, PGconn& conn)
       return std::unexpected(std::string{PQresultErrorMessage(res.get())});
     }
   }
-  // everyone membership for both users
-  {
-    std::array<const char*, 2> values = {denied_user.c_str(),
-                                         allowed_user.c_str()};
-    PgResultPtr res(plinth::db::exec_params(
-                        &conn,
-                        "INSERT INTO plinth.group_members (group_id, user_id) "
-                        "SELECT g.id, u.id "
-                        "FROM plinth.groups g, plinth.users u "
-                        "WHERE g.name = 'everyone' "
-                        "  AND u.username IN ($1, $2)",
-                        2, nullptr, values.data(), nullptr, nullptr, 0),
-                    PQclear);
-    if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
-      return std::unexpected(std::string{PQresultErrorMessage(res.get())});
-    }
-  }
   // allowed user → synthetic group membership
   {
     std::array<const char*, 2> values = {group_name.c_str(),

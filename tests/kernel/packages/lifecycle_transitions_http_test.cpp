@@ -533,15 +533,20 @@ auto dispatch_upgrade_async(plinth::http_test::HttpTestFixture& fx,
 // non-zero counter from the first sample.
 class InflightSimulator {
  public:
-  explicit InflightSimulator(std::string ext_name)
-      : name(std::move(ext_name)),
-        state(plinth::capabilities::drain::begin_drain(name)) {
+  explicit InflightSimulator(std::string ext_name) : name(std::move(ext_name)) {
     worker = std::thread([this]() {
       plinth::capabilities::drain::DispatchGuard guard(name);
+      admitted.store(guard.admitted(), std::memory_order_release);
+      ready.store(true, std::memory_order_release);
       while (!release.load(std::memory_order_acquire)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
     });
+    while (!ready.load(std::memory_order_acquire)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    REQUIRE(admitted.load(std::memory_order_acquire));
+    state = plinth::capabilities::drain::begin_drain(name);
     // Wait for the worker's DispatchGuard to increment in_flight,
     // so the next caller of `wait_for_zero(state, ...)` observes
     // counter=1 from its first sample.
@@ -570,6 +575,8 @@ class InflightSimulator {
  private:
   std::string name;
   std::shared_ptr<plinth::capabilities::drain::DrainState> state;
+  std::atomic<bool> ready{false};
+  std::atomic<bool> admitted{false};
   std::atomic<bool> release{false};
   std::thread worker;
 };

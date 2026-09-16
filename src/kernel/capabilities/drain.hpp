@@ -1,27 +1,20 @@
 #pragma once
 
-// plinth::capabilities::drain — upgrade-time dispatch-drain counter.
+// plinth::capabilities::drain — lifecycle dispatch fence and drain counter.
 //
 // ICD-0.4.5 §Atomic Swap T1/T2. On upgrade, after the new version's
 // REGISTERING commits, the old version's in-flight capability calls
 // must be allowed to complete before the atomic swap performs state
 // transitions and route cutover. `begin_drain(name)` activates a
-// per-extension counter; subsequent `call_capability` dispatches
-// whose signature namespace matches `name` increment the counter via
-// a RAII `DispatchGuard`. `wait_for_zero` blocks until the counter
-// reaches 0 or the timeout expires.
+// per-extension fence. Calls admitted before the fence remain counted by a
+// RAII `DispatchGuard`; calls arriving after it are rejected. `wait_for_zero`
+// blocks until every pre-fence call completes or the timeout expires.
 //
 // Semantics:
-//   - Calls started BEFORE begin_drain are not counted (their
-//     DispatchGuard saw no active drain at ctor time). These complete
-//     harmlessly against the old handler under the
-//     resolution.cpp state_mutex shared_lock; B7's T4 unregister
-//     naturally waits for them via the same shared_mutex.
-//   - Calls started AFTER begin_drain increment/decrement the counter.
-//     The timeout triggers when load pins the counter above zero.
-//   - When no drain is active, DispatchGuard is a pair of
-//     relaxed-atomic reads (check g_active_count == 0 early-out);
-//     hot-path cost is a single non-contended atomic load.
+//   - Calls started BEFORE begin_drain are counted and allowed to complete.
+//   - Calls started AFTER begin_drain are not admitted.
+//   - State entries persist after a fence is released so beginning a later
+//     drain cannot miss calls already admitted for that name.
 
 #include <atomic>
 #include <chrono>
@@ -37,20 +30,28 @@ namespace plinth::capabilities::drain {
 
 struct DrainState {
   std::atomic<std::size_t> in_flight{0};
+  std::atomic<bool> fenced{false};
+  std::atomic<bool> application_blocked{false};
   std::mutex mu;
   std::condition_variable cv;
 };
 
-// Register a drain on `name` (extension name, i.e. the capability
-// namespace prefix). Idempotent per (name): a second call returns the
-// existing state. Matching dispatches that enter AFTER this call
-// increment/decrement the returned state's counter.
+// Atomically fence new dispatches for `name` and return the state tracking
+// calls that were already admitted. Idempotent per name.
 auto begin_drain(std::string_view name) -> std::shared_ptr<DrainState>;
 
 // Remove `name` from the active-drain map. Outstanding DispatchGuards
 // keep their captured shared_ptr; further decrements remain safe and
 // wake any waiter on the state's condvar. Idempotent.
 auto end_drain(std::string_view name) -> void;
+
+// Return whether new dispatch is currently fenced for `name`.
+[[nodiscard]] auto is_fenced(std::string_view name) -> bool;
+
+// Keep discovery fail-closed after a lifecycle operation reaches an uncertain
+// or partially committed state. Cleared by end_drain after successful repair.
+auto block_application(std::string_view name) -> void;
+[[nodiscard]] auto is_application_blocked(std::string_view name) -> bool;
 
 // Block until `state->in_flight` reaches 0 or `timeout` elapses.
 // Returns `{reached_zero, outstanding_at_return}`. Does not remove
@@ -62,10 +63,10 @@ auto wait_for_zero(const std::shared_ptr<DrainState>& state,
 // Test-visible: active drain count (number of names with registered
 // drains). Hot-path uses the internal atomic for early-out.
 [[nodiscard]] auto active_drain_count() -> std::size_t;
+[[nodiscard]] auto tracked_state_count_for_test() -> std::size_t;
 
-// RAII guard. Ctor increments `in_flight` iff a drain is active for
-// `name`; dtor decrements only if ctor incremented. Copy + move
-// disabled — guards are scope-bound to one dispatch.
+// RAII guard. Ctor admits and counts the call unless the name is fenced; dtor
+// decrements only an admitted call. Copy + move disabled.
 class DispatchGuard {
  public:
   explicit DispatchGuard(std::string_view name);
@@ -75,8 +76,12 @@ class DispatchGuard {
   DispatchGuard(DispatchGuard&&) = delete;
   auto operator=(DispatchGuard&&) -> DispatchGuard& = delete;
 
+  [[nodiscard]] auto admitted() const -> bool { return was_admitted; }
+
  private:
+  std::string name;
   std::shared_ptr<DrainState> state;
+  bool was_admitted{false};
 };
 
 } // namespace plinth::capabilities::drain

@@ -114,7 +114,7 @@ export class RealtimeError extends Error {
     }
 }
 
-const subscriptions = new Map(); // channel -> Set<{handler, onError}>
+const subscriptions = new Map(); // channel -> Set<{handler, onError, onReady, readyOwner}>
 const stateListeners = new Set();
 let socket = null;
 let reconnectTimer = null;
@@ -149,6 +149,19 @@ function reportError(error, channel) {
         for (const entry of [...(set || [])]) {
             if (set.has(entry) && entry.onError) notify(entry.onError, error);
         }
+    }
+}
+
+function reportReady(owner, channel) {
+    const set = subscriptions.get(channel);
+    for (const entry of [...(set || [])]) {
+        if (!set.has(entry) || entry.readyOwner === owner || !entry.onReady) continue;
+        entry.readyOwner = owner;
+        queueMicrotask(() => {
+            if (socket === owner && !owner.closing && terminalError === null &&
+                set.has(entry) && owner.granted.has(channel) &&
+                entry.readyOwner === owner) notify(entry.onReady);
+        });
     }
 }
 
@@ -212,6 +225,7 @@ function acceptAcknowledgement(owner, frame) {
             owner.denied.delete(channel);
         } else if (acknowledged.has(channel)) {
             owner.granted.add(channel);
+            reportReady(owner, channel);
         } else {
             owner.denied.add(channel);
             reportError(new RealtimeError('subscription_denied',
@@ -299,13 +313,17 @@ export function subscribe(channel, handler, options = {}) {
     if (typeof channel !== 'string' || !channel || typeof handler !== 'function') {
         throw new TypeError('subscribe requires a nonempty channel and handler');
     }
+    if (options.onReady !== undefined && typeof options.onReady !== 'function') {
+        throw new TypeError('subscribe onReady must be a function');
+    }
     let set = subscriptions.get(channel);
     if (!set) {
         set = new Set();
         subscriptions.set(channel, set);
         socket?.denied.delete(channel);
     }
-    const entry = { handler, onError: options.onError };
+    const entry = { handler, onError: options.onError, onReady: options.onReady,
+        readyOwner: null };
     set.add(entry);
     if (terminalError) {
         const error = terminalError;
@@ -323,6 +341,7 @@ export function subscribe(channel, handler, options = {}) {
                 }
             });
         }
+        if (socket?.granted.has(channel)) reportReady(socket, channel);
         if (socket) reconcile(socket);
     }
     return function unsubscribe() {

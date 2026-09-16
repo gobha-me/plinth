@@ -5,6 +5,9 @@
   "scripts": {
     "test": "node shell-smoke.mjs",
     "test:transport": "node --experimental-vm-modules --test sdk-transport.test.mjs",
+    "test:launcher": "node --test launcher-model.test.mjs",
+    "test:launcher-browser": "node launcher-browser.mjs",
+    "test:launcher-production": "node launcher-production.mjs",
     "test:realtime": "node realtime-smoke.mjs"
   },
   "devDependencies": {

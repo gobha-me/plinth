@@ -13,6 +13,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -25,7 +26,11 @@ struct PanelEntry {
   std::string client_path;
   std::optional<std::string> title;
   std::optional<std::string> icon;
+  std::string rbac_rule;
+  std::uint32_t order = 0;
   nlohmann::json unknown_fields = nlohmann::json::object();
+
+  [[nodiscard]] auto declaration() const -> nlohmann::json;
 
   auto operator==(const PanelEntry&) const -> bool = default;
 };

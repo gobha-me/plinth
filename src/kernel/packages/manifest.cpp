@@ -1,4 +1,5 @@
 #include "kernel/packages/manifest.hpp"
+#include "kernel/packages/detail/launcher_validation.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -25,9 +26,10 @@ constexpr std::array<std::string_view, 7> SPDX_WHITELIST{
     "BSD-3-Clause", "ISC",        "Unlicense",
 };
 
-constexpr std::array<std::string_view, 10> KNOWN_TOP_LEVEL{
-    "name",        "version",  "description", "author",    "license",
-    "entry_point", "frontend", "runtime",     "shareable", "provider_extension",
+constexpr std::array<std::string_view, 12> KNOWN_TOP_LEVEL{
+    "name",        "display_name", "icon",      "version",
+    "description", "author",       "license",   "entry_point",
+    "frontend",    "runtime",      "shareable", "provider_extension",
 };
 
 auto is_known_top_level(std::string_view key) -> bool {
@@ -250,6 +252,44 @@ auto parse_name(const nlohmann::json& j, ErrorSink& sink, PackageManifest& m)
               "'name' must match ^[a-z][a-z0-9-]{1,63}$", "/name",
               "use lowercase letters, digits, and dashes; must start with a "
               "letter; 2–64 chars");
+  }
+}
+
+auto parse_launcher_metadata(const nlohmann::json& j, ErrorSink& sink,
+                             PackageManifest& m) -> void {
+  if (j.contains("display_name")) {
+    if (!j["display_name"].is_string()) {
+      sink.push("manifest.display_name.invalid",
+                "'display_name' must be a string", "/display_name");
+    } else {
+      auto value = j["display_name"].get<std::string>();
+      auto scalars = detail::unicode_scalar_count(value);
+      if (value.empty() || !scalars.has_value()) {
+        sink.push("manifest.display_name.invalid",
+                  "'display_name' must be non-empty valid UTF-8",
+                  "/display_name");
+      } else if (*scalars > 128) {
+        sink.push("manifest.display_name.too_long",
+                  "'display_name' exceeds 128 Unicode scalar values",
+                  "/display_name");
+      } else {
+        m.display_name = std::move(value);
+      }
+    }
+  }
+
+  if (j.contains("icon")) {
+    if (!j["icon"].is_string()) {
+      sink.push("manifest.icon.invalid", "'icon' must be a string", "/icon");
+    } else {
+      auto value = j["icon"].get<std::string>();
+      if (!detail::is_icon_token_valid(value)) {
+        sink.push("manifest.icon.invalid",
+                  "'icon' must match ^[a-z][a-z0-9-]{0,63}$", "/icon");
+      } else {
+        m.icon = std::move(value);
+      }
+    }
   }
 }
 
@@ -698,6 +738,7 @@ auto PackageManifest::parse(std::string_view json_text,
 
   PackageManifest m;
   parse_name(j, sink, m);
+  parse_launcher_metadata(j, sink, m);
   if (!is_bundled && m.name == "shell") {
     sink.push(
         "manifest.name.reserved",
@@ -731,6 +772,12 @@ auto PackageManifest::serialize() const -> std::string {
     out[it.key()] = it.value();
   }
   out["name"] = name;
+  if (display_name) {
+    out["display_name"] = *display_name;
+  }
+  if (icon) {
+    out["icon"] = *icon;
+  }
   out["version"] = version;
   out["description"] = description;
   out["author"] = author;

@@ -159,6 +159,7 @@ def main():
                 transition = resources.enter_context(CacheTransition(port))
                 child_env["PLINTH_BASE_URL"] = transition.origin
             child_env["PLINTH_BROWSER_PROFILE_DIR"] = str(root / "browser-profile")
+            child_env["PLINTH_TEST_BUILD_DIR"] = str(binary.parent)
             browser_tmp = root / "browser-tmp"
             browser_tmp.mkdir()
             child_env["TMPDIR"] = str(browser_tmp)
@@ -212,6 +213,9 @@ def main():
                         run_browser(["npm", "run", "test:realtime", "--prefix",
                                      str(repo / "tests/browser")],
                                     env=child_env, timeout=180)
+                        run_browser(["npm", "run", "test:launcher-production", "--prefix",
+                                     str(repo / "tests/browser")],
+                                    env=child_env, timeout=240)
                 stop_kernel(child)
             except BaseException:
                 print(output_path.read_text(), flush=True)

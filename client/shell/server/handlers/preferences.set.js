@@ -11,12 +11,36 @@
 // with a `validate(value) -> bool` predicate. Unknown keys pass through
 // unchecked — extensions own their own keyspace via `<ext>.*`.
 
+const APP_ID = /^[a-z][a-z0-9-]{1,63}$/;
+const PANEL_ID = /^[a-z][a-z0-9_-]{0,63}$/;
+
+function validLauncher(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)
+            || value.version !== 1) return false;
+    if (value.last_application !== null && value.last_application !== undefined
+            && (typeof value.last_application !== 'string'
+                || !APP_ID.test(value.last_application))) return false;
+    if (value.last_panels === null || typeof value.last_panels !== 'object'
+            || Array.isArray(value.last_panels)) return false;
+    const panels = Object.entries(value.last_panels);
+    if (panels.length > 256 || panels.some(([app, panel]) =>
+        !APP_ID.test(app) || typeof panel !== 'string' || !PANEL_ID.test(panel))) return false;
+    if (!Array.isArray(value.application_order) || value.application_order.length > 256
+            || value.application_order.some(app => typeof app !== 'string' || !APP_ID.test(app))) {
+        return false;
+    }
+    return true;
+}
+
 const SCHEMA = {
     'shell.theme': {
         validate: (v) => v === 'light' || v === 'dark' || v === 'system',
     },
     'shell.scale_pct': {
         validate: (v) => Number.isInteger(v) && v >= 80 && v <= 175,
+    },
+    'shell.launcher': {
+        validate: validLauncher,
     },
 };
 

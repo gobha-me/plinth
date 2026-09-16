@@ -478,6 +478,7 @@ add_executable(plinth
   src/kernel/shell/active_frontend.cpp
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
+  src/kernel/frontend/applications.cpp
   src/kernel/cap/api_cap.cpp
 )
 
@@ -516,6 +517,7 @@ add_executable(plinth_tests
   tests/kernel/audit/audit_teardown_test.cpp
   tests/kernel/auth/crypto_test.cpp
   tests/kernel/auth/rate_limiter_test.cpp
+  tests/kernel/auth/middleware_test.cpp
   tests/kernel/auth/auth_integration_test.cpp
   tests/kernel/auth/pat_integration_test.cpp
   tests/kernel/capabilities/validation_test.cpp
@@ -606,6 +608,7 @@ add_executable(plinth_tests
   tests/kernel/shell/preferences_test.cpp
   tests/kernel/shell/preferences_dispatch_test.cpp
   tests/kernel/frontend/api_frontend_test.cpp
+  tests/kernel/frontend/applications_test.cpp
   tests/kernel/cap/api_cap_test.cpp
   src/kernel/config.cpp
   src/kernel/lifecycle/async_task_registry.cpp
@@ -691,6 +694,7 @@ add_executable(plinth_tests
   src/kernel/shell/active_frontend.cpp
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
+  src/kernel/frontend/applications.cpp
   src/kernel/cap/api_cap.cpp
 )
 

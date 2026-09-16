@@ -44,7 +44,60 @@ TEST_CASE("PackageManifest parses a minimal valid manifest",
   REQUIRE(res.value->name == "notes");
   REQUIRE(res.value->version == "1.2.3");
   REQUIRE(res.value->license == "MIT");
+  REQUIRE_FALSE(res.value->display_name.has_value());
+  REQUIRE_FALSE(res.value->icon.has_value());
   REQUIRE(res.messages.empty());
+}
+
+TEST_CASE("PackageManifest parses and serializes launcher metadata",
+          "[packages][manifest][launcher]") {
+  auto json = nlohmann::json::parse(valid_manifest_json());
+  json["display_name"] = "Nøtes 📝";
+  json["icon"] = "edit-3";
+  auto res = PackageManifest::parse(json.dump(), "manifest.json");
+  REQUIRE(res.value.has_value());
+  REQUIRE(res.value->display_name == "Nøtes 📝");
+  REQUIRE(res.value->icon == "edit-3");
+
+  auto serialized = nlohmann::json::parse(res.value->serialize());
+  REQUIRE(serialized["display_name"] == "Nøtes 📝");
+  REQUIRE(serialized["icon"] == "edit-3");
+}
+
+TEST_CASE("PackageManifest counts display_name in Unicode scalar values",
+          "[packages][manifest][launcher]") {
+  auto json = nlohmann::json::parse(valid_manifest_json());
+  json["display_name"] = std::string(128, 'a') + "📝";
+  auto too_long = PackageManifest::parse(json.dump(), "manifest.json");
+  REQUIRE_FALSE(too_long.value.has_value());
+  REQUIRE(find_rule(too_long.messages, "manifest.display_name.too_long") !=
+          nullptr);
+
+  json["display_name"] = std::string(127, 'a') + "📝";
+  auto exact = PackageManifest::parse(json.dump(), "manifest.json");
+  REQUIRE(exact.value.has_value());
+}
+
+TEST_CASE("PackageManifest rejects invalid launcher metadata",
+          "[packages][manifest][launcher]") {
+  auto json = nlohmann::json::parse(valid_manifest_json());
+  json["display_name"] = "";
+  json["icon"] = "Edit_3";
+  auto res = PackageManifest::parse(json.dump(), "manifest.json");
+  REQUIRE_FALSE(res.value.has_value());
+  REQUIRE(find_rule(res.messages, "manifest.display_name.invalid") != nullptr);
+  REQUIRE(find_rule(res.messages, "manifest.icon.invalid") != nullptr);
+}
+
+TEST_CASE("PackageManifest rejects non-string launcher metadata",
+          "[packages][manifest][launcher]") {
+  auto json = nlohmann::json::parse(valid_manifest_json());
+  json["display_name"] = 42;
+  json["icon"] = false;
+  auto res = PackageManifest::parse(json.dump(), "manifest.json");
+  REQUIRE_FALSE(res.value.has_value());
+  REQUIRE(find_rule(res.messages, "manifest.display_name.invalid") != nullptr);
+  REQUIRE(find_rule(res.messages, "manifest.icon.invalid") != nullptr);
 }
 
 TEST_CASE("PackageManifest rejects invalid name", "[packages][manifest]") {

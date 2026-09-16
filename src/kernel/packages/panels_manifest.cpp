@@ -1,12 +1,15 @@
 #include "kernel/packages/panels_manifest.hpp"
+#include "kernel/packages/detail/launcher_validation.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <ranges>
+#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -19,11 +22,8 @@ namespace {
 constexpr std::size_t ID_MAX_LEN = 64;
 constexpr std::size_t TITLE_MAX_LEN = 256;
 
-constexpr std::array<std::string_view, 4> KNOWN_PANEL_FIELDS{
-    "id",
-    "client_path",
-    "title",
-    "icon",
+constexpr std::array<std::string_view, 6> KNOWN_PANEL_FIELDS{
+    "id", "client_path", "title", "icon", "rbac_rule", "order",
 };
 
 constexpr std::array<std::string_view, 1> KNOWN_TOP_LEVEL{
@@ -56,13 +56,16 @@ auto is_id_valid(std::string_view s) -> bool {
 }
 
 auto is_relative_path_valid(std::string_view s) -> bool {
-  if (s.empty() || s[0] == '/') {
+  if (s.empty() || s.front() == '/' || s.back() == '/' ||
+      s.find('\\') != std::string_view::npos ||
+      s.find('\0') != std::string_view::npos) {
     return false;
   }
   std::size_t start = 0;
   for (std::size_t i = 0; i <= s.size(); ++i) {
     if (i == s.size() || s[i] == '/') {
-      if (s.substr(start, i - start) == "..") {
+      auto component = s.substr(start, i - start);
+      if (component.empty() || component == "." || component == "..") {
         return false;
       }
       start = i + 1;
@@ -154,17 +157,18 @@ auto parse_client_path(const nlohmann::json& entry, std::size_t idx,
   if (!is_relative_path_valid(out.client_path)) {
     sink.push(make_rule(idx, "client_path", "invalid_path"),
               "'client_path' must be a non-empty relative path "
-              "(no leading '/', no '..' components)",
+              "with non-empty components other than '.' or '..' and no "
+              "backslash or NUL",
               make_path(idx, "client_path"));
     return false;
   }
   return true;
 }
 
-auto parse_optional_string(const nlohmann::json& entry, std::size_t idx,
-                           std::string_view field, std::size_t max_len,
-                           ErrorSink& sink, std::optional<std::string>& out)
+auto parse_optional_title(const nlohmann::json& entry, std::size_t idx,
+                          ErrorSink& sink, std::optional<std::string>& out)
     -> void {
+  constexpr std::string_view field = "title";
   std::string key{field};
   if (!entry.contains(key)) {
     return;
@@ -175,14 +179,81 @@ auto parse_optional_string(const nlohmann::json& entry, std::size_t idx,
     return;
   }
   auto val = entry[key].get<std::string>();
-  if (val.size() > max_len) {
+  auto scalars = detail::unicode_scalar_count(val);
+  if (val.empty() || !scalars.has_value()) {
+    sink.push(make_rule(idx, field, "invalid"),
+              "'title' must be non-empty valid UTF-8", make_path(idx, field));
+    return;
+  }
+  if (*scalars > TITLE_MAX_LEN) {
     sink.push(make_rule(idx, field, "too_long"),
-              "'" + key + "' exceeds " + std::to_string(max_len) +
-                  " characters",
+              "'title' exceeds 256 Unicode scalar values",
               make_path(idx, field));
     return;
   }
   out = std::move(val);
+}
+
+auto parse_icon(const nlohmann::json& entry, std::size_t idx, ErrorSink& sink,
+                PanelEntry& out) -> bool {
+  if (!entry.contains("icon")) {
+    return true;
+  }
+  if (!entry["icon"].is_string()) {
+    sink.push(make_rule(idx, "icon", "invalid"), "'icon' must be a string",
+              make_path(idx, "icon"));
+    return false;
+  }
+  auto value = entry["icon"].get<std::string>();
+  if (!detail::is_icon_token_valid(value)) {
+    sink.push(make_rule(idx, "icon", "invalid"),
+              "'icon' must match ^[a-z][a-z0-9-]{0,63}$",
+              make_path(idx, "icon"));
+    return false;
+  }
+  out.icon = std::move(value);
+  return true;
+}
+
+auto parse_rbac_rule(const nlohmann::json& entry, std::size_t idx,
+                     ErrorSink& sink, PanelEntry& out) -> bool {
+  if (!entry.contains("rbac_rule") || !entry["rbac_rule"].is_string()) {
+    sink.push(make_rule(idx, "rbac_rule", "missing"),
+              "'rbac_rule' is required and must be a string",
+              make_path(idx, "rbac_rule"));
+    return false;
+  }
+  out.rbac_rule = entry["rbac_rule"].get<std::string>();
+  if (!detail::is_rbac_rule_name_valid(out.rbac_rule)) {
+    sink.push(make_rule(idx, "rbac_rule", "invalid"),
+              "'rbac_rule' must use the RBAC rule-name grammar",
+              make_path(idx, "rbac_rule"));
+    return false;
+  }
+  return true;
+}
+
+auto parse_order(const nlohmann::json& entry, std::size_t idx, ErrorSink& sink,
+                 PanelEntry& out) -> bool {
+  if (!entry.contains("order")) {
+    return true;
+  }
+  const auto& value = entry["order"];
+  bool in_range = false;
+  if (value.is_number_unsigned()) {
+    in_range = value.get<std::uint64_t>() <= 10000;
+  } else if (value.is_number_integer()) {
+    auto signed_value = value.get<std::int64_t>();
+    in_range = signed_value >= 0 && signed_value <= 10000;
+  }
+  if (!in_range) {
+    sink.push(make_rule(idx, "order", "invalid"),
+              "'order' must be an integer in [0, 10000]",
+              make_path(idx, "order"));
+    return false;
+  }
+  out.order = value.get<std::uint32_t>();
+  return true;
 }
 
 auto parse_one_panel(const nlohmann::json& entry, std::size_t idx,
@@ -196,8 +267,10 @@ auto parse_one_panel(const nlohmann::json& entry, std::size_t idx,
   bool ok = true;
   ok = parse_id(entry, idx, sink, out) && ok;
   ok = parse_client_path(entry, idx, sink, out) && ok;
-  parse_optional_string(entry, idx, "title", TITLE_MAX_LEN, sink, out.title);
-  parse_optional_string(entry, idx, "icon", TITLE_MAX_LEN, sink, out.icon);
+  parse_optional_title(entry, idx, sink, out.title);
+  ok = parse_icon(entry, idx, sink, out) && ok;
+  ok = parse_rbac_rule(entry, idx, sink, out) && ok;
+  ok = parse_order(entry, idx, sink, out) && ok;
   for (auto it = entry.begin(); it != entry.end(); ++it) {
     if (!is_known_panel_field(it.key())) {
       out.unknown_fields[it.key()] = it.value();
@@ -261,9 +334,14 @@ auto PanelsManifest::parse(std::string_view json_text,
     return result;
   }
 
+  std::set<std::string> panel_ids;
   for (std::size_t i = 0; i < arr->size(); ++i) {
     PanelEntry pe;
     parse_one_panel((*arr)[i], i, sink, pe);
+    if (is_id_valid(pe.id) && !panel_ids.insert(pe.id).second) {
+      sink.push(make_rule(i, "id", "duplicate"),
+                "duplicate panel id '" + pe.id + "'", make_path(i, "id"));
+    }
     m.panels.push_back(std::move(pe));
   }
 
@@ -273,6 +351,24 @@ auto PanelsManifest::parse(std::string_view json_text,
   return result;
 }
 
+auto PanelEntry::declaration() const -> nlohmann::json {
+  auto entry = nlohmann::json::object();
+  for (auto it = unknown_fields.begin(); it != unknown_fields.end(); ++it) {
+    entry[it.key()] = it.value();
+  }
+  entry["id"] = id;
+  entry["client_path"] = client_path;
+  if (title) {
+    entry["title"] = *title;
+  }
+  if (icon) {
+    entry["icon"] = *icon;
+  }
+  entry["rbac_rule"] = rbac_rule;
+  entry["order"] = order;
+  return entry;
+}
+
 auto PanelsManifest::serialize() const -> std::string {
   auto out = nlohmann::json::object();
   for (auto it = unknown_fields.begin(); it != unknown_fields.end(); ++it) {
@@ -280,20 +376,7 @@ auto PanelsManifest::serialize() const -> std::string {
   }
   auto arr = nlohmann::json::array();
   for (const auto& pe : panels) {
-    auto entry = nlohmann::json::object();
-    for (auto it = pe.unknown_fields.begin(); it != pe.unknown_fields.end();
-         ++it) {
-      entry[it.key()] = it.value();
-    }
-    entry["id"] = pe.id;
-    entry["client_path"] = pe.client_path;
-    if (pe.title) {
-      entry["title"] = *pe.title;
-    }
-    if (pe.icon) {
-      entry["icon"] = *pe.icon;
-    }
-    arr.push_back(std::move(entry));
+    arr.push_back(pe.declaration());
   }
   out["panels"] = arr;
   return out.dump(2);

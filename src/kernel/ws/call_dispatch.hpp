@@ -23,13 +23,9 @@
 //      "message":"<human-readable>"}
 //
 // RBAC model: the `rbac_rule` stored on the Tier 1/Tier 2 entry governs
-// access. ConnState only carries `is_admin` (populated in auth_flow),
-// so for LH-0 the effective_rules vector is synthesized as
-// `{"kernel.admin"}` for admin users and empty for everyone else. The
-// resolver's `kernel.admin` universal-match (ICD-0.2.4) then gates
-// admin access; non-admin WS callers cannot invoke any RBAC-gated
-// capability. Widening the ConnState rule set is tracked as a future
-// extension, not LH-0 scope.
+// access. ConnState carries the authority monitor's complete effective-rule
+// snapshot, including virtual `everyone` grants, and every WS call forwards
+// that snapshot to the shared capability resolver.
 
 #include <drogon/WebSocketConnection.h>
 #include <json/value.h>

@@ -16,10 +16,14 @@
 // `plinth::shell::ensure_bundled_shell_installed` (ICD-0.6.1 §3.1; the
 // successor of `install_shell_if_needed` from ICD-0.4.4 slice B).
 
+#include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
+#include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/shell/firstboot.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -30,7 +34,9 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <string>
+#include <string_view>
 
 namespace fs = std::filesystem;
 
@@ -129,11 +135,23 @@ struct Scratch {
     cfg.db = db;
     cfg.shell.bundle_path =
         std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled";
+    cfg.packages_data_dir = ctx.data_dir.string();
+    cfg.packages_staging_dir = ctx.staging_dir.string();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    auto resolver = plinth::capabilities::init_resolver(db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
   }
   ~Scratch() {
+    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(base, ec);
     drop_all_ext_schemas(db);
+    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
   Scratch(const Scratch&) = delete;
   auto operator=(const Scratch&) -> Scratch& = delete;
@@ -256,8 +274,11 @@ TEST_CASE("I.12a: reconciler advances ACTIVATING with on-disk tree to ACTIVE",
   auto id = seed_row(s.db, "notesactivating", "2.0.0", "ACTIVATING");
   auto tree = s.ctx.data_dir / "extensions" / "notesactivating" / "2.0.0";
   write_tree(tree, "manifest.json", "{}\n");
+  write_tree(tree / "server", "main.js", "export default {};\n");
+  fs::create_symlink("2.0.0", tree.parent_path() / "active");
 
-  plinth::packages::reconcile_in_flight_installs(s.ctx);
+  auto reconciled = plinth::packages::reconcile_in_flight_installs(s.ctx);
+  REQUIRE(reconciled.has_value());
 
   REQUIRE(state_of(s.db, id) == "ACTIVE");
 }
@@ -273,7 +294,8 @@ TEST_CASE("I.12b: reconciler fails ACTIVATING with missing tree",
   auto id = seed_row(s.db, "notesmissingtree", "2.0.0", "ACTIVATING");
   // Deliberately no write_tree() — simulates EXTRACTING that never finished.
 
-  plinth::packages::reconcile_in_flight_installs(s.ctx);
+  auto reconciled = plinth::packages::reconcile_in_flight_installs(s.ctx);
+  REQUIRE(reconciled.has_value());
 
   REQUIRE(state_of(s.db, id) == "INSTALL_FAILED");
 }
@@ -289,10 +311,51 @@ TEST_CASE("I.11b: reconciler marks UPLOADING / VALIDATING rows INSTALL_FAILED",
   auto up = seed_row(s.db, "up-1", "1.0.0", "UPLOADING");
   auto val = seed_row(s.db, "val-1", "1.0.0", "VALIDATING");
 
-  plinth::packages::reconcile_in_flight_installs(s.ctx);
+  auto reconciled = plinth::packages::reconcile_in_flight_installs(s.ctx);
+  REQUIRE(reconciled.has_value());
 
   REQUIRE(state_of(s.db, up) == "INSTALL_FAILED");
   REQUIRE(state_of(s.db, val) == "INSTALL_FAILED");
+}
+
+TEST_CASE("I.11c: reconciler lock conflict leaves every candidate untouched",
+          "[crash_recovery][integration][I.11][locking]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto first = seed_row(s.db, "a-before-lock", "1.0.0", "UPLOADING");
+  auto blocked = seed_row(s.db, "z-held-lock", "1.0.0", "VALIDATING");
+
+  std::unique_ptr<PGconn, decltype(&PQfinish)> lock_conn(
+      PQconnectdb(conninfo_of(s.db).c_str()), PQfinish);
+  REQUIRE(PQstatus(lock_conn.get()) == CONNECTION_OK);
+  std::unique_ptr<PGresult, decltype(&PQclear)> locked(
+      PQexec(lock_conn.get(), "SELECT pg_advisory_lock(hashtextextended("
+                              "'plinth.packages.z-held-lock', 0))"),
+      PQclear);
+  REQUIRE(PQresultStatus(locked.get()) == PGRES_TUPLES_OK);
+
+  auto reconciled = plinth::packages::reconcile_in_flight_installs(s.ctx);
+  REQUIRE_FALSE(reconciled.has_value());
+  REQUIRE(reconciled.error().find("advisory-lock-held") != std::string::npos);
+  // Acquiring every name lock must precede every disposition. In particular,
+  // the lexically earlier row cannot be consumed before the later conflict is
+  // discovered, and the conflicting row remains untouched as well.
+  REQUIRE(state_of(s.db, first) == "UPLOADING");
+  REQUIRE(state_of(s.db, blocked) == "VALIDATING");
+
+  std::unique_ptr<PGresult, decltype(&PQclear)> first_released(
+      PQexec(lock_conn.get(), "SELECT pg_try_advisory_lock(hashtextextended("
+                              "'plinth.packages.a-before-lock', 0))"),
+      PQclear);
+  REQUIRE(PQresultStatus(first_released.get()) == PGRES_TUPLES_OK);
+  REQUIRE(std::string_view{PQgetvalue(first_released.get(), 0, 0)} == "t");
+
+  PQclear(PQexec(lock_conn.get(), "SELECT pg_advisory_unlock(hashtextextended("
+                                  "'plinth.packages.a-before-lock', 0))"));
+  PQclear(PQexec(lock_conn.get(), "SELECT pg_advisory_unlock(hashtextextended("
+                                  "'plinth.packages.z-held-lock', 0))"));
 }
 
 // ── I.16: bundled-shell first boot when no frontend is installed ──

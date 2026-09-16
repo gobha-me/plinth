@@ -86,11 +86,22 @@ It runs separately from `--upgrade-cache`, whose legacy HTTP fixture serves
 the retained-profile cache migration case. Both browser commands run under
 the descendant-owning supervisor described above.
 
-`npm run test:transport --prefix tests/browser` evaluates the unchanged SDK
+`npm run test:transport --prefix tests/browser` evaluates the packaged SDK
 module with linked test imports and deterministic sockets/timers. It covers
 authentication gating, granted/denied acknowledgements, removal during auth or
 an outstanding subscribe, duplicate error/close signals, timer cancellation,
-terminal auth failure/displacement, and explicit retry.
+terminal auth failure/displacement, explicit retry, and per-connection-epoch
+subscription readiness.
+
+`npm run test:launcher --prefix tests/browser` covers the pure discovery and
+preference normalization rules. `npm run test:launcher-browser --prefix
+tests/browser` serves the packaged shell and uses deterministic HTTP/WebSocket
+fixtures to exercise Home, application and panel navigation, per-epoch
+subscription readiness, retained panels and LRU eviction, dirty confirmation,
+panel-local failure, stale refresh, responsive layout, and terminal fail-closed
+DOM cleanup. These focused fixtures supplement the real-kernel production gate;
+they do not replace its SessionFilter, RBAC, package lifecycle, or durable
+realtime coverage.
 
 `npm run test:realtime --prefix tests/browser` requires `PLINTH_BASE_URL` plus
 `PLINTH_PG_HOST`, `PLINTH_PG_PORT`, `PLINTH_PG_USER`, `PLINTH_PG_PASSWORD`, and
@@ -104,6 +115,14 @@ RBAC gates and WebSocket protocol deliver the update to the browser. It checks
 multiple heartbeat replies, disconnect/reconnect without duplicate channel
 requests, unsubscribe while another channel stays connected, and terminal
 expired-session authentication. It never mocks the WebSocket transport.
+
+The same `--realtime` run also invokes `test:launcher-production`. That test
+uses a separate synthetic admin session to install the built `valid-install`
+package through the real multipart API, load its versioned panel module, then
+disable, enable, upgrade, and uninstall it. The browser must follow each
+durable application-catalog invalidation, remove retained panel DOM when
+authority is withdrawn, and import the upgraded generation from its new
+versioned URL; no HTTP or WebSocket request is mocked.
 
 C++ transport tests also cover cookie-versus-token authentication races,
 missing/cross-origin/opaque/scheme-mismatched origins, invalid/expired/revoked

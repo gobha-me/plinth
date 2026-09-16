@@ -89,6 +89,88 @@ test('wait for authentication, multiplex once, acknowledge grants, unsubscribe a
     assert.equal(sdk.getRealtimeState().status, 'idle');
 });
 
+test('onReady fires once per acknowledged connection epoch and unsubscribe cancels pending delivery', async () => {
+    const { sdk, sockets, runTimer } = await fixture();
+    const ready = [];
+    const remove = sdk.subscribe('a', () => {}, { onReady: () => ready.push('first') });
+    const first = sockets[0];
+    first.open();
+    first.receive({ type: 'connected' });
+    assert.deepEqual(ready, []);
+    first.receive({ type: 'subscribed', channels: ['a'] });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(ready, ['first']);
+
+    const removeLate = sdk.subscribe('a', () => {}, { onReady: () => ready.push('late') });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(ready, ['first', 'late']);
+
+    const removeCancelled = sdk.subscribe('a', () => {}, {
+        onReady: () => assert.fail('unsubscribed readiness callback ran'),
+    });
+    removeCancelled();
+    await new Promise(resolve => queueMicrotask(resolve));
+
+    first.close(1006);
+    runTimer();
+    const second = sockets[1];
+    second.open();
+    second.receive({ type: 'connected' });
+    assert.deepEqual(ready, ['first', 'late']);
+    second.receive({ type: 'subscribed', channels: ['a'] });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(ready, ['first', 'late', 'first', 'late']);
+    remove();
+    removeLate();
+});
+
+test('onReady rejects a non-function option', async () => {
+    const { sdk } = await fixture();
+    assert.throws(() => sdk.subscribe('a', () => {}, { onReady: true }),
+        error => error?.name === 'TypeError' && error.message === 'subscribe onReady must be a function');
+});
+
+test('denied and terminal subscriptions never report ready', async () => {
+    const { sdk, sockets } = await fixture();
+    const ready = [];
+    const errors = [];
+    const remove = sdk.subscribe('denied', () => {}, {
+        onReady: () => ready.push('ready'),
+        onError: error => errors.push(error.code),
+    });
+    sockets[0].open();
+    sockets[0].receive({ type: 'connected' });
+    sockets[0].receive({ type: 'subscribed', channels: [] });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(ready, []);
+    assert.deepEqual(errors, ['subscription_denied']);
+    sdk.reconnectRealtime();
+    sockets[1].open();
+    sockets[1].receive({ type: 'error', error: 'auth_failed' });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(ready, []);
+    assert.deepEqual(errors, ['subscription_denied', 'auth_failed']);
+    remove();
+});
+
+test('a terminal failure cancels readiness queued from the same connection epoch', async () => {
+    const { sdk, sockets } = await fixture();
+    const ready = [];
+    const errors = [];
+    const remove = sdk.subscribe('a', () => {}, {
+        onReady: () => ready.push('ready'),
+        onError: error => errors.push(error.code),
+    });
+    sockets[0].open();
+    sockets[0].receive({ type: 'connected' });
+    sockets[0].receive({ type: 'subscribed', channels: ['a'] });
+    sockets[0].receive({ type: 'error', error: 'auth_failed' });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(ready, []);
+    assert.deepEqual(errors, ['auth_failed']);
+    remove();
+});
+
 test('serialize removal during subscription acknowledgement and surface denied grants', async () => {
     const { sdk, sockets } = await fixture();
     const denied = [];
