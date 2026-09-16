@@ -208,10 +208,22 @@ This is sufficient for eventual consistency. There is no cache coherence guarant
 LISTEN/NOTIFY delivery is connection-scoped: a notification fired while the listener is reconnecting is lost forever. To bound the divergence, the listener calls:
 
 ```cpp
-auto reload_tier2_cache(const Config::Database& db_cfg) -> std::size_t;
+enum class Tier2ReloadError : std::uint8_t {
+  DATABASE_UNAVAILABLE,
+  QUERY_FAILED,
+};
+using Tier2ReloadResult = std::expected<std::size_t, Tier2ReloadError>;
+auto reload_tier2_cache(const Config::Database& db_cfg) -> Tier2ReloadResult;
 ```
 
-after every successful LISTEN open (initial connect *and* reconnect). `reload_tier2_cache` takes the resolver write lock, clears the Tier 2 cache, and re-runs the `WHERE enabled = true` load from `plinth.capabilities`. Missed-NOTIFY divergence is therefore bounded by one reconnect-backoff window (≤ 1 s) plus one `SELECT`, rather than by process lifetime. Tier 1 handlers are untouched.
+after every successful LISTEN open (initial connect *and* reconnect).
+`reload_tier2_cache` takes the resolver write lock, builds a complete
+replacement from `plinth.capabilities`, and swaps it into service only after a
+successful query. Its result distinguishes a successful empty snapshot from a
+connect/query failure; on failure, the previously admitted snapshot remains
+intact. Missed-NOTIFY divergence is therefore bounded by one reconnect-backoff
+window (≤ 1 s) plus one `SELECT`, rather than by process lifetime. Tier 1
+handlers are untouched.
 
 This reconnect resync was added in 0.2.4 as an amendment after an architect question about missed-NOTIFY TTL; it is now the canonical recovery mechanism for listener churn.
 

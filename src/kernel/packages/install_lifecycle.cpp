@@ -6,6 +6,7 @@
 #include "kernel/capabilities/registration.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/types.hpp"
+#include "kernel/capabilities/validation.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/js/db_batch_audit.hpp"
 #include "kernel/logging.hpp"
@@ -23,6 +24,7 @@
 #include "kernel/rbac/rule_validator.hpp"
 #include "kernel/realtime/broker.hpp"
 #include "kernel/realtime/coalescer.hpp"
+#include "kernel/realtime/emit.hpp"
 
 #include <json/value.h>
 #include <libpq-fe.h>
@@ -147,6 +149,184 @@ auto pg_exec(PGconn* conn, const char* sql)
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
   return {};
+}
+
+auto emit_applications_changed(PGconn* conn)
+    -> std::expected<void, std::string> {
+  Json::Value envelope(Json::objectValue);
+  envelope["layer"] = "system";
+  envelope["channel"] = "plinth:system:applications.changed";
+  envelope["payload"] = Json::Value(Json::objectValue);
+  auto emitted = plinth::realtime::emit_notify(*conn, envelope);
+  if (!emitted.has_value()) {
+    return std::unexpected("application catalog invalidation enqueue failed");
+  }
+  return {};
+}
+
+auto has_primary_panels(PGconn* conn, std::string_view package_id)
+    -> std::expected<bool, std::string> {
+  std::string id{package_id};
+  std::array<const char*, 1> values{id.c_str()};
+  PgResultPtr result(
+      plinth::db::exec_params(
+          conn,
+          "SELECT EXISTS(SELECT 1 FROM plinth.panels "
+          "WHERE package_id = $1::uuid AND panel_type = 'primary')",
+          1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear);
+  if (PQresultStatus(result.get()) != PGRES_TUPLES_OK ||
+      PQntuples(result.get()) != 1) {
+    return std::unexpected(std::string{PQresultErrorMessage(result.get())});
+  }
+  return std::string_view{PQgetvalue(result.get(), 0, 0)} == "t";
+}
+
+auto registered_panel_assets_ready(PGconn* conn, std::string_view package_id,
+                                   const fs::path& version_root)
+    -> std::expected<bool, std::string> {
+  std::string id{package_id};
+  std::array<const char*, 1> values{id.c_str()};
+  PgResultPtr result(
+      plinth::db::exec_params(
+          conn,
+          "SELECT declaration->>'client_path' FROM plinth.panels "
+          "WHERE package_id = $1::uuid AND panel_type = 'primary'",
+          1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear);
+  if (PQresultStatus(result.get()) != PGRES_TUPLES_OK) {
+    return std::unexpected(std::string{PQresultErrorMessage(result.get())});
+  }
+  if (PQntuples(result.get()) == 0) {
+    return false;
+  }
+
+  const auto panels_root = version_root / "client" / "panels";
+  std::error_code ec;
+  const auto canonical_root = fs::canonical(panels_root, ec);
+  if (ec || !fs::is_directory(canonical_root, ec) || ec) {
+    return false;
+  }
+  for (int row = 0; row < PQntuples(result.get()); ++row) {
+    if (PQgetisnull(result.get(), row, 0) != 0) {
+      return false;
+    }
+    const std::string path{PQgetvalue(result.get(), row, 0)};
+    if (path.empty() || path.front() == '/' || path.back() == '/' ||
+        path.find('\\') != std::string::npos ||
+        path.find('\0') != std::string::npos) {
+      return false;
+    }
+    fs::path relative{path};
+    for (const auto& component : relative) {
+      if (component.empty() || component == "." || component == "..") {
+        return false;
+      }
+    }
+    const auto candidate = fs::weakly_canonical(canonical_root / relative, ec);
+    if (ec) {
+      return false;
+    }
+    const auto [root_end, ignored] =
+        std::ranges::mismatch(canonical_root, candidate);
+    (void)ignored;
+    if (root_end != canonical_root.end() ||
+        !fs::is_regular_file(candidate, ec) || ec) {
+      return false;
+    }
+  }
+  return true;
+}
+
+struct CapabilityAuthorityRow {
+  std::string namespace_;
+  int version = 0;
+  std::string function;
+  std::string signature;
+  std::string scope;
+  std::string description;
+  std::string rbac_rule;
+
+  auto operator<=>(const CapabilityAuthorityRow&) const = default;
+};
+
+auto registered_capabilities_ready(PGconn* conn, std::string_view name,
+                                   const fs::path& version_root)
+    -> std::expected<bool, std::string> {
+  const auto manifest_path = version_root / "capabilities.json";
+  std::ifstream in(manifest_path);
+  if (!in) {
+    return false;
+  }
+  std::stringstream buffer;
+  buffer << in.rdbuf();
+  auto parsed = CapabilityManifest::parse(buffer.str(), manifest_path.string());
+  if (!parsed.value.has_value()) {
+    return false;
+  }
+
+  std::vector<CapabilityAuthorityRow> declared;
+  declared.reserve(parsed.value->provides.size());
+  for (const auto& cap : parsed.value->provides) {
+    capabilities::CapabilityRegistration registration{
+        .namespace_ = cap.namespace_,
+        .version = cap.version,
+        .function = cap.function,
+        .provider_type = "extension",
+        .extension_name = std::string{name},
+        .scope = cap.scope.empty() ? std::string{"instance"} : cap.scope,
+        .description = cap.description,
+        .rbac_rule = cap.rbac_rule.value_or(std::string{}),
+    };
+    declared.push_back({
+        .namespace_ = cap.namespace_,
+        .version = cap.version,
+        .function = cap.function,
+        .signature = capabilities::make_signature(registration),
+        .scope = registration.scope,
+        .description = cap.description,
+        .rbac_rule = registration.rbac_rule,
+    });
+  }
+  std::ranges::sort(declared);
+
+  std::string name_s{name};
+  std::array<const char*, 1> values{name_s.c_str()};
+  PgResultPtr result(
+      plinth::db::exec_params(
+          conn,
+          "SELECT namespace, version, function, signature, scope, description, "
+          "       rbac_rule, enabled, provider_type "
+          "FROM plinth.capabilities WHERE extension_name = $1 "
+          "ORDER BY namespace, version, function, scope",
+          1, nullptr, values.data(), nullptr, nullptr, 0),
+      PQclear);
+  if (PQresultStatus(result.get()) != PGRES_TUPLES_OK) {
+    return std::unexpected(std::string{PQresultErrorMessage(result.get())});
+  }
+  if (static_cast<std::size_t>(PQntuples(result.get())) != declared.size()) {
+    return false;
+  }
+  for (int row = 0; row < PQntuples(result.get()); ++row) {
+    const auto& expected = declared[static_cast<std::size_t>(row)];
+    if (std::string_view{PQgetvalue(result.get(), row, 0)} !=
+            expected.namespace_ ||
+        std::stoi(PQgetvalue(result.get(), row, 1)) != expected.version ||
+        std::string_view{PQgetvalue(result.get(), row, 2)} !=
+            expected.function ||
+        std::string_view{PQgetvalue(result.get(), row, 3)} !=
+            expected.signature ||
+        std::string_view{PQgetvalue(result.get(), row, 4)} != expected.scope ||
+        std::string_view{PQgetvalue(result.get(), row, 5)} !=
+            expected.description ||
+        std::string_view{PQgetvalue(result.get(), row, 6)} !=
+            expected.rbac_rule ||
+        std::string_view{PQgetvalue(result.get(), row, 7)} != "t" ||
+        std::string_view{PQgetvalue(result.get(), row, 8)} != "extension") {
+      return false;
+    }
+  }
+  return true;
 }
 
 auto json_nlohmann_to_jsoncpp(const nlohmann::json& src) -> Json::Value {
@@ -549,6 +729,9 @@ auto insert_packages_row(PGconn* conn, std::string_view id,
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
+  if (std::string_view{PQcmdTuples(res.get())} != "1") {
+    return std::unexpected("package state update matched no row");
+  }
   return {};
 }
 
@@ -566,11 +749,15 @@ auto update_packages_state(PGconn* conn, std::string_view id,
   if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
     return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
+  if (std::string_view{PQcmdTuples(res.get())} != "1") {
+    return std::unexpected("package report update matched no row");
+  }
   return {};
 }
 
 auto update_packages_report(PGconn* conn, std::string_view id,
-                            const nlohmann::json& report) -> void {
+                            const nlohmann::json& report)
+    -> std::expected<void, std::string> {
   std::string id_s{id};
   std::string report_s = report.dump();
   std::array<const char*, 2> values = {report_s.c_str(), id_s.c_str()};
@@ -580,7 +767,10 @@ auto update_packages_report(PGconn* conn, std::string_view id,
                       "SET last_install_report = $1::jsonb WHERE id = $2::uuid",
                       2, nullptr, values.data(), nullptr, nullptr, 0),
                   PQclear);
-  (void)res; // best-effort record of failure detail
+  if (PQresultStatus(res.get()) != PGRES_COMMAND_OK) {
+    return std::unexpected(std::string{PQresultErrorMessage(res.get())});
+  }
+  return {};
 }
 
 auto name_already_installed(PGconn* conn, std::string_view name)
@@ -944,12 +1134,7 @@ auto run_stage_registering_upgrade(PGconn* admin, std::string_view new_id,
           .panel_id = p.id,
           .panel_type = PanelType::PRIMARY,
           .slot_type = std::nullopt,
-          .declaration =
-              nlohmann::json{
-                  {"client_path", p.client_path},
-                  {"title", p.title.value_or(std::string{})},
-                  {"icon", p.icon.value_or(std::string{})},
-              },
+          .declaration = p.declaration(),
       };
       auto rp = register_panel(*admin, preg);
       if (!rp.has_value()) {
@@ -1041,12 +1226,7 @@ auto run_stage_registering(PGconn* admin, std::string_view id,
                                             // panels_manifest carries
                                             // a typed field.
           .slot_type = std::nullopt,
-          .declaration =
-              nlohmann::json{
-                  {"client_path", p.client_path},
-                  {"title", p.title.value_or(std::string{})},
-                  {"icon", p.icon.value_or(std::string{})},
-              },
+          .declaration = p.declaration(),
       };
       auto rp = register_panel(*admin, preg);
       if (!rp.has_value()) {
@@ -1114,6 +1294,8 @@ struct LoadedPackage {
   std::string state; // raw PG string
   std::string provenance;
   std::string manifest_checksum;
+  std::string entry_point;
+  bool application_ready{false};
   std::optional<std::string> frontend_mount;
   std::optional<std::string> frontend_entry; // ICD-0.6.1 §4.3
 };
@@ -1126,7 +1308,7 @@ auto load_package_row(PGconn* conn, std::string_view package_id)
       plinth::db::exec_params(
           conn,
           "SELECT name, version, state, manifest_checksum, frontend_mount, "
-          "       frontend_entry, provenance "
+          "       frontend_entry, provenance, application_ready, entry_point "
           "FROM plinth.packages WHERE id = $1::uuid",
           1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
@@ -1142,6 +1324,8 @@ auto load_package_row(PGconn* conn, std::string_view package_id)
   lp.version = PQgetvalue(res.get(), 0, 1);
   lp.state = PQgetvalue(res.get(), 0, 2);
   lp.provenance = PQgetvalue(res.get(), 0, 6);
+  lp.application_ready = std::string_view{PQgetvalue(res.get(), 0, 7)} == "t";
+  lp.entry_point = PQgetvalue(res.get(), 0, 8);
   lp.manifest_checksum = PQgetvalue(res.get(), 0, 3);
   if (PQgetisnull(res.get(), 0, 4) == 0) {
     lp.frontend_mount = std::string{PQgetvalue(res.get(), 0, 4)};
@@ -1529,6 +1713,24 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
     }
   }
 
+  // The collision path above delegates upgrades to their own long-lived
+  // fence. First installs fence only after that decision so an outer guard can
+  // never reopen a deliberately preserved failed-upgrade fence.
+  auto install_drain = capabilities::drain::begin_drain(minimal.name);
+  (void)install_drain;
+  struct InstallFenceGuard {
+    std::string name;
+    bool release_on_destroy{true};
+    ~InstallFenceGuard() {
+      if (release_on_destroy) {
+        capabilities::drain::end_drain(name);
+      } else {
+        capabilities::drain::block_application(name);
+      }
+    }
+    auto preserve() -> void { release_on_destroy = false; }
+  } install_fence{minimal.name};
+
   // ── INSERT plinth.packages row ───────────────────────────────────
   fs::path mf_path = staging / "manifest.json";
   std::ifstream mf_in(mf_path);
@@ -1573,7 +1775,8 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
     f.package_id = install_uuid;
     set_state("INSTALL_FAILED");
     if (!f.report.is_null()) {
-      update_packages_report(pg.conn, install_uuid, f.report);
+      static_cast<void>(
+          update_packages_report(pg.conn, install_uuid, f.report));
     }
     emit_install_failed_audit(ctx, f, minimal.name, minimal.version);
     return std::unexpected(std::move(f));
@@ -1600,7 +1803,7 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
   auto vr = validate(staging, vcfg);
   nlohmann::json vreport = build_validation_report(vr);
   if (!dry_run) {
-    update_packages_report(pg.conn, install_uuid, vreport);
+    static_cast<void>(update_packages_report(pg.conn, install_uuid, vreport));
   }
   if (vr.disposition() == 1) {
     return fail_at(InstallFailure{
@@ -1718,13 +1921,92 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
   fs::path client_root = dest_root / "client";
   asset_server::register_routes(minimal.name, minimal.version, client_root,
                                 manifest_checksum);
-  auto act = update_packages_state(pg.conn, install_uuid, "ACTIVE");
-  if (!act.has_value()) {
+  const bool server_package =
+      fs::is_regular_file(dest_root / minimal.entry_point);
+  const bool pool_created = plinth::extensions::create_pool(minimal.name);
+  if (!server_package || !pool_created) {
     asset_server::unregister_routes(minimal.name, minimal.version);
     return fail_at(InstallFailure{
         .failed_at = InstallStage::ACTIVATING,
         .kind = "activation-failed",
-        .message = act.error(),
+        .message = !server_package ? "declared entry point is unavailable"
+                                   : "extension runtime failed to start",
+    });
+  }
+  auto cache_reload = plinth::capabilities::reload_tier2_cache(ctx.db);
+  if (!cache_reload.has_value()) {
+    // Registration is durable but the resolver is still serving its prior
+    // snapshot. Do not expose the package through either capability ingress
+    // or launcher discovery until an explicit retry/reconciliation proves the
+    // authoritative snapshot is admitted.
+    install_fence.preserve();
+    asset_server::unregister_routes(minimal.name, minimal.version);
+    if (pool_created) {
+      plinth::extensions::destroy_pool(minimal.name);
+    }
+    return fail_at(InstallFailure{
+        .failed_at = InstallStage::ACTIVATING,
+        .kind = "activation-failed",
+        .message =
+            "capability cache refresh failed; application remains unready",
+    });
+  }
+  const bool application_ready =
+      panels_opt.has_value() && !panels_opt->panels.empty();
+  auto activation_begin = pg_exec(pg.conn, "BEGIN");
+  if (!activation_begin.has_value()) {
+    asset_server::unregister_routes(minimal.name, minimal.version);
+    return fail_at(InstallFailure{
+        .failed_at = InstallStage::ACTIVATING,
+        .kind = "activation-failed",
+        .message = activation_begin.error(),
+    });
+  }
+  std::string activation_error;
+  std::array<const char*, 2> activation_values{
+      install_uuid.c_str(), application_ready ? "true" : "false"};
+  PgResultPtr activated(
+      plinth::db::exec_params(
+          pg.conn,
+          "UPDATE plinth.packages SET state = 'ACTIVE', "
+          "application_ready = $2::boolean WHERE id = $1::uuid",
+          2, nullptr, activation_values.data(), nullptr, nullptr, 0),
+      PQclear);
+  if (PQresultStatus(activated.get()) != PGRES_COMMAND_OK ||
+      std::string_view{PQcmdTuples(activated.get())} != "1") {
+    activation_error = "application activation update failed";
+  } else if (application_ready) {
+    auto notified = emit_applications_changed(pg.conn);
+    if (!notified.has_value()) {
+      activation_error = notified.error();
+    }
+  }
+  bool activation_commit_uncertain = false;
+  if (activation_error.empty()) {
+    auto commit_result = pg_exec(pg.conn, "COMMIT");
+    if (!commit_result.has_value()) {
+      activation_error = commit_result.error();
+      activation_commit_uncertain = true;
+    }
+  }
+  if (!activation_error.empty()) {
+    if (activation_commit_uncertain) {
+      // A lost COMMIT acknowledgement may still mean ACTIVE+ready is durable.
+      // Retain the verified route/runtime but keep both capability ingress and
+      // discovery blocked until restart reconciliation establishes the exact
+      // durable outcome.
+      install_fence.preserve();
+    } else {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      asset_server::unregister_routes(minimal.name, minimal.version);
+      if (pool_created) {
+        plinth::extensions::destroy_pool(minimal.name);
+      }
+    }
+    return fail_at(InstallFailure{
+        .failed_at = InstallStage::ACTIVATING,
+        .kind = "activation-failed",
+        .message = activation_error,
     });
   }
 
@@ -1746,15 +2028,8 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
 
   (void)mig_report; // reserved for future last_install_report augmentation
   emit_installed_audit(ctx, rec);
-  // ICD-0.5.0.3 §Lifecycle — spin up the extension's RuntimePool now
-  // that ACTIVE is committed. A client-only package (no server/ tree)
-  // returns false silently; an error is logged but does not roll back
-  // the install (subsequent dispatch rejects with cap.extension_not_loaded
-  // until a retry).
-  plinth::extensions::create_pool(rec.name);
-  // LISTEN delivery may lag the commit. Publish the capability snapshot before
-  // handing this package to its RBAC worker (the reload API is best-effort).
-  static_cast<void>(plinth::capabilities::reload_tier2_cache(ctx.db));
+  spdlog::info("package activation committed: {} {}; releasing name lock",
+               rec.name, rec.version);
   if (auto released = release_name_lock_checked(pg.conn, rec.name); !released) {
     auto report = rbac_handoff_failure_report(released.error());
     // ACTIVE and its runtime/routes are already committed. Do not use fail_at,
@@ -1767,7 +2042,9 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
                        .report = std::move(report)});
   }
   lg.f = {};
-  rbac_test::schedule_rbac_test(rec.id, ctx, "install");
+  if (ctx.schedule_rbac_tests) {
+    rbac_test::schedule_rbac_test(rec.id, ctx, "install");
+  }
   spdlog::info("install complete: {} {} ({})", rec.name, rec.version,
                provenance_to_string(provenance));
   return rec;
@@ -1829,6 +2106,37 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
     auto operator=(LockGuard&&) -> LockGuard& = delete;
   } lg{release_lock};
 
+  auto disable_drain = capabilities::drain::begin_drain(lp.name);
+  struct DisableFenceGuard {
+    std::string name;
+    bool release_on_destroy{true};
+    bool finished{false};
+    ~DisableFenceGuard() {
+      if (finished) {
+        return;
+      }
+      if (release_on_destroy) {
+        capabilities::drain::end_drain(name);
+      } else {
+        capabilities::drain::block_application(name);
+      }
+    }
+    auto preserve() -> void { release_on_destroy = false; }
+    auto finish() -> void {
+      capabilities::drain::end_drain(name);
+      finished = true;
+    }
+  } disable_fence{lp.name};
+  auto [disable_drained, disable_outstanding] =
+      capabilities::drain::wait_for_zero(disable_drain,
+                                         ctx.upgrade_drain_timeout_ms);
+  if (!disable_drained) {
+    return std::unexpected(transition_failure(
+        TransitionKind::DISABLE, package_id, "drain-timeout",
+        "capability ingress fence timed out with " +
+            std::to_string(disable_outstanding) + " in-flight calls"));
+  }
+
   // ICD-0.5.1 §Extension-lifecycle integration — synchronously
   // flush every open coalescer window owned by this extension before
   // the state row update + capability deletion. Runs outside the Tx
@@ -1885,8 +2193,9 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
   PgResultPtr recheck(
       plinth::db::exec_params(
           pg.conn,
-          "SELECT state FROM plinth.packages WHERE id = $1::uuid FOR UPDATE", 1,
-          nullptr, id_v.data(), nullptr, nullptr, 0),
+          "SELECT state, application_ready FROM plinth.packages "
+          "WHERE id = $1::uuid FOR UPDATE",
+          1, nullptr, id_v.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(recheck.get()) != PGRES_TUPLES_OK ||
       PQntuples(recheck.get()) == 0) {
@@ -1895,6 +2204,8 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
                                               "recheck SELECT failed"));
   }
   std::string current_state = PQgetvalue(recheck.get(), 0, 0);
+  const bool was_application_ready =
+      std::string_view{PQgetvalue(recheck.get(), 0, 1)} == "t";
   if (current_state != "ACTIVE" && current_state != "ACTIVE_FLAGGED") {
     return std::unexpected(transition_failure(
         TransitionKind::DISABLE, package_id,
@@ -1921,7 +2232,8 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
   PgResultPtr upd(
       plinth::db::exec_params(pg.conn,
                               "UPDATE plinth.packages "
-                              "SET state = 'DISABLED', disabled_at = NOW() "
+                              "SET state = 'DISABLED', disabled_at = NOW(), "
+                              "application_ready = FALSE "
                               "WHERE id = $1::uuid",
                               1, nullptr, id_v.data(), nullptr, nullptr, 0),
       PQclear);
@@ -1930,14 +2242,20 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
                                               package_id, "db-error",
                                               PQresultErrorMessage(upd.get())));
   }
-
-  // §DISABLED step 5: in-memory asset server map entry. On COMMIT
-  // failure below the rollback guard re-registers from the loaded
-  // row so serving state matches the still-ACTIVE row.
-  asset_server::unregister_routes(lp.name, lp.version);
-  routes_unregistered = true;
+  if (was_application_ready) {
+    auto notified = emit_applications_changed(pg.conn);
+    if (!notified.has_value()) {
+      return std::unexpected(transition_failure(
+          TransitionKind::DISABLE, package_id, "db-error", notified.error()));
+    }
+  }
 
   // §DISABLED step 7 (COMMIT).
+  // Preserve the fence before COMMIT: a failed acknowledgement cannot tell us
+  // whether PostgreSQL made the withdrawal durable. The guard only turns this
+  // into a process-lifetime application block if we leave without reaching
+  // the confirmed-success teardown below.
+  disable_fence.preserve();
   auto commit = pg_exec(pg.conn, "COMMIT");
   if (!commit.has_value()) {
     return std::unexpected(transition_failure(
@@ -1945,11 +2263,16 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
   }
   committed = true;
 
+  // Visibility is now durably withdrawn; only now remove module ingress.
+  asset_server::unregister_routes(lp.name, lp.version);
+  routes_unregistered = true;
+
   // ICD-0.5.0.3 §Lifecycle — tear down the extension's pool now that
   // the DISABLED state has committed. Idempotent; safe under racing
   // dispatches (the shared_lock in `extensions::dispatch` waits for
   // in-flight callers before destroy_pool's exclusive lock proceeds).
   plinth::extensions::destroy_pool(lp.name);
+  disable_fence.finish();
 
   // §DISABLED step 8 (audit, post-commit, best-effort).
   emit_transition_audit(ctx, "packages.disabled", lp, "disabled_by_user_id");
@@ -2041,6 +2364,37 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
     LockGuard(LockGuard&&) = delete;
     auto operator=(LockGuard&&) -> LockGuard& = delete;
   } lg{release_lock};
+
+  auto enable_drain = capabilities::drain::begin_drain(lp.name);
+  struct EnableFenceGuard {
+    std::string name;
+    bool release_on_destroy{true};
+    bool finished{false};
+    ~EnableFenceGuard() {
+      if (finished) {
+        return;
+      }
+      if (release_on_destroy) {
+        capabilities::drain::end_drain(name);
+      } else {
+        capabilities::drain::block_application(name);
+      }
+    }
+    auto preserve() -> void { release_on_destroy = false; }
+    auto finish() -> void {
+      capabilities::drain::end_drain(name);
+      finished = true;
+    }
+  } enable_fence{lp.name};
+  auto [enable_drained, enable_outstanding] =
+      capabilities::drain::wait_for_zero(enable_drain,
+                                         ctx.upgrade_drain_timeout_ms);
+  if (!enable_drained) {
+    return std::unexpected(transition_failure(
+        TransitionKind::ENABLE, package_id, "drain-timeout",
+        "capability ingress fence timed out with " +
+            std::to_string(enable_outstanding) + " in-flight calls"));
+  }
 
   auto begin = pg_exec(pg.conn, "BEGIN");
   if (!begin.has_value()) {
@@ -2150,11 +2504,18 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
         TransitionKind::ENABLE, package_id, "db-error", cleared.error()));
   }
 
+  auto panel_presence = has_primary_panels(pg.conn, package_id);
+  if (!panel_presence.has_value()) {
+    return std::unexpected(transition_failure(TransitionKind::ENABLE,
+                                              package_id, "db-error",
+                                              panel_presence.error()));
+  }
+
   // §ACTIVE-from-DISABLED step 7 (state + disabled_at NULL).
   PgResultPtr upd(
       plinth::db::exec_params(pg.conn,
-                              "UPDATE plinth.packages "
-                              "SET state = 'ACTIVE', disabled_at = NULL "
+                              "UPDATE plinth.packages SET state = 'ACTIVE', "
+                              "disabled_at = NULL, application_ready = FALSE "
                               "WHERE id = $1::uuid",
                               1, nullptr, id_v.data(), nullptr, nullptr, 0),
       PQclear);
@@ -2163,8 +2524,9 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
                                               package_id, "db-error",
                                               PQresultErrorMessage(upd.get())));
   }
-
-  // §ACTIVE-from-DISABLED step 8 (COMMIT).
+  // §ACTIVE-from-DISABLED step 8 (COMMIT). Fence discovery before the
+  // commit attempt so a lost acknowledgement cannot expose an uncertain row.
+  enable_fence.preserve();
   auto commit = pg_exec(pg.conn, "COMMIT");
   if (!commit.has_value()) {
     return std::unexpected(transition_failure(
@@ -2172,13 +2534,91 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
   }
   committed = true;
 
-  // ICD-0.5.0.3 §Lifecycle — spin up the extension's pool so dispatch
-  // immediately resolves into real handlers; prior DISABLED state had
-  // no pool. Client-only packages skip silently.
-  plinth::extensions::create_pool(lp.name);
+  // The package is now ACTIVE with rematerialized authority but remains
+  // deliberately unready. Any later runtime/cache/admission failure must keep
+  // capability ingress fenced until an explicit retry repairs the generation.
+  const bool server_package =
+      fs::is_regular_file(package_root / lp.entry_point);
+  const bool pool_created = plinth::extensions::create_pool(lp.name);
+  if (!server_package || !pool_created) {
+    return std::unexpected(transition_failure(
+        TransitionKind::ENABLE, package_id, "runtime-start-failed",
+        !server_package
+            ? "declared entry point is unavailable; application remains unready"
+            : "extension runtime failed to start; application remains "
+              "unready"));
+  }
+  auto cache_reload = plinth::capabilities::reload_tier2_cache(ctx.db);
+  if (!cache_reload.has_value()) {
+    return std::unexpected(transition_failure(
+        TransitionKind::ENABLE, package_id, "capability-refresh-failed",
+        "capability cache refresh failed; application remains unready"));
+  }
+
+  bool panel_assets_ready = true;
+  if (*panel_presence) {
+    auto assets_ready =
+        registered_panel_assets_ready(pg.conn, package_id, package_root);
+    if (!assets_ready.has_value()) {
+      return std::unexpected(transition_failure(TransitionKind::ENABLE,
+                                                package_id, "db-error",
+                                                assets_ready.error()));
+    }
+    panel_assets_ready = *assets_ready;
+  }
+  auto capability_authority =
+      registered_capabilities_ready(pg.conn, lp.name, package_root);
+  if (!capability_authority.has_value()) {
+    return std::unexpected(transition_failure(TransitionKind::ENABLE,
+                                              package_id, "db-error",
+                                              capability_authority.error()));
+  }
+  if (!panel_assets_ready || !*capability_authority) {
+    return std::unexpected(transition_failure(
+        TransitionKind::ENABLE, package_id, "readiness-verification-failed",
+        !panel_assets_ready
+            ? "registered panel assets are unavailable; application remains "
+              "unready"
+            : "registered capability authority does not match the package "
+              "manifest; application remains unready"));
+  }
+
+  if (*panel_presence) {
+    auto admit_begin = pg_exec(pg.conn, "BEGIN");
+    if (!admit_begin.has_value()) {
+      return std::unexpected(transition_failure(
+          TransitionKind::ENABLE, package_id, "db-error", admit_begin.error()));
+    }
+    PgResultPtr admit(
+        plinth::db::exec_params(
+            pg.conn,
+            "UPDATE plinth.packages SET application_ready = TRUE "
+            "WHERE id = $1::uuid AND state IN ('ACTIVE','ACTIVE_FLAGGED')",
+            1, nullptr, id_v.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(admit.get()) != PGRES_COMMAND_OK ||
+        std::string_view{PQcmdTuples(admit.get())} != "1") {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      return std::unexpected(
+          transition_failure(TransitionKind::ENABLE, package_id, "db-error",
+                             "application readiness admission failed"));
+    }
+    auto notified = emit_applications_changed(pg.conn);
+    if (!notified.has_value()) {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      return std::unexpected(transition_failure(
+          TransitionKind::ENABLE, package_id, "db-error", notified.error()));
+    }
+    auto admit_commit = pg_exec(pg.conn, "COMMIT");
+    if (!admit_commit.has_value()) {
+      return std::unexpected(transition_failure(TransitionKind::ENABLE,
+                                                package_id, "db-error",
+                                                admit_commit.error()));
+    }
+  }
 
   emit_transition_audit(ctx, "packages.enabled", lp, "enabled_by_user_id");
-  static_cast<void>(plinth::capabilities::reload_tier2_cache(ctx.db));
+  enable_fence.finish();
   if (auto released = release_name_lock_checked(pg.conn, lp.name); !released) {
     auto report = rbac_handoff_failure_report(released.error());
     return std::unexpected(
@@ -2188,7 +2628,9 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
                           .report = std::move(report)});
   }
   lg.f = {};
-  rbac_test::schedule_rbac_test(lp.id, ctx, "enable");
+  if (ctx.schedule_rbac_tests) {
+    rbac_test::schedule_rbac_test(lp.id, ctx, "enable");
+  }
 
   PackageRecord rec{
       .id = lp.id,
@@ -2256,6 +2698,37 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
     auto operator=(LockGuard&&) -> LockGuard& = delete;
   } lg{release_lock};
 
+  auto uninstall_drain = capabilities::drain::begin_drain(lp.name);
+  struct UninstallFenceGuard {
+    std::string name;
+    bool release_on_destroy{true};
+    bool finished{false};
+    ~UninstallFenceGuard() {
+      if (finished) {
+        return;
+      }
+      if (release_on_destroy) {
+        capabilities::drain::end_drain(name);
+      } else {
+        capabilities::drain::block_application(name);
+      }
+    }
+    auto preserve() -> void { release_on_destroy = false; }
+    auto finish() -> void {
+      capabilities::drain::end_drain(name);
+      finished = true;
+    }
+  } uninstall_fence{lp.name};
+  auto [uninstall_drained, uninstall_outstanding] =
+      capabilities::drain::wait_for_zero(uninstall_drain,
+                                         ctx.upgrade_drain_timeout_ms);
+  if (!uninstall_drained) {
+    return std::unexpected(transition_failure(
+        TransitionKind::UNINSTALL, package_id, "drain-timeout",
+        "capability ingress fence timed out with " +
+            std::to_string(uninstall_outstanding) + " in-flight calls"));
+  }
+
   // ICD-0.5.1 §Extension-lifecycle integration — flush coalescer
   // windows owned by this extension before the UNINSTALLING marker.
   // After Tx A commits, downstream uninstall_cleanup will delete
@@ -2307,7 +2780,8 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
     PgResultPtr recheck(
         plinth::db::exec_params(
             pg.conn,
-            "SELECT state FROM plinth.packages WHERE id = $1::uuid FOR UPDATE",
+            "SELECT state, application_ready FROM plinth.packages "
+            "WHERE id = $1::uuid FOR UPDATE",
             1, nullptr, id_v.data(), nullptr, nullptr, 0),
         PQclear);
     if (PQresultStatus(recheck.get()) != PGRES_TUPLES_OK ||
@@ -2317,6 +2791,8 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
                                                 "recheck SELECT failed"));
     }
     std::string current_state = PQgetvalue(recheck.get(), 0, 0);
+    const bool was_application_ready =
+        std::string_view{PQgetvalue(recheck.get(), 0, 1)} == "t";
     if (current_state == "UNINSTALLING") {
       return std::unexpected(transition_failure(
           TransitionKind::UNINSTALL, package_id, "already-uninstalling",
@@ -2326,7 +2802,8 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
     PgResultPtr upd(plinth::db::exec_params(
                         pg.conn,
                         "UPDATE plinth.packages "
-                        "SET state = 'UNINSTALLING', uninstalling_at = NOW() "
+                        "SET state = 'UNINSTALLING', uninstalling_at = NOW(), "
+                        "application_ready = FALSE "
                         "WHERE id = $1::uuid",
                         1, nullptr, id_v.data(), nullptr, nullptr, 0),
                     PQclear);
@@ -2335,6 +2812,18 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
           transition_failure(TransitionKind::UNINSTALL, package_id, "db-error",
                              PQresultErrorMessage(upd.get())));
     }
+    if (was_application_ready) {
+      auto notified = emit_applications_changed(pg.conn);
+      if (!notified.has_value()) {
+        return std::unexpected(transition_failure(TransitionKind::UNINSTALL,
+                                                  package_id, "db-error",
+                                                  notified.error()));
+      }
+    }
+    // A failed COMMIT acknowledgement may still mean the UNINSTALLING marker
+    // became durable. Keep ingress fenced unless the entire idempotent cleanup
+    // reaches its terminal success path.
+    uninstall_fence.preserve();
     auto commit_a = pg_exec(pg.conn, "COMMIT");
     if (!commit_a.has_value()) {
       return std::unexpected(transition_failure(
@@ -2370,6 +2859,8 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
     return std::unexpected(cleanup.error());
   }
 
+  uninstall_fence.finish();
+
   emit_transition_audit(ctx, "packages.uninstalled", lp,
                         "uninstalled_by_user_id");
   spdlog::info("package uninstalled: {} {}", lp.name, lp.version);
@@ -2378,13 +2869,13 @@ auto uninstall_package(std::string_view package_id, bool confirmed,
 
 // machine over 6 InstallStage values; splitting would hide the "one row, one
 // disposition" structure.
-auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
+auto reconcile_in_flight_installs(const InstallerContext& ctx)
+    -> std::expected<void, std::string> {
   PgGuard pg(ctx.db);
   if (!pg.ok()) {
-    spdlog::error("reconcile_in_flight_installs: PG connect failed: {}",
-                  pg.conn != nullptr ? PQerrorMessage(pg.conn)
-                                     : "PQconnectdb returned null");
-    return;
+    return std::unexpected(pg.conn != nullptr
+                               ? std::string{PQerrorMessage(pg.conn)}
+                               : std::string{"PQconnectdb returned null"});
   }
 
   PgResultPtr res(plinth::db::exec(
@@ -2395,13 +2886,73 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
                       "WHERE state IN ('UPLOADING','VALIDATING','MIGRATING',"
                       "                'REGISTERING','EXTRACTING','ACTIVATING',"
                       "                'UNINSTALLING','SUPERSEDED') "
+                      "   OR (state IN ('ACTIVE','ACTIVE_FLAGGED') "
+                      "       AND supersedes_id IS NOT NULL) "
                       "ORDER BY installed_at ASC"),
                   PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
-    spdlog::error("reconcile_in_flight_installs: SELECT failed: {}",
-                  PQresultErrorMessage(res.get()));
-    return;
+    return std::unexpected(std::string{PQresultErrorMessage(res.get())});
   }
+
+  std::vector<std::string> names;
+  std::vector<std::string> candidate_ids;
+  names.reserve(static_cast<std::size_t>(PQntuples(res.get())));
+  candidate_ids.reserve(static_cast<std::size_t>(PQntuples(res.get())));
+  for (int row = 0; row < PQntuples(res.get()); ++row) {
+    candidate_ids.emplace_back(PQgetvalue(res.get(), row, 0));
+    names.emplace_back(PQgetvalue(res.get(), row, 1));
+  }
+  std::ranges::sort(names);
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+  struct ReconciliationLocks {
+    PGconn* conn;
+    std::vector<std::string> held;
+    ~ReconciliationLocks() {
+      for (auto it = held.rbegin(); it != held.rend(); ++it) {
+        release_name_lock(conn, *it);
+      }
+    }
+  } locks{pg.conn, {}};
+  locks.held.reserve(names.size());
+  for (const auto& name : names) {
+    auto acquired = try_acquire_name_lock(pg.conn, name);
+    if (!acquired.has_value()) {
+      return std::unexpected("in-flight reconciliation lock for '" + name +
+                             "' failed: " + acquired.error());
+    }
+    locks.held.push_back(name);
+  }
+
+  // Re-read every candidate under the package-name locks. The first query is
+  // identity discovery only; lifecycle state from that snapshot is never
+  // used for recovery decisions.
+  std::string id_list;
+  for (const auto& id : candidate_ids) {
+    if (!id_list.empty()) {
+      id_list.push_back('\n');
+    }
+    id_list.append(id);
+  }
+  std::array<const char*, 1> id_values{id_list.c_str()};
+  PgResultPtr locked_res(
+      plinth::db::exec_params(
+          pg.conn,
+          "SELECT id::text, name, version, state, "
+          "       supersedes_id::text "
+          "FROM plinth.packages "
+          "WHERE id::text = ANY(string_to_array($1, E'\\n')) "
+          "  AND (state IN ('UPLOADING','VALIDATING','MIGRATING',"
+          "                'REGISTERING','EXTRACTING','ACTIVATING',"
+          "                'UNINSTALLING','SUPERSEDED') "
+          "   OR (state IN ('ACTIVE','ACTIVE_FLAGGED') "
+          "       AND supersedes_id IS NOT NULL)) "
+          "ORDER BY installed_at ASC",
+          1, nullptr, id_values.data(), nullptr, nullptr, 0),
+      PQclear);
+  if (PQresultStatus(locked_res.get()) != PGRES_TUPLES_OK) {
+    return std::unexpected(std::string{PQresultErrorMessage(locked_res.get())});
+  }
+  res = std::move(locked_res);
   int row_count = PQntuples(res.get());
   if (row_count == 0) {
     spdlog::info("reconcile_in_flight_installs: no in-flight rows");
@@ -2411,56 +2962,87 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
   }
 
   auto write_report = [&](std::string_view id, const nlohmann::json& report) {
-    update_packages_report(pg.conn, id, report);
+    return update_packages_report(pg.conn, id, report);
+  };
+  auto write_recovery_record =
+      [&](std::string_view id, std::string_view state,
+          const nlohmann::json& report) -> std::expected<void, std::string> {
+    auto begin = pg_exec(pg.conn, "BEGIN");
+    if (!begin.has_value()) {
+      return std::unexpected(begin.error());
+    }
+    auto rollback = [&]() { static_cast<void>(pg_exec(pg.conn, "ROLLBACK")); };
+    if (auto updated = update_packages_state(pg.conn, id, state);
+        !updated.has_value()) {
+      rollback();
+      return updated;
+    }
+    if (auto reported = write_report(id, report); !reported.has_value()) {
+      rollback();
+      return reported;
+    }
+    auto committed = pg_exec(pg.conn, "COMMIT");
+    if (!committed.has_value()) {
+      return std::unexpected(committed.error());
+    }
+    return {};
   };
   auto mark_failed = [&](std::string_view id, std::string_view name,
                          std::string_view from_state, std::string_view reason,
-                         bool drop_schema) {
+                         bool drop_schema) -> std::expected<void, std::string> {
     nlohmann::json report;
     report["recovered_from_state"] = std::string{from_state};
     report["reconciled_at_bootstrap"] = true;
     report["disposition"] = "INSTALL_FAILED";
     report["reason"] = std::string{reason};
-    if (auto r = update_packages_state(pg.conn, id, "INSTALL_FAILED"); !r) {
-      spdlog::warn("reconcile: update {} -> INSTALL_FAILED failed: {}", id,
-                   r.error());
-    }
-    write_report(id, report);
     if (drop_schema) {
       auto drop = drop_schema_and_migrations(name, *pg.conn);
       if (!drop.has_value()) {
-        spdlog::warn("reconcile: drop_schema_and_migrations({}) failed — "
-                     "admin may need manual cleanup",
-                     name);
+        return std::unexpected("reconcile schema cleanup failed for " +
+                               std::string{name} + ": " + drop.error().message);
       }
+    }
+    if (auto r = write_recovery_record(id, "INSTALL_FAILED", report); !r) {
+      return std::unexpected("reconcile terminal record failed for " +
+                             std::string{id} + ": " + r.error());
     }
     spdlog::info("reconcile: id={} name={} -> INSTALL_FAILED ({})", id, name,
                  reason);
+    return {};
   };
-  auto mark_active = [&](std::string_view id, std::string_view name,
-                         std::string_view from_state, std::string_view note) {
+  auto mark_active =
+      [&](std::string_view id, std::string_view name,
+          std::string_view from_state,
+          std::string_view note) -> std::expected<void, std::string> {
     nlohmann::json report;
     report["recovered_from_state"] = std::string{from_state};
     report["reconciled_at_bootstrap"] = true;
     report["disposition"] = "ACTIVE";
     report["note"] = std::string{note};
-    if (auto r = update_packages_state(pg.conn, id, "ACTIVE"); !r) {
-      spdlog::warn("reconcile: update {} -> ACTIVE failed: {}", id, r.error());
+    // Bootstrap currently initializes the runtime registry before replaying
+    // package recovery. Ensure a row promoted here becomes executable during
+    // this same boot rather than waiting for a second restart.
+    if (!plinth::extensions::create_pool(name)) {
+      return std::unexpected("reconcile runtime pool creation failed for " +
+                             std::string{name});
     }
-    write_report(id, report);
+    if (auto r = write_recovery_record(id, "ACTIVE", report); !r) {
+      plinth::extensions::destroy_pool(name);
+      return std::unexpected("reconcile active record failed for " +
+                             std::string{id} + ": " + r.error());
+    }
     spdlog::info("reconcile: id={} name={} -> ACTIVE ({})", id, name, note);
+    return {};
   };
 
-  // ICD-0.4.5 §Crash Recovery mid-swap helper. For an ACTIVATING row
-  // with supersedes_id set, the upgrade's T3 PG tx either (a) never
-  // ran — no SUPERSEDED partner exists; back out the new row to
-  // INSTALL_FAILED and leave the existing ACTIVE alone — or (b) ran
-  // but the symlink rename hadn't completed; match via the old row's
-  // SUPERSEDED state and replay the rename.
-  auto resolve_upgrade_mid_swap = [&](std::string_view new_id,
-                                      std::string_view new_name,
-                                      std::string_view new_version,
-                                      std::string_view supersedes_id) -> void {
+  // ICD-0.4.5 §Crash Recovery mid-swap helper. The non-bundled T3 database
+  // transaction can durably mark the new row ACTIVE before the active symlink
+  // rename. Scan both ACTIVATING and successor ACTIVE rows so that shape is
+  // forward-completed before HTTP ingress, then recreate the runtime pool.
+  auto resolve_upgrade_mid_swap =
+      [&](std::string_view new_id, std::string_view new_name,
+          std::string_view new_version, std::string_view new_state,
+          std::string_view supersedes_id) -> std::expected<void, std::string> {
     std::string sup_s{supersedes_id};
     std::array<const char*, 1> sup_v = {sup_s.c_str()};
     PgResultPtr row(
@@ -2469,14 +3051,16 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
                                 "WHERE id = $1::uuid",
                                 1, nullptr, sup_v.data(), nullptr, nullptr, 0),
         PQclear);
-    if (PQresultStatus(row.get()) != PGRES_TUPLES_OK ||
-        PQntuples(row.get()) == 0) {
+    if (PQresultStatus(row.get()) != PGRES_TUPLES_OK) {
+      return std::unexpected("reconcile upgrade predecessor lookup failed: " +
+                             std::string{PQresultErrorMessage(row.get())});
+    }
+    if (PQntuples(row.get()) == 0) {
       // Predecessor row gone (deleted, perhaps by a separate
       // uninstall path); back out the orphan ACTIVATING.
-      mark_failed(new_id, new_name, "ACTIVATING",
-                  "upgrade predecessor missing; backed out",
-                  /*drop_schema=*/false);
-      return;
+      return mark_failed(new_id, new_name, "ACTIVATING",
+                         "upgrade predecessor missing; backed out",
+                         /*drop_schema=*/false);
     }
     std::string old_state = PQgetvalue(row.get(), 0, 0);
     std::string old_version = PQgetvalue(row.get(), 0, 1);
@@ -2484,16 +3068,20 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
     if (old_state == "ACTIVE" || old_state == "ACTIVE_FLAGGED") {
       // T3 PG tx never committed. Back out: new → INSTALL_FAILED,
       // old stays ACTIVE.
-      mark_failed(new_id, new_name, "ACTIVATING",
-                  "upgrade swap tx did not commit; backed out",
-                  /*drop_schema=*/false);
-      return;
+      if (new_state == "ACTIVATING") {
+        return mark_failed(new_id, new_name, new_state,
+                           "upgrade swap tx did not commit; backed out",
+                           /*drop_schema=*/false);
+      } else {
+        return std::unexpected(
+            "reconcile upgrade found active successor and predecessor for " +
+            std::string{new_name});
+      }
+      return {};
     }
     if (old_state != "SUPERSEDED") {
-      spdlog::warn("reconcile upgrade mid-swap: predecessor {} in unexpected "
-                   "state '{}'; leaving ACTIVATING for human inspection",
-                   sup_s, old_state);
-      return;
+      return std::unexpected("reconcile upgrade predecessor " + sup_s +
+                             " has unexpected state '" + old_state + "'");
     }
 
     // old=SUPERSEDED + new=ACTIVATING → T3 PG tx committed, symlink
@@ -2506,10 +3094,16 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
 
     if (link_str == new_version) {
       // Symlink already points at new; just advance state.
-      mark_active(new_id, new_name, "ACTIVATING",
-                  "mid-swap forward-completed "
-                  "(symlink already points at new version)");
-      return;
+      if (new_state == "ACTIVATING") {
+        return mark_active(new_id, new_name, new_state,
+                           "mid-swap forward-completed "
+                           "(symlink already points at new version)");
+      }
+      if (!plinth::extensions::create_pool(new_name)) {
+        return std::unexpected("reconcile runtime pool recreation failed for " +
+                               std::string{new_name});
+      }
+      return {};
     }
     if (link_str == old_version || ec) {
       // Symlink still at old (or unreadable). Complete the rename
@@ -2522,26 +3116,45 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
         spdlog::warn("reconcile mid-swap: create_symlink tmp for {} failed: "
                      "{}",
                      new_name, ec2.message());
-        return;
+        return std::unexpected("reconcile mid-swap symlink creation failed "
+                               "for " +
+                               std::string{new_name} + ": " + ec2.message());
       }
       if (::rename(tmp.c_str(), active_path.c_str()) != 0) {
         spdlog::warn("reconcile mid-swap: rename(active.tmp→active) for {} "
                      "failed: {}",
                      new_name, std::strerror(errno));
-        return;
+        return std::unexpected("reconcile mid-swap rename failed for " +
+                               std::string{new_name} + ": " +
+                               std::strerror(errno));
       }
-      mark_active(new_id, new_name, "ACTIVATING",
-                  "mid-swap forward-completed "
-                  "(symlink replayed new version)");
-      return;
+      if (new_state == "ACTIVATING") {
+        auto active = mark_active(new_id, new_name, new_state,
+                                  "mid-swap forward-completed "
+                                  "(symlink replayed new version)");
+        if (!active.has_value()) {
+          return active;
+        }
+      } else {
+        spdlog::info("reconcile: active successor {} pointer replayed to {}",
+                     new_id, new_version);
+      }
+      if (new_state != "ACTIVATING") {
+        if (!plinth::extensions::create_pool(new_name)) {
+          return std::unexpected(
+              "reconcile runtime pool recreation failed for " +
+              std::string{new_name});
+        }
+      }
+      return {};
     }
 
     // Symlink points at some third version — unexpected. Leave for
     // human inspection rather than guess.
-    spdlog::warn("reconcile mid-swap: active symlink for {} points at '{}' "
-                 "(expected '{}' or '{}'); ACTIVATING row {} left for human "
-                 "inspection",
-                 new_name, link_str, old_version, new_version, new_id);
+    return std::unexpected("reconcile active symlink for " +
+                           std::string{new_name} + " points at '" + link_str +
+                           "' (expected '" + old_version + "' or '" +
+                           std::string{new_version} + "')");
   };
 
   for (int i = 0; i < row_count; ++i) {
@@ -2557,8 +3170,12 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
     if (state == "UPLOADING" || state == "VALIDATING") {
       // Staging zip + validator scratch live outside plinth.packages;
       // no persistent schema side effects to clean.
-      mark_failed(id, name, state, "crashed before any persistent side effects",
-                  /*drop_schema=*/false);
+      if (auto recovered = mark_failed(
+              id, name, state, "crashed before any persistent side effects",
+              /*drop_schema=*/false);
+          !recovered.has_value()) {
+        return recovered;
+      }
       continue;
     }
     if (state == "MIGRATING" || state == "REGISTERING") {
@@ -2569,9 +3186,22 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
       // crash (capability / panel / rbac inserts are TX-scoped
       // in Slice A), but the schema created in MIGRATING still
       // needs to go — drop unconditionally.
-      mark_failed(id, name, state,
-                  "crashed during " + state + "; schema dropped",
-                  /*drop_schema=*/true);
+      if (auto recovered = mark_failed(
+              id, name, state, "crashed during " + state + "; schema dropped",
+              /*drop_schema=*/true);
+          !recovered.has_value()) {
+        return recovered;
+      }
+      continue;
+    }
+    if ((state == "ACTIVATING" || state == "ACTIVE" ||
+         state == "ACTIVE_FLAGGED") &&
+        !supersedes_id.empty()) {
+      if (auto recovered =
+              resolve_upgrade_mid_swap(id, name, version, state, supersedes_id);
+          !recovered.has_value()) {
+        return recovered;
+      }
       continue;
     }
     if (state == "EXTRACTING" || state == "ACTIVATING") {
@@ -2579,10 +3209,6 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
       // supersedes_id are upgrade mid-swap and need the symlink-
       // aware resolution path. First-install ACTIVATING rows
       // fall through to the 0.4.4 logic below.
-      if (state == "ACTIVATING" && !supersedes_id.empty()) {
-        resolve_upgrade_mid_swap(id, name, version, supersedes_id);
-        continue;
-      }
       fs::path tree = ctx.data_dir / "extensions" / name / version;
       fs::path manifest = tree / "manifest.json";
       std::error_code ec;
@@ -2594,11 +3220,18 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
         // MIGRATING, not EXTRACTING/ACTIVATING). Advancing to ACTIVE
         // is safe — the bootstrap restore_routes() call rebuilds
         // the in-memory asset route map from every ACTIVE row.
-        mark_active(id, name, state,
-                    "on-disk tree and manifest present; advanced");
+        if (auto recovered = mark_active(
+                id, name, state, "on-disk tree and manifest present; advanced");
+            !recovered.has_value()) {
+          return recovered;
+        }
       } else {
-        mark_failed(id, name, state, "on-disk tree incomplete after " + state,
-                    /*drop_schema=*/true);
+        if (auto recovered = mark_failed(
+                id, name, state, "on-disk tree incomplete after " + state,
+                /*drop_schema=*/true);
+            !recovered.has_value()) {
+          return recovered;
+        }
       }
       continue;
     }
@@ -2619,6 +3252,10 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
               "WHERE name = $1 AND state IN ('ACTIVE','ACTIVE_FLAGGED')",
               1, nullptr, name_v.data(), nullptr, nullptr, 0),
           PQclear);
+      if (PQresultStatus(active_row.get()) != PGRES_TUPLES_OK) {
+        return std::unexpected(
+            std::string{PQresultErrorMessage(active_row.get())});
+      }
       bool has_active = (PQresultStatus(active_row.get()) == PGRES_TUPLES_OK) &&
                         (PQntuples(active_row.get()) > 0);
       if (!has_active) {
@@ -2635,17 +3272,15 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
       // run_uninstall_cleanup is idempotent, so replay forward.
       auto lp_r = load_package_row(pg.conn, id);
       if (!lp_r.has_value()) {
-        spdlog::warn("reconcile UNINSTALLING: load_package_row({}) "
-                     "failed: {}",
-                     id, lp_r.error());
-        continue;
+        return std::unexpected("reconcile UNINSTALLING load failed for " + id +
+                               ": " + lp_r.error());
       }
       auto cleanup = run_uninstall_cleanup(pg.conn, *lp_r, ctx);
       if (!cleanup.has_value()) {
-        spdlog::warn("reconcile UNINSTALLING: cleanup for {} {} failed: {} — "
-                     "row remains UNINSTALLING for next boot",
-                     name, version, cleanup.error().message);
-        continue;
+        std::string message{"reconcile UNINSTALLING cleanup failed for "};
+        message.append(name).append(" ").append(version).append(": ").append(
+            cleanup.error().message);
+        return std::unexpected(std::move(message));
       }
       Json::Value detail(Json::objectValue);
       detail["id"] = lp_r->id;
@@ -2658,10 +3293,25 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
                    id, name);
       continue;
     }
-    spdlog::warn(
-        "reconcile: unexpected in-flight state '{}' for id={} name={}; "
-        "skipping",
-        state, id, name);
+    std::string message{"reconcile encountered unexpected state '"};
+    message.append(state)
+        .append("' for id=")
+        .append(id)
+        .append(" name=")
+        .append(name);
+    return std::unexpected(std::move(message));
+  }
+
+  // Recovery mutations are complete. Release every name lock before launching
+  // RBAC workers because each worker independently acquires the same lock.
+  while (!locks.held.empty()) {
+    const auto name = locks.held.back();
+    if (auto released = release_name_lock_checked(pg.conn, name);
+        !released.has_value()) {
+      return std::unexpected("in-flight reconciliation lock release for '" +
+                             name + "' failed: " + released.error());
+    }
+    locks.held.pop_back();
   }
 
   // ─── RBAC test sweeps (ICD-0.4.7) ─────────────────────────────
@@ -2674,14 +3324,34 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
   if (cleaned.has_value() && *cleaned > 0) {
     spdlog::info("reconcile: cleaned {} orphaned RBAC test run(s)", *cleaned);
   } else if (!cleaned.has_value()) {
-    spdlog::warn("reconcile: cleanup_orphaned_test_users failed: {}",
-                 cleaned.error());
+    return std::unexpected("reconcile RBAC user cleanup failed: " +
+                           cleaned.error());
   }
 
-  // (b) Schedule the RBAC test for fresh ACTIVE/ACTIVE_FLAGGED rows
-  // where last_rbac_test_run_at is NULL — covers the crash-during-
-  // post-install trigger window. 1 h ceiling bounds replays; older
-  // rows are treated as administratively complete.
+  if (ctx.schedule_rbac_tests) {
+    auto scheduled = schedule_pending_rbac_tests(ctx);
+    if (!scheduled.has_value()) {
+      return std::unexpected(scheduled.error());
+    }
+  }
+
+  spdlog::info("reconcile_in_flight_installs: done");
+  return {};
+}
+
+auto schedule_pending_rbac_tests(const InstallerContext& ctx)
+    -> std::expected<std::size_t, std::string> {
+  PgGuard pg(ctx.db);
+  if (!pg.ok()) {
+    return std::unexpected(pg.conn != nullptr
+                               ? std::string{PQerrorMessage(pg.conn)}
+                               : std::string{"PQconnectdb returned null"});
+  }
+
+  // Schedule the RBAC test for fresh ACTIVE/ACTIVE_FLAGGED rows where
+  // last_rbac_test_run_at is NULL. This covers the crash-during-post-install
+  // handoff window. The one-hour ceiling bounds replays; older rows are
+  // treated as administratively complete.
   PgResultPtr rbac_test_rows(
       plinth::db::exec(pg.conn,
                        "SELECT id::text FROM plinth.packages "
@@ -2689,22 +3359,21 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void {
                        "  AND last_rbac_test_run_at IS NULL "
                        "  AND installed_at > NOW() - interval '1 hour'"),
       PQclear);
-  if (PQresultStatus(rbac_test_rows.get()) == PGRES_TUPLES_OK) {
-    int rbac_test_count = PQntuples(rbac_test_rows.get());
-    for (int i = 0; i < rbac_test_count; ++i) {
-      plinth::db::OperationScope::checkpoint_current();
-      std::string rbac_test_id = PQgetvalue(rbac_test_rows.get(), i, 0);
-      rbac_test::schedule_rbac_test(rbac_test_id, ctx, "reconcile");
-    }
-    if (rbac_test_count > 0) {
-      spdlog::info("reconcile: scheduled {} RBAC test run(s)", rbac_test_count);
-    }
-  } else {
-    spdlog::warn("reconcile: RBAC test schedule SELECT failed: {}",
-                 PQresultErrorMessage(rbac_test_rows.get()));
+  if (PQresultStatus(rbac_test_rows.get()) != PGRES_TUPLES_OK) {
+    return std::unexpected(
+        "reconcile RBAC test schedule SELECT failed: " +
+        std::string{PQresultErrorMessage(rbac_test_rows.get())});
   }
-
-  spdlog::info("reconcile_in_flight_installs: done");
+  const int rbac_test_count = PQntuples(rbac_test_rows.get());
+  for (int i = 0; i < rbac_test_count; ++i) {
+    plinth::db::OperationScope::checkpoint_current();
+    std::string rbac_test_id = PQgetvalue(rbac_test_rows.get(), i, 0);
+    rbac_test::schedule_rbac_test(rbac_test_id, ctx, "reconcile");
+  }
+  if (rbac_test_count > 0) {
+    spdlog::info("reconcile: scheduled {} RBAC test run(s)", rbac_test_count);
+  }
+  return static_cast<std::size_t>(rbac_test_count);
 }
 
 // ─── 0.4.5 garbage collection ─────────────────────────────────────────
@@ -2786,6 +3455,7 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
       plinth::db::exec(
           pg.conn, "SELECT id, name, version, retired_at FROM plinth.packages "
                    "WHERE state = 'SUPERSEDED' AND retired_at IS NOT NULL "
+                   "AND application_ready = FALSE "
                    "ORDER BY retired_at ASC"),
       PQclear);
   if (PQresultStatus(rows.get()) != PGRES_TUPLES_OK) {
@@ -2834,12 +3504,19 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
     std::array<const char*, 1> idv = {id.c_str()};
     PgResultPtr del(plinth::db::exec_params(
                         pg.conn,
-                        "DELETE FROM plinth.packages WHERE id = $1::uuid", 1,
-                        nullptr, idv.data(), nullptr, nullptr, 0),
+                        "DELETE FROM plinth.packages WHERE id = $1::uuid "
+                        "AND state = 'SUPERSEDED' "
+                        "AND application_ready = FALSE",
+                        1, nullptr, idv.data(), nullptr, nullptr, 0),
                     PQclear);
     if (PQresultStatus(del.get()) != PGRES_COMMAND_OK) {
       report.warnings.push_back("gc: DELETE failed for id=" + id + ": " +
                                 PQresultErrorMessage(del.get()));
+      release_name_lock(pg.conn, name);
+      continue;
+    }
+    if (std::string_view{PQcmdTuples(del.get())} != "1") {
+      report.skipped_ids.push_back(id);
       release_name_lock(pg.conn, name);
       continue;
     }
@@ -2857,6 +3534,177 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
   }
 
   return report;
+}
+
+auto reconcile_application_readiness(const InstallerContext& ctx)
+    -> std::expected<std::size_t, std::string> {
+  PgGuard pg(ctx.db);
+  if (!pg.ok()) {
+    return std::unexpected(std::string{PQerrorMessage(pg.conn)});
+  }
+  // Snapshot only identities first, then take every package-name advisory lock
+  // in deterministic order. Each row is re-read under those locks below, so a
+  // concurrent lifecycle transition cannot be overwritten from a stale
+  // startup snapshot. Packages created under a brand-new name after this
+  // identity scan are owned by their lifecycle operation and are not touched.
+  PgResultPtr candidates(
+      plinth::db::exec(pg.conn, "SELECT id::text, name FROM plinth.packages "
+                                "ORDER BY name, installed_at, id"),
+      PQclear);
+  if (PQresultStatus(candidates.get()) != PGRES_TUPLES_OK) {
+    return std::unexpected(std::string{PQresultErrorMessage(candidates.get())});
+  }
+
+  std::vector<std::string> names;
+  names.reserve(static_cast<std::size_t>(PQntuples(candidates.get())));
+  for (int row = 0; row < PQntuples(candidates.get()); ++row) {
+    names.emplace_back(PQgetvalue(candidates.get(), row, 1));
+  }
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+  struct ReadinessLocks {
+    PGconn* conn;
+    std::vector<std::string> held;
+    ~ReadinessLocks() {
+      for (auto it = held.rbegin(); it != held.rend(); ++it) {
+        release_name_lock(conn, *it);
+      }
+    }
+  } locks{pg.conn, {}};
+  locks.held.reserve(names.size());
+  for (const auto& name : names) {
+    auto acquired = try_acquire_name_lock(pg.conn, name);
+    if (!acquired.has_value()) {
+      return std::unexpected("application readiness lock for '" + name +
+                             "' failed: " + acquired.error());
+    }
+    locks.held.push_back(name);
+  }
+
+  // Make the in-memory resolver snapshot authoritative before any durable
+  // application is admitted. A successful atomic reload plus the exact
+  // manifest-to-database comparison below proves the three views agree.
+  auto cache_reload = plinth::capabilities::reload_tier2_cache(ctx.db);
+  if (!cache_reload.has_value()) {
+    return std::unexpected(
+        "application readiness capability cache reload failed");
+  }
+
+  struct ReadinessChange {
+    std::string id;
+    bool ready;
+  };
+  std::vector<ReadinessChange> changes;
+  for (int row = 0; row < PQntuples(candidates.get()); ++row) {
+    const std::string id{PQgetvalue(candidates.get(), row, 0)};
+    const std::string name{PQgetvalue(candidates.get(), row, 1)};
+    std::array<const char*, 1> values{id.c_str()};
+    PgResultPtr current(
+        plinth::db::exec_params(
+            pg.conn,
+            "SELECT p.version, p.state, p.application_ready, EXISTS ("
+            " SELECT 1 FROM plinth.panels pn "
+            " JOIN plinth.rbac_rules r "
+            "   ON r.rule = pn.declaration->>'rbac_rule' "
+            "  AND r.extension_name = p.name AND r.orphaned_at IS NULL "
+            " WHERE pn.package_id = p.id AND pn.panel_type = 'primary' "
+            "   AND jsonb_typeof(pn.declaration->'client_path') = 'string' "
+            "   AND pn.declaration->>'client_path' <> ''"
+            "), NOT EXISTS ("
+            " SELECT 1 FROM plinth.packages successor "
+            " WHERE successor.supersedes_id = p.id"
+            "), p.entry_point FROM plinth.packages p WHERE p.id = $1::uuid",
+            1, nullptr, values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(current.get()) != PGRES_TUPLES_OK) {
+      return std::unexpected(std::string{PQresultErrorMessage(current.get())});
+    }
+    if (PQntuples(current.get()) == 0) {
+      continue;
+    }
+    const std::string version{PQgetvalue(current.get(), 0, 0)};
+    const std::string_view state{PQgetvalue(current.get(), 0, 1)};
+    const bool was_ready =
+        std::string_view{PQgetvalue(current.get(), 0, 2)} == "t";
+    const bool metadata_ready =
+        std::string_view{PQgetvalue(current.get(), 0, 3)} == "t";
+    const bool has_no_successor =
+        std::string_view{PQgetvalue(current.get(), 0, 4)} == "t";
+    const std::string entry_point{PQgetvalue(current.get(), 0, 5)};
+    const auto version_root = ctx.data_dir / "extensions" / name / version;
+    std::error_code ec;
+    const bool active_pointer_matches =
+        fs::equivalent(version_root.parent_path() / "active", version_root, ec);
+    bool prerequisites_ready =
+        !ec && active_pointer_matches &&
+        (state == "ACTIVE" || state == "ACTIVE_FLAGGED") && metadata_ready &&
+        fs::is_regular_file(version_root / entry_point, ec) && !ec &&
+        asset_server::has_registered_route(name, version) &&
+        !capabilities::drain::is_fenced(name);
+    if (prerequisites_ready) {
+      prerequisites_ready = extensions::has_pool(name);
+    }
+    if (prerequisites_ready) {
+      auto assets_ready =
+          registered_panel_assets_ready(pg.conn, id, version_root);
+      if (!assets_ready.has_value()) {
+        return std::unexpected(assets_ready.error());
+      }
+      prerequisites_ready = *assets_ready;
+    }
+    if (prerequisites_ready) {
+      auto authority_ready =
+          registered_capabilities_ready(pg.conn, name, version_root);
+      if (!authority_ready.has_value()) {
+        return std::unexpected(authority_ready.error());
+      }
+      prerequisites_ready = *authority_ready;
+    }
+    const bool should_be_ready =
+        prerequisites_ready && (was_ready || has_no_successor);
+    if (should_be_ready != was_ready) {
+      changes.push_back({.id = id, .ready = should_be_ready});
+    }
+  }
+
+  if (changes.empty()) {
+    return 0;
+  }
+  auto begin = pg_exec(pg.conn, "BEGIN");
+  if (!begin.has_value()) {
+    return std::unexpected(begin.error());
+  }
+  auto rollback = [&]() { static_cast<void>(pg_exec(pg.conn, "ROLLBACK")); };
+  std::size_t changed = 0;
+  for (const auto& change : changes) {
+    std::array<const char*, 2> values{change.id.c_str(),
+                                      change.ready ? "true" : "false"};
+    PgResultPtr updated(
+        plinth::db::exec_params(
+            pg.conn,
+            "UPDATE plinth.packages SET application_ready = $2::boolean "
+            "WHERE id = $1::uuid AND application_ready <> $2::boolean",
+            2, nullptr, values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(updated.get()) != PGRES_COMMAND_OK) {
+      auto error = std::string{PQresultErrorMessage(updated.get())};
+      rollback();
+      return std::unexpected(std::move(error));
+    }
+    changed +=
+        static_cast<std::size_t>(std::stoull(PQcmdTuples(updated.get())));
+  }
+  if (changed > 0) {
+    auto notified = emit_applications_changed(pg.conn);
+    if (!notified.has_value()) {
+      rollback();
+      return std::unexpected(notified.error());
+    }
+  }
+  auto committed = pg_exec(pg.conn, "COMMIT");
+  if (!committed.has_value()) {
+    return std::unexpected(committed.error());
+  }
+  return changed;
 }
 
 // ─── 0.4.5 upgrade_package ───────────────────────────────────────────
@@ -2959,7 +3807,7 @@ auto mark_upgrade_failed(PGconn* admin, std::string_view new_id,
       !u.has_value()) {
     spdlog::warn("upgrade: mark INSTALL_FAILED failed: {}", u.error());
   }
-  update_packages_report(admin, new_id, report);
+  static_cast<void>(update_packages_report(admin, new_id, report));
 }
 
 // List (namespace, version, function) tuples currently registered in
@@ -3048,6 +3896,33 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     LockGuard(LockGuard&&) = delete;
     auto operator=(LockGuard&&) -> LockGuard& = delete;
   } lg{release_lock};
+
+  struct UpgradeDrainGuard {
+    std::string name;
+    bool active{false};
+    bool release_on_destroy{true};
+    explicit UpgradeDrainGuard(std::string n) : name(std::move(n)) {}
+    ~UpgradeDrainGuard() {
+      if (release_on_destroy) {
+        finish();
+      } else if (active) {
+        capabilities::drain::block_application(name);
+      }
+    }
+    auto start() -> std::shared_ptr<capabilities::drain::DrainState> {
+      active = true;
+      return capabilities::drain::begin_drain(name);
+    }
+    auto finish() -> void {
+      if (active) {
+        capabilities::drain::end_drain(name);
+        active = false;
+      }
+    }
+    auto preserve_fence() -> void { release_on_destroy = false; }
+    UpgradeDrainGuard(const UpgradeDrainGuard&) = delete;
+    auto operator=(const UpgradeDrainGuard&) -> UpgradeDrainGuard& = delete;
+  } upgrade_drain{existing.name};
 
   // 3. Staging extract + minimal manifest parse.
   std::string new_id = uuid_v4();
@@ -3185,6 +4060,59 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
                                          "upgrade validation failed",
                                          build_validation_report(vr)));
   }
+
+  // Fence capability ingress and drain before migration or registration can
+  // mutate shared package authority. Once quiesced, atomically withdraw the
+  // old launcher generation and publish the durable refresh hint.
+  auto drain_state = upgrade_drain.start();
+  auto drain_start = std::chrono::steady_clock::now();
+  auto [drained, outstanding] = capabilities::drain::wait_for_zero(
+      drain_state, ctx.upgrade_drain_timeout_ms);
+  auto drain_waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - drain_start);
+  if (!drained) {
+    nlohmann::json report;
+    report["kind"] = "upgrade-drain-timeout";
+    report["outstanding"] = outstanding;
+    return std::unexpected(
+        fail_and_mark("upgrade-drain-timeout", "drain window expired", report));
+  }
+  if (existing.application_ready) {
+    if (auto begin = pg_exec(pg.conn, "BEGIN"); !begin.has_value()) {
+      return std::unexpected(fail_and_mark("db-error", begin.error()));
+    }
+    std::string old_id{existing.id};
+    std::array<const char*, 1> old_values{old_id.c_str()};
+    PgResultPtr hidden(
+        plinth::db::exec_params(
+            pg.conn,
+            "UPDATE plinth.packages SET application_ready = FALSE "
+            "WHERE id = $1::uuid",
+            1, nullptr, old_values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(hidden.get()) != PGRES_COMMAND_OK) {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      return std::unexpected(
+          fail_and_mark("db-error", PQresultErrorMessage(hidden.get())));
+    }
+    auto notified = emit_applications_changed(pg.conn);
+    if (!notified.has_value()) {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      return std::unexpected(fail_and_mark("db-error", notified.error()));
+    }
+    // A failed acknowledgement can still mean the readiness withdrawal and
+    // invalidation committed remotely. Preserve ingress before COMMIT and only
+    // release it from the verified terminal success path.
+    upgrade_drain.preserve_fence();
+    auto committed = pg_exec(pg.conn, "COMMIT");
+    if (!committed.has_value()) {
+      return std::unexpected(fail_and_mark("db-error", committed.error()));
+    }
+  }
+  // From this point onward migration/registration may have changed shared
+  // authority. Any failure remains fail-closed and leaves ingress fenced for
+  // an explicit retry/reconciliation instead of exposing a mixed generation.
+  upgrade_drain.preserve_fence();
 
   // Trusted bundled upgrades retain one transaction through migration,
   // registration, extraction and activation. A later failure restores the
@@ -3333,40 +4261,7 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     return std::unexpected(fail_and_mark("db-error", u.error()));
   }
 
-  // T1 — begin drain on the old version's capability namespace.
-  auto drain_state = capabilities::drain::begin_drain(existing.name);
-  struct DrainGuard {
-    std::string name;
-    bool active = true;
-    explicit DrainGuard(std::string n) : name(std::move(n)) {}
-    ~DrainGuard() { finish(); }
-    auto finish() -> void {
-      if (active) {
-        capabilities::drain::end_drain(name);
-        active = false;
-      }
-    }
-    DrainGuard(const DrainGuard&) = delete;
-    auto operator=(const DrainGuard&) -> DrainGuard& = delete;
-    DrainGuard(DrainGuard&&) = delete;
-    auto operator=(DrainGuard&&) -> DrainGuard& = delete;
-  };
-  DrainGuard dg{existing.name};
-
-  // T2 — wait_for_zero with timeout.
-  auto drain_start = std::chrono::steady_clock::now();
-  auto [drained, outstanding] = capabilities::drain::wait_for_zero(
-      drain_state, ctx.upgrade_drain_timeout_ms);
-  auto drain_waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - drain_start);
-  if (!drained) {
-    nlohmann::json r;
-    r["kind"] = "upgrade-drain-timeout";
-    r["message"] = "drain window expired with in-flight calls";
-    r["outstanding"] = outstanding;
-    return std::unexpected(
-        fail_and_mark("upgrade-drain-timeout", "drain window expired", r));
-  }
+  // T1/T2 were completed before migration and registration above.
 
   // T3 — swap tx: old → SUPERSEDED+retired_at, new → ACTIVE.
   if (!bundled) {
@@ -3515,8 +4410,17 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   fs::path new_client_root = new_version_dir / "client";
   asset_server::register_routes(minimal.name, minimal.version, new_client_root,
                                 manifest_checksum);
-  plinth::extensions::create_pool(minimal.name);
-
+  const bool server_package =
+      fs::is_regular_file(new_version_dir / minimal.entry_point);
+  const bool pool_created = plinth::extensions::create_pool(minimal.name);
+  if (!server_package || !pool_created) {
+    return std::unexpected(upgrade_failure(
+        new_id, "runtime-start-failed",
+        !server_package
+            ? "declared entry point is unavailable; application remains unready"
+            : "new extension runtime failed to start; application remains "
+              "unready"));
+  }
   // Unregister v1-only capabilities. (v1∩v2 rows were already
   // DELETEd + re-INSERTed during REGISTERING-upgrade, so this only
   // catches capabilities present in old but removed in new — which
@@ -3533,10 +4437,52 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     }
   }
 
+  // Refresh after the defensive unregister pass so releasing the lifecycle
+  // fence can never expose a v1-only entry retained by the old snapshot.
+  auto cache_reload = plinth::capabilities::reload_tier2_cache(ctx.db);
+  if (!cache_reload.has_value()) {
+    return std::unexpected(upgrade_failure(
+        new_id, "capability-refresh-failed",
+        "capability cache refresh failed; application remains unready"));
+  }
+
+  const bool new_application_ready =
+      panels.has_value() && !panels->panels.empty();
+  if (new_application_ready) {
+    if (auto begin = pg_exec(pg.conn, "BEGIN"); !begin.has_value()) {
+      return std::unexpected(
+          upgrade_failure(new_id, "db-error", begin.error()));
+    }
+    std::array<const char*, 1> new_values{new_id.c_str()};
+    PgResultPtr admitted(
+        plinth::db::exec_params(
+            pg.conn,
+            "UPDATE plinth.packages SET application_ready = TRUE "
+            "WHERE id = $1::uuid AND state IN ('ACTIVE','ACTIVE_FLAGGED')",
+            1, nullptr, new_values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(admitted.get()) != PGRES_COMMAND_OK ||
+        std::string_view{PQcmdTuples(admitted.get())} != "1") {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      return std::unexpected(upgrade_failure(
+          new_id, "db-error", PQresultErrorMessage(admitted.get())));
+    }
+    auto notified = emit_applications_changed(pg.conn);
+    if (!notified.has_value()) {
+      static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
+      return std::unexpected(
+          upgrade_failure(new_id, "db-error", notified.error()));
+    }
+    auto committed = pg_exec(pg.conn, "COMMIT");
+    if (!committed.has_value()) {
+      return std::unexpected(
+          upgrade_failure(new_id, "db-error", committed.error()));
+    }
+  }
+
   emit_upgrade_audit(ctx, "packages.upgrade_completed", existing, new_id,
                      minimal.version);
-  static_cast<void>(plinth::capabilities::reload_tier2_cache(ctx.db));
-  dg.finish();
+  upgrade_drain.finish();
   if (auto released = release_name_lock_checked(pg.conn, minimal.name);
       !released) {
     auto report = rbac_handoff_failure_report(released.error());
@@ -3549,7 +4495,9 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
                           .report = std::move(report)});
   }
   lg.f = {};
-  rbac_test::schedule_rbac_test(new_id, ctx, "upgrade");
+  if (ctx.schedule_rbac_tests) {
+    rbac_test::schedule_rbac_test(new_id, ctx, "upgrade");
+  }
 
   // T5 — retention starts with retired_at on the old row. 0.7.x
   // scheduler reads that column on a cadence; 0.4.5 ships only the

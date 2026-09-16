@@ -1,5 +1,13 @@
 {
   "panels": [
-    {"id": "editor", "client_path": "editor.js"}
+    {
+      "id": "editor",
+      "client_path": "editor.js",
+      "title": "Editor",
+      "icon": "edit-3",
+      "rbac_rule": "notes.read",
+      "order": 10,
+      "future_panel_field": {"retained": true}
+    }
   ]
 }

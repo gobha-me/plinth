@@ -129,6 +129,10 @@ struct InstallerContext {
   std::filesystem::path staging_dir; // scratch space
   std::size_t max_package_size_bytes = 50ULL * 1024ULL * 1024ULL;
   std::chrono::milliseconds upgrade_drain_timeout_ms{5000};
+  // Production startup defers post-transition probes until readiness has
+  // reconciled every package under the same per-name lock. Interactive HTTP
+  // transitions keep the normal immediate handoff.
+  bool schedule_rbac_tests = true;
 };
 
 // Primary entry point. Drives UPLOADING through ACTIVE or
@@ -138,8 +142,10 @@ struct InstallerContext {
 // A post-commit RBAC handoff error has failed_at=ACTIVE and
 // report.committed=true: the package remains installed; inspect state and
 // explicitly rerun its RBAC test. Install/enable/upgrade schedule only after
-// cutover, synchronous cache reload, and acknowledged name-lock release. Cache
-// reload remains best-effort.
+// cutover, successful synchronous cache reload, and acknowledged name-lock
+// release. A cache reload failure keeps the application unready and capability
+// admission fenced. Startup may defer this handoff until its readiness sweep
+// has released every package-name lock.
 //
 // Dry-run mode (ICD-0.4.4 §HTTP Surface line 173, I.19): when
 // `dry_run=true`, runs UPLOADING + VALIDATING and returns early
@@ -163,7 +169,18 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
 // inhibit the drop).
 //
 // Stubbed in Slice A — body ships in Slice B (0.4.4.1).
-auto reconcile_in_flight_installs(const InstallerContext& ctx) -> void;
+auto reconcile_in_flight_installs(const InstallerContext& ctx)
+    -> std::expected<void, std::string>;
+
+// Schedule the bounded fresh-package RBAC sweep after startup readiness has
+// released every package-name lock. Returns the number of workers handed off.
+auto schedule_pending_rbac_tests(const InstallerContext& ctx)
+    -> std::expected<std::size_t, std::string>;
+
+// After startup restores capability cache, runtimes, and immutable asset
+// routes, reconcile the durable launcher marker for verified ACTIVE rows.
+auto reconcile_application_readiness(const InstallerContext& ctx)
+    -> std::expected<std::size_t, std::string>;
 
 // `install_shell_if_needed` (ICD-0.4.4 slice B) was removed in
 // ICD-0.6.1 §3.1; the bundled-shell first-boot install now lives at

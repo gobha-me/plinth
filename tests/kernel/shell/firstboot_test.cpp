@@ -5,10 +5,14 @@
 // tests/kernel/packages/crash_recovery_test.cpp keep their ICD-0.4.4
 // slice-B framing; this file is the ICD-0.6.1-shaped suite.
 
+#include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
+#include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/shell/firstboot.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -111,11 +115,23 @@ struct Scratch {
     cfg.db = db;
     cfg.shell.bundle_path =
         std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled";
+    cfg.packages_data_dir = ctx.data_dir.string();
+    cfg.packages_staging_dir = ctx.staging_dir.string();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    auto resolver = plinth::capabilities::init_resolver(db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
   }
   ~Scratch() {
+    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(base, ec);
     drop_all_ext_schemas(db);
+    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
   Scratch(const Scratch&) = delete;
   auto operator=(const Scratch&) -> Scratch& = delete;

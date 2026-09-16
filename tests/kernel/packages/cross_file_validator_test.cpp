@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -39,6 +40,31 @@ auto has_phase_rule(const ValidationReport& r, Phase phase,
     return m.phase == phase && m.rule == rule;
   });
 }
+
+class FixtureCopy {
+ public:
+  explicit FixtureCopy(std::string_view name) {
+    root_ = fs::temp_directory_path() / "plinth-cross-file-launcher" /
+            std::string{name};
+    std::error_code ec;
+    fs::remove_all(root_, ec);
+    fs::create_directories(root_.parent_path());
+    fs::copy(fixture("valid-cross-file"), root_, fs::copy_options::recursive);
+  }
+
+  ~FixtureCopy() {
+    std::error_code ec;
+    fs::remove_all(root_, ec);
+  }
+
+  FixtureCopy(const FixtureCopy&) = delete;
+  auto operator=(const FixtureCopy&) -> FixtureCopy& = delete;
+
+  [[nodiscard]] auto root() const -> const fs::path& { return root_; }
+
+ private:
+  fs::path root_;
+};
 
 } // namespace
 
@@ -88,6 +114,38 @@ TEST_CASE("cross-file: CF3 panel-missing-client-file errors",
   auto r = plinth::packages::validate(fixture("panel-missing-client-file"));
   REQUIRE(r.disposition() == 1);
   REQUIRE(has_phase_rule(r, Phase::CROSS_FILE, "panel-missing-client-file"));
+}
+
+TEST_CASE("cross-file: CF3 rejects a panel found only under client/components",
+          "[packages][cross-file][launcher]") {
+  FixtureCopy copy{"components-only"};
+  fs::create_directories(copy.root() / "client" / "components");
+  fs::rename(copy.root() / "client" / "panels" / "list.js",
+             copy.root() / "client" / "components" / "list.js");
+
+  auto r = plinth::packages::validate(copy.root());
+  REQUIRE(r.disposition() == 1);
+  REQUIRE(has_phase_rule(r, Phase::CROSS_FILE, "panel-missing-client-file"));
+
+  ValidationConfig structure_only;
+  structure_only.cross_file = false;
+  auto structural = plinth::packages::validate(copy.root(), structure_only);
+  REQUIRE(structural.disposition() == 1);
+  REQUIRE(has_rule(structural, "panel-missing"));
+}
+
+TEST_CASE("cross-file: panel rbac_rule must be declared by the same package",
+          "[packages][cross-file][launcher]") {
+  FixtureCopy copy{"foreign-panel-rule"};
+  std::ofstream panels{copy.root() / "panels.json", std::ios::trunc};
+  REQUIRE(panels.is_open());
+  panels
+      << R"({"panels":[{"id":"list","client_path":"list.js","rbac_rule":"other.read"}]})";
+  panels.close();
+
+  auto r = plinth::packages::validate(copy.root());
+  REQUIRE(r.disposition() == 1);
+  REQUIRE(has_phase_rule(r, Phase::CROSS_FILE, "panel-rbac-rule-unknown"));
 }
 
 // ─── CF4 + flag-flip with --structure-only ───────────────────────────
@@ -172,6 +230,16 @@ TEST_CASE("cross-file: CFW3 entry-imports-client warns",
   auto r = plinth::packages::validate(fixture("entry-imports-client"));
   REQUIRE(r.disposition() == 2);
   REQUIRE(has_phase_rule(r, Phase::CROSS_FILE, "entry-imports-client"));
+}
+
+TEST_CASE("cross-file: declared entry point must be a regular file",
+          "[packages][cross-file][fixture]") {
+  FixtureCopy copy{"missing-entry-point"};
+  REQUIRE(fs::remove(copy.root() / "server" / "main.js"));
+
+  auto r = plinth::packages::validate(copy.root());
+  REQUIRE(r.disposition() == 1);
+  REQUIRE(has_phase_rule(r, Phase::CROSS_FILE, "entry-point-missing"));
 }
 
 // ─── CFW4 ────────────────────────────────────────────────────────────

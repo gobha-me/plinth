@@ -194,16 +194,17 @@ using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
 //
 // Called under the state_mutex write lock from both init_resolver
 // (one-shot startup) and reload_tier2_cache (listener reconnect resync
-// — 0.2.4). The caller is responsible for clearing tier2_cache first
-// if a full refresh is required; this function only inserts.
-auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
+// — 0.2.4). Build into a private snapshot so a failed connect/SELECT cannot
+// erase or partially replace the currently admitted authority.
+auto load_tier2_snapshot_locked(const Config::Database& db_cfg)
+    -> std::expected<decltype(tier2_cache), Tier2ReloadError> {
   auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
     std::string err = PQerrorMessage(conn);
     PQfinish(conn);
     spdlog::error("tier2 load: PG connect failed: {}", err);
-    return 0;
+    return std::unexpected(Tier2ReloadError::DATABASE_UNAVAILABLE);
   }
   std::unique_ptr<PGconn, decltype(&PQfinish)> guard(conn, PQfinish);
 
@@ -216,11 +217,12 @@ auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::error("tier2 load: SELECT failed: {}",
                   PQresultErrorMessage(res.get()));
-    return 0;
+    return std::unexpected(Tier2ReloadError::QUERY_FAILED);
   }
 
-  std::size_t inserted = 0;
+  decltype(tier2_cache) replacement;
   int rows = PQntuples(res.get());
+  replacement.reserve(static_cast<std::size_t>(rows));
   for (int i = 0; i < rows; ++i) {
     CachedCapability entry{
         .signature = PQgetvalue(res.get(), i, 0),
@@ -234,10 +236,9 @@ auto load_tier2_cache_locked(const Config::Database& db_cfg) -> std::size_t {
     // Only instance-scope rows exist in 0.2.x (per ICD-0.2.0
     // user-scope deferral). The user_scope_key path is still
     // exercised by unit tests via seed_tier2_cache_for_test.
-    tier2_cache[entry.signature] = std::move(entry);
-    ++inserted;
+    replacement[entry.signature] = std::move(entry);
   }
-  return inserted;
+  return replacement;
 }
 
 // ── Tier-specific dispatch ───────────────────────────────────────────
@@ -330,22 +331,34 @@ auto dispatch_tier2(const CachedCapability& entry,
 
 // ── Public API ───────────────────────────────────────────────────────
 
-auto init_resolver(const Config::Database& db_cfg) -> void {
+auto init_resolver(const Config::Database& db_cfg) -> Tier2ReloadResult {
   std::unique_lock lock(state_mutex);
   tier1_map.clear();
   tier2_cache.clear();
   register_kernel_stubs_locked();
   register_lh0_harness_handlers_locked();
-  auto loaded = load_tier2_cache_locked(db_cfg);
+  auto loaded = load_tier2_snapshot_locked(db_cfg);
+  if (!loaded.has_value()) {
+    spdlog::critical("capability resolver initialization failed");
+    return std::unexpected(loaded.error());
+  }
+  tier2_cache = std::move(*loaded);
   spdlog::info("capability resolver initialized: tier1_handlers={} "
                "tier2_entries={}",
-               tier1_map.size(), loaded);
+               tier1_map.size(), tier2_cache.size());
+  return tier2_cache.size();
 }
 
-auto reload_tier2_cache(const Config::Database& db_cfg) -> std::size_t {
+auto reload_tier2_cache(const Config::Database& db_cfg) -> Tier2ReloadResult {
   std::unique_lock lock(state_mutex);
-  tier2_cache.clear();
-  auto loaded = load_tier2_cache_locked(db_cfg);
+  auto replacement = load_tier2_snapshot_locked(db_cfg);
+  if (!replacement.has_value()) {
+    spdlog::warn("tier2 cache resync failed; retaining {} admitted entries",
+                 tier2_cache.size());
+    return std::unexpected(replacement.error());
+  }
+  const auto loaded = replacement->size();
+  tier2_cache.swap(*replacement);
   spdlog::info("tier2 cache resynced: entries={}", loaded);
   return loaded;
 }
@@ -371,6 +384,9 @@ auto call_capability(const CapabilityCall& call, const UserContext& ctx)
   // relaxed atomic read inside the guard ctor.
   drain::DispatchGuard drain_guard(
       std::get<ParsedSignature>(parsed).namespace_);
+  if (!drain_guard.admitted()) {
+    return failure(CapabilityError::CAPABILITY_DISABLED);
+  }
 
   // Steps 3–5 — resolve the candidate entry under a single shared
   // lock, run the RBAC check against its rbac_rule, then dispatch.
@@ -463,6 +479,9 @@ auto call_capability_async(const CapabilityCall& call, const UserContext& ctx,
   // frame for the duration of the dispatch.
   drain::DispatchGuard drain_guard(
       std::get<ParsedSignature>(parsed).namespace_);
+  if (!drain_guard.admitted()) {
+    co_return failure(CapabilityError::CAPABILITY_DISABLED);
+  }
 
   // Steps 3-5 under the shared lock: Tier 1 / Tier 2 lookup + RBAC.
   // For extension entries we extract identity + release the lock

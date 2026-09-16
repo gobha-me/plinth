@@ -43,6 +43,8 @@ struct PackageManifestParseResult;
 
 struct PackageManifest {
   std::string name;
+  std::optional<std::string> display_name;
+  std::optional<std::string> icon;
   std::string version;
   std::string description;
   std::string author;

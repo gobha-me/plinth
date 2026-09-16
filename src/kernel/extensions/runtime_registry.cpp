@@ -801,8 +801,14 @@ auto invoke_handler(plinth::js::BridgeContext& bc,
 // sync libpq rather than Drogon's coroutine DbClient because this
 // runs inside init_registry which the main thread calls before
 // `drogon::app().run()` (no event loop available yet).
+struct ActiveExtension {
+  std::string name;
+  std::string version;
+};
+
 auto connect_and_list_active_extensions(const Config::Database& db_cfg,
-                                        std::vector<std::string>& out) -> bool {
+                                        std::vector<ActiveExtension>& out)
+    -> bool {
   auto conninfo = plinth::db::connection_info(db_cfg);
   PGconn* conn = plinth::db::connect(conninfo.c_str());
   if (PQstatus(conn) != CONNECTION_OK) {
@@ -813,7 +819,7 @@ auto connect_and_list_active_extensions(const Config::Database& db_cfg,
   }
   std::unique_ptr<PGconn, decltype(&PQfinish)> guard(conn, PQfinish);
   PGresult* res =
-      plinth::db::exec(conn, "SELECT name FROM plinth.packages "
+      plinth::db::exec(conn, "SELECT name, version FROM plinth.packages "
                              "WHERE state IN ('ACTIVE', 'ACTIVE_FLAGGED')");
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     spdlog::error("extensions::init_registry: SELECT failed: {}",
@@ -824,7 +830,8 @@ auto connect_and_list_active_extensions(const Config::Database& db_cfg,
   int rows = PQntuples(res);
   out.reserve(static_cast<std::size_t>(rows));
   for (int i = 0; i < rows; ++i) {
-    out.emplace_back(PQgetvalue(res, i, 0));
+    out.push_back(
+        {.name = PQgetvalue(res, i, 0), .version = PQgetvalue(res, i, 1)});
   }
   PQclear(res);
   return true;
@@ -847,22 +854,34 @@ auto init_registry(const Config& cfg) -> void {
     cfg_ptr = &cfg;
     accepting_dispatches = true;
   }
-  std::vector<std::string> active_names;
-  if (!connect_and_list_active_extensions(cfg.db, active_names)) {
+  std::vector<ActiveExtension> active_extensions;
+  if (!connect_and_list_active_extensions(cfg.db, active_extensions)) {
     spdlog::warn("extensions::init_registry: proceeding with empty pool "
                  "registry; install-lifecycle hooks will repopulate");
     return;
   }
   std::size_t created = 0;
-  for (const auto& name : active_names) {
+  for (const auto& extension : active_extensions) {
     plinth::db::OperationScope::checkpoint_current();
-    if (create_pool(name)) {
+    const auto extension_root =
+        fs::path{cfg.packages_data_dir} / "extensions" / extension.name;
+    std::error_code ec;
+    const bool generation_matches = fs::equivalent(
+        extension_root / "active", extension_root / extension.version, ec);
+    if (ec || !generation_matches) {
+      spdlog::warn(
+          "extensions::init_registry: active pointer for {} does not match "
+          "database version {}; leaving runtime unavailable",
+          extension.name, extension.version);
+      continue;
+    }
+    if (create_pool(extension.name)) {
       ++created;
     }
   }
   spdlog::info(
       "extensions::init_registry: active_extensions={} pools_created={}",
-      active_names.size(), created);
+      active_extensions.size(), created);
 }
 
 auto shutdown_registry(std::chrono::milliseconds timeout) -> bool {
@@ -1010,6 +1029,11 @@ auto destroy_pool(std::string_view extension_name) -> void {
   if (retirement) {
     finish_retirement(std::move(retirement), true);
   }
+}
+
+auto has_pool(std::string_view extension_name) -> bool {
+  std::shared_lock lock(registry_mutex);
+  return pools.contains(std::string{extension_name});
 }
 
 auto inflight_dispatch_count_for_test() -> std::size_t {

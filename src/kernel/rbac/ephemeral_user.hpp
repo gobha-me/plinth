@@ -45,8 +45,9 @@ struct RunUserPair {
 };
 
 // Creates the denied user, the allowed user, and the synthetic group,
-// and issues `everyone` membership for both users plus synthetic-group
-// membership for the allowed user. Preconditions: caller has acquired
+// and issues synthetic-group membership for the allowed user. `everyone`
+// membership is virtual and therefore creates no stored rows. Preconditions:
+// caller has acquired
 // the per-name advisory lock; caller owns the transaction. Returns the
 // pair on success or a PG error message on failure. On failure the
 // caller MUST call `destroy_run_users` to back out any partial inserts.

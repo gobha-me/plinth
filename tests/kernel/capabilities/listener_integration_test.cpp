@@ -470,7 +470,8 @@ TEST_CASE("reload_tier2_cache syncs the cache from plinth.capabilities",
   REQUIRE(plinth::capabilities::tier2_cache_size() == 1);
 
   auto loaded = plinth::capabilities::reload_tier2_cache(db);
-  REQUIRE(loaded == 1);
+  REQUIRE(loaded.has_value());
+  REQUIRE(*loaded == 1);
   REQUIRE(plinth::capabilities::tier2_cache_size() == 1);
 
   // Stale entry is gone; real entry resolves through dispatch (sync

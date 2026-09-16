@@ -10,13 +10,18 @@
 // I.18-I.20 (concurrent POST / dry-run / RBAC denial — need the HTTP
 // surface, not the library entry point).
 
+#include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
+#include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/rbac_test_runner.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 #include <zip.h>
 
 #include <atomic>
@@ -104,6 +109,7 @@ std::atomic<uint64_t> g_scratch_counter{0};
 
 struct Scratch {
   plinth::Config::Database db;
+  plinth::Config cfg;
   fs::path base;
   plinth::packages::InstallerContext ctx;
 
@@ -127,11 +133,25 @@ struct Scratch {
     ctx.data_dir = base / "data";
     ctx.staging_dir = base / "staging";
     ctx.max_package_size_bytes = 50ULL * 1024ULL * 1024ULL;
+
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    cfg.db = db;
+    cfg.packages_data_dir = ctx.data_dir.string();
+    cfg.packages_staging_dir = ctx.staging_dir.string();
+    auto resolver = plinth::capabilities::init_resolver(db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
   }
   ~Scratch() {
+    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(base, ec);
     drop_all_ext_schemas(db);
+    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
   Scratch(const Scratch&) = delete;
   auto operator=(const Scratch&) -> Scratch& = delete;
@@ -221,6 +241,22 @@ TEST_CASE("I.01: valid install -> ACTIVE with DB + disk artefacts",
   REQUIRE(r->version == "1.2.3");
   REQUIRE(fs::exists(s.ctx.data_dir / "extensions" / "notes" / "1.2.3" /
                      "manifest.json"));
+
+  PGconn* conn = PQconnectdb(conninfo_of(s.db).c_str());
+  REQUIRE(PQstatus(conn) == CONNECTION_OK);
+  PGresult* declaration =
+      PQexec(conn, ("SELECT declaration FROM plinth.panels WHERE package_id='" +
+                    r->id + "' AND panel_id='editor'")
+                       .c_str());
+  REQUIRE(PQresultStatus(declaration) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(declaration) == 1);
+  auto panel = nlohmann::json::parse(PQgetvalue(declaration, 0, 0));
+  REQUIRE(panel["id"] == "editor");
+  REQUIRE(panel["rbac_rule"] == "notes.read");
+  REQUIRE(panel["order"] == 10);
+  REQUIRE(panel["future_panel_field"]["retained"] == true);
+  PQclear(declaration);
+  PQfinish(conn);
 }
 
 TEST_CASE("I.02: valid install without panels.json -> ACTIVE, no panels rows",

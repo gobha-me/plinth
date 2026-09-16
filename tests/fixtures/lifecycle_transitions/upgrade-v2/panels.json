@@ -1,5 +1,11 @@
 {
   "panels": [
-    {"id": "editor", "client_path": "editor.js"}
+    {
+      "id": "editor",
+      "client_path": "editor.js",
+      "rbac_rule": "notes.read",
+      "order": 20,
+      "future_panel_field": "upgrade-retained"
+    }
   ]
 }

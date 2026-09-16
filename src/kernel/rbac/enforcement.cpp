@@ -247,16 +247,18 @@ auto RbacFilter::doFilter(const drogon::HttpRequestPtr& req,
   auto session_id = req->attributes()->get<std::string>(auth::ATTR_SESSION_ID);
   auto ip = get_client_ip(req);
 
-  // 3. Query effective rules: union of all rules from all groups the user
-  // belongs to.
+  // 3. Query effective rules: explicit memberships plus the built-in
+  // `everyone` group's virtual membership for every authenticated identity.
   auto db = drogon::app().getDbClient();
   auto shared_fcb = std::make_shared<Callback>(std::move(fcb));
 
   db->execSqlAsync(
       "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
       "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
-      "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
-      "WHERE gm.user_id = $1::uuid",
+      "JOIN plinth.groups g ON g.id = gr.group_id "
+      "LEFT JOIN plinth.group_members gm ON gm.group_id = g.id "
+      "WHERE r.orphaned_at IS NULL "
+      "AND (gm.user_id = $1::uuid OR g.name = 'everyone')",
       [req, shared_fcb, fccb = std::move(fccb), required_rules, db, user_id,
        session_id, ip,
        path_pattern](const drogon::orm::Result& result) mutable {
@@ -270,7 +272,12 @@ auto RbacFilter::doFilter(const drogon::HttpRequestPtr& req,
           effective_list.push_back(std::move(rule));
         }
 
-        // 4. ANY required rule in effective set grants access.
+        // 4. kernel.admin is universal; otherwise any required rule grants.
+        if (effective_set.contains("kernel.admin")) {
+          set_rbac_attributes(req, effective_list, true, "kernel.admin");
+          fccb();
+          return;
+        }
         for (const auto& rule : required_rules) {
           if (effective_set.contains(rule)) {
             set_rbac_attributes(req, effective_list, true, rule);

@@ -232,16 +232,24 @@ TEST_CASE("Granting kernel.admin to everyone unlocks anonymous on gated routes",
   auto routes = plinth::rbac::list_registered_rules();
   REQUIRE_FALSE(routes.empty());
 
-  // Baseline: `everyone` has no rules, anonymous locked out everywhere.
+  constexpr std::string_view applications_changed_rule =
+      "kernel.realtime.subscribe.applications.changed";
+
+  // Baseline: `everyone` has only the launcher catalog invalidation rule.
   {
     auto baseline = everyone_effective_rules(pg);
-    REQUIRE(baseline.empty());
+    REQUIRE(baseline.size() == 1);
+    REQUIRE(baseline[0] == applications_changed_rule);
     auto anon =
         plinth::capabilities::UserContext::anonymous_with_rules(baseline);
     for (const auto& route : routes) {
       INFO("baseline route: method=" << drogon::to_string_view(route.method)
                                      << " path=" << route.path_pattern);
-      CHECK_FALSE(grants_access(anon.effective_rules, route.rules));
+      const bool is_catalog_invalidation =
+          std::ranges::find(route.rules, applications_changed_rule) !=
+          route.rules.end();
+      CHECK(grants_access(anon.effective_rules, route.rules) ==
+            is_catalog_invalidation);
     }
   }
 
@@ -250,8 +258,10 @@ TEST_CASE("Granting kernel.admin to everyone unlocks anonymous on gated routes",
   grant_rule_to_group_by_name(pg, "everyone", "kernel.admin");
   {
     auto unlocked = everyone_effective_rules(pg);
-    REQUIRE(unlocked.size() == 1);
-    REQUIRE(unlocked[0] == "kernel.admin");
+    REQUIRE(unlocked.size() == 2);
+    REQUIRE(std::ranges::find(unlocked, "kernel.admin") != unlocked.end());
+    REQUIRE(std::ranges::find(unlocked, applications_changed_rule) !=
+            unlocked.end());
     auto anon =
         plinth::capabilities::UserContext::anonymous_with_rules(unlocked);
 
@@ -278,11 +288,16 @@ TEST_CASE("Granting kernel.admin to everyone unlocks anonymous on gated routes",
   revoke_rule_from_group_by_name(pg, "everyone", "kernel.admin");
   {
     auto post_revoke = everyone_effective_rules(pg);
-    REQUIRE(post_revoke.empty());
+    REQUIRE(post_revoke.size() == 1);
+    REQUIRE(post_revoke[0] == applications_changed_rule);
     auto anon =
         plinth::capabilities::UserContext::anonymous_with_rules(post_revoke);
     for (const auto& route : routes) {
-      CHECK_FALSE(grants_access(anon.effective_rules, route.rules));
+      const bool is_catalog_invalidation =
+          std::ranges::find(route.rules, applications_changed_rule) !=
+          route.rules.end();
+      CHECK(grants_access(anon.effective_rules, route.rules) ==
+            is_catalog_invalidation);
     }
   }
 }

@@ -139,13 +139,12 @@ TEST_CASE("B.04 create_run_users / destroy_run_users idempotency",
       count(s.conn,
             "SELECT COUNT(*) FROM plinth.users WHERE is_test_user = true") ==
       2);
-  // One synthetic group; both users in `everyone`; one user in the
-  // synthetic group.
+  // One synthetic group and one explicit membership. `everyone` is virtual.
   REQUIRE(count(s.conn, "SELECT COUNT(*) FROM plinth.groups "
                         "WHERE name = '__rbac_test_abc123'") == 1);
   REQUIRE(count(s.conn, "SELECT COUNT(*) FROM plinth.group_members m "
                         "JOIN plinth.groups g ON g.id = m.group_id "
-                        "WHERE g.name = 'everyone'") == 2);
+                        "WHERE g.name = 'everyone'") == 0);
   REQUIRE(count(s.conn, "SELECT COUNT(*) FROM plinth.group_members m "
                         "JOIN plinth.groups g ON g.id = m.group_id "
                         "WHERE g.name = '__rbac_test_abc123'") == 1);

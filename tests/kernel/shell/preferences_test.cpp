@@ -15,7 +15,9 @@
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
+#include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/shell/firstboot.hpp"
 
 #include "../js/async_bridge_fixture.hpp"
@@ -121,14 +123,26 @@ struct PrefScratch {
     cfg.db = db;
     cfg.shell.bundle_path =
         std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled";
+    cfg.packages_data_dir = ctx.data_dir.string();
+    cfg.packages_staging_dir = ctx.staging_dir.string();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    auto resolver = plinth::capabilities::init_resolver(db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
 
     REQUIRE(
         plinth::shell::ensure_bundled_shell_installed(cfg, ctx).has_value());
   }
   ~PrefScratch() {
+    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(base, ec);
     drop_all_ext_schemas(db);
+    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
   PrefScratch(const PrefScratch&) = delete;
   auto operator=(const PrefScratch&) -> PrefScratch& = delete;
@@ -461,29 +475,6 @@ TEST_CASE("P.dispatch.01: bundled-shell preferences round-trip via "
 
   PrefScratch s;
   auto uid = seed_user(s.db, "p_dispatch_01_alice");
-
-  // Wire the runtime registry to the same data dir PrefScratch's
-  // installer used. Without this `init_registry` would scan the
-  // default `./data` and find nothing.
-  s.cfg.packages_data_dir = (s.base / "data").string();
-
-  plinth::capabilities::init_resolver(s.cfg.db);
-  plinth::extensions::init_registry(s.cfg);
-
-  // Per-test scope teardown — sidesteps the 0.6.3.N Bug 2 atexit
-  // failure mode (init_registry paired with `drogon::app().quit()`
-  // from atexit). RAII guard runs even on REQUIRE-fail.
-  struct RegistryGuard {
-    RegistryGuard() = default;
-    ~RegistryGuard() {
-      (void)plinth::extensions::shutdown_registry();
-      plinth::capabilities::clear_resolver_for_test();
-    }
-    RegistryGuard(const RegistryGuard&) = delete;
-    auto operator=(const RegistryGuard&) -> RegistryGuard& = delete;
-    RegistryGuard(RegistryGuard&&) = delete;
-    auto operator=(RegistryGuard&&) -> RegistryGuard& = delete;
-  } guard;
 
   // session_id is UUID-typed in plinth.audit_log — leave empty so
   // the audit insert binds NULL rather than a bogus string. ip_address

@@ -284,7 +284,7 @@ TEST_CASE("Non-admin user has no kernel.admin",
   add_user_to_group(pg, user_id, everyone_id);
 
   auto effective = get_effective_rules(pg, user_id);
-  REQUIRE(effective.empty());
+  REQUIRE(std::ranges::find(effective, "kernel.admin") == effective.end());
 
   auto granting = check_permission(effective, {"kernel.admin"});
   REQUIRE(granting.empty());

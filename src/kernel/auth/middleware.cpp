@@ -18,6 +18,19 @@ auto make_401(const std::string& error_code, const std::string& message)
   json["message"] = message;
   auto resp = drogon::HttpResponse::newHttpJsonResponse(json);
   resp->setStatusCode(drogon::k401Unauthorized);
+  resp->addHeader("Cache-Control", "no-store");
+  resp->addHeader("Vary", "Cookie, Authorization");
+  return resp;
+}
+
+auto make_auth_503() -> drogon::HttpResponsePtr {
+  Json::Value json;
+  json["error"] = "service_unavailable";
+  json["message"] = "Authentication service is temporarily unavailable";
+  auto resp = drogon::HttpResponse::newHttpJsonResponse(json);
+  resp->setStatusCode(drogon::k503ServiceUnavailable);
+  resp->addHeader("Cache-Control", "no-store");
+  resp->addHeader("Vary", "Cookie, Authorization");
   return resp;
 }
 
@@ -89,53 +102,61 @@ auto validate_session_token(const std::string& raw_token,
   auto shared_cb = std::make_shared<TokenValidationCallback>(std::move(cb));
 
   auto db = database ? std::move(database) : drogon::app().getDbClient();
-  db->execSqlAsync(
-      "SELECT s.id, s.user_id, u.username, s.revoked_at, "
-      "       (s.expires_at <= NOW()) AS is_expired "
-      "FROM plinth.sessions s "
-      "JOIN plinth.users u ON u.id = s.user_id "
-      "WHERE s.token_hash = $1 AND u.disabled_at IS NULL",
-      [shared_cb, token_hash](const drogon::orm::Result& result) {
-        if (result.empty()) {
-          (*shared_cb)(
-              {.ok = false, .context = {}, .error_code = "not_authenticated"});
-          return;
-        }
+  try {
+    db->execSqlAsync(
+        "SELECT s.id, s.user_id, u.username, s.revoked_at, "
+        "       (s.expires_at <= NOW()) AS is_expired "
+        "FROM plinth.sessions s "
+        "JOIN plinth.users u ON u.id = s.user_id "
+        "WHERE s.token_hash = $1 AND u.disabled_at IS NULL",
+        [shared_cb, token_hash](const drogon::orm::Result& result) {
+          if (result.empty()) {
+            (*shared_cb)({.ok = false,
+                          .context = {},
+                          .error_code = "not_authenticated"});
+            return;
+          }
 
-        auto row = result[0];
+          auto row = result[0];
 
-        if (!row["revoked_at"].isNull()) {
-          (*shared_cb)(
-              {.ok = false, .context = {}, .error_code = "session_revoked"});
-          return;
-        }
+          if (!row["revoked_at"].isNull()) {
+            (*shared_cb)(
+                {.ok = false, .context = {}, .error_code = "session_revoked"});
+            return;
+          }
 
-        if (row["is_expired"].as<bool>()) {
-          (*shared_cb)(
-              {.ok = false, .context = {}, .error_code = "session_expired"});
-          return;
-        }
+          if (row["is_expired"].as<bool>()) {
+            (*shared_cb)(
+                {.ok = false, .context = {}, .error_code = "session_expired"});
+            return;
+          }
 
-        (*shared_cb)({
-            .ok = true,
-            .context =
-                AuthContext{
-                    .user_id = row["user_id"].as<std::string>(),
-                    .username = row["username"].as<std::string>(),
-                    .auth_type = "session",
-                    .session_id = row["id"].as<std::string>(),
-                    .pat_id = "",
-                    .token_hash = token_hash,
-                },
-            .error_code = "",
-        });
-      },
-      [shared_cb](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("session validation DB error: {}", e.base().what());
-        (*shared_cb)(
-            {.ok = false, .context = {}, .error_code = "not_authenticated"});
-      },
-      token_hash);
+          (*shared_cb)({
+              .ok = true,
+              .context =
+                  AuthContext{
+                      .user_id = row["user_id"].as<std::string>(),
+                      .username = row["username"].as<std::string>(),
+                      .auth_type = "session",
+                      .session_id = row["id"].as<std::string>(),
+                      .pat_id = "",
+                      .token_hash = token_hash,
+                  },
+              .error_code = "",
+          });
+        },
+        [shared_cb](const drogon::orm::DrogonDbException& e) {
+          spdlog::error("session validation DB error: {}", e.base().what());
+          (*shared_cb)({.ok = false,
+                        .context = {},
+                        .error_code = "service_unavailable"});
+        },
+        token_hash);
+  } catch (const std::exception& e) {
+    spdlog::error("session validation submission failed: {}", e.what());
+    (*shared_cb)(
+        {.ok = false, .context = {}, .error_code = "service_unavailable"});
+  }
 }
 
 auto validate_pat_token(const std::string& raw_token,
@@ -153,55 +174,63 @@ auto validate_pat_token(const std::string& raw_token,
   auto shared_cb = std::make_shared<TokenValidationCallback>(std::move(cb));
 
   auto db = database ? std::move(database) : drogon::app().getDbClient();
-  db->execSqlAsync(
-      "SELECT p.id, p.user_id, u.username "
-      "FROM plinth.pats p "
-      "JOIN plinth.users u ON u.id = p.user_id "
-      "WHERE p.token_hash = $1 "
-      "  AND p.revoked_at IS NULL "
-      "  AND (p.expires_at IS NULL OR p.expires_at > NOW()) "
-      "  AND u.disabled_at IS NULL",
-      [shared_cb, token_hash, db](const drogon::orm::Result& result) {
-        if (result.empty()) {
-          (*shared_cb)(
-              {.ok = false, .context = {}, .error_code = "not_authenticated"});
-          return;
-        }
+  try {
+    db->execSqlAsync(
+        "SELECT p.id, p.user_id, u.username "
+        "FROM plinth.pats p "
+        "JOIN plinth.users u ON u.id = p.user_id "
+        "WHERE p.token_hash = $1 "
+        "  AND p.revoked_at IS NULL "
+        "  AND (p.expires_at IS NULL OR p.expires_at > NOW()) "
+        "  AND u.disabled_at IS NULL",
+        [shared_cb, token_hash, db](const drogon::orm::Result& result) {
+          if (result.empty()) {
+            (*shared_cb)({.ok = false,
+                          .context = {},
+                          .error_code = "not_authenticated"});
+            return;
+          }
 
-        auto row = result[0];
-        auto pat_id = row["id"].as<std::string>();
+          auto row = result[0];
+          auto pat_id = row["id"].as<std::string>();
 
-        (*shared_cb)({
-            .ok = true,
-            .context =
-                AuthContext{
-                    .user_id = row["user_id"].as<std::string>(),
-                    .username = row["username"].as<std::string>(),
-                    .auth_type = "pat",
-                    .session_id = "",
-                    .pat_id = pat_id,
-                    .token_hash = token_hash,
-                },
-            .error_code = "",
-        });
+          (*shared_cb)({
+              .ok = true,
+              .context =
+                  AuthContext{
+                      .user_id = row["user_id"].as<std::string>(),
+                      .username = row["username"].as<std::string>(),
+                      .auth_type = "pat",
+                      .session_id = "",
+                      .pat_id = pat_id,
+                      .token_hash = token_hash,
+                  },
+              .error_code = "",
+          });
 
-        // Fire-and-forget last_used_at update
-        db->execSqlAsync(
-            "UPDATE plinth.pats SET last_used_at = NOW() "
-            "WHERE id = $1::uuid",
-            [](const drogon::orm::Result&) {},
-            [pat_id](const drogon::orm::DrogonDbException& e) {
-              spdlog::warn("PAT last_used_at update failed for {}: {}", pat_id,
-                           e.base().what());
-            },
-            pat_id);
-      },
-      [shared_cb](const drogon::orm::DrogonDbException& e) {
-        spdlog::error("PAT validation DB error: {}", e.base().what());
-        (*shared_cb)(
-            {.ok = false, .context = {}, .error_code = "not_authenticated"});
-      },
-      token_hash);
+          // Fire-and-forget last_used_at update
+          db->execSqlAsync(
+              "UPDATE plinth.pats SET last_used_at = NOW() "
+              "WHERE id = $1::uuid",
+              [](const drogon::orm::Result&) {},
+              [pat_id](const drogon::orm::DrogonDbException& e) {
+                spdlog::warn("PAT last_used_at update failed for {}: {}",
+                             pat_id, e.base().what());
+              },
+              pat_id);
+        },
+        [shared_cb](const drogon::orm::DrogonDbException& e) {
+          spdlog::error("PAT validation DB error: {}", e.base().what());
+          (*shared_cb)({.ok = false,
+                        .context = {},
+                        .error_code = "service_unavailable"});
+        },
+        token_hash);
+  } catch (const std::exception& e) {
+    spdlog::error("PAT validation submission failed: {}", e.what());
+    (*shared_cb)(
+        {.ok = false, .context = {}, .error_code = "service_unavailable"});
+  }
 }
 
 auto validate_token(const std::string& raw_token, TokenValidationCallback cb,
@@ -214,9 +243,12 @@ auto validate_token(const std::string& raw_token, TokenValidationCallback cb,
   }
 }
 
-auto SessionFilter::doFilter(const drogon::HttpRequestPtr& req,
+namespace {
+
+auto dispatch_session_filter(const drogon::HttpRequestPtr& req,
                              drogon::FilterCallback&& fcb,
-                             drogon::FilterChainCallback&& fccb) -> void {
+                             drogon::FilterChainCallback&& fccb,
+                             test_seam::TokenValidator validator) -> void {
   auto raw_token = extract_token(req);
   if (!raw_token.has_value()) {
     fcb(make_401("not_authenticated", "No authentication token provided"));
@@ -227,9 +259,13 @@ auto SessionFilter::doFilter(const drogon::HttpRequestPtr& req,
   auto shared_fccb =
       std::make_shared<drogon::FilterChainCallback>(std::move(fccb));
 
-  validate_token(raw_token.value(), [req, shared_fcb, shared_fccb](
-                                        const TokenValidationResult& result) {
+  validator(raw_token.value(), [req, shared_fcb, shared_fccb](
+                                   const TokenValidationResult& result) {
     if (!result.ok) {
+      if (result.error_code == "service_unavailable") {
+        (*shared_fcb)(make_auth_503());
+        return;
+      }
       (*shared_fcb)(
           make_401(result.error_code, error_message(result.error_code)));
       return;
@@ -237,6 +273,26 @@ auto SessionFilter::doFilter(const drogon::HttpRequestPtr& req,
     set_auth_attributes(req, result.context);
     (*shared_fccb)();
   });
+}
+
+} // namespace
+
+auto SessionFilter::doFilter(const drogon::HttpRequestPtr& req,
+                             drogon::FilterCallback&& fcb,
+                             drogon::FilterChainCallback&& fccb) -> void {
+  dispatch_session_filter(
+      req, std::move(fcb), std::move(fccb),
+      [](const std::string& raw_token, TokenValidationCallback cb) {
+        validate_token(raw_token, std::move(cb));
+      });
+}
+
+auto test_seam::dispatch_session_filter(const drogon::HttpRequestPtr& req,
+                                        drogon::FilterCallback&& fcb,
+                                        drogon::FilterChainCallback&& fccb,
+                                        TokenValidator validator) -> void {
+  plinth::auth::dispatch_session_filter(req, std::move(fcb), std::move(fccb),
+                                        std::move(validator));
 }
 
 } // namespace plinth::auth

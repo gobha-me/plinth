@@ -8,8 +8,11 @@
 // install a fixture package as the transition precondition, then
 // drive disable/enable/uninstall directly.
 
+#include "kernel/capabilities/drain.hpp"
+#include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
@@ -96,6 +99,7 @@ std::atomic<std::uint64_t> g_scratch_counter{0};
 
 struct Scratch {
   plinth::Config::Database db;
+  plinth::Config cfg;
   fs::path base;
   plinth::packages::InstallerContext ctx;
   PGconn* conn = nullptr;
@@ -119,6 +123,18 @@ struct Scratch {
     ctx.staging_dir = base / "staging";
     ctx.max_package_size_bytes = 50ULL * 1024ULL * 1024ULL;
 
+    // These direct lifecycle tests do not start the production kernel. Give
+    // the runtime registry a scoped config whose package root matches this
+    // Scratch; otherwise pool creation depends on whether an earlier WS test
+    // happened to initialize the process-global registry.
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    cfg.db = db;
+    cfg.packages_data_dir = ctx.data_dir.string();
+    cfg.packages_staging_dir = ctx.staging_dir.string();
+    auto resolver = plinth::capabilities::init_resolver(db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
+
     conn = PQconnectdb(conninfo_of(db).c_str());
   }
   ~Scratch() {
@@ -128,6 +144,7 @@ struct Scratch {
     // Scrub in-memory asset_server state so subsequent Scratches
     // don't leak routes from a prior install.
     plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
     std::error_code ec;
     fs::remove_all(base, ec);
     drop_all_ext_schemas(db);
@@ -375,6 +392,60 @@ TEST_CASE("D.08: enable with edited manifest returns "
                    "WHERE extension_name='notes'") == "0");
 }
 
+TEST_CASE("D.09: enable fails closed when a registered panel asset is missing",
+          "[lifecycle_transitions][integration][D.09][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+  REQUIRE(plinth::packages::disable_package(rec.id, s.ctx).has_value());
+
+  const auto panel_asset = s.ctx.data_dir / "extensions" / rec.name /
+                           rec.version / "client" / "panels" / "editor.js";
+  REQUIRE(fs::is_regular_file(panel_asset));
+  std::error_code remove_error;
+  REQUIRE(fs::remove(panel_asset, remove_error));
+  REQUIRE_FALSE(remove_error);
+
+  auto enabled = plinth::packages::enable_package(rec.id, s.ctx);
+  REQUIRE_FALSE(enabled.has_value());
+  REQUIRE(enabled.error().report["kind"] == "readiness-verification-failed");
+  REQUIRE(s.scalar("SELECT state FROM plinth.packages WHERE id='" + rec.id +
+                   "'") == "ACTIVE");
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+  REQUIRE(plinth::capabilities::drain::is_fenced(rec.name));
+  plinth::capabilities::drain::end_drain(rec.name);
+}
+
+TEST_CASE("D.10: panel-less package enables successfully and remains hidden",
+          "[lifecycle_transitions][integration][D.10][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto blob = read_fixture_zip("valid-install-no-panels");
+  REQUIRE_FALSE(blob.empty());
+  auto installed = plinth::packages::install_package(
+      blob, plinth::packages::Provenance::USER, s.ctx);
+  REQUIRE(installed.has_value());
+  wait_rbac_test_settled(s, installed->id);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   installed->id + "'") == "false");
+
+  REQUIRE(plinth::packages::disable_package(installed->id, s.ctx).has_value());
+  auto enabled = plinth::packages::enable_package(installed->id, s.ctx);
+  REQUIRE(enabled.has_value());
+  REQUIRE(enabled->state == plinth::packages::InstallStage::ACTIVE);
+  wait_rbac_test_settled(s, installed->id);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   installed->id + "'") == "false");
+}
+
 // ── U.01: uninstall ACTIVE drives full cleanup ───────────────────
 
 TEST_CASE("U.01: uninstall ACTIVE deletes row + rbac + caps + schema + files",
@@ -481,7 +552,8 @@ TEST_CASE("U.05: already-UNINSTALLING row returns already-uninstalling (409)",
   // Manually seed UNINSTALLING state (mid-uninstall crash simulator).
   PGresult* r =
       PQexec(s.conn, ("UPDATE plinth.packages SET state='UNINSTALLING', "
-                      "uninstalling_at = NOW() WHERE id='" +
+                      "application_ready=FALSE, uninstalling_at = NOW() "
+                      "WHERE id='" +
                       rec.id + "'")
                          .c_str());
   REQUIRE(PQresultStatus(r) == PGRES_COMMAND_OK);
@@ -491,6 +563,39 @@ TEST_CASE("U.05: already-UNINSTALLING row returns already-uninstalling (409)",
       plinth::packages::uninstall_package(rec.id, /*confirmed=*/true, s.ctx);
   REQUIRE_FALSE(u.has_value());
   REQUIRE(u.error().report["kind"] == "already-uninstalling");
+}
+
+TEST_CASE("U.05b: cleanup failure leaves launcher withdrawn and ingress fenced",
+          "[lifecycle_transitions][integration][U.05b]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+
+  auto* renamed = PQexec(
+      s.conn, "ALTER TABLE plinth.group_rules RENAME TO group_rules_broken");
+  REQUIRE(PQresultStatus(renamed) == PGRES_COMMAND_OK);
+  PQclear(renamed);
+
+  auto result =
+      plinth::packages::uninstall_package(rec.id, /*confirmed=*/true, s.ctx);
+  REQUIRE_FALSE(result.has_value());
+  REQUIRE(s.scalar("SELECT state FROM plinth.packages WHERE id='" + rec.id +
+                   "'") == "UNINSTALLING");
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+  REQUIRE(plinth::capabilities::drain::is_fenced(rec.name));
+
+  auto* restored = PQexec(
+      s.conn, "ALTER TABLE plinth.group_rules_broken RENAME TO group_rules");
+  REQUIRE(PQresultStatus(restored) == PGRES_COMMAND_OK);
+  PQclear(restored);
+  plinth::capabilities::drain::end_drain(rec.name);
 }
 
 // ── U.06: reconciler recovers UNINSTALLING row with rules still present ──
@@ -507,7 +612,8 @@ TEST_CASE("U.06: reconciler recovers UNINSTALLING crashed pre-Tx-B",
   // committed, Tx B never ran" mid-state.
   PGresult* r =
       PQexec(s.conn, ("UPDATE plinth.packages SET state='UNINSTALLING', "
-                      "uninstalling_at = NOW() WHERE id='" +
+                      "application_ready=FALSE, uninstalling_at = NOW() "
+                      "WHERE id='" +
                       rec.id + "'")
                          .c_str());
   REQUIRE(PQresultStatus(r) == PGRES_COMMAND_OK);
@@ -546,8 +652,8 @@ TEST_CASE("U.07: reconciler recovers UNINSTALLING crashed pre-row-delete",
        "'; " + "DELETE FROM plinth.panels WHERE package_id='" + rec.id + "'; " +
        "DELETE FROM plinth.capabilities WHERE extension_name='" + rec.name +
        "'; " + "DROP SCHEMA IF EXISTS ext_" + rec.name + " CASCADE; " +
-       "UPDATE plinth.packages SET state='UNINSTALLING', uninstalling_at = "
-       "NOW() WHERE id='" +
+       "UPDATE plinth.packages SET state='UNINSTALLING', "
+       "application_ready=FALSE, uninstalling_at = NOW() WHERE id='" +
        rec.id + "'")
           .c_str());
   REQUIRE(PQresultStatus(r) == PGRES_COMMAND_OK);
@@ -618,6 +724,16 @@ TEST_CASE("X.01: upgrade v1.3.0 over ACTIVE v1.2.3 lands ACTIVE + SUPERSEDED",
   REQUIRE(s.scalar("SELECT COUNT(*) FROM plinth.capabilities "
                    "WHERE extension_name='notes' AND function='read'") == "1");
 
+  REQUIRE(s.scalar("SELECT declaration->>'rbac_rule' FROM plinth.panels "
+                   "WHERE package_id='" +
+                   r->id + "' AND panel_id='editor'") == "notes.read");
+  REQUIRE(s.scalar("SELECT declaration->>'order' FROM plinth.panels "
+                   "WHERE package_id='" +
+                   r->id + "' AND panel_id='editor'") == "20");
+  REQUIRE(s.scalar("SELECT declaration->>'future_panel_field' "
+                   "FROM plinth.panels WHERE package_id='" +
+                   r->id + "' AND panel_id='editor'") == "upgrade-retained");
+
   // RBAC reconciliation: notes.comment added, notes.read updated in-place.
   REQUIRE(s.scalar("SELECT COUNT(*) FROM plinth.rbac_rules "
                    "WHERE extension_name='notes' AND rule='notes.comment' "
@@ -625,6 +741,39 @@ TEST_CASE("X.01: upgrade v1.3.0 over ACTIVE v1.2.3 lands ACTIVE + SUPERSEDED",
   REQUIRE(s.scalar("SELECT COUNT(*) FROM plinth.rbac_rules "
                    "WHERE extension_name='notes' AND rule='notes.read' "
                    "  AND orphaned_at IS NULL") == "1");
+}
+
+TEST_CASE("X.01b: startup reconciles committed ACTIVE upgrade pointer",
+          "[lifecycle_transitions][integration][X.01b]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto v1 = install_valid_notes(s);
+  auto v2_blob = read_fixture_zip("upgrade-v2");
+  REQUIRE(!v2_blob.empty());
+  auto v2 = plinth::packages::install_package(
+      v2_blob, plinth::packages::Provenance::USER, s.ctx);
+  REQUIRE(v2.has_value());
+  wait_rbac_test_settled(s, v2->id);
+
+  const auto extension_root = s.ctx.data_dir / "extensions" / "notes";
+  const auto active = extension_root / "active";
+  std::error_code ec;
+  fs::remove(active, ec);
+  REQUIRE_FALSE(ec);
+  fs::create_symlink(v1.version, active, ec);
+  REQUIRE_FALSE(ec);
+  plinth::extensions::destroy_pool("notes");
+  REQUIRE_FALSE(plinth::extensions::has_pool("notes"));
+
+  auto reconciled = plinth::packages::reconcile_in_flight_installs(s.ctx);
+  REQUIRE(reconciled.has_value());
+
+  REQUIRE(fs::read_symlink(active).filename().string() == v2->version);
+  REQUIRE(s.scalar("SELECT state FROM plinth.packages WHERE id='" + v2->id +
+                   "'") == "ACTIVE");
+  REQUIRE(plinth::extensions::has_pool("notes"));
 }
 
 // ── X.02: upgrade rejected when version is the same ──────────────────
@@ -671,6 +820,213 @@ TEST_CASE("X.04: upload against DISABLED name → 409 disabled-version-present",
   // No new row inserted.
   REQUIRE(s.scalar("SELECT COUNT(*) FROM plinth.packages WHERE name='notes'") ==
           "1");
+}
+
+TEST_CASE("X.06: failed post-quiesce upgrade preserves the ingress fence",
+          "[lifecycle_transitions][integration][X.06]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto v1 = install_valid_notes(s);
+  auto broken = read_fixture_zip("upgrade-v2-broken-migration");
+  REQUIRE(!broken.empty());
+
+  auto result = plinth::packages::install_package(
+      broken, plinth::packages::Provenance::USER, s.ctx);
+  REQUIRE_FALSE(result.has_value());
+  REQUIRE(result.error().kind == "upgrade-migration-failed");
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   v1.id + "'") == "false");
+  REQUIRE(plinth::capabilities::drain::is_fenced(v1.name));
+  plinth::capabilities::drain::end_drain(v1.name);
+
+  auto reconciled = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(reconciled.has_value());
+  REQUIRE(*reconciled == 0);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   v1.id + "'") == "false");
+}
+
+TEST_CASE("R.01: startup readiness reconciliation only withdraws generations",
+          "[lifecycle_transitions][integration][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+
+  plinth::packages::asset_server::unregister_routes(rec.name, rec.version);
+  auto changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+
+  const auto client_root =
+      s.ctx.data_dir / "extensions" / rec.name / rec.version / "client";
+  plinth::packages::asset_server::register_routes(rec.name, rec.version,
+                                                  client_root, "fixture");
+  changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+
+  const auto entry_point = s.ctx.data_dir / "extensions" / rec.name /
+                           rec.version / "server" / "main.js";
+  std::ifstream entry_in(entry_point);
+  const std::string entry_source{std::istreambuf_iterator<char>{entry_in}, {}};
+  REQUIRE_FALSE(entry_source.empty());
+  std::error_code remove_error;
+  fs::remove(entry_point, remove_error);
+  REQUIRE_FALSE(remove_error);
+  changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+
+  std::ofstream entry_out(entry_point);
+  entry_out << entry_source;
+  entry_out.close();
+  changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+
+  fs::remove(client_root / "panels" / "editor.js", remove_error);
+  REQUIRE_FALSE(remove_error);
+  changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+}
+
+TEST_CASE("R.02: readiness reconciliation refuses a held package-name lock",
+          "[lifecycle_transitions][integration][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+  auto* locked = PQexec(
+      s.conn,
+      "SELECT pg_advisory_lock(hashtextextended('plinth.packages.notes', 0))");
+  REQUIRE(PQresultStatus(locked) == PGRES_TUPLES_OK);
+  PQclear(locked);
+
+  auto reconciled = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE_FALSE(reconciled.has_value());
+  REQUIRE(reconciled.error().find("advisory-lock-held") != std::string::npos);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+
+  auto* unlocked = PQexec(
+      s.conn,
+      "SELECT pg_advisory_unlock(hashtextextended('plinth.packages.notes', "
+      "0))");
+  REQUIRE(PQresultStatus(unlocked) == PGRES_TUPLES_OK);
+  PQclear(unlocked);
+}
+
+TEST_CASE("R.03: readiness reconciliation withdraws missing capability "
+          "authority and refreshes the resolver cache",
+          "[lifecycle_transitions][integration][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+
+  const auto capability_count = static_cast<std::size_t>(
+      std::stoull(s.scalar("SELECT COUNT(*) FROM plinth.capabilities WHERE "
+                           "extension_name='notes'")));
+  REQUIRE(capability_count > 0);
+  const auto cache_size_before = plinth::capabilities::tier2_cache_size();
+  REQUIRE(cache_size_before >= capability_count);
+
+  auto* deleted = PQexec(
+      s.conn, "DELETE FROM plinth.capabilities WHERE extension_name='notes'");
+  REQUIRE(PQresultStatus(deleted) == PGRES_COMMAND_OK);
+  REQUIRE(std::string_view{PQcmdTuples(deleted)} == "1");
+  PQclear(deleted);
+
+  // This fixture does not run the capability listener, so the resolver holds
+  // the deleted row until reconciliation performs an authoritative reload.
+  REQUIRE(plinth::capabilities::tier2_cache_size() == cache_size_before);
+  auto changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+  REQUIRE(plinth::capabilities::tier2_cache_size() ==
+          cache_size_before - capability_count);
+}
+
+TEST_CASE("R.04: readiness reconciliation rejects stale capability "
+          "signatures",
+          "[lifecycle_transitions][integration][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+
+  auto* tampered = PQexec(
+      s.conn, "UPDATE plinth.capabilities SET signature='notes:99:stale' "
+              "WHERE extension_name='notes'");
+  REQUIRE(PQresultStatus(tampered) == PGRES_COMMAND_OK);
+  REQUIRE(std::string_view{PQcmdTuples(tampered)} == "1");
+  PQclear(tampered);
+
+  auto changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 1);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "false");
+}
+
+TEST_CASE("R.05: readiness reconciliation repairs a stale resolver cache",
+          "[lifecycle_transitions][integration][readiness]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch s;
+  auto rec = install_valid_notes(s);
+  const auto signature = s.scalar(
+      "SELECT signature FROM plinth.capabilities WHERE extension_name='notes'");
+  REQUIRE_FALSE(signature.empty());
+  const auto cache_size_before = plinth::capabilities::tier2_cache_size();
+
+  plinth::capabilities::erase_tier2_entry(signature, "instance");
+  REQUIRE(plinth::capabilities::tier2_cache_size() + 1 == cache_size_before);
+
+  auto changed = plinth::packages::reconcile_application_readiness(s.ctx);
+  REQUIRE(changed.has_value());
+  REQUIRE(*changed == 0);
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   rec.id + "'") == "true");
+  REQUIRE(plinth::capabilities::tier2_cache_size() == cache_size_before);
 }
 
 // ── G.02: garbage_collect deletes eligible SUPERSEDED row + tree ────

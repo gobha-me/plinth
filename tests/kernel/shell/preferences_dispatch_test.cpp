@@ -8,7 +8,9 @@
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
+#include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/shell/firstboot.hpp"
 
 #include "../js/async_bridge_fixture.hpp"
@@ -125,11 +127,14 @@ class ShellDispatchFixture {
     cfg.packages_staging_dir = installer.staging_dir.string();
     cfg.shell.bundle_path =
         std::string{CMAKE_BINARY_DIR} + "/share/plinth/bundled";
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    auto resolver = plinth::capabilities::init_resolver(cfg.db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
     REQUIRE(plinth::shell::ensure_bundled_shell_installed(cfg, installer)
                 .has_value());
 
-    plinth::capabilities::init_resolver(cfg.db);
-    plinth::extensions::init_registry(cfg);
     username = std::string{test_name};
     user_id = add_user(username);
   }
@@ -138,10 +143,13 @@ class ShellDispatchFixture {
     for (const auto& key : successful_set_keys) {
       (void)wait_for_audit(key, 2s);
     }
-    (void)plinth::extensions::shutdown_registry();
+    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
     plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(root, ec);
+    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
 
   ShellDispatchFixture(const ShellDispatchFixture&) = delete;

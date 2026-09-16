@@ -10,7 +10,9 @@
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/db/operations.hpp"
+#include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
+#include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
 
@@ -133,6 +135,7 @@ auto reopen_fixture_workers() -> void {
 
 struct Scratch {
   plinth::Config::Database db;
+  plinth::Config cfg;
   PGconn* conn = nullptr;
   plinth::packages::InstallerContext ctx;
   std::string package_id;
@@ -160,9 +163,19 @@ struct Scratch {
     ctx.data_dir = base / "data";
     ctx.staging_dir = base / "staging";
     ctx.max_package_size_bytes = 50ULL * 1024ULL * 1024ULL;
+
+    static_cast<void>(plinth::extensions::shutdown_registry());
+    cfg.db = db;
+    cfg.packages_data_dir = ctx.data_dir.string();
+    cfg.packages_staging_dir = ctx.staging_dir.string();
+    auto resolver = plinth::capabilities::init_resolver(db);
+    REQUIRE(resolver.has_value());
+    plinth::extensions::init_registry(cfg);
   }
   ~Scratch() {
     drain_fixture_workers();
+    plinth::packages::asset_server::cancel_all_registrations();
+    static_cast<void>(plinth::extensions::shutdown_registry());
     plinth::capabilities::clear_resolver_for_test();
     if (conn != nullptr) {
       PQfinish(conn);
@@ -985,7 +998,7 @@ TEST_CASE(
   REQUIRE(!blob.empty());
   // This synchronous log is after ACTIVE/files/runtime/cache publication but
   // before the installer sends its checked advisory unlock.
-  PausedInstall pending{"tier2 cache resynced:"};
+  PausedInstall pending{"package activation committed:"};
   pending.start(std::move(blob), s.ctx);
   REQUIRE(pending.gate->wait_for_entry());
   REQUIRE(pending.result.wait_for(0ms) == std::future_status::timeout);
@@ -1198,6 +1211,26 @@ TEST_CASE("PB.16 shutdown owns and drains a timed capability worker",
   REQUIRE(plinth::packages::rbac_test::active_async_worker_count_for_test() ==
           0);
   REQUIRE(plinth::packages::rbac_test::start_async_workers());
+}
+
+TEST_CASE("startup defers RBAC workers until readiness releases package locks",
+          "[rbac_test][integration][lifecycle][startup-rbac-handoff]") {
+  if (!pg_available()) {
+    SKIP("PG unavailable");
+  }
+  Scratch s;
+  auto pid = seed_package(s.conn, "notes", "1.0.0");
+  seed_rule(s.conn, "notes.read", "notes", "notes", std::nullopt);
+
+  s.ctx.schedule_rbac_tests = false;
+  REQUIRE(plinth::packages::reconcile_in_flight_installs(s.ctx));
+  REQUIRE(plinth::packages::rbac_test::active_async_worker_count_for_test() ==
+          0);
+
+  auto scheduled = plinth::packages::schedule_pending_rbac_tests(s.ctx);
+  REQUIRE(scheduled.has_value());
+  REQUIRE(*scheduled == 1);
+  REQUIRE(wait_rbac_test(s.conn, pid));
 }
 
 TEST_CASE("PB.07 re-run via CLI clears flag — poisoned deny, fix, re-run",

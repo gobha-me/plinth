@@ -41,15 +41,11 @@ auto make_call_error(const std::string& id, std::string_view code,
   return v;
 }
 
-// Build a UserContext for the resolver from ConnState. ConnState carries
-// is_admin (per ws/auth_flow.cpp) but not the full rules vector; see the
-// RBAC comment in call_dispatch.hpp for why this is the LH-0-scope choice.
+// Build a UserContext from the authority monitor's complete effective snapshot.
 auto to_user_context(const ConnState& state, const std::string& ip)
     -> capabilities::UserContext {
-  std::vector<std::string> rules;
-  if (state.is_admin) {
-    rules.emplace_back("kernel.admin");
-  }
+  std::vector<std::string> rules{state.effective_rules.begin(),
+                                 state.effective_rules.end()};
   return capabilities::UserContext{
       .user_id = state.auth.user_id,
       .username = state.auth.username,

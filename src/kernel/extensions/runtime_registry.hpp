@@ -82,6 +82,10 @@ auto create_pool(std::string_view extension_name) -> bool;
 // finish safely.
 auto destroy_pool(std::string_view extension_name) -> void;
 
+// Read-only admission diagnostic used by startup readiness reconciliation.
+// A server-backed application is not ready until its runtime pool exists.
+[[nodiscard]] auto has_pool(std::string_view extension_name) -> bool;
+
 // Test-visible ownership diagnostic. Returns the number of dispatch leases
 // which shutdown must drain.
 [[nodiscard]] auto inflight_dispatch_count_for_test() -> std::size_t;

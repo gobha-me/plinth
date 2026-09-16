@@ -52,8 +52,10 @@ auto load_effective_rules(const Config::Database& db_cfg,
           conn,
           "SELECT DISTINCT r.rule FROM plinth.rbac_rules r "
           "JOIN plinth.group_rules gr ON gr.rule_id = r.id "
-          "JOIN plinth.group_members gm ON gm.group_id = gr.group_id "
-          "WHERE gm.user_id = $1::uuid",
+          "JOIN plinth.groups g ON g.id = gr.group_id "
+          "LEFT JOIN plinth.group_members gm ON gm.group_id = g.id "
+          "WHERE r.orphaned_at IS NULL "
+          "AND (gm.user_id = $1::uuid OR g.name = 'everyone')",
           1, nullptr, params.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {

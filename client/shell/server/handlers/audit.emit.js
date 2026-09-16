@@ -5,7 +5,8 @@
 //
 // Browser-side panel code calls
 //   plinth.call("shell.audit.emit",
-//               { panel_id, error_message, error_stack?, component_path? })
+//               { application_id, panel_id, error_message,
+//                 error_stack?, component_path? })
 // and the kernel writes a single audit row pinned to the literal action
 // `ext.shell.frontend.boundary.caught`. The action name comes from this
 // handler — never from the caller's `detail` — so panels cannot forge
@@ -55,6 +56,8 @@ const ACTION = 'ext.shell.frontend.boundary.caught';
 const MESSAGE_LIMIT   = 1024;
 const STACK_LIMIT     = 8192;
 const COMPONENT_LIMIT = 8192;
+const APPLICATION_LIMIT = 64;
+const PANEL_LIMIT = 64;
 
 // Reserved payload keys per audit_bindings.cpp:52-54 (RESERVED_PAYLOAD_KEYS).
 // Stripping them ensures the client cannot smuggle them past the binding
@@ -75,9 +78,13 @@ export default async function audit_emit(detail, _ctx) {
                 message: 'detail must be an object' };
     }
     const sanitized = {};
+    sanitized.application_id =
+        (typeof detail.application_id === 'string')
+            ? trim(detail.application_id, APPLICATION_LIMIT)
+            : null;
     sanitized.panel_id =
-        (typeof detail.panel_id === 'string' || detail.panel_id === null)
-            ? detail.panel_id
+        (typeof detail.panel_id === 'string')
+            ? trim(detail.panel_id, PANEL_LIMIT)
             : null;
     if (typeof detail.error_message !== 'string'
             || detail.error_message.length === 0) {

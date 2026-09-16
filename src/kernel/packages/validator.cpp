@@ -712,17 +712,14 @@ auto run_panel_files(const fs::path& root, const ParsedPackage& parsed,
   }
   for (const auto& pe : parsed.panels->panels) {
     auto under_panels = root / "client" / "panels" / pe.client_path;
-    auto under_components = root / "client" / "components" / pe.client_path;
-    if (fs::exists(under_panels) || fs::exists(under_components)) {
+    if (fs::exists(under_panels)) {
       continue;
     }
-    r.error(
-        "panel-missing",
-        "panels.json references '" + pe.client_path +
-            "' but neither client/panels/" + pe.client_path +
-            " nor client/components/" + pe.client_path + " exists",
-        "client/panels/" + pe.client_path,
-        "create the missing file under client/panels/ or client/components/");
+    r.error("panel-missing",
+            "panels.json references '" + pe.client_path +
+                "' but client/panels/" + pe.client_path + " does not exist",
+            "client/panels/" + pe.client_path,
+            "create the missing file under client/panels/");
   }
 }
 

@@ -38,6 +38,7 @@
 #include "kernel/capabilities/types.hpp"
 #include "kernel/config.hpp"
 
+#include <cstdint>
 #include <drogon/utils/coroutine.h>
 #include <expected>
 #include <functional>
@@ -134,11 +135,19 @@ using CapabilityHandler = std::function<HandlerOutcome(
 
 // ── Public API ───────────────────────────────────────────────────────
 
+enum class Tier2ReloadError : std::uint8_t {
+  DATABASE_UNAVAILABLE,
+  QUERY_FAILED,
+};
+
+using Tier2ReloadResult = std::expected<std::size_t, Tier2ReloadError>;
+
 // One-shot startup wiring (idempotent within a process): registers the
 // kernel Tier 1 stub handlers and loads every enabled row from
 // plinth.capabilities into the Tier 2 cache via sync libpq. Called from
-// main.cpp after bootstrap_kernel_capabilities and before app().run().
-auto init_resolver(const Config::Database& db_cfg) -> void;
+// main.cpp after bootstrap_kernel_capabilities and before app().run(). Startup
+// must abort when the authoritative Tier 2 snapshot cannot be loaded.
+auto init_resolver(const Config::Database& db_cfg) -> Tier2ReloadResult;
 
 // The dispatch entry point (ICD-0.2.2 §Resolution Algorithm). Pure
 // function of (call, ctx, resolver state): no DB access on the hot path.
@@ -173,9 +182,11 @@ auto call_capability_async(const CapabilityCall& call, const UserContext& ctx,
                            std::string* ext_detail_message_out = nullptr)
     -> drogon::Task<ResolveResult>;
 
-// Full Tier 2 cache resync from plinth.capabilities. Takes the
-// resolver write lock, clears tier2_cache, and reloads all canonical rows,
-// including their enabled state. Returns the number of rows loaded.
+// Full Tier 2 cache resync from plinth.capabilities. Builds a complete
+// replacement while holding the resolver write lock and swaps it into service
+// only after the authoritative SELECT succeeds. On failure, the old snapshot
+// remains intact and the error result lets lifecycle callers keep admission
+// fenced. A successful empty result is therefore distinct from failure.
 //
 // Cache-invalidation policy (0.2.4): LISTEN/NOTIFY is the primary
 // channel, but a NOTIFY delivered during a reconnect backoff window
@@ -183,7 +194,7 @@ auto call_capability_async(const CapabilityCall& call, const UserContext& ctx,
 // LISTEN open so missed-NOTIFY recovery is bounded by reconnect
 // backoff (≤ 1 s) plus one SELECT, not by process lifetime. Tier 1
 // handlers are untouched.
-auto reload_tier2_cache(const Config::Database& db_cfg) -> std::size_t;
+auto reload_tier2_cache(const Config::Database& db_cfg) -> Tier2ReloadResult;
 
 // ── Test / bootstrap helpers ─────────────────────────────────────────
 //

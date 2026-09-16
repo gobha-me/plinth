@@ -196,7 +196,7 @@ auto cf2_rbac_test_call(const ParsedPackage& pkg, Reporter& r) -> void {
   }
 }
 
-// ─── CF3 — panel client_path resolves under client/{panels,components}/ ──
+// ─── CF3 — panel client_path resolves under client/panels/ ─────────
 
 auto cf3_panel_client_files(const ParsedPackage& pkg,
                             const fs::path& package_root, Reporter& r) -> void {
@@ -211,22 +211,45 @@ auto cf3_panel_client_files(const ParsedPackage& pkg,
   for (std::size_t i = 0; i < pkg.panels->panels.size(); ++i) {
     const auto& pe = pkg.panels->panels[i];
     auto under_panels = package_root / "client" / "panels" / pe.client_path;
-    auto under_components =
-        package_root / "client" / "components" / pe.client_path;
     bool ok_panels = fs::is_regular_file(under_panels, ec) &&
                      path_within_root(root_real, under_panels);
-    bool ok_components = fs::is_regular_file(under_components, ec) &&
-                         path_within_root(root_real, under_components);
-    if (ok_panels || ok_components) {
+    if (ok_panels) {
       continue;
     }
     r.error("panel-missing-client-file",
             "panels[" + std::to_string(i) + "].client_path '" + pe.client_path +
-                "' resolves to neither client/panels/" + pe.client_path +
-                " nor client/components/" + pe.client_path,
+                "' does not resolve beneath client/panels/" + pe.client_path,
+            "panels.json", "create the missing file under client/panels/",
+            Phase::CROSS_FILE);
+  }
+}
+
+// ─── CF3b — panel RBAC rule is declared by this package ─────────
+
+auto cf3_panel_rbac_rules(const ParsedPackage& pkg, Reporter& r) -> void {
+  if (!pkg.panels) {
+    return;
+  }
+  std::set<std::string> declared;
+  if (pkg.rbac_raw && pkg.rbac_raw->is_object() &&
+      pkg.rbac_raw->contains("rules") && (*pkg.rbac_raw)["rules"].is_array()) {
+    for (const auto& rule : (*pkg.rbac_raw)["rules"]) {
+      if (rule.is_object() && rule.contains("rule") &&
+          rule["rule"].is_string()) {
+        declared.insert(rule["rule"].get<std::string>());
+      }
+    }
+  }
+  for (std::size_t i = 0; i < pkg.panels->panels.size(); ++i) {
+    const auto& pe = pkg.panels->panels[i];
+    if (declared.contains(pe.rbac_rule)) {
+      continue;
+    }
+    r.error("panel-rbac-rule-unknown",
+            "panels[" + std::to_string(i) + "].rbac_rule '" + pe.rbac_rule +
+                "' is not declared by this package's rbac.json",
             "panels.json",
-            "create the missing file under client/panels/ or "
-            "client/components/",
+            "declare the exact rule in rbac.json or correct rbac_rule",
             Phase::CROSS_FILE);
   }
 }
@@ -396,6 +419,12 @@ auto cfw3_entry_imports_client(const ParsedPackage& pkg,
   auto ep = package_root / pkg.manifest->entry_point;
   std::error_code ec;
   if (!fs::is_regular_file(ep, ec)) {
+    r.error("entry-point-missing",
+            "entry_point '" + pkg.manifest->entry_point +
+                "' is not a regular file",
+            pkg.manifest->entry_point,
+            "include the declared server entry point as a regular file",
+            Phase::CROSS_FILE);
     return;
   }
   auto bytes = read_file_bytes(ep);
@@ -486,6 +515,7 @@ auto run_cross_file_validation(const ParsedPackage& pkg,
   cf1_rbac_orphan_namespace(pkg, r);
   cf2_rbac_test_call(pkg, r);
   cf3_panel_client_files(pkg, package_root, r);
+  cf3_panel_rbac_rules(pkg, r);
   cf4_handler_files(pkg, package_root, r);
   cf5_frontend_mount_reserved(pkg, r);
   cf6_name_reserved(pkg, r);
