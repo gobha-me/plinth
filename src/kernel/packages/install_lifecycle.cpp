@@ -3277,9 +3277,10 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
       }
       auto cleanup = run_uninstall_cleanup(pg.conn, *lp_r, ctx);
       if (!cleanup.has_value()) {
-        return std::unexpected("reconcile UNINSTALLING cleanup failed for " +
-                               name + " " + version + ": " +
-                               cleanup.error().message);
+        std::string message{"reconcile UNINSTALLING cleanup failed for "};
+        message.append(name).append(" ").append(version).append(": ").append(
+            cleanup.error().message);
+        return std::unexpected(std::move(message));
       }
       Json::Value detail(Json::objectValue);
       detail["id"] = lp_r->id;
@@ -3292,8 +3293,13 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
                    id, name);
       continue;
     }
-    return std::unexpected("reconcile encountered unexpected state '" + state +
-                           "' for id=" + id + " name=" + name);
+    std::string message{"reconcile encountered unexpected state '"};
+    message.append(state)
+        .append("' for id=")
+        .append(id)
+        .append(" name=")
+        .append(name);
+    return std::unexpected(std::move(message));
   }
 
   // Recovery mutations are complete. Release every name lock before launching
