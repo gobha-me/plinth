@@ -73,7 +73,8 @@ OID-driven PG-type → JS-type mapping (PG-Value → JS-Value). Paired
 paper ICD authoring slot `0.5.2.N` precedes this code work per
 METHODOLOGY §3.1 forward-ICD-presence rule and `feedback_icd_horizon.md`.
 
-**Status:** Ready for implementation
+**Status:** Historical implementation contract; shipped, with current-state
+corrections below
 
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)
 
@@ -137,6 +138,20 @@ verbatim); [docs/icd/ICD-0.5.2-ws-broker.md](ICD-0.5.2-ws-broker.md)
 window-flush envelopes; no broker change required by 0.5.3).
 
 ---
+
+## Current implementation note (reconciled 2026-09-16)
+
+This ICD records the design at delivery time. Current extension SQL authority
+comes from a restricted per-extension login plus the transient guard described
+in [architecture/extension-database-isolation.md](../architecture/extension-database-isolation.md),
+not from `search_path` alone. The runtime holds a shared Drogon `Transaction`,
+releases the final owner into a commit-callback awaiter, and calls
+`Transaction::rollback()` explicitly on rollback; it does not send the
+explicit `COMMIT` sequence shown later in this historical document. Batch and
+runtime teardown are owned by the bounded coordinator in
+[architecture/shutdown.md](../architecture/shutdown.md), not `atexit` or a
+hand-copied test-fixture chain. PostgreSQL SQLSTATE loss through Drogon batch
+abort remains separately tracked by [#92](https://github.com/gobha-me/plinth/issues/92).
 
 ## Overview
 

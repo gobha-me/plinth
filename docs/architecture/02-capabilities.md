@@ -9,9 +9,8 @@ lifecycle, batching semantics, and the kernel standard library surface
 - `architecture/01-identity.md §2` (every capability call passes through
   RBAC enforcement using the additive union model).
 - `DESIGN-rbac-philosophy.md`.
-- `DESIGN-capability-registry.md` (permanent authority on resolution,
-  scoping, caching, and RBAC integration — this doc is the kernel-level
-  architectural summary; the design doc is the mechanism).
+- `DESIGN-capability-registry.md` (historical 0.2.x rationale; this document
+  owns the current resolution, scoping, caching, and RBAC contract).
 - `DESIGN-quickjs-bridge.md` (the transport between JS `cap.call()` and
   kernel C++ dispatch).
 - `DESIGN-logging-subsystem.md` (audit path for denials).
@@ -33,8 +32,8 @@ The kernel maintains a registry of all registered capabilities and
 resolves calls at runtime. Every capability call passes through RBAC
 enforcement (see `ICD-0.1.5-rbac-enforcement.md`).
 
-See `DESIGN-capability-registry.md` for the permanent authority on
-resolution, scoping, caching, and RBAC integration.
+See `DESIGN-capability-registry.md` for the historical 0.2.x rationale and its
+current-state correction.
 
 ### 1.1 Contract Format
 
@@ -54,10 +53,10 @@ fs:1:read(path: string) -> string
 llm:1:complete(prompt: string, model: string) -> response
 kernel:1:db.query(sql: string) -> rows
 kernel:1:db.exec(sql: string) -> result
-kernel:1:storage.put(key: string, data: buffer) -> boolean
-kernel:1:storage.get(key: string) -> buffer
-kernel:1:users.list() -> { user_ids: UUID[] }
 ```
+
+These are identifier-shape examples, not availability promises. Planned
+storage and user-list surfaces are classified in §2.
 
 The version is an integer. It increments when the signature changes in
 a breaking way (different params, different return type, different
@@ -99,10 +98,10 @@ compatibility.
 
 Every capability call resolves through three tiers, tried in order.
 
-**Tier 1 — In-process (zero overhead).**
-Capabilities provided by the kernel itself or by the same extension
-resolve to a direct function pointer. No registry lookup. No PG hit.
-Most `kernel:1:*` calls land here.
+**Tier 1 — In-process.** Kernel handlers resolve to an in-process function.
+Extension-provided handlers, including same-extension calls, are registered in
+Tier 2 and dispatch asynchronously through `RuntimeRegistry`; the synchronous
+path rejects them with `cap.async_required`.
 
 **Tier 2 — Local-node (in-memory registry).**
 Capabilities provided by other extensions running on this node resolve
@@ -130,10 +129,11 @@ PostgreSQL channels do not have producer ACLs.
   window. Coalesce all invalidation events in the window. Rebuild
   cache once.
 
-**Tier 3 — Remote-proxy (cross-node).**
-Capabilities only reachable via another node (sidecars on a different
-node, or extensions hot-moved to another replica). PG lookup for
-sidecar location + HTTP proxy to the correct node. This path has:
+**Tier 3 — Remote-proxy (planned).** The current resolver returns
+`TIER3_NOT_AVAILABLE`. [Issue #66](https://github.com/gobha-me/plinth/issues/66)
+owns remote capability dispatch; [#67](https://github.com/gobha-me/plinth/issues/67)
+and [#73](https://github.com/gobha-me/plinth/issues/73) own containment and
+cross-node routing. The target path has:
 
 - **Latency budget.** Configurable timeout, default 500ms.
 - **Circuit breaker.** If a remote node fails N times in M seconds, the
@@ -153,20 +153,21 @@ const results = await cap.batch([
 ]);
 ```
 
-Batches are dispatched as a single unit. Calls to the same tier are
-parallelized. Calls to the same remote node are multiplexed over a
-single connection.
+The QuickJS binding validates the batch and composes ordinary `cap.call`
+promises with `Promise.all`; it is not an atomic dispatch unit. The C++ batch
+helper is sequential. Remote grouping and multiplexing are future Tier 3
+design inputs, not current behavior.
 
 ### 1.5 Failure Modes
 
 | Scenario | Behavior |
 |----------|----------|
-| Capability not registered | Error: "capability `X` not found" with suggestions if similar names exist |
-| Target node down | Circuit breaker trips after N failures. Error: "capability unavailable, provider node unreachable" |
-| Sidecar disconnected | Registry updated via `LISTEN/NOTIFY`. Subsequent calls get "capability unavailable" |
-| RBAC denied | Error: "permission denied for `X`" with the rule name that would grant access |
-| Handler throws exception | Error propagated to caller with exception message. Audit logged. |
-| Timeout exceeded | Error: "capability call timed out after Nms" |
+| Capability not registered | `cap.not_found` with the requested signature |
+| Target node down | Planned Tier 3 behavior; current builds return `TIER3_NOT_AVAILABLE`. |
+| Sidecar disconnected | Planned sidecar behavior; no current sidecar transport exists. |
+| RBAC denied | `cap.permission_denied` with the requested signature; the server-side audit records the required rule |
+| Handler load/evaluation fails | `cap.handler_load_failed` or `cap.handler_threw`; the bounded message carries an error-kind tag |
+| Wall-clock limit exceeded | `cap.handler_threw` with a `wall_clock_exceeded` kind tag |
 
 ### 1.6 Resolution Path
 
@@ -174,7 +175,8 @@ When extension code calls `cap.call("terminal:1:shell", "ls")`:
 
 1. Kernel parses the capability identifier: `namespace=terminal`,
    `version=1`, `function=shell`.
-2. Checks Tier 1 (in-process) → Tier 2 (local cache) → Tier 3 (remote).
+2. Checks Tier 1 (kernel) → Tier 2 (local provider cache). A Tier 3
+   candidate currently fails closed as unavailable.
 3. Checks RBAC: does the calling user's group set include a rule
    that grants `terminal.shell.execute`? (NOT version-aware.)
 4. If authorized, dispatches to the resolved handler.
@@ -187,13 +189,10 @@ Simple, predictable, debuggable.
 
 - Provider registers v1.
 - Provider adds v2 (both v1 and v2 are active).
-- Kernel can report: "package X requires `terminal:1:shell` —
-  `terminal:2:shell` is also available" (upgrade guidance).
-- Provider drops v1 → all v1 callers get a clear error:
-  "capability `terminal:1:shell` no longer available,
-  `terminal:2:shell` exists".
-- The removal of a version is an admin-visible event (audit log +
-  notification if any installed packages still require it).
+- Provider drops v1 → exact v1 calls return `cap.not_found` with the requested
+  signature. The current resolver does not suggest alternative versions.
+- Package lifecycle audit records the provider transition. Dependency-aware
+  upgrade guidance and admin notifications are not current behavior.
 
 ### 1.8 Tool Discovery (Thought Experiment — NOT v1)
 
@@ -207,26 +206,27 @@ block it.
 
 - **Instance scope.** Capability is available to all users on this
   instance. Registered once. Example: `fs:1:read`, `terminal:1:shell`.
-- **User scope.** Capability is per-user. Each user may have their own
-  provider. Example: `llm:1:complete` (user's own API key).
+- **User scope (conditional, not implemented).** Registration currently rejects
+  this scope with `USER_SCOPE_NOT_SUPPORTED`. No delivery is scheduled; a
+  concrete consumer must first produce a bounded issue and authority design.
 
 ### 1.10 Conflict Resolution
 
 - **Same namespace + version + function, same scope:** rejected. Second
   registration fails with a conflict error. Admin must resolve.
-- **Same namespace + version + function, different scope:** allowed.
-  User-scope overrides instance-scope for that user (personal
-  provider).
+- **Same namespace + version + function, different scope:** reserved for the
+  conditional user-scope design; not accepted by current registration.
 - **Same namespace, different version, same function:** allowed. This
   is how backward compatibility works.
 
-### 1.11 HA Considerations
+### 1.11 HA Considerations (planned)
 
 - Capability registry stored in PG (`plinth.capabilities` table,
   defined in `DESIGN-capability-registry.md §Data Model`).
 - All nodes see the same registry via Tier 2 cache +
   `LISTEN/NOTIFY` invalidation.
-- Cross-node dispatch via Tier 3 proxy with circuit breaker.
+- Cross-node dispatch via Tier 3 proxy with circuit breaker is owned by #66,
+  #67, #73, and #74.
 
 ### 1.12 Composition Hooks (reserved)
 
@@ -262,10 +262,10 @@ not counted by the guard but are naturally serialized via the
 `state_mutex` shared lock that the resolution path holds, so REGISTERING's
 unique lock acquisition still waits on them.
 
-The drain primitive is the per-extension-name analog of the kernel-wide
-`g_shutdown_pending` gate (see `architecture/04-services-ha.md §1`):
-both bracket dispatch with a decrement-after-completion contract,
-both are designed to be free on the hot path. Future Tier 3 sidecar
+The drain primitive is specific to extension-name upgrade admission. Process
+shutdown uses the separate coordinator and async-task registry described in
+`architecture/shutdown.md`; there is no kernel-wide `g_shutdown_pending`
+dispatch counter. Future Tier 3 sidecar
 dispatch and any future asynchronous wrapper that lands as the
 caller for `call_capability_async` must compose with the drain by
 incrementing through the same `DispatchGuard`. Uninstall
@@ -281,58 +281,49 @@ through the guard for any extension-scoped capability invocation.
 
 ## 2. Kernel Standard Library (QuickJS APIs)
 
-The kernel injects these APIs into every QuickJS extension runtime.
-This is the complete surface area available to extension code. All
-`audit.log()` and `log.*` calls route through the spdlog subsystem
-defined in `DESIGN-logging-subsystem.md`.
+The status column distinguishes the shipped QuickJS surface from planned
+contracts. All `audit.log()` and `log.*` calls route through the spdlog
+subsystem defined in `DESIGN-logging-subsystem.md`.
 
 ### 2.1 Always Available (no permission required)
 
-| API | Purpose |
-|-----|---------|
-| `db.query(sql)` | Query extension's own tables (search_path enforced) |
-| `db.exec(sql, opts?)` | Write to extension's own tables. `opts.silent` suppresses events. |
-| `db.batch(fn)` | Execute multiple writes, emit single coalesced event |
-| `log.info(msg)`, `.warn()`, `.error()`, `.debug()` | Write to kernel log, tagged with extension + timestamp |
-| `audit.log(action, detail)` | Append to `plinth.audit_log` |
-| `cap.call(capability, ...args)` | Call a registered capability (RBAC-gated per-capability) |
-| `cap.batch(calls[])` | Batched capability calls, parallelized per-tier |
-| `pubsub.publish(channel, payload)` | Publish to extension's own channels |
-| `pubsub.subscribe(channel, callback)` | Subscribe to own channels |
-| `notify.send(userId, notification)` | In-app notification to a user |
-| `storage.get(key)`, `.put()`, `.delete()`, `.list()` | File/blob storage within extension's prefix |
-| `metrics.gauge(name, value)`, `.counter(name)` | Register and update metrics |
-| `config.get(key)` | Read extension's own config values |
-| `crypto.hash(algo, data)`, `.hmac(algo, key, data)` | Basic crypto primitives |
+| API | Status | Purpose / owner |
+|-----|--------|-----------------|
+| `db.query(sql)`, `db.exec(sql, opts?)`, `db.batch(fn)` | Shipped | Restricted-login extension database access; see `extension-database-isolation.md`. |
+| `log.info(msg)`, `.warn()`, `.error()`, `.debug()` | Shipped | Write to the kernel log with extension attribution. |
+| `audit.log(action, detail)` | Shipped | Append through the bounded audit path. |
+| `cap.call(capability, ...args)`, `cap.batch(calls[])` | Shipped | RBAC-gated dispatch; batch is `Promise.all` composition, not atomic. |
+| `pubsub.publish(channel, payload)`, `pubsub.subscribe(channel, callback)` | Shipped | Protected realtime publication and subscription. |
+| `config.get(key)` | Shipped | Read extension-scoped configuration. |
+| `crypto.hash`, `crypto.randomBytes`, `crypto.timingSafeEqual` | Shipped | Current bounded crypto primitives. |
+| `notify.send(userId, notification)` | Planned | [#81](https://github.com/gobha-me/plinth/issues/81). |
+| `storage.get`, `.put`, `.delete`, `.list` | Planned | [#78](https://github.com/gobha-me/plinth/issues/78), [#79](https://github.com/gobha-me/plinth/issues/79). |
+| `metrics.*` | Planned | [#61](https://github.com/gobha-me/plinth/issues/61). |
+
+`crypto.hmac` is not shipped or scheduled. It is not part of the supported
+surface unless a concrete consumer produces a reviewed issue.
 
 ### 2.2 Permission-Gated (requires RBAC rule)
 
 | API | Required rule | Purpose |
 |-----|---------------|---------|
-| `http.get(url)`, `.post()`, etc. | `kernel.http.outbound` | External HTTP. Admin URL allowlist. |
+| `http.get(url)`, `.post()`, etc. | `kernel.http.outbound` | Planned by [#82](https://github.com/gobha-me/plinth/issues/82); external HTTP with an admin allowlist. |
 | `pubsub.subscribe(channel, handler) → Promise<() => void>` | per-channel rule (cross-extension only) | Subscribe a handler to a channel; resolves to an unsubscribe function. Own-extension channels skip the RBAC gate. Cross-extension subscription requires the per-channel rule. Contract pinned in [ICD-0.5.2 §`pubsub.subscribe`](../icd/ICD-0.5.2-ws-broker.md). |
-| `storage.get(other_prefix)` | per-extension rule | Cross-extension storage access |
+| `storage.get(other_prefix)` | per-extension rule | Planned with the storage contract; cross-extension access is not current behavior. |
 
-**Pattern:** read-your-own-data is free. Cross-extension access is
-RBAC-gated. External I/O is RBAC-gated. Logging and metrics are always
-available.
+**Pattern:** read-your-own-data is free. Cross-extension access and external
+I/O are RBAC-gated when their owning issue lands. Logging is always available.
 
 ### 2.3 Kernel-Provided Capabilities (summary)
 
-The kernel provides a set of capabilities callable via `cap.call()`.
-These are `namespace=kernel` and available Tier 1. Non-exhaustive:
-
-- `kernel:1:db.query`, `kernel:1:db.exec` — same as the injected
-  `db.*` API, exposed also as capabilities for uniformity.
-- `kernel:1:storage.put`, `kernel:1:storage.get`, `kernel:1:storage.delete`,
-  `kernel:1:storage.list` — same relationship with `storage.*`.
-- `kernel:1:users.list` — see `architecture/01-identity.md §4.2`.
-- `kernel:1:pubsub.publish`, `kernel:1:pubsub.subscribe` — pub/sub
-  wrappers for cases where extensions need capability-style dispatch
-  rather than the injected API.
-
-The authoritative list is defined in the kernel's `capabilities.json`
-seed at bootstrap.
+The bootstrap currently reserves DB, log, audit, and config capability rows,
+but their Tier 1 handlers fail with `not_implemented`; extensions use the
+shipped injected APIs above. There is no authoritative kernel
+`capabilities.json` seed. A capability becomes public only when its owning issue
+defines implementation, RBAC, lifecycle, and tests. In particular,
+`kernel:1:users.list` is planned by
+[#97](https://github.com/gobha-me/plinth/issues/97), while storage and
+capability-style pub/sub wrappers are not current surfaces.
 
 ---
 
@@ -343,7 +334,7 @@ own design document: `DESIGN-quickjs-bridge.md`. This is a Scale 3
 (Architecture Arc) item per the methodology.
 
 The bridge connects QuickJS (single-threaded JS interpreter) to Drogon
-(multi-threaded async C++ framework) using C++20 coroutines. Each
+(multi-threaded async C++ framework) using C++23 coroutines. Each
 extension execution is a Drogon coroutine. The bridge translates JS
 `await` into Drogon `co_await`, yielding the thread back to the event
 loop so other requests proceed while JS awaits. Extension-provider
@@ -371,17 +362,16 @@ per §1.13-adjacent call-depth enforcement). Tier 1 kernel stubs and
 sidecar stubs continue to resolve through both sync and async paths;
 only extension-provider entries are async-required.
 
-**Per-extension `RuntimePool` ownership.** A process-lifetime
-`plinth::extensions::RuntimeRegistry` owns one `plinth::js::RuntimePool`
-per installed-and-ACTIVE extension. Install-lifecycle transitions
-create/destroy pools at `create_pool` (INSTALL, ENABLE, UPGRADE-T4)
-and `destroy_pool` (DISABLE, UPGRADE-cutover-prep, UNINSTALL) call
-sites. A dispatch acquires a fresh `BridgeContext` from the target
-extension's pool; the callee's `bc.extension_name` is pool-populated
-(the `pubsub.publish` identity gate matches on this), the callee's
-`bc.user` is a value-copy of the caller's (audit + nested `cap.call`
-/ `db.query` attribution runs under the caller). Per-call failures
-tear down the `BridgeContext` but the pool persists.
+**Per-extension `RuntimePool` ownership.** `RuntimeRegistry` owns one shared
+pool per installed-and-ACTIVE extension. Dispatches hold shared leases; pool
+replacement/removal and last-lease retirement are claimed under the registry
+mutex, then bounded shutdown runs outside it. Failed closes retain durable
+owners for coordinator retry, and shutdown waits for both dispatches and
+retirements. A dispatch acquires a fresh `BridgeContext`; the callee extension
+identity comes from the pool and user authority is copied from the caller.
+Database clients follow the explicit private-loop ownership graph in
+`architecture/shutdown.md`. Per-call failure releases the context lease but
+does not bypass pool retirement.
 
 **Extension-specific `cap.*` rejection codes** introduced alongside
 this surface:
@@ -401,9 +391,10 @@ JSON-serializable value or a Promise of one. The convention was
 observable in 0.4.x fixtures; ICD-0.5.0.3 promotes it to normative
 contract.
 
-See `docs/icd/ICD-0.5.0.3-extension-dispatch.md` for the full contract
-(sync-vs-async framing, RuntimeRegistry lifecycle, handler-invocation
-wrapper, error-taxonomy mapping, eight security constraints).
+`docs/icd/ICD-0.5.0.3-extension-dispatch.md` records the original dispatch
+contract. Its raw lookup, unique-owner, and `atexit` lifecycle text is
+superseded by the shared-lease coordinator contract above and
+`architecture/shutdown.md`.
 
 ---
 
@@ -434,10 +425,10 @@ called from `src/kernel/ws/call_dispatch.cpp::on_call` **before**
 Tier 1 / Tier 2 / Tier 3 resolution chain. Drives `run_on_context` on
 a process-lifetime `RuntimePool` with `default_runtime_limits()`
 (16 MiB mem, 100 ms CPU, 30 s wall-clock, 8 concurrent async ops).
-Admin-only via synthesised RBAC at the dispatch site. Pool init in
-`src/kernel/main.cpp` after `init_resolver`; pool teardown from the
-existing atexit lambda before `drogon::app().quit()` (pool teardown
-pumps pending JS jobs and needs the Drogon loop alive).
+Admin-only via synthesised RBAC at the dispatch site. Pool init occurs after
+`init_resolver`. The shared shutdown coordinator closes diagnostic admission,
+drains its owned leases, and retires the pool before Drogon event loops stop;
+`atexit` is not a lifecycle owner. See `architecture/shutdown.md`.
 
 **Why these are not blueprints.** Both surfaces exist to exercise
 specific paths under load that production extensions reach via
@@ -460,11 +451,11 @@ reproductions of `free_zero_refcount` / `list_empty(&rt->gc_obj_list)` /
 `bad_weak_ptr`) closed the hypothesis-vs-empirical-finding question
 on the WS-teardown bandaid family — see `DEFERRED.md` WS-teardown
 entry and `RE-EVAL-0.4.x-arc-closeout.md §2.4 + §5.1` for the
-narrative. Future LH-* milestones (LH-1 LISTEN/NOTIFY storm, LH-2
-WS fan-out, LH-3 reconnect-storm, LH-4 metrics cross-validation)
-extend this stream with similarly-purpose-built diagnostic
-surfaces; each carries its own ICD-LH-* contract under the same
-"not a blueprint" framing.
+narrative. Future load work is issue-owned: reconnect-under-storm is
+[#88](https://github.com/gobha-me/plinth/issues/88), while hard/crushing
+metrics cross-validation is [#62](https://github.com/gobha-me/plinth/issues/62).
+New diagnostic surfaces remain "not a blueprint" and require their own bounded
+contract.
 
 ---
 
@@ -486,14 +477,15 @@ Capability String Parsed
     │  namespace=terminal, version=1, function=shell
     │
     ▼
-Three-Tier Resolution
+Resolution
     │
-    ├── Tier 1: In-process? → direct function call (zero overhead)
+    ├── Tier 1: Kernel handler? → direct function call
     │
-    ├── Tier 2: Local-node cache? → dispatch locally
+    ├── Tier 2: Local extension? → async RuntimeRegistry dispatch
     │
-    └── Tier 3: Remote? → PG sidecar lookup → proxy to node
-         │                 (circuit breaker, 500ms timeout)
+    └── Sidecar/remote candidate? → fail closed: TIER3_NOT_AVAILABLE
+         │
+         └── Planned #66/#67/#73/#74: bounded remote dispatch
          │
          ▼
 RBAC Check
@@ -508,11 +500,10 @@ RBAC Check
          ▼
     Dispatch to handler
          │
-         ├── Local handler → execute, return result
+         ├── Kernel handler → execute, return result
          │
-         └── Sidecar → POST /execute → return result
-              │
-              ▼
+         └── Extension handler → await bounded QuickJS dispatch
+
     Result returned to JS runtime via Promise resolution
     JS_ExecutePendingJob continues execution
 ```

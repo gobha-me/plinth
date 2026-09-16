@@ -15,6 +15,8 @@ top of that philosophy).
   event.)
 - `architecture/04-services-ha.md §1` (audit logging; all permission
   denials audit.)
+- `architecture/websocket-authority.md` (database-backed WebSocket
+  credential and effective-rule lease).
 - ICD-0.1.2, ICD-0.1.3 (sessions, PATs)
 - ICD-0.1.4, ICD-0.1.5 (groups, RBAC storage and enforcement)
 
@@ -25,11 +27,12 @@ top of that philosophy).
 - Local user accounts (username + argon2id password hash)
 - Session tokens (HTTP-only cookies for web, bearer tokens for API)
 - Personal Access Tokens (PATs) for programmatic access
-- Bootstrap tokens for sidecar registration (single-use, time-limited)
+- Bootstrap tokens for sidecar registration (planned by
+  [#63](https://github.com/gobha-me/plinth/issues/63))
 
 **No OAuth provider built into kernel.** OAuth can be an extension.
 
-**K8s JWT validation (post-v1).** When running in K8s, the kernel can
+**K8s JWT validation (conditional, not implemented).** A future design may
 validate service account JWTs for sidecar auto-registration. Sidecars
 in the same namespace present their JWT instead of a bootstrap token.
 Trust-by-proximity: "you're in my namespace, I trust you to register."
@@ -38,14 +41,23 @@ This is a kernel capability (trust boundary), not a package.
 See `ICD-0.1.2-auth-sessions.md` and `ICD-0.1.3-pats.md` for full
 contracts.
 
+First-user creation and admin membership commit in one advisory-lock-
+serialized transaction. Concurrent bootstrap attempts cannot create multiple
+first administrators, and success is not published before commit
+acknowledgment. Session and PAT validation both fail closed for disabled users.
+WebSocket credentials and rule snapshots use the bounded renewal contract in
+`architecture/websocket-authority.md` rather than connection-lifetime caching.
+The broader local-registration policy remains owned by
+[#37](https://github.com/gobha-me/plinth/issues/37).
+
 ### 1.1 User Record (summary)
 
 The kernel owns one identity table, `plinth.users`, storing the base
 identity record: user id (UUID), username, password hash (argon2id),
-timestamps. Extensions that attach per-user data do so in their own
-schemas using the user id as a foreign-key-shaped reference, but they
-do not enforce referential integrity against `plinth.users` (see §4 for
-the cleanup contract).
+timestamps. Extensions that attach per-user data do so in their own schemas
+using the user id as a reference. The restricted extension role may declare an
+extension-owned foreign key to `plinth.users(id)`; this is optional, and
+extensions without such a constraint need the planned cleanup contract in §4.
 
 ---
 
@@ -139,12 +151,13 @@ contract.
 
 ### 2.3 Admin Group
 
-The `admin` group is granted the `kernel.admin` rule (or equivalent
-comprehensive rule set) by default. It is **not** an absolute bypass
-outside the RBAC system. All permission checks, including for admin
-users, flow through the normal rule evaluation path defined in
-`ICD-0.1.5-rbac-enforcement.md`. This enables full auditability and
-supports true least-privilege administration.
+The `admin` group is bootstrapped with the explicit kernel-owned rules
+`kernel.admin`, `packages.install`, and `packages.read`; package manifests may
+separately opt extension rules into the admin group's defaults. It is **not**
+an enforcement bypass outside the RBAC system. Capability resolution treats
+`kernel.admin` as its universal match, while routes declare their required
+rules through normal registration. All checks flow through the RBAC paths
+defined in `ICD-0.1.5-rbac-enforcement.md` and remain auditable.
 
 ### 2.4 Rule Lifecycle
 
@@ -162,18 +175,20 @@ human-readable `description`, and owning `extension_name`.
 
 Group-by-namespace UI with collapse-by-default. Namespace-level toggles,
 orphaned rule warnings, and clear visibility into which packages provide
-which rules. The admin UI itself lives in the `DESIGN-admin-v06x.md`
-extension (a built-in, bundled alongside the shell).
+which rules. `DESIGN-admin-v06x.md` is design input for planned administration
+extensions #50-#55; no admin package is currently bundled.
 
 ---
 
 ## 3. Anonymous Identity
 
-Every request processed by the kernel carries a `UserContext`. For
-authenticated requests (via session cookie or PAT), this context is
-populated from `SessionFilter` and `PatFilter`. For requests on a
-kernel path that does not require authentication — and for any future
-public-facing path — the kernel synthesizes `UserContext::anonymous()`:
+`SessionFilter` accepts either the HttpOnly session cookie or a PAT and attaches
+an `AuthContext`; `RbacFilter` attaches the route's `RbacContext`. Capability
+handlers combine authenticated identity and effective rules into the
+`UserContext` passed to resolution.
+Login, registration, health, and frontend assets are intentionally public and
+do not synthesize authority. `UserContext::anonymous()` is the reserved context
+for a future explicitly public RBAC-gated surface:
 
 - User ID: `null` (sentinel, not a real user)
 - Groups: `{"everyone"}` only
@@ -183,18 +198,16 @@ By the philosophy in `DESIGN-rbac-philosophy.md`, the `everyone` group
 starts with zero rules. Therefore `UserContext::anonymous()` is denied
 by every RBAC-gated route and every RBAC-gated capability call.
 
-**This changes nothing behaviorally in the current architecture.** Every
-existing kernel route still requires `SessionFilter` and an
-authenticated user. Anonymous contexts hit `RbacFilter` and are denied
-with the standard `permission_denied` response.
+No current production route injects this anonymous context. Public routes have
+their own narrow handlers; authenticated routes fail before RBAC if credentials
+are missing or invalid.
 
 **What this reserves.** A future capability such as the deferred share
 primitive (see `architecture/05-extensions.md §Deferred`) requires a
-well-defined anonymous identity. Defining it now — while the RBAC model
-is being implemented in 0.1.5 — costs nothing and avoids a retrofit
-later.
+well-defined anonymous identity. Defining it before a public surface lands
+avoids a retrofit later.
 
-**Enforcement test (required in 0.1.5).** A test case asserting that
+**Enforcement invariant.** Tests assert that
 `UserContext::anonymous()` is rejected by every RBAC-gated route until
 a rule is explicitly granted to `everyone`. This test is the permanent
 safeguard against accidental public exposure of authenticated
@@ -203,6 +216,12 @@ endpoints.
 ---
 
 ## 4. User Deletion Cleanup Contract
+
+**Status: planned, not implemented.**
+[Issue #97](https://github.com/gobha-me/plinth/issues/97) owns the final
+authority, privacy, delivery, reconciliation, and test contract. The shape
+below is the original architecture input to that issue, not a current product
+claim.
 
 When a user is deleted from `plinth.users`, every extension with
 per-user data has orphaned rows (shell preferences, notes authored by
@@ -221,8 +240,9 @@ The kernel emits a `users.deleted` event on the realtime event bus
 - **Emission point:** after `DELETE FROM plinth.users WHERE id = ?`
   succeeds, within the same PG transaction. If the transaction aborts,
   no event is emitted.
-- **HA:** emission happens once per deletion; all kernel nodes receive
-  it via `LISTEN/NOTIFY` and fan out to their extension subscribers.
+- **HA:** the final design must use the protected realtime authority and
+  multi-node semantics current when #97 is implemented; raw notification
+  payloads are never authoritative.
 
 Extensions subscribe during their runtime initialization. Their
 handlers run cleanup asynchronously (`DELETE FROM ext_*.table WHERE
@@ -272,13 +292,11 @@ not in the returned set.
   soft-delete implement it themselves (tombstone rows, `deleted_at`
   columns, etc.).
 
-### 4.4 ICD Milestone
+### 4.4 Delivery owner
 
-The `users.deleted` event and `kernel:1:users.list()` capability are
-committed architecturally now but become an ICD when the first
-extension needs them. The expected milestone is 0.10.x (storage /
-notifications polish) or earlier if a pre-0.10 extension requires
-cleanup.
+The `users.deleted` event and `kernel:1:users.list()` capability remain a
+fuzzy long-horizon commitment. #97, rather than a historical release number,
+is the executable owner.
 
 ---
 

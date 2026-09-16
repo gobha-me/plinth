@@ -1,9 +1,11 @@
 # Living subsystem contract docs — proposal
 
-**Status:** Discussion capture — proposal for the next architecture session
+**Status:** Discussion capture — decision owned by GitHub issue #41
 **Source:** four-ICD audit pass (0.1.2, 0.3.3, 0.4.4, 0.5.2), 2026-04-24
 **Participants:** the maintainer (Architect) — proposal author
-**Scheduled for ratification:** `0.6.0.N Architecture session: contract-docs proposal` (paper slot, ROADMAP §0.6)
+**Decision owner:** [#41](https://github.com/gobha-me/plinth/issues/41), after
+the Dogfood architecture dependency #29; the historical `0.6.0.N` slot is not
+a release promise
 **Feeds into:** new `docs/contracts/` tier; METHODOLOGY §Phase 3 update
 **References:**
 - `docs/METHODOLOGY-llm-assisted-development.md` §Phase 3 (Re-evaluation;
@@ -370,13 +372,13 @@ demoted to implementation reality; the contract doc is normative.
 
 ---
 
-## Scheduling note (post-2026-04-27 cleanup)
+## Scheduling note (reconciled 2026-09-16)
 
-Slotted on ROADMAP as `0.6.0.N Architecture session: contract-docs
-proposal` `[strong]`, paper. Runs alongside the existing 0.6.0.N
-follow-ups (`Test-fixture buildout`, `ICD-0.6.1 authoring`); not
-critical-path for 0.6.0 code. Decision precedes any contract-fill
-sessions.
+The historical `0.6.0.N` slot did not become an active deliverable. GitHub
+issue [#41](https://github.com/gobha-me/plinth/issues/41) now owns the bounded
+adopt-or-reject decision after the Dogfood architecture dependency. No
+contract-fill session should be inferred from this discussion until #41 is
+resolved.
 
 **Updated candidate list (post-0.5.5 ship):** the realtime pipeline
 ("Wait for arc close" entry above) is now ready — 0.5.0/0.5.1/0.5.2/

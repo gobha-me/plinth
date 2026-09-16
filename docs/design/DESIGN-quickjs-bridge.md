@@ -1,6 +1,6 @@
 # DESIGN: QuickJS Async Bridge
 
-**Status:** Draft  
+**Status:** Historical 0.3.x design; current-state corrections below
 **Scale:** 3 — Architecture Arc  
 **Milestone:** 0.3 (QuickJS Integration)  
 **Author:** the maintainer (Architect) + Claude (Architecture Session)
@@ -9,6 +9,16 @@
 **Implementation tasks:** 0.3.0–0.3.5
 
 ---
+
+## Current-state correction (reconciled 2026-09-16)
+
+The current mechanism is defined by `architecture/02-capabilities.md`,
+`architecture/03-data.md`, `architecture/extension-database-isolation.md`, and
+`architecture/shutdown.md`, plus their source/test owners. Runtime contexts and
+database clients use shared leases and coordinator-owned bounded teardown;
+realtime envelopes enter the protected outbox while `NOTIFY` carries only a
+row id; and `storage.*`/`http.*` are not implemented. Conflicting cancellation,
+direct-notification, or standard-library text below is historical.
 
 ## 1. Why This Exists
 
@@ -28,9 +38,9 @@ If the bridge can't enforce resource limits during async gaps, a
 malicious extension can evade memory and CPU constraints by spending
 most of its time in `await`.
 
-**This document defines the exact mechanism.** A code session
-implementing 0.3.x reads this document, not the architecture doc's
-summary.
+This document records the mechanism proposed for the 0.3.x delivery arc. The
+current-state correction above identifies the live authorities where later
+security and lifecycle work superseded it.
 
 ---
 

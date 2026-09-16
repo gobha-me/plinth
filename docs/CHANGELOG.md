@@ -11,6 +11,23 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-16 — post-v0.6.3 architecture re-evaluation
+
+- Reconciled the architecture set with current identity, WebSocket authority,
+  restricted extension database, durable realtime, QuickJS, and bounded
+  shutdown implementations.
+- Distinguished shipped frontend and kernel primitives from planned launcher,
+  deployment, metrics, sidecar, HA, storage, notification, and extension-HTTP
+  work.
+- Reclassified the live issue backlog, published the Dogfood dependency waves,
+  assigned previously unowned user-deletion cleanup to issue #97, and retained
+  historical ICDs with explicit current-state corrections.
+
+This closes [GitHub issue #29](https://github.com/gobha-me/plinth/issues/29)
+without changing runtime behavior.
+
+---
+
 ## 2026-09-15 — deterministic extension database client shutdown
 
 - Added an explicit, idempotent `RuntimePool` shutdown path that stops

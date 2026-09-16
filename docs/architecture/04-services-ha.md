@@ -9,8 +9,8 @@ security stance.
 - `architecture/01-identity.md §2` (all RBAC-gated decisions).
 - `architecture/02-capabilities.md` (Tier 3 resolution dispatches to
   sidecars; audit and metrics participate in the capability path).
-- `architecture/03-data.md §3` (realtime event bus carries kernel
-  events; HA uses `LISTEN/NOTIFY`).
+- `architecture/03-data.md §3` (protected realtime outbox carries events;
+  `LISTEN/NOTIFY` is a wake hint, not authority).
 - `DESIGN-logging-subsystem.md` (spdlog is the authority on logging
   and audit — this document is the contract on top of that).
 
@@ -78,6 +78,11 @@ arc builds on; full list in
 
 ## 2. Scheduled Tasks
 
+**Status: planned.** The current `cleanup_events` timer is a focused realtime
+retention task, not the general scheduler described below.
+[#58](https://github.com/gobha-me/plinth/issues/58) owns distributed scheduling
+and [#59](https://github.com/gobha-me/plinth/issues/59) owns default tasks.
+
 - Kernel provides a cron-like scheduler.
 - Extensions register tasks with schedule expressions.
 - **HA.** PG advisory locks per task — any node can grab, first wins.
@@ -91,15 +96,17 @@ arc builds on; full list in
 
 ## 3. Metrics
 
-**Lightweight: in-memory counters + Prometheus exposition endpoint. No
-PG storage. No partitioning. No cleanup tasks.**
-
-The kernel does NOT store metrics in PostgreSQL. Prometheus / Grafana
-already exist; self-hosters who want metrics already run them.
+**Status: planned, not implemented.** The former in-memory-only decision is
+superseded by the outcome backlog: [#57](https://github.com/gobha-me/plinth/issues/57)
+owns bounded, retention-aware partitioned PostgreSQL metrics; [#61](https://github.com/gobha-me/plinth/issues/61)
+owns extension recording; [#62](https://github.com/gobha-me/plinth/issues/62)
+owns load/ground-truth validation. The exact schema, dimensions, retention,
+export surface, and failure policy remain fuzzy until those issues are planned.
+Existing subsystem counters and test seams are not a supported metrics product.
 
 ### 3.1 What the Kernel Provides
 
-**In-memory counters** (atomic increments, lock-free histograms):
+The planned inventory includes:
 
 - Request count and latency histogram (per-endpoint).
 - Active WebSocket connections.
@@ -110,7 +117,8 @@ already exist; self-hosters who want metrics already run them.
 - Extension failure counts (from `architecture/05-extensions.md §2.3`
   supervision).
 
-**`GET /metrics` endpoint** in Prometheus exposition format:
+An eventual export surface may use Prometheus exposition, but no production
+`GET /metrics` implementation is claimed today. Illustrative target shape:
 
 ```
 # HELP plinth_requests_total Total HTTP requests
@@ -126,7 +134,7 @@ plinth_capability_resolution_seconds_bucket{tier="3",le="0.1"} 350
 
 ### 3.2 Extension Metrics
 
-Extensions register custom metrics via the `metrics.*` API:
+Issue #61 will decide the bounded extension API. Illustrative input:
 
 ```javascript
 metrics.counter("my_extension_requests_total").inc();
@@ -134,19 +142,22 @@ metrics.gauge("my_extension_queue_depth", queueLength);
 metrics.histogram("my_extension_processing_seconds").observe(elapsed);
 ```
 
-These appear on the `/metrics` endpoint under the extension's
-namespace.
+Naming, persistence, quotas, labels, RBAC, and hostile-cardinality behavior are
+unresolved until #61.
 
-### 3.3 What the Kernel Does NOT Provide
+### 3.3 Explicit current boundary
 
-- No `plinth.metrics` table. No PG storage for metrics.
-- No built-in metrics dashboard (card → modal → charts).
-- A metrics dashboard extension can be built that scrapes `/metrics`
-  or queries a Prometheus instance.
+- No supported metrics table, extension API, dashboard, or export endpoint.
+- Do not infer an in-memory-only architecture from historical prose.
+- A later dashboard belongs to the shell/administration roadmap and consumes
+  the contract that #57/#61 actually ship.
 
 ---
 
 ## 4. Notifications
+
+**Status: planned by [#81](https://github.com/gobha-me/plinth/issues/81).**
+The bullets below are design input, not current behavior.
 
 - Kernel provides a notification bus.
 - Extensions emit notifications; kernel routes to subscribers.
@@ -158,6 +169,10 @@ namespace.
 ---
 
 ## 5. Sidecar Contract
+
+**Status: planned.** [#63](https://github.com/gobha-me/plinth/issues/63)
+through [#70](https://github.com/gobha-me/plinth/issues/70) own registration,
+resolution, dispatch, containment, health, metrics, UI, and re-evaluation.
 
 Sidecars are external processes that connect inward to the kernel.
 
@@ -194,6 +209,12 @@ See `architecture/01-identity.md §1`.
 
 ## 6. High Availability
 
+**Status: planned.** [#71](https://github.com/gobha-me/plinth/issues/71)
+through [#77](https://github.com/gobha-me/plinth/issues/77) own membership,
+self-eviction, routing, aggregate metrics, and reconnect behavior. Current
+single-node realtime still uses PostgreSQL for durability; that does not make
+multi-node operation supported.
+
 ### 6.1 Architecture
 
 - N kernel nodes, all equal (leaderless by default).
@@ -209,12 +230,12 @@ See `architecture/01-identity.md §1`.
 |-------|-----------|
 | User sessions | PG `plinth.sessions` (any node can validate) |
 | Capability registry | PG `plinth.capabilities` + per-node cache, `LISTEN/NOTIFY` invalidation |
-| WebSocket subscriptions | PG pub/sub bridge (`LISTEN/NOTIFY`) |
+| WebSocket subscriptions | Per-node connection state fed from the protected realtime outbox; `LISTEN/NOTIFY` is a wake hint |
 | Scheduled tasks | PG advisory locks (first-grab) |
 | Sidecar connections | PG `plinth.sidecar_registry` (which node holds which sidecar) |
-| Metrics | In-memory counters, exposed via `/metrics` endpoint per-node |
+| Metrics | Planned retained metrics (#57) plus eventual aggregation (#76) |
 | Audit log | PG `plinth.audit_log` (each node writes own, queryable from any) |
-| Realtime events | PG `plinth.events` (delta sync on reconnect) |
+| Realtime events | PG `plinth.realtime_outbox` ingress and `plinth.events` replay history |
 
 ### 6.3 No Leader Election
 
@@ -229,10 +250,10 @@ SERIALIZABLE for conflict-sensitive operations).
 ### 7.1 Principles
 
 - Extensions run in sandboxed QuickJS runtimes — no escape by default.
-- Extension database access isolated by PG schema
-  (`architecture/03-data.md §1.2`).
-- Sidecars connect inward — nothing can just attach.
-- Bootstrap tokens are single-use, time-limited.
+- Extension database access uses restricted PostgreSQL logins and explicit
+  grants (`architecture/extension-database-isolation.md`).
+- Planned sidecars connect inward; #63 must define single-use bootstrap
+  authority before that surface exists.
 - All capability calls pass through RBAC
   (`architecture/02-capabilities.md §1`).
 - Audit everything.
@@ -242,20 +263,27 @@ SERIALIZABLE for conflict-sensitive operations).
 
 QuickJS provides:
 
-- No filesystem access (kernel-mediated `storage.*` only).
-- No network access (kernel-mediated `http.*` only, RBAC-gated).
+- No filesystem access.
+- No network access.
 - No process spawning.
-- Memory limits (runtime-enforced, configurable).
-- CPU time limits (runtime-enforced, configurable).
+- Fixed default memory, CPU, wall-time, stack, call-depth, concurrency, and
+  result-size limits. Per-extension/admin overrides are not applied today.
 - `eval()` disabled by default.
 
-PG schema isolation provides:
+Restricted PostgreSQL roles provide:
 
-- Extensions can only query their own tables.
-- Cross-schema access rejected by kernel query filter.
-- PG `GRANT` controls what kernel tables extensions can read.
+- Ownership and normal access only within the extension's own schema.
+- No kernel-account fallback even if extension SQL changes `search_path`.
+- Narrow shared grants, currently user id/username lookup and foreign-key
+  `REFERENCES(id)`; no credentials, sessions, or outbox authority.
+
+Future file access (#78/#79) and outbound HTTP (#82) must be kernel-mediated
+and RBAC-bounded; they are not current sandbox APIs.
 
 ### 7.3 Sidecar Security
+
+**Planned, not current.** #63-#70 own the final registration, transport,
+containment, and administration security contract.
 
 - Bootstrap token required for registration (or K8s JWT, post-v1).
 - Admin approval required (or auto-approve flag).
@@ -269,8 +297,8 @@ PG schema isolation provides:
   `architecture/06-frontend.md §3`).
 - Reserved URL prefixes are immutable post-1.0
   (`architecture/05-extensions.md §2`).
-- Storage HTTP surface is always RBAC-gated, never anonymous
-  (`architecture/03-data.md §2.3`).
+- Planned storage HTTP must be RBAC-gated and non-anonymous (#78;
+  `architecture/03-data.md §2.3`).
 - Public HTTP surface options (share primitive, site-host extension)
   are deferred and, if built, use explicit anonymous identity
   (`architecture/01-identity.md §3`) routed through the same RBAC

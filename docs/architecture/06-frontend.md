@@ -22,8 +22,8 @@ alternative frontends.
 - `DESIGN-shell-v06x.md` (the 0.6.x shell arc: bootstrap, schema, the
   panel SDK, the tab/launcher model, floating panels, the system
   tray, content-type negotiation, and intents).
-- `DESIGN-admin-v06x.md` (the admin extension, the second bundled
-  package, consumes the shell's panel SDK).
+- `DESIGN-admin-v06x.md` (planned administration-extension design; no admin
+  package is currently bundled).
 - `DESIGN-packages-v04x.md` (install lifecycle, atomic version swap,
   `frontend.mount` validation).
 
@@ -31,30 +31,26 @@ alternative frontends.
 
 ## 1. The Shell is an Extension
 
-Plinth's reference frontend — the shell — is implemented as a built-in
-extension, not as kernel-privileged code. It consumes the same kernel
-APIs (auth, RBAC, capability registry, realtime events, storage) that
-every other extension uses. It has no special bypass into kernel
-internals.
+Plinth's reference frontend — the shell — runs as a package rather than as
+kernel-privileged UI code. It consumes the shipped auth, RBAC, capability, and
+realtime APIs available to extensions; storage remains planned.
 
-The shell is bundled with the kernel binary as a package blob
-(`architecture/05-extensions.md §1.4`). On first boot, the kernel
-bootstrap step checks whether a frontend extension is installed; if
-none exists, the kernel extracts the bundled shell package and
-installs it through the standard 0.4 package install lifecycle. From
-that point on, the shell is a normal row in `plinth.packages`,
-indistinguishable from any other extension except for a
-`provenance = 'bundled'` flag.
+The distribution installs a trusted companion asset at
+`share/plinth/bundled/shell.zip`; it is not embedded in the kernel binary. On
+first boot, the kernel checks for an active frontend and, when absent, installs
+that bundle through the package lifecycle with `provenance = 'bundled'`. The
+`shell` package name and bundled provenance are deliberately special: ordinary
+user/HTTP installs cannot claim or upgrade them.
 
 **Three properties fall out of this:**
 
-- **Upgradability without kernel rebuild.** A new shell version ships
-  as a package. An admin installs it; the standard install lifecycle
-  runs. No C++ recompile.
-- **Architectural cleanliness.** The kernel has no shell-privileged
-  code path. Every feature the shell uses is available to any other
-  extension that requests it through the normal API. Code that
-  special-cases the shell by name is a bug.
+- **Upgradability without kernel rebuild.** An operator can replace the trusted
+  companion bundle and explicitly run `--upgrade-bundled-shell` in non-dev
+  mode. The kernel-owned operation uses the package upgrade lifecycle; ordinary
+  admin package installation is not this authority.
+- **Narrow special treatment.** Package execution and API use remain ordinary,
+  while the kernel reserves the canonical name/provenance and owns first boot
+  plus explicit trusted-bundle upgrade.
 - **Dogfooding of the package system.** The shell's manifest is the
   first test case for package validation. If the shell can't install
   cleanly through the 0.4 lifecycle, the lifecycle is wrong.
@@ -62,15 +58,15 @@ indistinguishable from any other extension except for a
 Full shell design: `DESIGN-shell-v06x.md`. Full packaging contract:
 `DESIGN-packages-v04x.md`.
 
-**Implemented 2026-04-27 (v0.6.0).** Initial in-browser frame pinned in
-ICD-0.6.0 (login flow consuming ICD-0.1.2, empty four-zone topbar, top-
-level Preact error boundary). The 0.4.4 first-boot install lifecycle
-already extracts the bundled shell to disk per `install_shell_if_needed`;
-0.6.0 adds the kernel-stub static handler at `/app/*` that serves from
-that on-disk location with strict CSP. The `frontend.mount` manifest
-contract — i.e., the kernel reading the active frontend's mount prefix
-from `plinth.packages` rather than hardcoding `/app/*` — is still
-pending in 0.6.1 per `DESIGN-shell-v06x.md §9.1`.
+**Implemented baseline (v0.6.0-v0.6.3).** The browser frame, login flow,
+top-level Preact error boundary, first-boot shell companion package, strict-CSP asset
+handler, active-frontend lookup, manifest-declared mount, versioned asset
+base, design-token redirect, and SDK redirect are implemented and covered by
+kernel and browser tests. The bundled shell is intentionally still minimal:
+application discovery, launcher navigation, tabs, and complete panel
+lifecycle are the next Dogfood deliverables [#30](https://github.com/gobha-me/plinth/issues/30),
+[#31](https://github.com/gobha-me/plinth/issues/31), and
+[#32](https://github.com/gobha-me/plinth/issues/32), not shipped behavior.
 
 ---
 
@@ -214,9 +210,9 @@ that resolves to the active frontend's currently-installed version.
 |----------|----------|
 | `/api/frontend/tokens.css` | ✓ implemented v0.6.2 — 302 → `/ext/{active-frontend}/{version}/css/tokens.css` |
 | `/api/frontend/sdk.js` | ✓ implemented v0.6.3 — 302 → `/ext/{active-frontend}/{version}/client/sdk.js` |
-| `/api/frontend/fonts/{name}` | (deferred) 302 → `/ext/{active-frontend}/{version}/fonts/{name}` |
-| `/api/frontend/icons/{name}` | (deferred) 302 → `/ext/{active-frontend}/{version}/icons/{name}` |
-| `/api/frontend/manifest.json` | (deferred) 200, JSON describing the active frontend's name, version, and exported asset paths |
+| `/api/frontend/fonts/{name}` | Conditional follow-up; no current endpoint or scheduled issue |
+| `/api/frontend/icons/{name}` | Conditional follow-up; no current endpoint or scheduled issue |
+| `/api/frontend/manifest.json` | Discovery shape to be settled by [#30](https://github.com/gobha-me/plinth/issues/30); no current endpoint |
 
 ### 4.2 Cache Semantics
 
@@ -286,23 +282,31 @@ chase a moving target.
 
 ## 5. Panel System (Summary)
 
-**Status (2026-04-30, v0.6.3): operational.** Per ICD-0.6.3 §3
-(Panel SDK API surface) and §4 (Panel module loading), extensions
-register UI panels via `panels.json`; the shell's panel loader
-(`client/shell/client/panels/loader.js`) dynamic-imports panel
-modules and injects the `plinth.panel` API object.
+**Status (reconciled 2026-09-16): primitives shipped; application shell
+journey not yet operational.** Per ICD-0.6.3 §3 (Panel SDK API surface) and
+§4 (Panel module loading), the repository contains a `panels.json` parser,
+panel-module loader, design-token endpoint, SDK endpoint, and focused fixture
+coverage. The production shell does not yet discover installed applications
+or provide the launcher/tab navigation needed to reach those panels. [#30](https://github.com/gobha-me/plinth/issues/30)
+owns the current contract, [#31](https://github.com/gobha-me/plinth/issues/31)
+owns implementation, and [#32](https://github.com/gobha-me/plinth/issues/32)
+owns deferred browser/client-runtime coverage.
 
-Extensions register UI panels via `panels.json`. The active frontend
-(the shell, in the default deployment) provides:
+Extensions register UI panels via `panels.json`. The active frontend design
+calls for:
 
-- **Panel container.** Topbar navigation, content area, tab strip,
-  launcher. Authoritatively specified in `DESIGN-shell-v06x.md`.
-- **Panel lifecycle.** Activate, deactivate, destroy.
+- **Panel container (planned in #30/#31).** Topbar navigation, content area,
+  tab strip, and launcher, bounded by `DESIGN-shell-v06x.md` and the refreshed
+  issue contract.
+- **Panel lifecycle (partially implemented).** The loader exposes activate,
+  deactivate, and destroy primitives; production discovery and navigation
+  integration remain #31 work.
 - **Inter-panel communication.** Through the kernel realtime event
   system (`architecture/03-data.md §3`), not a frontend-specific bus.
   Panels talk to each other the same way services talk to each other.
-- **Shared component library.** Primitives (buttons, forms, modals,
-  tables) and design tokens (§4).
+- **Shared frontend surface.** Design tokens and the client SDK are shipped.
+  A broader component library is conditional future work, not a current
+  kernel guarantee.
 
 The panel SDK is a **frontend-ecosystem contract**, not a kernel
 contract. A `client/` directory in an extension assumes the shell's
