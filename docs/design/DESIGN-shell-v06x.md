@@ -12,6 +12,12 @@
 **Informs:** Files extension, Notes extension, Admin extension, all panel-bearing extensions
 **Visual reference:** `docs/sketches/shell-topbar-reference.html`
 
+**Current contract note (2026-09-16):** This remains a historical draft for the
+broader shell arc. `../icd/ICD-application-discovery-launcher.md` supersedes its
+application discovery, launcher, primary-panel tab, lifecycle replacement,
+realtime invalidation, preference, data-ipoint, accessibility, and responsive
+requirements. Legacy `0.6.4` wording is traceability only, not a release promise.
+
 ---
 
 ## 1. What the Shell Is

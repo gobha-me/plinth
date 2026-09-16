@@ -19,6 +19,14 @@
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)
 **Decision date:** 2026-04-16
 
+**Current contract note (2026-09-16):** Section 8 remains the historical
+baseline for headless package upgrade. For a panel-bearing package,
+`../icd/ICD-application-discovery-launcher.md` §8-§9.2 and the current-contract
+amendment in `../icd/ICD-0.4.5-package-lifecycle-transitions.md` supersede its
+ordering: capability ingress is fenced and launcher readiness is cleared
+before migration or registration mutates shared state; neither generation is
+discoverable during cutover; the verified new generation is admitted last.
+
 ---
 
 ## 1. Decision

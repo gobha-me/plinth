@@ -5,6 +5,23 @@
 **Milestone:** 0.4.5 — complete the package lifecycle beyond first install: disable, enable, uninstall, and upgrade (with atomic swap + 24h retention contract for a 0.7.x scheduler to consume). Does NOT implement rule validator RBAC validation extensions (0.4.6), RBAC test integration tests (0.4.7), the 0.7.x garbage-collection scheduler itself (ICD-0.4.5 specifies its contract, 0.7.x owns the cron + invocation), or admin-UI wiring (0.6a-A).
 **Status:** Ready for implementation
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)
+
+**Current contract amendment (2026-09-16):** For a panel-bearing package, the
+launcher readiness contract in `ICD-application-discovery-launcher.md` extends
+the choreography below. Under the package-name lock, upgrade fences new package
+capability ingress, drains admitted calls, and atomically clears
+`application_ready` plus enqueues invalidation before MIGRATING or REGISTERING
+can change shared schema, RBAC, or capability state. There is no discoverable
+old-generation fallback during upgrade. Existing T3/T4 state, symlink, route,
+and runtime cutover then proceeds while both generations are unready. The new
+`ACTIVE`/`ACTIVE_FLAGGED` row becomes ready only after its route and backend
+authority are verified. On failure, the old row is re-admitted only after its
+route, authority, capabilities, and runtime are restored and verified;
+otherwise it remains absent for operator repair. X.10 still requires the old
+route to be 404 after completed cutover. Garbage collection must lock-recheck
+and exclude a ready row defensively. #31 owns this amendment and its
+barrier/restart tests; headless packages retain the earlier ordering.
+
 **Related:** `migrations/schema.sql:123–128` (state CHECK — `SUPERSEDED` added in this milestone; `disabled_at` / `uninstalling_at` columns at lines 136–137 gain writers; `retired_at` + `supersedes_id` columns added); `src/kernel/packages/install_lifecycle.{hpp,cpp}` (extended with four new entry points + upgrade branch that reuses `install_package`'s existing path through EXTRACTING); `src/kernel/packages/asset_server.{hpp,cpp}` (route `register_routes` / `unregister_routes` reused; the map-guarded trampoline from 0.4.4 slice A permits per-version add/remove without Drogon route-table mutation); `src/kernel/packages/handlers.{hpp,cpp}` (gains `PATCH /api/packages/{id}` + `DELETE /api/packages/{id}` controllers); `src/kernel/packages/migrations.{hpp,cpp}` (0.4.3's `drop_schema_and_migrations` called at uninstall; `run_migrations` called pre-swap at upgrade); `src/kernel/rbac/rule_registrar.cpp` (new `delete_extension_rules` + `mark_extension_rules_orphaned` / `clear_extension_rules_orphaned` helpers; `upsert_extension_rule` already handles update-in-place via the `orphaned_at=NULL` clear per CHANGELOG 0.4.4 deviation note); `src/kernel/capabilities/registration.{hpp,cpp}` (new `unregister_capability(namespace, version, function, PGconn&)` surface — 0.4.4 only calls `register_capability`. **Implementation deviation (0.4.5 file placement):** the symbol shipped in `registration.{hpp,cpp}` rather than the ICD-named `resolution.{hpp,cpp}`, for symmetry with `register_capability_tx` already in `registration.cpp`. Public symbol name and signature unchanged. Documented in `RE-EVAL-0.4.x-arc-closeout.md §2.2`.); `DEFERRED.md` (I.18/I.19/I.20 HTTP-harness entry stays orthogonal — §2.1 of RE-EVAL-0.4.x-following-0.4.4; not absorbed here).
 
 ---

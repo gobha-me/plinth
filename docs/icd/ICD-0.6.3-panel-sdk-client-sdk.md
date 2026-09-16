@@ -1,5 +1,11 @@
 # ICD-0.6.3-panel-sdk-client-sdk
 
+**Current contract note (2026-09-16):** This document remains the historical
+authority for the shipped panel/client SDK primitives. Its deferred discovery,
+launcher, tab, dirty-switch, replacement, and primary-panel boundary decisions
+are resolved by `ICD-application-discovery-launcher.md`, which controls the #31
+implementation where the contracts differ.
+
 **Traces to:** ICD-0.6.0 §15 *Panel SDK and client SDK* (lines
 1055–1063 — "`DESIGN-shell-v06x.md §4` specifies the `plinth.panel.*`
 API surface (lifecycle hooks, navigation intents, focus, shortcuts,

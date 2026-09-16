@@ -5,6 +5,15 @@
 **Status:** Ready for implementation (post-review v2)  
 **Methodology:** LLM-Assisted Development (METHODOLOGY-llm-assisted-development.md)
 
+**Current contract amendment (2026-09-16):** Shared authentication middleware
+must distinguish invalid, expired, or revoked credentials from an unavailable
+authentication database. The former retain their existing `401` bodies; a
+database failure returns `503` with exactly
+`{"error":"service_unavailable","message":"Authentication service is temporarily unavailable"}`.
+This generic result applies to every protected route. Issue #31 implements the
+currently missing outcome and regression coverage; it does not change token,
+cookie, expiry, or revocation semantics.
+
 ---
 
 ## Overview
