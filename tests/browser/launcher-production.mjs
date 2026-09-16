@@ -108,6 +108,8 @@ try {
 
     await page.getByRole('button', { name: 'Notes', exact: true }).click();
     await page.locator('.panel-container:not([hidden])').waitFor();
+    const previousPanel = await page.locator('.panel-container:not([hidden])').elementHandle();
+    assert(previousPanel, 'the pre-upgrade panel must have a concrete DOM node');
     let upgradedModuleLoads = 0;
     page.on('response', response => {
         if (/\/ext\/notes\/1\.3\.0\/panels\/editor\.js$/.test(new URL(response.url()).pathname)) {
@@ -124,18 +126,42 @@ try {
     assert.equal(activeRecord.version, '1.3.0');
     assert.notEqual(activeRecord.id, record.id, 'upgrade must publish a new generation');
     try {
-        await page.locator('.panel-container').waitFor({ state: 'detached', timeout: 15000 });
+        await page.waitForFunction(panel => !panel.isConnected, previousPanel, { timeout: 15000 });
     } catch (error) {
-        const catalog = await page.evaluate(async () => {
-            const response = await fetch('/api/frontend/applications', { cache: 'no-store' });
-            return { status: response.status, body: await response.text() };
-        });
-        throw new Error(`upgrade invalidation did not remove the old panel; catalog=${JSON.stringify(catalog)} frames=${JSON.stringify(realtimeFrames.slice(-30))}`, { cause: error });
+        const diagnostics = await page.evaluate(async panel => {
+            let catalog;
+            try {
+                const response = await fetch('/api/frontend/applications', { cache: 'no-store' });
+                catalog = { status: response.status, body: await response.text() };
+            } catch (catalogError) {
+                catalog = { error: String(catalogError) };
+            }
+            return {
+                oldPanelConnected: panel.isConnected,
+                homeVisible: Boolean(document.querySelector('.launcher-home:not([hidden])')),
+                panels: [...document.querySelectorAll('.panel-container')].map(current => ({
+                    id: current.id, hidden: current.hidden, connected: current.isConnected,
+                })),
+                catalog,
+            };
+        }, previousPanel);
+        throw new Error(`upgrade invalidation did not disconnect the old panel; diagnostics=${JSON.stringify(diagnostics)} upgradedModuleLoads=${upgradedModuleLoads} frames=${JSON.stringify(realtimeFrames.slice(-30))} pageErrors=${JSON.stringify(errors)}`, { cause: error });
     }
-    await page.getByRole('button', { name: 'Notes', exact: true }).click();
+    await page.waitForFunction(() =>
+        document.querySelector('.panel-container:not([hidden])') ||
+        document.querySelector('.launcher-home:not([hidden]) .launcher-tile[aria-label="Notes"]'),
+    undefined, { timeout: 15000 });
+    const postUpgradeState = await page.evaluate(() => {
+        if (document.querySelector('.panel-container:not([hidden])')) return 'replacement';
+        document.querySelector('.launcher-home:not([hidden]) .launcher-tile[aria-label="Notes"]').click();
+        return 'home';
+    });
+    assert(['home', 'replacement'].includes(postUpgradeState),
+        `upgrade must render Home or the replacement panel, received ${postUpgradeState}`);
     await page.locator('.panel-container:not([hidden])').waitFor();
     assert.equal(upgradedModuleLoads, 1,
-        'upgrade must discard old DOM and import the new versioned module once');
+        `upgrade from ${postUpgradeState} must discard old DOM and import the new versioned module once`);
+    await previousPanel.dispose();
 
     await lifecycle(`/api/packages/${activeRecord.id}?confirm=true`, { method: 'DELETE' }, [204]);
     await page.getByText('No applications are available.', { exact: true }).waitFor({ timeout: 15000 });
