@@ -1,0 +1,15 @@
+apiVersion: v2
+name: plinth
+description: Secure single-instance Plinth deployment behind an optional Traefik edge
+type: application
+version: 0.1.0
+kubeVersion: ">=1.35.0-0"
+home: https://github.com/gobha-me/plinth
+sources:
+  - https://github.com/gobha-me/plinth
+keywords:
+  - plinth
+  - self-hosted
+  - traefik
+annotations:
+  artifacthub.io/license: MIT

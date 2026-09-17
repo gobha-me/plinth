@@ -1,0 +1,25 @@
+{{- if .Values.traefik.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: {{ include "plinth.fullname" . }}
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  forwardingTimeouts:
+    dialTimeout: {{ .Values.traefik.forwardingTimeouts.dialTimeout | quote }}
+    responseHeaderTimeout: {{ .Values.traefik.forwardingTimeouts.responseHeaderTimeout | quote }}
+    idleConnTimeout: {{ .Values.traefik.forwardingTimeouts.idleConnTimeout | quote }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: {{ include "plinth.fullname" . }}-package
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  forwardingTimeouts:
+    dialTimeout: {{ .Values.traefik.forwardingTimeouts.dialTimeout | quote }}
+    responseHeaderTimeout: {{ .Values.traefik.forwardingTimeouts.packageResponseHeaderTimeout | quote }}
+    idleConnTimeout: {{ .Values.traefik.forwardingTimeouts.idleConnTimeout | quote }}
+{{- end }}

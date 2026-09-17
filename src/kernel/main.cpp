@@ -511,6 +511,8 @@ auto main(int argc, char* argv[]) -> int {
       if (!cli_host.empty()) {
         cfg.listen_host = cli_host;
       }
+      const auto package_limits =
+          plinth::package_size_limits(cfg.packages_max_package_size_mb);
 
       // Block before logging or any subsystem starts a thread. The service
       // owner below consumes these signals synchronously and invokes the
@@ -678,8 +680,7 @@ auto main(int argc, char* argv[]) -> int {
             .db = cfg.db,
             .data_dir = cfg.packages_data_dir,
             .staging_dir = cfg.packages_staging_dir,
-            .max_package_size_bytes =
-                cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
+            .max_package_size_bytes = package_limits.package_bytes,
             .upgrade_drain_timeout_ms = cfg.packages_upgrade_drain_timeout_ms,
         };
         plinth::packages::register_package_routes(pkgs_cfg);
@@ -700,8 +701,7 @@ auto main(int argc, char* argv[]) -> int {
             .caller_user_id = "",
             .data_dir = cfg.packages_data_dir,
             .staging_dir = cfg.packages_staging_dir,
-            .max_package_size_bytes =
-                cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
+            .max_package_size_bytes = package_limits.package_bytes,
             .upgrade_drain_timeout_ms =
                 std::chrono::milliseconds{
                     cfg.packages_upgrade_drain_timeout_ms},
@@ -800,6 +800,7 @@ auto main(int argc, char* argv[]) -> int {
         drogon::app()
             .setLogPath("") // Drogon logging disabled — spdlog handles it
             .setLogLevel(trantor::Logger::kWarn)
+            .setClientMaxBodySize(package_limits.request_body_bytes)
             .addListener(cfg.listen_host, cfg.listen_port)
             .setThreadNum(std::thread::hardware_concurrency())
             .disableSigtermHandling();
@@ -835,13 +836,14 @@ auto main(int argc, char* argv[]) -> int {
           has_config
               ? plinth::load_config(test_rbac_cmd.get<std::string>("--config"))
               : plinth::load_config();
+      const auto package_limits =
+          plinth::package_size_limits(cfg.packages_max_package_size_mb);
       plinth::packages::InstallerContext ctx{
           .db = cfg.db,
           .caller_user_id = "",
           .data_dir = cfg.packages_data_dir,
           .staging_dir = cfg.packages_staging_dir,
-          .max_package_size_bytes =
-              cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
+          .max_package_size_bytes = package_limits.package_bytes,
           .upgrade_drain_timeout_ms =
               std::chrono::milliseconds{cfg.packages_upgrade_drain_timeout_ms},
       };

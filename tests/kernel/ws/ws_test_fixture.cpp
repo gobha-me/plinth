@@ -273,6 +273,8 @@ auto start_test_server() -> void {
   // routes (/ws/*). Per-test (name,version) mappings are added via
   // asset_server::register_routes() inside individual test cases.
   plinth::packages::asset_server::register_drogon_handler();
+  const auto package_limits =
+      plinth::package_size_limits(cfg.packages_max_package_size_mb);
 
   // 0.6.0.N HTTP fixture (session 2): register the packages routes
   // (POST/GET /api/packages, GET/PATCH/DELETE /api/packages/{id}) so
@@ -284,8 +286,7 @@ auto start_test_server() -> void {
       .db = cfg.db,
       .data_dir = cfg.packages_data_dir,
       .staging_dir = cfg.packages_staging_dir,
-      .max_package_size_bytes =
-          cfg.packages_max_package_size_mb * 1024ULL * 1024ULL,
+      .max_package_size_bytes = package_limits.package_bytes,
       .upgrade_drain_timeout_ms = cfg.packages_upgrade_drain_timeout_ms,
   });
 
@@ -308,6 +309,7 @@ auto start_test_server() -> void {
   drogon::app()
       .setLogPath("")
       .setLogLevel(trantor::Logger::kWarn)
+      .setClientMaxBodySize(package_limits.request_body_bytes)
       .addListener(cfg.listen_host, cfg.listen_port)
       .setThreadNum(2)
       .disableSigtermHandling();

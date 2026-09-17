@@ -26,6 +26,9 @@ tools/public_readiness.py
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure --parallel 1
+.github/scripts/install-deployment-tools.sh contract
+export PATH="${PLINTH_DEPLOYMENT_TOOLS_DIR:-/tmp/plinth-deployment-tools/bin}:$PATH"
+python3 tests/deployment/helm_contract_test.py
 ```
 
 PostgreSQL and WebSocket coverage uses a disposable database configured with
@@ -80,6 +83,40 @@ the anonymous digest pull and confirms the exact version tag resolves to that
 same digest. The release is incomplete until those checks and the tag workflow
 are terminal green; do not work around them with a mutable alias or a separate
 manual build.
+
+Deployment changes must preserve the contract in `docs/KUBERNETES.md`. Install
+the checksum-pinned tools and run the non-cluster chart contract test for every
+chart, deployment-doc, or deployment-CI change. Kubeconform downloads schemas
+from a commit-pinned upstream URL, so this check requires network access on a
+cold cache. Both deployment tests require Python 3 with PyYAML:
+
+```bash
+.github/scripts/install-deployment-tools.sh contract
+export PATH="${PLINTH_DEPLOYMENT_TOOLS_DIR:-/tmp/plinth-deployment-tools/bin}:$PATH"
+python3 tests/deployment/helm_contract_test.py
+```
+
+The live lifecycle harness requires Docker, k3d, Helm, kubectl, OpenSSL, and the
+exact locally available candidate image. It creates only task-owned cluster
+state and must prove install, health, TLS Host/origin handling, SIGTERM restart,
+sequential replacement with retained data, Helm uninstall, and cleanup:
+
+```bash
+.github/scripts/install-deployment-tools.sh all
+export PATH="${PLINTH_DEPLOYMENT_TOOLS_DIR:-/tmp/plinth-deployment-tools/bin}:$PATH"
+image='plinth-runtime:exact-candidate'
+python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes min
+python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes max
+```
+
+The installer requires `curl`, `tar`, and `sha256sum`; `all` mode also requires
+`jq` to verify the downloaded kubectl and k3d versions.
+
+CI is authoritative for the pinned k3d/Kubernetes, Helm, kubectl, and Traefik
+versions used by that harness. Do not silently fall back to a mutable tool,
+image, chart dependency, or public cluster. Live tests use fake credentials in
+a disposable namespace or cluster; they must inventory and remove their exact
+task-owned resources even after failure.
 
 Do not add unexplained or wildcard `NOLINT` suppressions. Follow the exact
 suppression syntax documented in `AGENTS.md`.

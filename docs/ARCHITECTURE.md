@@ -50,7 +50,7 @@ and codifies decisions that worked while discarding what didn't.
 | Testing | Catch2 | C++ standard, header-only option, well-documented |
 | Build | CMake | Industry standard for C++ |
 | Allocator | System allocator in the supported runtime image | The kernel target and production image do not preload or link jemalloc. |
-| Deployment | Native development, Docker Compose, and a supported OCI runtime | The OCI image begins with v0.6.6; [#36](https://github.com/gobha-me/plinth/issues/36) owns Kubernetes/Traefik support. |
+| Deployment | Native development, Docker Compose, OCI, and single-instance Kubernetes/Traefik | The OCI image begins with v0.6.6; `KUBERNETES.md` owns the supported orchestrated boundary. |
 | CI | GitHub Actions | GCC, Clang 20/21, ASan/UBSan, formatting/static analysis, CodeQL, and full image validation |
 
 ---
@@ -119,12 +119,19 @@ release evidence.
 
 ### 4.3 Kubernetes
 
-No supported Helm chart or Kubernetes deployment exists yet.
-[Issue #36](https://github.com/gobha-me/plinth/issues/36) owns the supported
-Kubernetes and Traefik contract after the production image and browser-origin
-security boundary are ready. The HA topology in
-`architecture/04-services-ha.md §6` is a planned contract, not a claim that
-multi-node operation is currently supported.
+Beginning with the first released v0.6.6 image digest,
+`deploy/helm/plinth` is the supported generic chart. It requires an exact
+release digest, an operator-managed PostgreSQL Secret and database, persistent
+POSIX storage, and an exact public browser origin. Its default topology is one
+non-root Pod behind an internal application ClusterIP Service and headless
+StatefulSet governing Service, a default-deny NetworkPolicy, and optional TLS
+routing through existing Traefik CRDs. Ordered replacement prevents two kernels
+from mutating one database and package volume concurrently.
+
+[`KUBERNETES.md`](KUBERNETES.md) owns the installation, Traefik, security,
+storage, probe, lifecycle, upgrade, and removal contract. The HA topology in
+`architecture/04-services-ha.md §6` remains planned; increasing replicas or
+using a multi-writer package volume is not supported evidence.
 
 ---
 

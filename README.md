@@ -5,9 +5,11 @@
 Plinth is an early-stage, self-hosted application kernel written in C++23. Its
 implemented kernel provides identity, authorization, groups, local capability
 dispatch, PostgreSQL-backed extension data, realtime pub/sub, audit logging,
-and a sandboxed QuickJS extension runtime. File storage, general metrics,
-sidecars, multi-node coordination, and supported orchestrated deployment remain
-roadmap work; see the [roadmap](docs/ROADMAP.md) for their owning issues.
+and a sandboxed QuickJS extension runtime. Beginning with the first released
+v0.6.6 image digest, a single-instance Kubernetes and Traefik deployment is
+supported. File storage, general metrics, sidecars, and
+multi-node coordination remain roadmap work; see the
+[roadmap](docs/ROADMAP.md) for their owning issues.
 
 Plinth is pre-1.0 software. Its interfaces and storage contracts can change,
 and it has not yet received an independent security review. Keep development
@@ -35,9 +37,11 @@ cp config.json.example config.json
 ./build/plinth serve --config config.json
 ```
 
-The example temporarily enables registration so the first local account can
-become administrator. Disable `registration_enabled` immediately afterward.
-The example database credentials are development-only. See
+The example temporarily enables general registration for local development.
+Disable `registration_enabled` immediately after creating the first account.
+An empty production database permits only its first account even while general
+registration remains disabled. The example database credentials are
+development-only. See
 [Configuration](docs/CONFIGURATION.md) before changing the bind address or
 deploying behind a TLS reverse proxy.
 
@@ -72,14 +76,16 @@ docker run --rm "$image" --version
 
 The exact digest, its signed provenance, and its SBOM are the release identity;
 do not substitute an unversioned or locally rebuilt image. See
-[Configuration](docs/CONFIGURATION.md) for the runtime paths, persistence, and
-network boundary. GHCR package visibility is maintained separately from the
-repository; a release is supported only after its recorded digest is available
-to an unauthenticated pull.
+[Configuration](docs/CONFIGURATION.md) for the runtime paths and
+[Kubernetes and Traefik deployment](docs/KUBERNETES.md) for the supported
+single-instance orchestration boundary. GHCR package visibility is maintained
+separately from the repository; a release is supported only after its recorded
+digest is available to an unauthenticated pull.
 
 ## Development
 
-Run the repository checks before opening a pull request:
+Run the repository checks before opening a pull request. The deployment checks
+require Python 3 with PyYAML in addition to the toolchain listed above:
 
 ```bash
 tools/format.sh --check
@@ -87,6 +93,9 @@ tools/lint.sh
 cmake --build build --parallel 2
 ctest --test-dir build --output-on-failure --parallel 1
 tools/public_readiness.py
+.github/scripts/install-deployment-tools.sh contract
+export PATH="${PLINTH_DEPLOYMENT_TOOLS_DIR:-/tmp/plinth-deployment-tools/bin}:$PATH"
+python3 tests/deployment/helm_contract_test.py
 ```
 
 PostgreSQL-backed tests use the `PLINTH_PG_*` variables shown in CI. See
@@ -96,6 +105,7 @@ PostgreSQL-backed tests use the `PLINTH_PG_*` variables shown in CI. See
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Configuration and deployment](docs/CONFIGURATION.md)
+- [Kubernetes and Traefik deployment](docs/KUBERNETES.md)
 - [Retained-install bundled shell upgrades](docs/bundled-shell-upgrade.md)
 - [Extension guide](docs/EXTENSION-GUIDE.md)
 - [Shutdown dependency graph](docs/architecture/shutdown.md)

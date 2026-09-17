@@ -40,6 +40,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -77,6 +78,43 @@ TEST_CASE("cookie package POST rejects a missing CSRF header before mutation",
   plinth::ws_test::TestPg observer{plinth::ws_test::test_config().db};
   const auto count = observer.exec("SELECT count(*) FROM plinth.packages");
   REQUIRE(std::string{PQgetvalue(count.get(), 0, 0)} == "0");
+}
+
+TEST_CASE("package POST above Drogon's default body cap reaches Plinth",
+          "[integration][packages][http][ws]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+
+  plinth::http_test::HttpTestFixture fixture;
+  const auto token = fixture.seed_admin();
+  std::vector<std::byte> invalid_zip(2ULL * 1024ULL * 1024ULL, std::byte{0});
+  const auto response =
+      fixture.dispatch(fixture.build_post(invalid_zip, token));
+
+  REQUIRE(response->statusCode() == drogon::k400BadRequest);
+  const auto body = parse_json_body(response);
+  REQUIRE(body["state"].asString() == "INSTALL_FAILED");
+  REQUIRE(body["failed_at_stage"].asString() == "UPLOADING");
+  REQUIRE(body["kind"].asString() == "not-a-zip");
+}
+
+TEST_CASE("package POST above the configured transport cap is rejected",
+          "[integration][packages][http][ws]") {
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+
+  plinth::http_test::HttpTestFixture fixture;
+  const auto token = fixture.seed_admin();
+  std::vector<std::byte> oversized_body(52ULL * 1024ULL * 1024ULL,
+                                        std::byte{0});
+  const auto response =
+      fixture.dispatch(fixture.build_post(oversized_body, token));
+
+  REQUIRE(response->statusCode() == drogon::k413RequestEntityTooLarge);
+  const auto body = parse_json_body(response);
+  REQUIRE_FALSE(body.isMember("kind"));
 }
 
 TEST_CASE("I.18: concurrent POSTs for same package name produce 201 + 409 "

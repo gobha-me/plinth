@@ -1,0 +1,151 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "plinth.fullname" . }}
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "plinth.fullname" . }}-headless
+  replicas: 1
+  revisionHistoryLimit: 2
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "plinth.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "plinth.selectorLabels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.rolloutNonce }}
+        plinth.gobha.me/rollout-nonce: {{ .Values.rolloutNonce | quote }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "plinth.fullname" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: plinth
+          image: {{ include "plinth.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --config
+            - /etc/plinth/config.json
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            privileged: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: PLINTH_DEV_MODE
+              value: "false"
+            - name: PLINTH_REGISTRATION_ENABLED
+              value: {{ .Values.registration.enabled | quote }}
+            - name: PLINTH_PG_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.keys.host | quote }}
+            - name: PLINTH_PG_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.keys.port | quote }}
+            - name: PLINTH_PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.keys.user | quote }}
+            - name: PLINTH_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.keys.password | quote }}
+            - name: PLINTH_PG_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.database.existingSecret | quote }}
+                  key: {{ .Values.database.keys.database | quote }}
+            - name: PLINTH_PG_POOL_SIZE
+              value: {{ .Values.database.poolSize | quote }}
+            - name: PLINTH_NODE_ID
+              value: {{ include "plinth.fullname" . | quote }}
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              scheme: HTTP
+            failureThreshold: 60
+            periodSeconds: 5
+            timeoutSeconds: 2
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              scheme: HTTP
+            failureThreshold: 3
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+              scheme: HTTP
+            failureThreshold: 3
+            periodSeconds: 10
+            timeoutSeconds: 2
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/plinth
+              readOnly: true
+            - name: data
+              mountPath: /var/lib/plinth/data
+            - name: logs
+              mountPath: /var/lib/plinth/logs
+            - name: tmp
+              mountPath: /tmp
+            - name: uploads
+              mountPath: /var/lib/plinth/uploads
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "plinth.fullname" . }}-config
+            defaultMode: 0444
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "plinth.dataClaimName" . | quote }}
+        - name: logs
+          persistentVolumeClaim:
+            claimName: {{ include "plinth.logsClaimName" . | quote }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi
+        - name: uploads
+          emptyDir:
+            sizeLimit: 128Mi

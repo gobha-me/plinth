@@ -1,0 +1,56 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $dnsPeers := .Values.networkPolicy.dns.peers -}}
+{{- $dbPeers := .Values.networkPolicy.database.peers -}}
+{{- $dbIPBlocks := .Values.networkPolicy.database.ipBlocks -}}
+{{- if and (eq (len $dbPeers) 0) (eq (len $dbIPBlocks) 0) -}}
+{{- fail "networkPolicy.database must select database pods or declare an explicit ipBlock" -}}
+{{- end -}}
+{{- if .Values.traefik.enabled -}}
+{{- if eq (len .Values.networkPolicy.traefik.peers) 0 -}}
+{{- fail "networkPolicy.traefik.peers must not be empty when Traefik is enabled" -}}
+{{- end -}}
+{{- end -}}
+{{- $dbTargets := list -}}
+{{- range $dbPeers -}}
+{{- $dbTargets = append $dbTargets . -}}
+{{- end -}}
+{{- range $dbIPBlocks -}}
+{{- $dbTargets = append $dbTargets (dict "ipBlock" .) -}}
+{{- end -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "plinth.fullname" . }}
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "plinth.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  {{- if .Values.traefik.enabled }}
+  ingress:
+    - from:
+        {{- toYaml .Values.networkPolicy.traefik.peers | nindent 8 }}
+      ports:
+        - port: 8080
+          protocol: TCP
+  {{- else }}
+  ingress: []
+  {{- end }}
+  egress:
+    - to:
+        {{- toYaml $dnsPeers | nindent 8 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        {{- toYaml $dbTargets | nindent 8 }}
+      ports:
+        - port: {{ .Values.networkPolicy.database.port }}
+          protocol: TCP
+{{- end }}

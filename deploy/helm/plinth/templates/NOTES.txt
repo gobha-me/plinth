@@ -1,0 +1,23 @@
+Plinth was rendered as a single-replica, digest-pinned deployment.
+
+Service:
+  {{ include "plinth.fullname" . }}.{{ .Release.Namespace }}.svc:8080
+
+Database credentials are read from Secret {{ .Values.database.existingSecret | quote }}.
+The chart did not create or copy that Secret.
+
+{{- if .Values.traefik.enabled }}
+TLS origin:
+  {{ include "plinth.origin" . }}
+
+Traefik preserves the incoming Host. Verify that no controller-wide middleware
+rewrites it and that TLS Secret {{ .Values.traefik.tls.secretName | quote }}
+covers {{ .Values.public.host }}.
+{{- else }}
+Traefik exposure is disabled. The ClusterIP Service is isolated by the default
+NetworkPolicy. Use a local port-forward for first-administrator bootstrap.
+{{- end }}
+
+Generated PersistentVolumeClaims are retained on uninstall when their
+persistence.*.retain value is true. Database Secret rotation requires a
+controlled replacement; change rolloutNonce to trigger one.

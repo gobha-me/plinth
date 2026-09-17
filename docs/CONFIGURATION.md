@@ -19,15 +19,17 @@ defaults that bind only to `127.0.0.1` and disable account registration.
 
 ## First administrator
 
-The first registered account becomes an administrator. Keep Plinth bound to
-loopback while bootstrapping it:
+The first registered account becomes an administrator. An empty user table
+permits that first account even when general registration is disabled. Keep
+Plinth bound to loopback while bootstrapping it:
 
 1. copy and edit `config.json.example`;
-2. leave `listen_host` as `127.0.0.1` and temporarily set
-   `registration_enabled` to `true`;
+2. leave `listen_host` as `127.0.0.1` and set
+   `registration_enabled` to `false` (the development example defaults to
+   `true` and must be changed);
 3. start Plinth and register the first account locally;
-4. set `registration_enabled` to `false` and restart;
-5. place an authenticated TLS reverse proxy in front of Plinth before allowing
+4. confirm that subsequent registration is disabled; and
+5. place a TLS reverse proxy in front of Plinth before allowing
    traffic from another host.
 
 Do not expose a registration-enabled instance to an untrusted network.
@@ -54,10 +56,12 @@ reset and must remain disabled outside disposable development databases.
 ## Network exposure
 
 The built-in HTTP server does not terminate TLS. Bind to loopback and use a
-reverse proxy that supplies TLS, request-size limits, timeouts, and appropriate
-forwarded-client headers. If an orchestrator requires Plinth to listen on all
-container interfaces, constrain exposure at the published port, firewall, or
-network-policy layer.
+reverse proxy that supplies TLS, request-size limits, and timeouts. A proxy may
+send forwarded-client headers, but Plinth currently uses the socket peer for
+auditing and login throttling; it does not trust those headers as client
+identity or browser authority. If an orchestrator requires Plinth to listen on
+all container interfaces, constrain exposure at the published port, firewall,
+or network-policy layer.
 
 The sample Compose file publishes Plinth on host loopback even though the
 process listens on all interfaces inside its container network.
@@ -122,3 +126,17 @@ docker run --rm --name plinth \
 The container changes only the process/network boundary. The first
 administrator, registration, reverse-proxy origin, database isolation, and
 non-development requirements in this document still apply.
+
+## Kubernetes and Traefik
+
+Beginning with the first released v0.6.6 image digest, the supported chart is
+`deploy/helm/plinth`. It deploys one instance from an exact release digest,
+consumes an existing PostgreSQL Secret, mounts persistent
+data and logs, uses a ClusterIP Service and default-deny network posture, and
+optionally creates a TLS Traefik route. It does not install PostgreSQL or create
+credentials or certificates.
+
+See [Kubernetes and Traefik deployment](KUBERNETES.md) before rendering or
+installing the chart. That document is authoritative for Host/origin handling,
+superuser database requirements, storage semantics, probe limitations,
+sequential replacement, lifecycle bounds, validation, upgrade, and removal.

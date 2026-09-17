@@ -72,7 +72,7 @@ jobs:
       - name: Install runtime verification dependency
         run: |
           sudo apt-get update
-          sudo apt-get install -y postgresql-client
+          sudo apt-get install -y postgresql-client python3-yaml
 
       - name: Verify the effective Docker context policy
         run: python3 tests/tools/docker_context_test.py
@@ -168,6 +168,18 @@ jobs:
           python3 tests/browser/run-production.py --image "$image" --realtime
           python3 tests/browser/run-production.py --image "$image" --upgrade-cache
           python3 tests/browser/run-bundled-upgrade.py --image "$image"
+
+      - name: Exercise the Kubernetes and Traefik lifecycle
+        if: ${{ matrix.arch == 'amd64' }}
+        env:
+          PLINTH_DEPLOYMENT_TOOLS_DIR: /tmp/plinth-deployment-tools/bin
+        run: |
+          set -euo pipefail
+          .github/scripts/install-deployment-tools.sh all
+          export PATH="$PLINTH_DEPLOYMENT_TOOLS_DIR:$PATH"
+          image="plinth-runtime:amd64-$GITHUB_RUN_ID"
+          python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes min
+          python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes max
 
   release_preflight:
     name: Validate immutable release identity

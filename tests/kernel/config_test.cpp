@@ -4,6 +4,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
@@ -98,6 +99,42 @@ TEST_CASE("Config defaults are correct", "[config][unit]") {
   REQUIRE(cfg.listen_port == 8080);
   REQUIRE(cfg.registration_enabled == false);
   REQUIRE(cfg.node_id == "node-1");
+}
+
+TEST_CASE("Package size limits reserve multipart overhead and fail closed",
+          "[config][packages][unit]") {
+  constexpr std::size_t MIB = 1024ULL * 1024ULL;
+  const auto defaults = plinth::package_size_limits(50);
+  REQUIRE(defaults.package_bytes == 50ULL * MIB);
+  REQUIRE(defaults.request_body_bytes == 51ULL * MIB);
+
+  constexpr auto MAX_PACKAGE_MIB =
+      (std::numeric_limits<std::size_t>::max() - MIB) / MIB;
+  const auto maximum = plinth::package_size_limits(MAX_PACKAGE_MIB);
+  REQUIRE(maximum.package_bytes == MAX_PACKAGE_MIB * MIB);
+  REQUIRE(maximum.request_body_bytes == maximum.package_bytes + MIB);
+  REQUIRE_THROWS_WITH(plinth::package_size_limits(MAX_PACKAGE_MIB + 1),
+                      "config.packages.max_package_size_mb_out_of_range");
+  REQUIRE_THROWS_WITH(plinth::package_size_limits(0),
+                      "config.packages.max_package_size_mb_out_of_range");
+}
+
+TEST_CASE("Config rejects an invalid package size",
+          "[config][packages][unit]") {
+  EnvGuard guard;
+  const std::array invalid_values{
+      nlohmann::json(0),
+      nlohmann::json(-1),
+      nlohmann::json(1.5),
+      nlohmann::json::parse("18446744073709551616"),
+  };
+  for (const auto& value : invalid_values) {
+    auto path =
+        write_temp_config({{"packages", {{"max_package_size_mb", value}}}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.packages.max_package_size_mb_out_of_range");
+    remove_file(path);
+  }
 }
 
 TEST_CASE("Config loads from JSON file", "[config][unit]") {

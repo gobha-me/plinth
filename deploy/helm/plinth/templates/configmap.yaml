@@ -1,0 +1,20 @@
+{{- $config := dict
+      "dev_mode" false
+      "listen_host" "0.0.0.0"
+      "listen_port" 8080
+      "registration_enabled" .Values.registration.enabled
+      "packages" (dict
+        "data_dir" "/var/lib/plinth/data"
+        "staging_dir" "/var/lib/plinth/data/staging") -}}
+{{- if .Values.traefik.enabled -}}
+{{- $_ := set $config "browser_origin" (include "plinth.origin" .) -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "plinth.fullname" . }}-config
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+data:
+  config.json: |-
+    {{- $config | toPrettyJson | nindent 4 }}
