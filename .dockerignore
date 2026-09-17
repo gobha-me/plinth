@@ -1,19 +1,83 @@
-.git
-.github
-.gitea
-docker
+# Runtime builds use an explicit source allowlist. This keeps local config,
+# credentials, repository metadata, documentation, and unrelated tools out of
+# both the build context and BuildKit provenance.
+**
 
-build
-build-*
-cmake-build-*
+!.dockerignore
+!CMakeLists.txt
+!VERSION
+!LICENSE
+!THIRD_PARTY_NOTICES.md
+!sbom.cdx.json
 
-.env
-.env.*
+!cmake/
+!cmake/**
+
+!src/
+!src/**
+
+!client/
+!client/shell/
+!client/shell/**
+
+!migrations/
+!migrations/**
+
+!tests/
+!tests/**
+
+!third_party/
+!third_party/**
+
+!tools/
+!tools/pack_shell.py
+
+# Configuration files are denied even below broad source allowlists. Re-include
+# only the versioned package manifests which are required by the build/tests.
 config.json
+**/config.json
 config.yml
+**/config.yml
 config.yaml
-AGENTS.override.md
+**/config.yaml
+!client/shell/config.json
+!tests/fixtures/install_lifecycle/fail-migration/config.json
+!tests/fixtures/install_lifecycle/fail-validator/config.json
+!tests/fixtures/install_lifecycle/missing-manifest/config.json
+!tests/fixtures/install_lifecycle/valid-install-frontend/config.json
+!tests/fixtures/install_lifecycle/valid-install-no-panels/config.json
+!tests/fixtures/install_lifecycle/valid-install/config.json
+!tests/fixtures/lifecycle_transitions/upgrade-v1-slow/config.json
+!tests/fixtures/lifecycle_transitions/upgrade-v2-broken-migration/config.json
+!tests/fixtures/lifecycle_transitions/upgrade-v2-slow/config.json
+!tests/fixtures/lifecycle_transitions/upgrade-v2/config.json
+!tests/fixtures/packages/valid-cross-file/config.json
+!tests/fixtures/packages/valid-full/config.json
+!tests/fixtures/rbac_test_runner/assert-allow-side-effect/config.json
+!tests/fixtures/rbac_test_runner/broken-assert-allow/config.json
+!tests/fixtures/rbac_test_runner/broken-assert-deny/config.json
+!tests/fixtures/rbac_test_runner/happy-all-pass/config.json
+!tests/fixtures/rbac_test_runner/mixed-pass-fail/config.json
+!tests/fixtures/rbac_test_runner/no-test-contracts/config.json
 
-*.log
+# Keep local control files and credential-shaped files out even when they live
+# below an allowlisted source directory. Docker applies the last matching rule,
+# so this deny block must remain after every `!` exception above.
+.git
+**/.git
+**/.git/**
+.env
+**/.env
+.env.*
+**/.env.*
+AGENTS.override.md
+**/AGENTS.override.md
 *.pem
+**/*.pem
 *.key
+**/*.key
+**/node_modules
+**/node_modules/**
+**/__pycache__
+**/__pycache__/**
+**/*.pyc

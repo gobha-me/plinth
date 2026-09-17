@@ -230,8 +230,11 @@ auto reset_cursor(std::string user_id, std::int64_t new_seq)
   if (!db) {
     co_return;
   }
-  co_await upsert_reset(
-      db, FlushPlan{.user_id = std::move(user_id), .last_seq = new_seq});
+  // GCC 12 can bitwise-copy an owning aggregate temporary across a nested
+  // coroutine call, leaving both frames to free the same std::string storage
+  // (GCC PR 107288). Materialize the plan, then copy it into the child frame.
+  const FlushPlan plan{.user_id = std::move(user_id), .last_seq = new_seq};
+  co_await upsert_reset(db, plan);
 }
 
 auto flush_all_for_shutdown() -> drogon::Task<void> {

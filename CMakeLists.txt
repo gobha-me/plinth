@@ -12,8 +12,31 @@ set(PLINTH_VERSION_MINOR ${CMAKE_MATCH_2})
 set(PLINTH_VERSION_PATCH ${CMAKE_MATCH_3})
 set(PLINTH_GIT_VERSION "v${PLINTH_VERSION}")
 
-find_package(Git QUIET)
-if(Git_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+set(PLINTH_BUILD_REVISION "" CACHE STRING
+    "Exact 40-character source revision supplied by a hermetic build")
+option(PLINTH_BUILD_EXACT_TAG
+       "Report the release version without development revision metadata" OFF)
+if(PLINTH_BUILD_REVISION)
+  string(LENGTH "${PLINTH_BUILD_REVISION}" PLINTH_BUILD_REVISION_LENGTH)
+  if(NOT PLINTH_BUILD_REVISION_LENGTH EQUAL 40 OR
+     NOT PLINTH_BUILD_REVISION MATCHES "^[0-9a-f]+$")
+    message(FATAL_ERROR
+            "PLINTH_BUILD_REVISION must be a 40-character lowercase Git SHA")
+  endif()
+  if(NOT PLINTH_BUILD_EXACT_TAG)
+    string(SUBSTRING "${PLINTH_BUILD_REVISION}" 0 12 PLINTH_GIT_SHA)
+    set(PLINTH_GIT_VERSION
+        "v${PLINTH_VERSION}-dev+g${PLINTH_GIT_SHA}")
+  endif()
+elseif(PLINTH_BUILD_EXACT_TAG)
+  message(FATAL_ERROR
+          "PLINTH_BUILD_EXACT_TAG requires PLINTH_BUILD_REVISION")
+else()
+  find_package(Git QUIET)
+endif()
+
+if(NOT PLINTH_BUILD_REVISION AND Git_FOUND AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
   execute_process(
     COMMAND "${GIT_EXECUTABLE}" describe --tags --exact-match
             --match "v${PLINTH_VERSION}" HEAD
@@ -314,20 +337,21 @@ add_custom_target(plinth_rbac_test_runner_fixture_zips
 
 set(PLINTH_SHELL_SRC_DIR ${CMAKE_SOURCE_DIR}/client/shell)
 set(PLINTH_SHELL_ZIP ${CMAKE_BINARY_DIR}/shell.zip)
+set(PLINTH_SHELL_PACKER ${CMAKE_SOURCE_DIR}/tools/pack_shell.py)
+
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 file(GLOB_RECURSE PLINTH_SHELL_INPUTS CONFIGURE_DEPENDS
      ${PLINTH_SHELL_SRC_DIR}/*)
 
 add_custom_command(
   OUTPUT ${PLINTH_SHELL_ZIP}
-  COMMAND ${CMAKE_COMMAND} -E rm -f ${PLINTH_SHELL_ZIP}
-  COMMAND ${CMAKE_COMMAND} -E tar cf ${PLINTH_SHELL_ZIP} --format=zip --
-          manifest.json capabilities.json rbac.json panels.json config.json
-          client server migrations
-  WORKING_DIRECTORY ${PLINTH_SHELL_SRC_DIR}
-  DEPENDS ${PLINTH_SHELL_INPUTS}
+  COMMAND ${Python3_EXECUTABLE} ${PLINTH_SHELL_PACKER}
+          --source ${PLINTH_SHELL_SRC_DIR}
+          --output ${PLINTH_SHELL_ZIP}
+  DEPENDS ${PLINTH_SHELL_INPUTS} ${PLINTH_SHELL_PACKER}
   VERBATIM
-  COMMENT "Packing client/shell/ -> shell.zip"
+  COMMENT "Packing deterministic client/shell/ -> shell.zip"
 )
 add_custom_target(plinth_shell_zip DEPENDS ${PLINTH_SHELL_ZIP})
 
@@ -350,7 +374,21 @@ add_custom_target(plinth_shell_bundle_staged
                   DEPENDS ${PLINTH_SHELL_BUNDLE_STAGED})
 
 install(FILES ${PLINTH_SHELL_ZIP}
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/plinth/bundled)
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/plinth/bundled
+        COMPONENT Runtime)
+
+install(FILES
+          ${CMAKE_SOURCE_DIR}/migrations/schema.sql
+          ${CMAKE_SOURCE_DIR}/migrations/extension_database.sql
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/plinth/migrations
+        COMPONENT Runtime)
+
+install(FILES
+          ${CMAKE_SOURCE_DIR}/LICENSE
+          ${CMAKE_SOURCE_DIR}/THIRD_PARTY_NOTICES.md
+          ${CMAKE_SOURCE_DIR}/sbom.cdx.json
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/plinth
+        COMPONENT Runtime)
 
 # QuickJS — vendored via FetchContent (quickjs-ng fork; bellard/quickjs has
 # no version tags as of 2026-04). Upstream CMakeLists declares extra
@@ -505,8 +543,21 @@ target_link_libraries(plinth PRIVATE
 
 add_dependencies(plinth plinth_shell_bundle_staged)
 
+install(TARGETS plinth
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        COMPONENT Runtime)
+
 # ─── Tests ────────────────────────────────────────────────────
 enable_testing()
+
+add_test(NAME plinth_shell_package_determinism
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tests/tools/pack_shell_test.py
+          --packer ${PLINTH_SHELL_PACKER}
+          --source ${PLINTH_SHELL_SRC_DIR}
+)
+set_tests_properties(plinth_shell_package_determinism PROPERTIES TIMEOUT 30)
+
 add_executable(plinth_tests
   tests/kernel/main_test.cpp
   tests/kernel/lifecycle/async_task_registry_test.cpp

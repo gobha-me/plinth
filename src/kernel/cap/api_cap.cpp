@@ -235,12 +235,13 @@ auto handle_post_cap(const drogon::HttpRequestPtr& req,
   // co_awaits. Mirrors call_dispatch.cpp:109's precedent.
   try {
     drogon::async_run([response_callback, call = std::move(call),
-                       ctx = std::move(ctx), async_task]() -> drogon::Task<> {
+                       ctx = std::move(ctx),
+                       async_task]() mutable -> drogon::Task<> {
       try {
         std::string ext_code;
         std::string ext_message;
         auto result = co_await capabilities::call_capability_async(
-            call, ctx, &ext_code, &ext_message);
+            std::move(call), std::move(ctx), &ext_code, &ext_message);
         if (result) {
           (*response_callback)(make_success(*result));
           co_return;

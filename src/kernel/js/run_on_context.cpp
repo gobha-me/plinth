@@ -45,6 +45,7 @@
 #include "kernel/realtime/emit.hpp"
 #include "kernel/realtime/sql_classify.hpp"
 
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <coroutine>
@@ -61,6 +62,7 @@
 #include <json/value.h>
 #include <json/writer.h>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <quickjs.h>
 #include <string>
@@ -332,26 +334,103 @@ struct SqlBinderAwaiter : public drogon::CallbackAwaiter<drogon::orm::Result> {
 // commit and may outlive the owning extension database client. Await the
 // canonical destructor-driven commit so the async operation owns the
 // transaction through PostgreSQL's acknowledgement.
-struct TransactionCommitAwaiter : public drogon::CallbackAwaiter<bool> {
+struct TransactionCommitAwaiter {
+  struct CompletionState {
+    std::atomic<bool> resume_queued{false};
+    std::recursive_mutex lifecycle;
+    std::coroutine_handle<> suspended{};
+    trantor::EventLoop* owner_loop{nullptr};
+    bool committed{false};
+    bool active{true};
+  };
+
   explicit TransactionCommitAwaiter(
       std::shared_ptr<drogon::orm::Transaction> transaction_in)
-      : transaction(std::move(transaction_in)) {}
+      : transaction(std::move(transaction_in)),
+        completion(std::make_shared<CompletionState>()) {
+    completion->owner_loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+    if (completion->owner_loop == nullptr) {
+      completion->owner_loop = drogon::app().getLoop();
+    }
+  }
 
-  auto await_suspend(std::coroutine_handle<> handle) -> void {
-    transaction->setCommitCallback([this, handle](bool committed) {
-      setValue(committed);
-      handle.resume();
+  TransactionCommitAwaiter(const TransactionCommitAwaiter&) = delete;
+  auto operator=(const TransactionCommitAwaiter&)
+      -> TransactionCommitAwaiter& = delete;
+  TransactionCommitAwaiter(TransactionCommitAwaiter&&) = delete;
+  auto operator=(TransactionCommitAwaiter&&)
+      -> TransactionCommitAwaiter& = delete;
+
+  ~TransactionCommitAwaiter() {
+    std::lock_guard<std::recursive_mutex> guard{completion->lifecycle};
+    completion->active = false;
+    completion->suspended = {};
+  }
+
+  [[nodiscard]] auto await_ready() const noexcept -> bool { return false; }
+
+  auto await_suspend(std::coroutine_handle<> handle) -> bool {
+    if (completion->owner_loop == nullptr) {
+      // A transaction completion without an event loop cannot safely resume
+      // its coroutine. Mark it for rollback before releasing the final owner;
+      // otherwise Drogon's destructor-driven transaction completion would
+      // commit even though await_resume() reports failure.
+      transaction->rollback();
+      transaction.reset();
+      return false;
+    }
+    {
+      std::lock_guard<std::recursive_mutex> guard{completion->lifecycle};
+      completion->suspended = handle;
+    }
+    transaction->setCommitCallback([state = completion](bool committed) {
+      // TransactionImpl invokes this callback from inside its DB completion
+      // stack. Resuming there is re-entrant: the continuation destroys this
+      // awaiter while Drogon still owns callback copies, which Release builds
+      // can surface as an unreachable/cold-path trap. Keep all callback state
+      // independently alive and defer one resume onto the coroutine's owning
+      // event loop.
+      if (state->resume_queued.exchange(true, std::memory_order_acq_rel)) {
+        return;
+      }
+      state->owner_loop->queueInLoop([state, committed]() mutable {
+        // Serialize cancellation/frame destruction with resumption. A
+        // recursive mutex is intentional: suspended.resume() destroys this
+        // awaiter on the same thread before it returns, and the destructor
+        // must be able to revoke the handle while this guard is held.
+        std::lock_guard<std::recursive_mutex> guard{state->lifecycle};
+        if (!state->active) {
+          state->suspended = {};
+          return;
+        }
+        state->committed = committed;
+        auto suspended = std::exchange(state->suspended, {});
+        if (suspended) {
+          suspended.resume();
+        }
+      });
     });
     transaction.reset();
+    return true;
+  }
+
+  [[nodiscard]] auto await_resume() const noexcept -> bool {
+    return completion->committed;
   }
 
  private:
   std::shared_ptr<drogon::orm::Transaction> transaction;
+  std::shared_ptr<CompletionState> completion;
 };
 
 auto commit_transaction(std::shared_ptr<drogon::orm::Transaction> transaction)
     -> drogon::Task<> {
-  if (!(co_await TransactionCommitAwaiter{std::move(transaction)})) {
+  // Keep the co_await outside the conditional. GCC 12 miscomputes the
+  // coroutine frame layout for `if (co_await ...)` (GCC PR 106713), causing
+  // the resumed actor to read its state from the wrong offset and trap.
+  const bool committed =
+      co_await TransactionCommitAwaiter{std::move(transaction)};
+  if (!committed) {
     throw std::runtime_error("database transaction commit failed");
   }
 }
@@ -590,7 +669,8 @@ auto run_cap_call_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
   std::string ext_detail_code;
   std::string ext_detail_message;
   auto res = co_await plinth::capabilities::call_capability_async(
-      cc, op.cap_user, &ext_detail_code, &ext_detail_message);
+      std::move(cc), std::move(op.cap_user), &ext_detail_code,
+      &ext_detail_message);
   if (res.has_value()) {
     co_return res->data;
   }

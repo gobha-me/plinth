@@ -446,9 +446,7 @@ auto call_capability(const CapabilityCall& call, const UserContext& ctx)
   return dispatch_tier2(*tier2_hit, call, ctx);
 }
 
-// header: arguments outlive the coroutine; copying defeats the resolver's "no
-// behavior change" guarantee for the sync-lane portion of this path.
-auto call_capability_async(const CapabilityCall& call, const UserContext& ctx,
+auto call_capability_async(CapabilityCall call, UserContext ctx,
                            std::string* ext_detail_code_out,
                            std::string* ext_detail_message_out)
     -> drogon::Task<ResolveResult> {

@@ -115,12 +115,13 @@ auto on_call(const drogon::WebSocketConnectionPtr& conn,
   try {
     drogon::async_run([conn = conn, call = std::move(call),
                        ctx = std::move(ctx), async_task,
-                       call_id]() -> drogon::Task<> {
+                       call_id]() mutable -> drogon::Task<> {
       try {
         std::string ext_detail_code;
         std::string ext_detail_message;
         auto result = co_await capabilities::call_capability_async(
-            call, ctx, &ext_detail_code, &ext_detail_message);
+            std::move(call), std::move(ctx), &ext_detail_code,
+            &ext_detail_message);
         if (result) {
           conn->sendJson(make_call_result(call_id, *result));
           co_return;

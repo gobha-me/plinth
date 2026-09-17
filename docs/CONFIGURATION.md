@@ -78,3 +78,47 @@ present they must be identical or startup fails. Leaving `browser_origin`
 empty is correct only when the scheme seen by Plinth plus the exact `Host`
 header is also the browser-visible origin. In particular, an HTTPS browser in
 front of an HTTP upstream must configure the public HTTPS origin.
+
+## Supported runtime image
+
+The supported OCI image begins with v0.6.6 and is published as
+`ghcr.io/gobha-me/plinth:vMAJOR.MINOR.PATCH` for `linux/amd64` and
+`linux/arm64`. No image exists for v0.6.5 or older, and no mutable `latest`,
+major, or minor alias is published. Deploy the digest reference reported by the
+release workflow, not an inferred tag.
+
+The process runs as numeric UID/GID 10001 with `/var/lib/plinth` as its home
+and working directory. The image declares persistent volumes at
+`/var/lib/plinth/data` and `/var/lib/plinth/logs`; the operator must ensure that
+mounted paths are writable by 10001:10001. The installed binary and immutable
+assets are:
+
+- `/usr/local/bin/plinth`
+- `/usr/local/share/plinth/migrations`
+- `/usr/local/share/plinth/bundled/shell.zip`
+- `/usr/local/share/doc/plinth`
+
+`PLINTH_MIGRATIONS_DIR` already points to the installed migrations directory.
+The entry point is the Plinth binary and the default command is
+`serve --host 0.0.0.0`; publish port 8080 only on a trusted interface or behind
+the TLS proxy described above. Supply database settings and secrets at runtime
+through the deployment secret manager. Never bake a configuration file,
+credential, extension data, or logs into a derived image.
+
+For example, with `image` set to the exact release digest and the PostgreSQL
+variables already exported:
+
+```bash
+docker run --rm --name plinth \
+  --publish 127.0.0.1:8080:8080 \
+  --volume plinth-data:/var/lib/plinth/data \
+  --volume plinth-logs:/var/lib/plinth/logs \
+  --env PLINTH_PG_HOST --env PLINTH_PG_PORT \
+  --env PLINTH_PG_USER --env PLINTH_PG_PASSWORD \
+  --env PLINTH_PG_DATABASE \
+  "$image"
+```
+
+The container changes only the process/network boundary. The first
+administrator, registration, reverse-proxy origin, database isolation, and
+non-development requirements in this document still apply.

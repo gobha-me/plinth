@@ -189,7 +189,7 @@ auto run_resolver(std::string_view signature, const Json::Value& args,
       .call_depth = 0,
   };
   return drogon::sync_wait(plinth::capabilities::call_capability_async(
-      call, admin_ctx(), ext_code_out, ext_msg_out));
+      std::move(call), admin_ctx(), ext_code_out, ext_msg_out));
 }
 
 } // namespace
@@ -235,6 +235,52 @@ TEST_CASE("R.01: cap_call_extdispatch_echo_happy_path",
   REQUIRE(r->data["doubled"].asInt() == 84);
   REQUIRE(r->resolved_tier == "tier2");
   REQUIRE(r->provider_type == "extension");
+}
+
+TEST_CASE("R.02: resolver task owns temporary inputs across suspension",
+          "[cap][res][ext][integration][lifetime]") {
+  SKIP_WITHOUT_PG();
+  ExtScratch s;
+  s.stage_extension("extdispatch", {
+                                       {"slow_identity", R"(
+            export default async function slow_identity(args, ctx) {
+              await db.query('SELECT pg_sleep(0.05)');
+              return {
+                marker: args.marker,
+                username: ctx.user.username,
+              };
+            }
+        )"},
+                                   });
+  seed_tier2("extdispatch:1:slow_identity", "extdispatch");
+  REQUIRE(plinth::extensions::create_pool("extdispatch"));
+
+  Json::Value args(Json::objectValue);
+  args["marker"] = "owned-call";
+
+  // Task has an initial suspend: both arguments are destroyed at the end of
+  // this statement, before the resolver starts. The extension handler then
+  // suspends again on pg_sleep, exercising frame ownership across the full
+  // asynchronous dispatch rather than only an eager success path.
+  auto pending = plinth::capabilities::call_capability_async(
+      plinth::capabilities::CapabilityCall{
+          .signature = "extdispatch:1:slow_identity",
+          .args = std::move(args),
+          .call_depth = 0,
+      },
+      plinth::capabilities::UserContext{
+          .user_id = "u-temporary",
+          .username = "temporary-user",
+          .auth_type = "session",
+          .effective_rules = {"kernel.admin"},
+          .session_id = "session-temporary",
+          .ip_address = "127.0.0.1",
+      });
+
+  auto result = drogon::sync_wait(pending);
+  REQUIRE(result.has_value());
+  REQUIRE(result->data["marker"].asString() == "owned-call");
+  REQUIRE(result->data["username"].asString() == "temporary-user");
 }
 
 // ─── Group E — Errors ────────────────────────────────────────────

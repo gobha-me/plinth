@@ -22,6 +22,7 @@ import zipfile
 from process_cleanup import start_browser, stop_browser
 from cache_transition import CacheTransition
 from database_cleanup import drop_database
+from kernel_runtime import add_runtime_arguments, runtime_from_args
 
 spec = importlib.util.spec_from_file_location("production", Path(__file__).with_name("run-production.py"))
 production = importlib.util.module_from_spec(spec)
@@ -30,9 +31,9 @@ spec.loader.exec_module(production)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, required=True)
+    add_runtime_arguments(parser)
     args = parser.parse_args()
-    binary = args.binary.resolve(strict=True)
+    runtime = runtime_from_args(args)
     repo = Path(__file__).resolve().parents[2]
     pg_env = os.environ.copy()
     for suffix, default in (("HOST", "127.0.0.1"), ("PORT", "5432"),
@@ -52,6 +53,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="plinth-bundled-upgrade-") as temporary, ExitStack() as owned:
             root = Path(temporary)
+            runtime.prepare_root(root)
             bundles = root / "bundled"
             bundles.mkdir()
             old = production.package_cache_probe(repo, root, "901.0.1", legacy_document=True)
@@ -64,13 +66,16 @@ def main():
             config.write_text(json.dumps({"database": {"pool_size": 4},
                 "dev_mode": False, "registration_enabled": False,
                 "listen_host": "127.0.0.1", "listen_port": port,
-                "migrations_dir": str(repo / "migrations"),
-                "packages": {"data_dir": str(root / "data"), "staging_dir": str(root / "staging")},
-                "shell": {"enabled": True, "bundle_path": str(bundles)}}))
+                "migrations_dir": runtime.migrations_dir(repo),
+                "packages": {"data_dir": runtime.path(root, root / "data"),
+                             "staging_dir": runtime.path(
+                                 root, root / "data" / "staging")},
+                "shell": {"enabled": True,
+                          "bundle_path": runtime.path(root, bundles)}}))
             env = os.environ | {"PLINTH_PG_" + suffix: pg_env["PG" + suffix]
                                 for suffix in ("HOST", "PORT", "USER", "PASSWORD")}
             env.update(PLINTH_PG_DATABASE=database, PLINTH_PG_POOL_SIZE="4", PLINTH_DEV_MODE="false",
-                PLINTH_MIGRATIONS_DIR=str(repo / "migrations"),
+                PLINTH_MIGRATIONS_DIR=runtime.migrations_dir(repo),
                 PLINTH_BASE_URL=f"http://127.0.0.1:{port}",
                 PLINTH_BROWSER_PROFILE_DIR=str(root / "browser-profile"))
             browser_tmp = root / "browser-tmp"
@@ -84,9 +89,10 @@ def main():
             def launch(upgrade=False, fails="", cancel_commit=None):
                 output_path = root / f"kernel-{len(children)}.log"
                 with output_path.open("w") as output:
-                    child = subprocess.Popen([str(binary), "serve", "--config", str(config)] +
-                        (["--upgrade-bundled-shell"] if upgrade else []), cwd=root, env=env,
-                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
+                    child = runtime.start(
+                        ["serve", "--config", runtime.path(root, config)] +
+                        (["--upgrade-bundled-shell"] if upgrade else []),
+                        root=root, env=env, output=output)
                 children.append(child)
                 try:
                     if cancel_commit is not None:
@@ -115,6 +121,8 @@ def main():
                         try:
                             with urllib.request.urlopen(env["PLINTH_BASE_URL"] + "/healthz", timeout=1) as response:
                                 if response.status == 200:
+                                    if runtime.is_container:
+                                        child.assert_plinth_is_pid1()
                                     return child
                         except (urllib.error.URLError, TimeoutError):
                             pass
@@ -125,8 +133,10 @@ def main():
                     raise
 
             def status():
-                result = subprocess.run([str(binary), "shell", "status", "--config", str(config), "--json"],
-                    cwd=root, env=env, check=True, timeout=20, text=True, capture_output=True)
+                result = runtime.run(
+                    ["shell", "status", "--config", runtime.path(root, config), "--json"],
+                    root=root, env=env, check=True, timeout=20, text=True,
+                    capture_output=True)
                 return json.loads(result.stdout)
 
             def snapshot():
@@ -274,6 +284,7 @@ def main():
                 assert sql("SELECT count(*) FROM plinth.packages n JOIN plinth.packages o ON n.supersedes_id=o.id "
                     "WHERE n.version='901.0.2' AND n.state IN ('ACTIVE','ACTIVE_FLAGGED') AND n.provenance='bundled' "
                     "AND o.version='901.0.1' AND o.state='SUPERSEDED' AND o.retired_at IS NOT NULL") == "1"
+                runtime.refresh_root(root, child)
                 assert active.readlink() == Path("901.0.2")
                 assert sql("SELECT id FROM plinth.packages WHERE name='shell' AND version='901.0.2'") == failed_id
                 assert int(sql("SELECT count(*) FROM plinth.audit_log WHERE action='packages.bundled_upgrade_failed'")) >= int(failure_audits)
