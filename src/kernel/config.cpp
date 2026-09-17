@@ -3,6 +3,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <regex>
 #include <spdlog/spdlog.h>
@@ -95,6 +96,10 @@ auto apply_packages(Config& cfg, const nlohmann::json& p) -> void {
     cfg.packages_staging_dir = p["staging_dir"].get<std::string>();
   }
   if (p.contains("max_package_size_mb")) {
+    if (!p["max_package_size_mb"].is_number_unsigned()) {
+      throw std::runtime_error(
+          "config.packages.max_package_size_mb_out_of_range");
+    }
     cfg.packages_max_package_size_mb =
         p["max_package_size_mb"].get<std::size_t>();
   }
@@ -562,9 +567,27 @@ auto apply_env(Config& cfg) -> void {
 
 } // namespace
 
+auto package_size_limits(std::size_t max_package_size_mb) -> PackageSizeLimits {
+  constexpr std::size_t MIB = 1024ULL * 1024ULL;
+  constexpr std::size_t MULTIPART_ENVELOPE_BYTES = MIB;
+  constexpr std::size_t MAX_PACKAGE_MIB =
+      (std::numeric_limits<std::size_t>::max() - MULTIPART_ENVELOPE_BYTES) /
+      MIB;
+  if (max_package_size_mb == 0 || max_package_size_mb > MAX_PACKAGE_MIB) {
+    throw std::runtime_error(
+        "config.packages.max_package_size_mb_out_of_range");
+  }
+  const auto package_bytes = max_package_size_mb * MIB;
+  return {
+      .package_bytes = package_bytes,
+      .request_body_bytes = package_bytes + MULTIPART_ENVELOPE_BYTES,
+  };
+}
+
 auto load_config() -> Config {
   Config cfg;
   apply_env(cfg);
+  (void)package_size_limits(cfg.packages_max_package_size_mb);
   return cfg;
 }
 
@@ -591,6 +614,8 @@ auto load_config(const std::string& config_path) -> Config {
 
   // Layer 2: Environment variable overrides
   apply_env(cfg);
+
+  (void)package_size_limits(cfg.packages_max_package_size_mb);
 
   return cfg;
 }

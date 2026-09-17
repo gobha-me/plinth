@@ -311,9 +311,11 @@ auto resolve_bundle_path(const std::string& configured) -> fs::path {
 
 auto bundled_shell_status(const Config& cfg)
     -> std::expected<BundledShellStatus, std::string> {
-  auto bundle = inspect_bundle(
-      resolve_bundle_path(cfg.shell.bundle_path) / "shell.zip",
-      cfg.packages_max_package_size_mb * std::size_t{1024} * 1024);
+  const auto package_limits =
+      package_size_limits(cfg.packages_max_package_size_mb);
+  auto bundle =
+      inspect_bundle(resolve_bundle_path(cfg.shell.bundle_path) / "shell.zip",
+                     package_limits.package_bytes);
   if (!bundle) {
     return std::unexpected(bundle.error());
   }

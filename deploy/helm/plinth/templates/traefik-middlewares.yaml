@@ -1,0 +1,49 @@
+{{- if .Values.traefik.enabled }}
+{{- if gt (int .Values.traefik.limits.defaultRequestBodyBytes) (int .Values.traefik.limits.maxRequestBodyBytes) -}}
+{{- fail "traefik.limits.defaultRequestBodyBytes must not exceed maxRequestBodyBytes" -}}
+{{- end -}}
+{{- if gt (int .Values.traefik.limits.memoryRequestBodyBytes) (int .Values.traefik.limits.defaultRequestBodyBytes) -}}
+{{- fail "traefik.limits.memoryRequestBodyBytes must not exceed defaultRequestBodyBytes" -}}
+{{- end -}}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "plinth.fullname" . }}-default-body
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  buffering:
+    maxRequestBodyBytes: {{ .Values.traefik.limits.defaultRequestBodyBytes | int64 }}
+    memRequestBodyBytes: {{ .Values.traefik.limits.memoryRequestBodyBytes | int64 }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "plinth.fullname" . }}-package-body
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  buffering:
+    maxRequestBodyBytes: {{ .Values.traefik.limits.maxRequestBodyBytes | int64 }}
+    memRequestBodyBytes: {{ .Values.traefik.limits.memoryRequestBodyBytes | int64 }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "plinth.fullname" . }}-inflight
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  inFlightReq:
+    amount: {{ .Values.traefik.limits.maxInFlightRequests }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "plinth.fullname" . }}-package-inflight
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  inFlightReq:
+    amount: {{ .Values.traefik.limits.maxPackageInFlightRequests }}
+{{- end }}

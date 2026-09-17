@@ -113,6 +113,273 @@ def check_runtime_image_workflow() -> list[str]:
     return errors
 
 
+def check_kubernetes_deployment() -> list[str]:
+    """Require the supported chart, operator contract, tests, and pinned CI."""
+    errors: list[str] = []
+    chart = ROOT / "deploy" / "helm" / "plinth"
+    required_files = (
+        chart / "Chart.yaml",
+        chart / "README.md",
+        chart / "values.yaml",
+        chart / "values.schema.json",
+        chart / "templates" / "NOTES.txt",
+        chart / "templates" / "_helpers.tpl",
+        chart / "templates" / "configmap.yaml",
+        chart / "templates" / "statefulset.yaml",
+        chart / "templates" / "networkpolicy.yaml",
+        chart / "templates" / "persistentvolumeclaims.yaml",
+        chart / "templates" / "service.yaml",
+        chart / "templates" / "service-headless.yaml",
+        chart / "templates" / "serviceaccount.yaml",
+        chart / "templates" / "traefik-ingressroute.yaml",
+        chart / "templates" / "traefik-middlewares.yaml",
+        chart / "templates" / "traefik-serverstransport.yaml",
+        ROOT / "docs" / "KUBERNETES.md",
+        ROOT / "tests" / "deployment" / "helm_contract_test.py",
+        ROOT / "tests" / "deployment" / "k3d_lifecycle_test.py",
+        ROOT / ".github" / "scripts" / "install-deployment-tools.sh",
+    )
+    for path in required_files:
+        if not path.is_file():
+            errors.append(
+                f"supported deployment file is missing: {path.relative_to(ROOT)}"
+            )
+    if errors:
+        return errors
+
+    values = (chart / "values.yaml").read_text(encoding="utf-8")
+    schema_text = (chart / "values.schema.json").read_text(encoding="utf-8")
+    try:
+        schema = json.loads(schema_text)
+    except json.JSONDecodeError as error:
+        return [f"deploy/helm/plinth/values.schema.json is invalid: {error}"]
+    if schema.get("additionalProperties") is not False:
+        errors.append("Helm values schema must reject unknown top-level values")
+    for marker in (
+        '"pattern": "^sha256:[0-9a-f]{64}$"',
+        '"existingSecret"',
+        '"registration"',
+        '"networkPolicy"',
+        '"databasePeer"',
+        '"rolloutNonce"',
+        '"maxRequestBodyBytes"',
+        '"responseHeaderTimeout"',
+    ):
+        if marker not in schema_text:
+            errors.append(f"Helm values schema is missing {marker}")
+    for marker in (
+        "digest: \"\"",
+        "existingSecret:",
+        "poolSize: 32",
+        "database:\n    port: 5432",
+        "retain: true",
+        "enabled: false",
+        "defaultRequestBodyBytes: 1048576",
+        "maxRequestBodyBytes: 67108864",
+        "responseHeaderTimeout: 60s",
+        "packageResponseHeaderTimeout: 15m",
+        "idleConnTimeout: 90s",
+    ):
+        if marker not in values:
+            errors.append(f"Helm secure defaults are missing {marker}")
+    if re.search(r"(?m)^\s*tag:\s*", values):
+        errors.append("Helm values must not expose an image tag fallback")
+
+    templates = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((chart / "templates").glob("*"))
+        if path.is_file()
+    )
+    required_template_markers = (
+        'printf "%s@%s" $repository $digest',
+        "replicas: 1",
+        "kind: StatefulSet",
+        "podManagementPolicy: OrderedReady",
+        "updateStrategy:",
+        "terminationGracePeriodSeconds: 60",
+        "runAsUser: 10001",
+        "runAsGroup: 10001",
+        "readOnlyRootFilesystem: true",
+        "allowPrivilegeEscalation: false",
+        "automountServiceAccountToken: false",
+        "path: /healthz",
+        "type: ClusterIP",
+        "clusterIP: None",
+        "policyTypes:",
+        "helm.sh/resource-policy: keep",
+        "/var/lib/plinth/data",
+        "/var/lib/plinth/logs",
+        "/var/lib/plinth/uploads",
+        "PLINTH_PG_PASSWORD",
+        "PLINTH_DEV_MODE",
+        "PLINTH_REGISTRATION_ENABLED",
+        "browser_origin",
+        "passHostHeader: true",
+        "port: {{ .Values.networkPolicy.database.port }}",
+    )
+    for marker in required_template_markers:
+        if marker not in templates:
+            errors.append(f"Helm deployment contract is missing {marker}")
+    if re.search(
+        r"(?m)^\s*(?:type:\s*(?:NodePort|LoadBalancer)|"
+        r"hostNetwork:\s*true|hostPort:)",
+        templates,
+    ):
+        errors.append(
+            "Helm chart must not expose a node, load balancer, or host network"
+        )
+
+    deployment_doc = (ROOT / "docs" / "KUBERNETES.md").read_text(
+        encoding="utf-8"
+    )
+    for marker in (
+        "ghcr.io/gobha-me/plinth@sha256:",
+        "Traefik 3.7.13",
+        'org.opencontainers.image.revision',
+        'git clone --depth 1 --branch',
+        'test "$(git rev-parse HEAD)" = "$revision"',
+        'test "$(tr -d \'\\r\\n\' < VERSION)" = "$version"',
+        "headless governing Service",
+        "scale statefulset/plinth --replicas=0",
+        "wait --for=delete pod/plinth-0",
+        "passHostHeader=true",
+        "only a TLS route",
+        "Forwarded` and `X-Forwarded-*` never establish",
+        "trusted edge",
+        "must remain a PostgreSQL",
+        "no PostgreSQL TLS mode, root CA",
+        "unsupported",
+        "networkPolicy.database.port",
+        "one replica",
+        "OrderedReady",
+        "force-delete",
+        "GET /healthz",
+        "300-second failure budget",
+        "50-second",
+        "absolute process watchdog",
+        "grant at least 60 seconds before",
+        "tests/deployment/helm_contract_test.py",
+        "tests/deployment/k3d_lifecycle_test.py",
+        "helm uninstall",
+        "serverstransport.traefik.io",
+    ):
+        if marker not in deployment_doc:
+            errors.append(
+                f"docs/KUBERNETES.md is missing deployment contract: {marker}"
+            )
+
+    contract_command = "python3 tests/deployment/helm_contract_test.py"
+    live_commands = (
+        'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes min',
+        'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes max',
+    )
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    runtime_ci = (ROOT / ".github" / "workflows" / "runtime-image.yml").read_text(
+        encoding="utf-8"
+    )
+    quality_job = workflow_job(ci, "quality")
+    candidate_job = workflow_job(runtime_ci, "candidate")
+    if re.search(
+        rf"(?m)^\s*{re.escape(contract_command)}\s*$", quality_job
+    ) is None:
+        errors.append("CI is missing the non-cluster Helm contract test invocation")
+    for live_command in live_commands:
+        if re.search(
+            rf"(?m)^\s*{re.escape(live_command)}\s*$", candidate_job
+        ) is None:
+            errors.append(
+                "Runtime image CI is missing the live k3d lifecycle invocation: "
+                + live_command
+            )
+    if re.search(
+        r"(?m)^\s*\.github/scripts/install-deployment-tools\.sh contract\s*$",
+        quality_job,
+    ) is None:
+        errors.append("CI is missing the pinned deployment-tool contract installer")
+    if re.search(
+        r"(?m)^\s*\.github/scripts/install-deployment-tools\.sh all\s*$",
+        candidate_job,
+    ) is None:
+        errors.append("Runtime image CI is missing the pinned deployment-tool installer")
+    for marker in (
+        "matrix.arch == 'amd64'",
+        'image="plinth-runtime:amd64-$GITHUB_RUN_ID"',
+    ):
+        if marker not in candidate_job:
+            errors.append(f"Runtime image live deployment job is missing {marker}")
+
+    contract_test = (
+        ROOT / "tests" / "deployment" / "helm_contract_test.py"
+    ).read_text(encoding="utf-8")
+    if re.search(
+        r'(?m)^SCHEMA_COMMIT = "[0-9a-f]{40}"$', contract_test
+    ) is None:
+        errors.append("non-cluster Helm validation schema is not commit-pinned")
+
+    live_test = (
+        ROOT / "tests" / "deployment" / "k3d_lifecycle_test.py"
+    ).read_text(encoding="utf-8")
+    for variable in (
+        "K3S_MIN_IMAGE",
+        "K3S_MAX_IMAGE",
+        "REGISTRY_IMAGE",
+        "POSTGRES_IMAGE",
+        "CURL_IMAGE",
+    ):
+        assignment = re.search(
+            rf'(?ms)^{variable} = \(\n(.*?)^\)$', live_test
+        )
+        if (
+            assignment is None
+            or re.search(r':[A-Za-z0-9._-]+@', assignment.group(1)) is None
+            or re.search(r'sha256:[0-9a-f]{64}', assignment.group(1)) is None
+        ):
+            errors.append(f"live lifecycle {variable} is not tag-and-digest pinned")
+    traefik_tag = re.search(
+        r'(?m)^TRAEFIK_IMAGE_TAG = "[0-9]+\.[0-9]+\.[0-9]+"$', live_test
+    )
+    if traefik_tag is None:
+        errors.append("live lifecycle Traefik tag is not version-pinned")
+    else:
+        expected_traefik = "Traefik " + traefik_tag.group(0).split('"')[1]
+        if expected_traefik not in deployment_doc:
+            errors.append(
+                "deployment docs do not match the live Traefik version: "
+                + expected_traefik
+            )
+    if re.search(
+        r'(?ms)^TRAEFIK_IMAGE_DIGEST = \(\n.*?'
+        r'sha256:[0-9a-f]{64}"\n\)$',
+        live_test,
+    ) is None:
+        errors.append("live lifecycle Traefik image is not digest-pinned")
+
+    installer_path = (
+        ROOT / ".github" / "scripts" / "install-deployment-tools.sh"
+    )
+    installer = installer_path.read_text(encoding="utf-8")
+    for variable in (
+        "HELM_VERSION",
+        "KUBECTL_VERSION",
+        "K3D_VERSION",
+        "KUBECONFORM_VERSION",
+    ):
+        if re.search(rf"(?m)^{variable}=v\d+\.\d+\.\d+$", installer) is None:
+            errors.append(f"deployment tool installer does not pin {variable}")
+    for architecture in ("helm", "kubectl", "k3d", "kubeconform"):
+        assignments = re.findall(
+            rf"(?m)^\s*{architecture}_sha256=([0-9a-f]{{64}})$", installer
+        )
+        if len(assignments) != 2:
+            errors.append(
+                f"deployment tool installer must pin two {architecture} SHA-256 values"
+            )
+    if "sha256sum --check --status" not in installer:
+        errors.append("deployment tool installer must verify downloaded SHA-256 values")
+
+    return errors
+
+
 def load_dependencies() -> list[dict[str, object]]:
     document = json.loads(DEPENDENCIES.read_text(encoding="utf-8"))
     if document.get("schema") != 1 or not isinstance(document.get("components"), list):
@@ -244,6 +511,7 @@ def check(components: list[dict[str, object]]) -> list[str]:
                 errors.append(f"{workflow.relative_to(ROOT)}: action is not SHA-pinned: {action}")
 
     errors.extend(check_runtime_image_workflow())
+    errors.extend(check_kubernetes_deployment())
 
     forbidden_text = (
         ".claude/plans/",
@@ -380,7 +648,10 @@ def main() -> int:
         print(f"public-readiness: {error}", file=sys.stderr)
     if errors:
         return 1
-    print("public-readiness: dependency, license, workflow, and SBOM checks passed")
+    print(
+        "public-readiness: dependency, license, workflow, deployment, and SBOM "
+        "checks passed"
+    )
     return 0
 
 

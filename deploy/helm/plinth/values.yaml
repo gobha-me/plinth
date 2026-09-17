@@ -1,0 +1,115 @@
+image:
+  repository: ghcr.io/gobha-me/plinth
+  # Required. Use the sha256 digest recorded by the Plinth release workflow.
+  digest: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+public:
+  # Required only when traefik.enabled=true. Lowercase DNS name, without a
+  # scheme, path, wildcard, or port.
+  host: ""
+  port: 443
+
+registration:
+  # The first account can bootstrap through kubectl port-forward while this
+  # remains false. The chart refuses to expose general registration through
+  # Traefik.
+  enabled: false
+
+database:
+  # The chart never renders database credentials. This Secret must already
+  # exist in the release namespace with all five keys below.
+  existingSecret: plinth-database
+  keys:
+    host: host
+    port: port
+    user: user
+    password: password
+    database: database
+  poolSize: 32
+
+persistence:
+  data:
+    existingClaim: ""
+    size: 10Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: ""
+    retain: true
+  logs:
+    existingClaim: ""
+    size: 1Gi
+    accessModes:
+      - ReadWriteOnce
+    storageClassName: ""
+    retain: true
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+    ephemeral-storage: 64Mi
+  limits:
+    cpu: "2"
+    memory: 1Gi
+    ephemeral-storage: 512Mi
+
+traefik:
+  enabled: false
+  ingressClassName: traefik
+  entryPoints:
+    - websecure
+  tls:
+    # Required when Traefik is enabled. The Secret must already exist in the
+    # release namespace and contain a certificate for public.host.
+    secretName: ""
+  limits:
+    # Ordinary requests receive the smaller bound. Only POST /api/packages
+    # receives maxRequestBodyBytes. WebSocket upgrades receive neither
+    # buffering nor in-flight middleware.
+    defaultRequestBodyBytes: 1048576
+    maxRequestBodyBytes: 67108864
+    memoryRequestBodyBytes: 1048576
+    maxInFlightRequests: 64
+    # At most two package bodies may occupy the 128 MiB upload scratch volume.
+    maxPackageInFlightRequests: 2
+  forwardingTimeouts:
+    dialTimeout: 5s
+    responseHeaderTimeout: 60s
+    packageResponseHeaderTimeout: 15m
+    idleConnTimeout: 90s
+
+networkPolicy:
+  enabled: true
+  traefik:
+    # Peer arrays replace atomically under Helm values merging, so overriding
+    # cluster-specific labels cannot retain an unintended default selector.
+    peers:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: traefik
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: traefik
+  dns:
+    peers:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: kube-system
+        podSelector:
+          matchLabels:
+            k8s-app: kube-dns
+  database:
+    port: 5432
+    # A peer with only a podSelector is limited to the release namespace.
+    # Replace this array with a namespace+pod peer for a database elsewhere.
+    peers:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: postgresql
+    ipBlocks: []
+
+# Change this value to force a controlled one-at-a-time replacement, including
+# after rotating an externally managed database Secret.
+rolloutNonce: ""

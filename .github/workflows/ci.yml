@@ -46,7 +46,7 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake pkg-config git ca-certificates \
             libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
-            libargon2-dev nodejs \
+            libargon2-dev nodejs python3-yaml \
             "clang-format-$CLANG_VERSION" "clang-tidy-$CLANG_VERSION" \
             "clang-tools-$CLANG_VERSION"
 
@@ -55,6 +55,15 @@ jobs:
 
       - name: Check licenses, dependency pins, and SBOM
         run: tools/public_readiness.py
+
+      - name: Verify the Helm deployment contract
+        env:
+          PLINTH_DEPLOYMENT_TOOLS_DIR: /tmp/plinth-deployment-tools/bin
+        run: |
+          set -euo pipefail
+          .github/scripts/install-deployment-tools.sh contract
+          export PATH="$PLINTH_DEPLOYMENT_TOOLS_DIR:$PATH"
+          python3 tests/deployment/helm_contract_test.py
 
       - name: Scan repository and history for secrets
         run: .github/scripts/run-gitleaks.sh

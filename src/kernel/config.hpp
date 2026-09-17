@@ -235,6 +235,17 @@ struct Config {
   Shell shell;
 };
 
+struct PackageSizeLimits {
+  std::size_t package_bytes;
+  std::size_t request_body_bytes;
+};
+
+// Convert the operator-facing MiB setting once, reserving one MiB for the
+// single multipart field accepted by POST /api/packages. Invalid values fail
+// closed instead of wrapping or removing Drogon's transport limit.
+[[nodiscard]] auto package_size_limits(std::size_t max_package_size_mb)
+    -> PackageSizeLimits;
+
 // Load secure defaults and environment-variable overrides.
 auto load_config() -> Config;
 
