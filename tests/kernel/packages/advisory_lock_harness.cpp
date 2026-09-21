@@ -11,6 +11,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <sys/select.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -24,6 +25,7 @@ namespace {
 constexpr std::size_t STDOUT_CAP_BYTES = 4UL * 1024UL;
 constexpr std::size_t READ_CHUNK_BYTES = 1024;
 constexpr long SELECT_TICK_USEC = 50'000; // 50 ms
+constexpr std::string_view READY_MARKER = "READY\n";
 
 struct ChildSlot {
   pid_t pid = -1;
@@ -32,6 +34,8 @@ struct ChildSlot {
   bool reaped = false;
   int status = 0;
   std::string buffer;
+  std::string ready_tail;
+  bool ready_seen = false;
   std::chrono::steady_clock::time_point fork_at;
 };
 
@@ -45,6 +49,15 @@ auto drain_pipe(ChildSlot& slot) -> void {
   while (true) {
     ssize_t n = ::read(slot.read_fd, chunk.data(), chunk.size());
     if (n > 0) {
+      if (!slot.ready_seen) {
+        slot.ready_tail.append(chunk.data(), static_cast<std::size_t>(n));
+        slot.ready_seen =
+            slot.ready_tail.find(READY_MARKER) != std::string::npos;
+        const auto TAIL_SIZE = READY_MARKER.size() - 1;
+        if (!slot.ready_seen && slot.ready_tail.size() > TAIL_SIZE) {
+          slot.ready_tail.erase(0, slot.ready_tail.size() - TAIL_SIZE);
+        }
+      }
       const auto ROOM = STDOUT_CAP_BYTES > slot.buffer.size()
                             ? STDOUT_CAP_BYTES - slot.buffer.size()
                             : 0;
@@ -74,23 +87,31 @@ auto reap_if_exited(ChildSlot& slot) -> void {
     return;
   }
   int status = 0;
-  pid_t r = ::waitpid(slot.pid, &status, WNOHANG);
+  pid_t r = -1;
+  do {
+    r = ::waitpid(slot.pid, &status, WNOHANG);
+  } while (r < 0 && errno == EINTR);
   if (r == slot.pid) {
     slot.status = status;
     slot.reaped = true;
   }
 }
 
-auto sigkill_and_reap(ChildSlot& slot) -> void {
+auto sigkill_and_reap(ChildSlot& slot) -> bool {
   if (slot.reaped) {
-    return;
+    return false;
   }
-  ::kill(slot.pid, SIGKILL);
+  const bool kill_requested = ::kill(slot.pid, SIGKILL) == 0;
   int status = 0;
-  // Blocking waitpid post-SIGKILL — kernel reaps quickly.
-  ::waitpid(slot.pid, &status, 0);
-  slot.status = status;
-  slot.reaped = true;
+  pid_t reaped = -1;
+  do {
+    reaped = ::waitpid(slot.pid, &status, 0);
+  } while (reaped < 0 && errno == EINTR);
+  if (reaped == slot.pid) {
+    slot.status = status;
+    slot.reaped = true;
+  }
+  return kill_requested;
 }
 
 auto exit_code_from(int status) -> int {
@@ -271,14 +292,16 @@ auto AdvisoryLockHarness::run(int n, std::chrono::milliseconds child_timeout,
   outcomes.reserve(static_cast<std::size_t>(n));
   for (auto& s : slots) {
     bool timed_out = false;
+    bool kill_requested = false;
     if (!s.reaped) {
-      sigkill_and_reap(s);
+      kill_requested = sigkill_and_reap(s);
       timed_out = true;
     }
     // One more drain pass post-reap to capture any remaining bytes.
     drain_pipe(s);
     auto out = outcome_from(s);
     out.timed_out = timed_out;
+    out.kill_requested = kill_requested;
     outcomes.push_back(std::move(out));
   }
   return outcomes;
@@ -309,7 +332,7 @@ auto AdvisoryLockHarness::run_with_contention(
     tv.tv_usec = SELECT_TICK_USEC;
     (void)::select(slot.read_fd + 1, &rset, nullptr, nullptr, &tv);
     drain_pipe(slot);
-    if (slot.buffer.find("READY\n") != std::string::npos) {
+    if (slot.ready_seen) {
       ready = true;
     }
   }
@@ -346,14 +369,63 @@ auto AdvisoryLockHarness::run_with_contention(
   }
 
   bool timed_out = false;
+  bool kill_requested = false;
   if (!slot.reaped) {
-    sigkill_and_reap(slot);
+    kill_requested = sigkill_and_reap(slot);
     timed_out = true;
   }
   drain_pipe(slot);
 
   auto out = outcome_from(slot);
   out.timed_out = timed_out;
+  out.checkpoint_reached = ready;
+  out.kill_requested = kill_requested;
+  return out;
+}
+
+auto AdvisoryLockHarness::run_until_ready_and_kill(
+    std::chrono::milliseconds child_timeout, const ChildFn& child_fn)
+    -> ChildOutcome {
+  auto slot = fork_one(db, /*idx=*/0, /*total=*/1, child_fn);
+  const auto DEADLINE = std::chrono::steady_clock::now() + child_timeout;
+
+  bool ready = false;
+  while (!ready && !slot.reaped) {
+    if (std::chrono::steady_clock::now() >= DEADLINE) {
+      break;
+    }
+
+    fd_set rset;
+    FD_ZERO(&rset);
+    int nfds = -1;
+    if (!slot.closed) {
+      FD_SET(slot.read_fd, &rset);
+      nfds = slot.read_fd;
+    }
+    struct timeval tv{};
+    tv.tv_sec = 0;
+    tv.tv_usec = SELECT_TICK_USEC;
+    if (nfds >= 0) {
+      (void)::select(nfds + 1, &rset, nullptr, nullptr, &tv);
+    } else {
+      ::usleep(static_cast<useconds_t>(SELECT_TICK_USEC));
+    }
+    drain_pipe(slot);
+    ready = slot.ready_seen;
+    reap_if_exited(slot);
+  }
+
+  const bool timed_out = !ready && !slot.reaped;
+  bool kill_requested = false;
+  if (!slot.reaped) {
+    kill_requested = sigkill_and_reap(slot);
+  }
+  drain_pipe(slot);
+
+  auto out = outcome_from(slot);
+  out.timed_out = timed_out;
+  out.checkpoint_reached = ready;
+  out.kill_requested = kill_requested;
   return out;
 }
 

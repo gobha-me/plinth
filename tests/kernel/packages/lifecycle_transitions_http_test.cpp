@@ -15,8 +15,9 @@
 // that does not exist today; their own follow-up session.
 //
 // X.12 (crash-at-swap-T3) lives in `atomic_swap_crash_test.cpp`
-// per ICD-0.4.5 §675 — seeded-state + reconcile_in_flight_installs
-// pattern, distinct from this fixture-driven file.
+// per ICD-0.4.5 §675. It SIGKILLs the exact installer child after the
+// production T3 commit and drives startup reconciliation in a fresh child,
+// distinct from this fixture-driven HTTP file.
 //
 // Routing: same `[ws]` tag as session-2's `install_lifecycle_http_test.cpp`
 // to steer cases into `plinth_tests_ws` (the sole drogon-starter

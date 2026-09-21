@@ -41,7 +41,7 @@ This is the orchestrator's second half. 0.4.4 supplies `install_package` (UPLOAD
 - **Extended `POST /api/packages` semantics.** The existing 0.4.4 endpoint rejects a same-name upload with 409. In 0.4.5 the pre-INSERT collision check in UPLOADING is augmented: if a row exists with state `ACTIVE` or `ACTIVE_FLAGGED` and a strictly-earlier `version` per SemVer comparison, the upload enters the upgrade branch instead of rejecting. Same-version or older-version uploads still reject (409 `upgrade-version-not-newer`).
 - **New atomic-swap choreography** — a named phase inside the upgrade path, between EXTRACTING and ACTIVATING. See §State Machine for the sequence. The swap covers: route unregister/register, capability handler unregister/register, RBAC rule reconciliation (new/missing/changed), active-symlink repoint, and row-state flip (old → SUPERSEDED with `retired_at`; new → ACTIVE).
 - **RBAC reconciliation on upgrade.** Three cases per rule, comparing the v1 and v2 `rbac.json` by the namespaced `rule` string: new in v2 → INSERT; present in v1 but absent in v2 → `orphaned_at = NOW()` (preserve `plinth.group_rules` grants so a downgrade / re-enable restores them); present in both → UPDATE `description`, `test_contract`, `extension_name` in place; clear `orphaned_at` unconditionally for v2 rules (idempotent re-enable side-effect).
-- **Crash recovery extensions.** `reconcile_in_flight_installs` from 0.4.4 handled the install-path states. 0.4.5 extends it to recognize: (a) a SUPERSEDED row with no matching ACTIVE row for the same name (swap crashed between old → SUPERSEDED and new → ACTIVE; replay the swap or back out); (b) an UNINSTALLING row (complete the uninstall or roll back to the pre-uninstall state); (c) an upgrade row at ACTIVATING with a non-NULL `supersedes_id` (mid-swap, replay from the last durable point).
+- **Crash recovery extensions.** `reconcile_in_flight_installs` from 0.4.4 handled the install-path states. 0.4.5 extends it to recognize: (a) a committed swap whose predecessor is SUPERSEDED and whose successor is ACTIVE with a non-NULL `supersedes_id`, but whose `active` symlink still names the predecessor (the real post-COMMIT/pre-rename crash shape; replay the pointer cutover); (b) an UNINSTALLING row (complete the uninstall or roll back to the pre-uninstall state); (c) an upgrade row at ACTIVATING with a non-NULL `supersedes_id` whose predecessor is still ACTIVE (the swap transaction did not commit; back out the successor).
 - **PG advisory lock per package name** — the same `hashtextextended('plinth.packages.' || name, 0)` key used by 0.4.4 install. All four 0.4.5 transitions acquire the lock. Simultaneous disable + uninstall for the same name serialize; different-name transitions proceed in parallel. Upgrade's long lock-hold window (potentially seconds, not milliseconds) is explicitly documented as acceptable.
 - **Per-transition audit events** — `packages.disabled` / `packages.enabled` / `packages.uninstall_confirmed` / `packages.uninstalled` / `packages.upgrade_started` / `packages.upgrade_swapped` / `packages.upgrade_completed`. Failure variants (`packages.disable_failed`, etc.) mirror the success set.
 - **Test fixtures.** A new `tests/fixtures/lifecycle_transitions/` tree with 25 cases — see §Test Cases. `PLINTH_KERNEL_TESTS=ON` gated on the PG-backed cases; a unit-level file covers the GC contract and the RBAC reconciliation comparator without PG.
@@ -228,17 +228,18 @@ At this point the new version's files are on disk and fsynced, the DB row is at 
 3. **T2 — Drain resolution.**
    - All in-flight calls complete within the timeout → proceed to T3.
    - Timeout expires with in-flight calls outstanding → UPDATE new row `state = 'INSTALL_FAILED'`, `last_install_report` = `{kind: "upgrade-drain-timeout", outstanding: N}`. The new-version files and schema edits remain, but no swap occurs; the admin can retry the upgrade (a subsequent POST with the same zip will re-extract into the existing `{new-version}/` directory and try again — files are overwritten, idempotent). Drogon's graceful-shutdown equivalent is not involved; the drain is a capability-layer mechanism.
-4. **T3 — Swap transaction (single PG + filesystem atomic rename).** Inside a single PG transaction:
+4. **T3 — Swap transaction followed by filesystem atomic rename.** Under the package-name advisory lock:
    a. UPDATE old row: `state = 'SUPERSEDED'`, `retired_at = NOW()`.
    b. UPDATE new row: `state = 'ACTIVE'`.
-   Outside the PG transaction but synchronized to it via advisory lock:
-   c. Symlink flip: `symlink({new-version}, {staging}/active.tmp)` + `rename({staging}/active.tmp, {data_dir}/extensions/{name}/active)`. Atomic on POSIX filesystems when source and destination are on the same mountpoint; we require `{data_dir}` to be a single mountpoint (§Security Constraint 4).
-   d. COMMIT the PG transaction immediately before the symlink rename's `rename()` syscall. The DB commit provides durability; the `rename()` provides atomicity for readers (asset-route handlers resolve the symlink on each request, so a reader either sees the old path or the new one, never a half-way state).
+   c. COMMIT the PG transaction. The two row updates are one durability unit: a process death cannot expose SUPERSEDED + ACTIVATING from this transaction.
+   d. Outside the PG transaction, but still under the advisory lock, flip the symlink with `symlink({new-version}, {data_dir}/extensions/{name}/active.tmp)` + `rename({data_dir}/extensions/{name}/active.tmp, {data_dir}/extensions/{name}/active)`. The temporary link and destination are siblings, so the rename is atomic on POSIX filesystems; we require `{data_dir}` to be a single mountpoint (§Security Constraint 4).
+
+   A process killed after step c and before step d leaves the exact durable X.12 state: the old row is SUPERSEDED, the new row is ACTIVE with `supersedes_id` naming the old row, both version directories remain, and `active` still points at the old version. On restart, `reconcile_in_flight_installs` recognizes that pair, atomically repoints `active` to the new version, recreates the successor runtime pool, and leaves the committed row states and retained directories intact before ingress opens.
 5. **T4 — Route + capability cutover.** `asset_server::unregister_routes(name, old_version)` — old `/ext/{name}/{old-version}/*` starts returning 404 (deliberate — forces browser cache invalidation). `asset_server::register_routes(name, new_version, new_client_root)` — new route live. If frontend mount differs between versions (rare but possible), unregister old mount and register new; if same, no change. `plinth::capabilities::unregister_capability` for each capability in the old-version manifest; the new-version capabilities are already in the registry from REGISTERING. Dispatch for subsequent calls immediately routes to new handlers.
 6. **T5 — Retention timer.** `retired_at` on the old row is the logical retention-window start. 0.7.x's scheduler reads `retired_at` and applies the configured retention (default 24h). No timer is set in-process at 0.4.5 — see §Library Surface.
 7. **ACTIVATING complete** — continue into the 0.4.4 ACTIVATING tail (audit `packages.installed`-variant event, now `packages.upgrade_completed`).
 
-**On any swap-transaction failure** (T3 fails): PG transaction rolls back. If the rename already occurred but the commit fails, the symlink must be un-rolled by a compensating rename (`rename(previous_active_target, ...)`). The reconciler detects this via `(old row state, symlink target)` comparison at kernel start and corrects.
+**Before-COMMIT swap failure:** the PG transaction rolls back and the symlink is still old. **After-COMMIT pointer failure or process death:** the database outcome is authoritative; the reconciler forward-completes the symlink to the committed ACTIVE successor. It does not manufacture a rollback to ACTIVATING or delete either retained version.
 
 ### SUPERSEDED (terminal until GC)
 
@@ -649,7 +650,7 @@ All tests gated `PLINTH_KERNEL_TESTS=ON` unless marked otherwise.
 | X.09 | Upgrade atomic swap — drain timeout exceeded | New row → INSTALL_FAILED with kind `upgrade-drain-timeout`; old row → ACTIVE (untouched); 504 response. _**Closed in 0.6.0.N session 9** with one production deviation: HTTP 400 (not the ICD's 504) because `install_lifecycle.cpp:1402` hardcodes `failed_at = UPLOADING` for the upgrade-path conversion — same root cause as session 4's X.06 deviation; both reconcile together as the failure-conversion follow-up._ |
 | X.10 | Upgrade asset routes — old 404, new serves | `/ext/notes/1.2.3/main.js` → 404 immediately post-swap; `/ext/notes/1.3.0/main.js` → 200 |
 | X.11 | Upgrade filesystem — both versions coexist | `{data_dir}/extensions/notes/1.2.3/` present; `{data_dir}/extensions/notes/1.3.0/` present; `active` symlink → `1.3.0` |
-| X.12 | Crash at swap T3 (after old → SUPERSEDED, before new → ACTIVE) | Reconciler detects two rows for same name (SUPERSEDED + ACTIVATING with `supersedes_id`); replays swap to final state; symlink re-checked and corrected |
+| X.12 | Exact child receives SIGKILL at swap T3 after the two-row PG transaction commits and before `active.tmp` is created | Before restart: old=SUPERSEDED, new=ACTIVE with `supersedes_id`, `active` still names old, and both version directories remain. Reconciler forward-completes the pointer to new, recreates the successor runtime pool, and preserves both committed rows/directories. The bounded harness reaps only the signalled child and leaves no fixture artifact. |
 | X.13 | Concurrent POSTs for the same name with different new versions | First acquires advisory lock, proceeds; second waits (up to a configurable bound) or 409 `in-flight-operation` |
 
 ### GC Contract (G.*)
@@ -672,7 +673,7 @@ File: `tests/kernel/packages/lifecycle_transitions_unit_test.cpp`
 - GC eligibility predicate: a pure function `is_eligible(retired_at, now, retention_hours) -> bool`. Edge cases at the boundary.
 - State-enum string conversions round-trip for the added `SUPERSEDED` value.
 
-**Test count: 9 D.* + 7 U.* + 13 X.* + 3 G.* = 32 fixture cases + unit-level file. I.11 / I.12-analog crash-recovery cases (U.06, U.07, X.12) use the 0.4.4 slice B seeded-state approach — per CHANGELOG v0.4.4 deviation note: `No fork()/exec()/SIGKILL subprocess harness. Crash recovery exercised by seeding plinth.packages rows with manufactured in-flight states + invoking reconcile_in_flight_installs() in-process.` Apply the same pattern to U.06/U.07/X.12.**
+**Test count: 9 D.* + 7 U.* + 13 X.* + 3 G.* = 32 fixture cases + unit-level file. U.06/U.07 retain the 0.4.4 slice B seeded-state approach. X.12 is the deliberate exception: it uses `AdvisoryLockHarness::run_until_ready_and_kill` to kill the exact child at the production post-COMMIT/pre-symlink checkpoint, then starts a fresh child through the production bootstrap reconciliation path and verifies the durable database/filesystem state.**
 
 ---
 
@@ -689,11 +690,11 @@ File: `tests/kernel/packages/lifecycle_transitions_unit_test.cpp`
 - `tests/fixtures/lifecycle_transitions/` — 25 new fixtures (see §Test Cases).
 - `tests/kernel/packages/lifecycle_transitions_test.cpp` — **new**. PG-gated. Drives D.* + U.* + X.* cases through the full library surface.
 - `tests/kernel/packages/lifecycle_transitions_unit_test.cpp` — **new**. No PG gate. Unit cases for GC predicate, RBAC comparator, SemVer compare, drain state machine, enum round-trip.
-- `tests/kernel/packages/atomic_swap_crash_test.cpp` — **new**. PG-gated. Seeded-state crash-recovery cases for X.12 + U.06/U.07.
+- `tests/kernel/packages/atomic_swap_crash_test.cpp` — **new**. PG-gated subprocess coverage for X.12: production v1 install + v2 upgrade, exact-child SIGKILL after the swap COMMIT, retained-state assertions, and fresh-process production reconciliation. U.06/U.07 remain in the seeded-state recovery suite.
 - `src/kernel/main.cpp` — adds the `{data_dir}` single-mountpoint check to the bootstrap self-check list (§Security Constraint 4). No change to the reconciler invocation site — same function, extended body.
 - `CMakeLists.txt` — no new external dependencies. libzip and shell_blob from 0.4.4 are untouched. New test TUs added to the existing test-source globs.
 - `run-clang-tidy-20` zero findings on new + modified TUs.
-- CI: integration tests add ~30s for D.*+U.*+X.* PG-gated cases; unit cases add <1s. Crash-recovery cases add ~10s (no subprocess fork; all in-process seeded-state per 0.4.4 slice B pattern).
+- CI: integration tests add ~30s for D.*+U.*+X.* PG-gated cases; unit cases add <1s. X.12 uses the bounded subprocess/SIGKILL harness; every child is reaped and its package/database/filesystem fixture is removed before the case returns.
 
 ---
 

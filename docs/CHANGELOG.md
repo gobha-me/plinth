@@ -11,6 +11,25 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-21 — bounded crash-injection recovery coverage
+
+- Extended the shared PostgreSQL subprocess harness with a bounded READY
+  handshake, exact-child SIGKILL, and mandatory reap so crash tests cannot
+  leak children or signal unrelated processes.
+- Covered package swap X.12 at the production post-COMMIT/pre-symlink
+  checkpoint: the durable old=SUPERSEDED/new=ACTIVE pair and both retained
+  version trees survive, then a fresh production restart reconciles `active`
+  to the new version.
+- Covered realtime S.07 with production `events_writer` processes: the victim
+  commits V and is killed before broker dispatch, a survivor commits later S,
+  restart/replay observes V then S in order, and a later live delivery L
+  advances the durable per-user cursor. Every child is reaped and task-owned
+  rows are removed.
+
+This resolves [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34).
+
+---
+
 ## 2026-09-16 — browser mutation CSRF boundary
 
 - Bound a readable double-submit token to each HttpOnly session and required

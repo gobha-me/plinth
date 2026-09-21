@@ -144,8 +144,9 @@ are ready.
 ## Reconciliation notes
 
 - LH-1 was already completed; its stale unchecked line was removed.
-- Only ICD-0.4.5 X.12 and ICD-0.5.5 S.07 remain from the old crash-injection
-  fixture umbrella; they are tracked together in #34.
+- ICD-0.4.5 X.12 and ICD-0.5.5 S.07 were the last gaps from the old
+  crash-injection fixture umbrella; #34 covers both with bounded exact-child
+  SIGKILL/reap control and production restart recovery.
 - The duplicate pre-1.0 security-audit line now resolves to #86.
 - Browser/client backfill is #32; DAST is #40; reconnect stress is #88.
 - The source-code CSRF deferral is #33, and the previously unscheduled Drogon

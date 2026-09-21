@@ -655,6 +655,7 @@ add_executable(plinth_tests
   tests/kernel/packages/lifecycle_transitions_test.cpp
   tests/kernel/packages/lifecycle_transitions_unit_test.cpp
   tests/kernel/packages/crash_recovery_test.cpp
+  tests/kernel/packages/atomic_swap_crash_test.cpp
   tests/kernel/packages/rbac_test_report_test.cpp
   tests/kernel/packages/rbac_test_runner_test.cpp
   tests/kernel/main/cli_test_rbac_test.cpp
