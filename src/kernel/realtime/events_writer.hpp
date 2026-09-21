@@ -63,6 +63,13 @@ auto enqueue_for_test(DispatchedEvent ev) -> bool;
 
 [[nodiscard]] auto queue_size_for_test() -> std::size_t;
 
+// Deterministic subprocess seam: serialize against timer-side admission,
+// admit one event to an otherwise-empty queue, and run the real production
+// insert path synchronously before releasing the dispatch lock. Returns false
+// when the writer is unavailable, the queue is not empty, or persistence
+// throws. The post-COMMIT hook may intentionally prevent this call returning.
+auto enqueue_and_drain_one_for_test(DispatchedEvent ev) -> bool;
+
 // Pin a specific DbClient. When set, every PG operation routes through
 // this client instead of `drogon::app().getDbClient()`. Pass nullptr
 // to clear.
@@ -83,6 +90,14 @@ auto clear_insert_hook_for_test() -> void;
 auto set_advisory_lock_hook_for_test(
     std::function<bool(const std::string& /*key*/)> hook) -> void;
 auto clear_advisory_lock_hook_for_test() -> void;
+
+// Production-arm crash checkpoint. Fires immediately after the INSERT
+// transaction COMMIT succeeds and before the returned seq is stamped or the
+// broker/cursor path runs. Kept as an atomic function pointer so a forked
+// subprocess can stop at the exact durable boundary without taking a mutex.
+using PostCommitHook = void (*)() noexcept;
+auto set_post_commit_hook_for_test(PostCommitHook hook) noexcept -> void;
+auto clear_post_commit_hook_for_test() noexcept -> void;
 
 // ICD-0.5.5 §14 — fires after the writer stamps `ev.envelope["seq"]`
 // from the RETURNING result, BEFORE `broker::dispatch` is invoked.

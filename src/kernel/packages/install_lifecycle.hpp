@@ -259,4 +259,18 @@ auto check_single_mountpoint(const std::filesystem::path& data_dir,
                              const std::filesystem::path& staging_dir)
     -> std::expected<void, std::string>;
 
+namespace test_seam {
+
+// Crash-injection boundary for the non-bundled upgrade path. The hook runs
+// immediately after T3's database transaction commits and before any active
+// symlink manipulation. Keep callbacks async-signal-safe: subprocess tests use
+// only write(2) and pause(2), then the parent kills the exact child process.
+using UpgradeSwapCommittedHook = void (*)() noexcept;
+
+auto set_upgrade_swap_committed_hook(UpgradeSwapCommittedHook hook) noexcept
+    -> void;
+auto clear_upgrade_swap_committed_hook() noexcept -> void;
+
+} // namespace test_seam
+
 } // namespace plinth::packages

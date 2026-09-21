@@ -15,7 +15,7 @@
 // and reporter flush. Parent reads each child's stdout via a pipe
 // (capped at 4 KiB), reaps with `waitpid`, returns outcomes.
 //
-// Two shapes:
+// Three shapes:
 //   * `run(N, ...)` — N children all run in parallel; harness waits
 //     for all to exit. Used for I.02-style "racing writers" tests.
 //   * `run_with_contention(...)` — 1 child runs, signals "READY\n"
@@ -23,6 +23,8 @@
 //     returns or `child_timeout` elapses. Parent runs `parent_fn`
 //     synchronously while the child holds its lock. Used for G.03-style
 //     "child holds, parent acts under contention" tests.
+//   * `run_until_ready_and_kill(...)` — 1 child signals "READY\n" at a
+//     durable boundary; the harness SIGKILLs and reaps that exact child.
 
 #include "kernel/config.hpp"
 
@@ -41,7 +43,9 @@ struct ChildOutcome {
   int exit_code = -1;      // _exit value; 0 = success
   std::string stdout_text; // pipe-captured, capped 4 KiB
   std::chrono::milliseconds wall{0};
-  bool timed_out = false; // true → harness sent SIGKILL
+  bool timed_out = false;          // deadline expired before child completion
+  bool checkpoint_reached = false; // child emitted the literal "READY\n"
+  bool kill_requested = false;     // harness sent SIGKILL to this exact pid
 };
 
 // Child lambda contract: receives an open libpq conn (caller does NOT
@@ -78,6 +82,16 @@ class AdvisoryLockHarness {
   [[nodiscard]] auto run_with_contention(
       std::chrono::milliseconds child_timeout, const ChildFn& child_fn,
       const std::function<void()>& parent_fn) -> ChildOutcome;
+
+  // Fork 1 child and wait up to `child_timeout` for the literal line
+  // "READY\n". Once observed, send SIGKILL to that exact child pid and reap
+  // it before returning. A child that exits before the checkpoint is reaped
+  // normally; a child that misses the deadline is killed with timed_out=true.
+  // This is the crash-injection counterpart to run_with_contention(): callers
+  // place READY at the durable boundary whose restart behavior they exercise.
+  [[nodiscard]] auto run_until_ready_and_kill(
+      std::chrono::milliseconds child_timeout, const ChildFn& child_fn)
+      -> ChildOutcome;
 
  private:
   plinth::Config::Database db;

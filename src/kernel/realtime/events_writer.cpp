@@ -102,6 +102,7 @@ drogon::orm::DbClientPtr g_test_db_client;
 InsertHook g_insert_hook;
 LockHook g_lock_hook;
 PreBrokerHook g_pre_broker_hook;
+std::atomic<PostCommitHook> g_post_commit_hook{nullptr};
 
 // Process-wide success counter — Phase 3 seam for E.* assertions.
 std::atomic<std::uint64_t> g_writes_persisted{0};
@@ -346,6 +347,10 @@ auto insert_envelope(QueueEntry entry) -> drogon::Task<void> {
     // INSERT (destructor under sync_wait can race the test query).
     // See run_on_context.cpp:841 for the canonical pattern.
     co_await tx->execSqlCoro("COMMIT");
+    if (auto hook = g_post_commit_hook.load(std::memory_order_acquire);
+        hook != nullptr) {
+      hook();
+    }
     // ICD-0.5.5 §5 — stamp the canonical envelope `seq` from the
     // RETURNING result, fire the optional pre-broker test seam,
     // then invoke `broker::dispatch` so the WS + JS fan-out arms
@@ -712,6 +717,33 @@ auto queue_size_for_test() -> std::size_t {
   return g_queue.size();
 }
 
+auto enqueue_and_drain_one_for_test(DispatchedEvent ev) -> bool {
+  std::lock_guard dispatch_lock(g_dispatch_mu);
+  if (!g_running.load() || g_shutting_down.load() || !g_cfg.enabled) {
+    return false;
+  }
+
+  std::optional<QueueEntry> entry;
+  {
+    std::lock_guard queue_lock(g_queue_mu);
+    if (!g_queue.empty() || g_queue.size() >= g_cfg.write_queue_size) {
+      return false;
+    }
+    g_queue.push_back(
+        {.ev = std::move(ev), .received_at = std::chrono::system_clock::now()});
+    entry = std::move(g_queue.front());
+    g_queue.pop_front();
+  }
+
+  try {
+    drogon::sync_wait(insert_envelope(std::move(*entry)));
+  } catch (...) {
+    g_delivery_failed.store(true);
+    return false;
+  }
+  return true;
+}
+
 auto set_db_client_for_test(drogon::orm::DbClientPtr db) -> void {
   std::lock_guard lock(g_test_mu);
   g_test_db_client = std::move(db);
@@ -739,6 +771,14 @@ auto set_advisory_lock_hook_for_test(
 auto clear_advisory_lock_hook_for_test() -> void {
   std::lock_guard lock(g_test_mu);
   g_lock_hook = nullptr;
+}
+
+auto set_post_commit_hook_for_test(PostCommitHook hook) noexcept -> void {
+  g_post_commit_hook.store(hook, std::memory_order_release);
+}
+
+auto clear_post_commit_hook_for_test() noexcept -> void {
+  g_post_commit_hook.store(nullptr, std::memory_order_release);
 }
 
 auto set_pre_broker_hook_for_test(

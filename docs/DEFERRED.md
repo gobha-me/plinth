@@ -20,14 +20,13 @@ Cross-referenced from:
 
 ## Active issue index
 
-Reconciled against current source, tests, CHANGELOG, and GitHub on 2026-09-16.
+Reconciled against current source, tests, CHANGELOG, and GitHub on 2026-09-21.
 The detailed legacy entries below intentionally retain their original analysis,
 including partial-resolution narratives. A heading marked `resolved` or a topic
 not present in this index is historical context, not unscheduled work.
 
 - Browser/client runtime coverage: [#32](https://github.com/gobha-me/plinth/issues/32)
 - Extension HTTP contract and implementation: [#47](https://github.com/gobha-me/plinth/issues/47), [#48](https://github.com/gobha-me/plinth/issues/48)
-- Upgrade/realtime process-death injection: [#34](https://github.com/gobha-me/plinth/issues/34)
 - Realtime source-sequence contract: [#42](https://github.com/gobha-me/plinth/issues/42)
 - Reconnect-under-storm load evidence: [#88](https://github.com/gobha-me/plinth/issues/88)
 - PostgreSQL SQLSTATE typing through Drogon batch aborts: [#92](https://github.com/gobha-me/plinth/issues/92)
@@ -303,9 +302,9 @@ if a real workload demands.
 - [`docs/discussion/DISCUSSION-extension-http-surface.md`](discussion/DISCUSSION-extension-http-surface.md)
   Risks-and-Unknowns section frames the original questions.
 
-### 2026-04-26 — ICD-0.5.4 I.02 / I.03 + ICD-0.5.5 S.06 / S.07 / L.03 / L.04 / L.05 / W.06 / I.01 / I.02 / I.03 / I.04 — realtime test coverage + W.06 design defer [deferred from v0.5.4 / v0.5.5 ship; ICD-0.5.4 I.02 closed in 0.6.0.N session 3; ICD-0.5.4 I.03 discharged via L.03 in session 6; ICD-0.5.5 L.03 / L.04 / L.05 closed in 0.6.0.N session 6; ICD-0.5.5 S.06 closed in 0.6.0.N session 8]
+### 2026-04-26 — ICD-0.5.4 I.02 / I.03 + ICD-0.5.5 S.06 / S.07 / L.03 / L.04 / L.05 / W.06 / I.01 / I.02 / I.03 / I.04 — realtime test coverage + W.06 design defer [deferred from v0.5.4 / v0.5.5 ship; ICD-0.5.4 I.02 closed in 0.6.0.N session 3; ICD-0.5.4 I.03 discharged via L.03 in session 6; ICD-0.5.5 L.03 / L.04 / L.05 closed in 0.6.0.N session 6; ICD-0.5.5 S.06 closed in 0.6.0.N session 8; S.07 resolved by #34]
 
-**Tracking:** S.07 process-death coverage is [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34), W.06 source-sequence design is [#42](https://github.com/gobha-me/plinth/issues/42), and the production reconnect load tier is [#88](https://github.com/gobha-me/plinth/issues/88). All other cases in this entry are resolved or absorbed as described below.
+**Tracking:** S.07 process-death coverage was resolved by [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34), W.06 source-sequence design is [#42](https://github.com/gobha-me/plinth/issues/42), and the production reconnect load tier is [#88](https://github.com/gobha-me/plinth/issues/88). All other cases in this entry are resolved or absorbed as described below.
 
 **Milestone:** v0.5.4 enumerated 41 ICD test cases and shipped 38
 (D.08 absorbed into ICD-0.5.5 as L.03; **I.02 multi-process advisory-
@@ -329,9 +328,12 @@ deferral splits into three buckets per CHANGELOG v0.5.5 §Test counts:
   via per-conn cache + immediate-send-path detection in
   [`src/kernel/ws/publish.cpp`](../src/kernel/ws/publish.cpp). See
   the dedicated Resolved entry below for the full close-out.
-  **S.07** cursor catch-up after writer crash mid-window remains
-  open and reuses the v0.5.4 I.02 multi-process harness's reserved
-  `run_with_kill` extension once the SIGKILL-family follow-up lands.
+  **S.07** cursor catch-up after writer crash mid-window is covered
+  by issue #34's bounded `run_until_ready_and_kill` extension. The
+  exact victim uses the production `events_writer`, commits V, and is
+  killed before broker dispatch; a surviving production writer
+  commits later S; restart/replay observes V then S in order, and a
+  later live delivery advances the durable cursor.
 - **L.03 / L.04 / L.05** mid-replay live-buffer integration +
   overflow scenarios — **closed 0.6.0.N session 6 (2026-04-28)** at
   [`tests/kernel/realtime/live_replay_ordering_test.cpp`](../tests/kernel/realtime/live_replay_ordering_test.cpp)
@@ -394,8 +396,8 @@ gap.
   (2026-04-27) at
   [`tests/kernel/packages/advisory_lock_harness.{hpp,cpp}`](../tests/kernel/packages/advisory_lock_harness.hpp);
   ICD-0.5.4 I.02 closed in the same session. Remaining harness
-  consumer **S.07** (writer-crash mid-window cursor catch-up) needs
-  the harness's reserved `run_with_kill` extension; **I.01–I.04** live
+  consumer **S.07** (writer-crash mid-window cursor catch-up) now
+  uses the bounded `run_until_ready_and_kill` extension; **I.01–I.04** live
   in `load-harness/`, not `plinth_tests`, so they're out of the
   test-fixture-buildout scope.
 - **Live-buffer fault-injection seam** — landed in 0.6.0.N session 6
@@ -490,9 +492,9 @@ fixture extends with the second-install-fixture helper.
 
 ---
 
-### 2026-04-22 — ICD-0.4.5 X.05 / X.06 / X.07 / X.08 / X.09 / X.10 / X.11 / X.12 / X.13 + G.03 — extended upgrade and GC test coverage [deferred from v0.4.5 ship; G.03 closed in 0.6.0.N session 3; X.05 / X.06 / X.07 (partial) / X.10 / X.11 / X.13 closed in 0.6.0.N session 4; X.07 missing+changed sub-cases / X.08 / X.09 closed in 0.6.0.N session 9]
+### 2026-04-22 — ICD-0.4.5 X.05 / X.06 / X.07 / X.08 / X.09 / X.10 / X.11 / X.12 / X.13 + G.03 — extended upgrade and GC test coverage [resolved; X.12 closed by #34]
 
-**Tracking:** only X.12 remains, consolidated with realtime S.07 in [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34).
+**Tracking:** X.12 was consolidated with realtime S.07 and resolved by [GitHub issue #34](https://github.com/gobha-me/plinth/issues/34).
 
 **Milestone:** ICD-0.4.5 enumerates ~25 test cases across the
 D.* / U.* / X.* / G.* prefixes. v0.4.5 Slice B shipped X.01 (happy-path
@@ -565,7 +567,12 @@ the ICD's 504)** — same root cause as session 4's X.06 deviation
 the upgrade-path conversion); both reconcile together as the
 failure-conversion follow-up.
 
-**X.12 remains deferred** — see "Future approach" below.
+**X.12 is covered by issue #34.** Its exact child is killed after the
+two-row T3 transaction commits and before the sibling `active.tmp`
+symlink is created. The retained state is therefore old=SUPERSEDED,
+new=ACTIVE, both version directories present, and `active` still on
+the old version. A fresh production reconciliation child must
+forward-complete the pointer and runtime state.
 
 **Why deferred:** The deferred set splits roughly into two clusters
 that each need shared infrastructure not yet in place:
@@ -607,14 +614,14 @@ need a separate decision on whether to add the fork/SIGKILL harness
 or continue substituting library-level state-injection — either is
 defensible; the ROADMAP slot's scope leaves this open.
 
-**Future approach (post-session-9):** One follow-up owns the
-remaining case:
+**Resolution (issue #34):** The final follow-up owns both crash cases:
 
-1. **X.12 (crash at swap T3)** — SIGKILL extension of the session-3
-   `AdvisoryLockHarness`. The harness already reserves the design
-   shape (`run_with_kill(int n, ChildFn body, KillSpec spec)`) per
-   the session-3 macro plan §C. Same session also closes ICD-0.5.5
-   S.07 (cursor catch-up after writer crash mid-window).
+1. **X.12 (crash at swap T3)** — the session-3
+   `AdvisoryLockHarness` gains bounded, exact-child
+   `run_until_ready_and_kill`. The same issue closes ICD-0.5.5 S.07
+   (cursor catch-up after writer crash mid-window), with bounded
+   waits, exact child reaping, and task-owned database/filesystem
+   cleanup shared across both consumers.
 
 **Reference:** ICD-0.4.5 §Test Cases (X.* and G.* sections);
 CHANGELOG v0.4.5 §Slice B / B10 deviation 4;

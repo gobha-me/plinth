@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <chrono>
@@ -85,6 +86,9 @@ auto stage_to_string(InstallStage s) -> std::string_view {
 namespace {
 
 using PgResultPtr = std::unique_ptr<PGresult, decltype(&PQclear)>;
+
+std::atomic<test_seam::UpgradeSwapCommittedHook> g_upgrade_swap_committed_hook{
+    nullptr};
 
 struct PgGuard {
   PGconn* conn = nullptr;
@@ -4326,6 +4330,14 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     (void)retired_at_s; // structured report sent at T4
   }
 
+  if (!bundled) {
+    if (auto hook =
+            g_upgrade_swap_committed_hook.load(std::memory_order_acquire);
+        hook != nullptr) {
+      hook();
+    }
+  }
+
   // T3 — symlink flip, synchronized via advisory lock (held).
   fs::path active_path = ctx.data_dir / "extensions" / minimal.name / "active";
   fs::path tmp_path = ctx.data_dir / "extensions" / minimal.name / "active.tmp";
@@ -4554,5 +4566,18 @@ auto check_single_mountpoint(const fs::path& data_dir,
   }
   return {};
 }
+
+namespace test_seam {
+
+auto set_upgrade_swap_committed_hook(UpgradeSwapCommittedHook hook) noexcept
+    -> void {
+  g_upgrade_swap_committed_hook.store(hook, std::memory_order_release);
+}
+
+auto clear_upgrade_swap_committed_hook() noexcept -> void {
+  g_upgrade_swap_committed_hook.store(nullptr, std::memory_order_release);
+}
+
+} // namespace test_seam
 
 } // namespace plinth::packages

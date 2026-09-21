@@ -7,36 +7,50 @@
 // production code path, and that the failure / lock-loss / disabled
 // branches preserve the no-stamp / no-dispatch invariants.
 //
-// S.06 (gap-detected audit) + S.07 (cursor catch-up across writer
-// crash) ride Phase 5 (broker-side gap detection) and the multi-node
-// integration harness respectively; both `SKIP()` here with a
-// pointer to where they will land.
+// S.06 (gap-detected audit) rides Phase 5's broker-side coverage. S.07
+// uses the shared multi-process harness to kill an exact production writer
+// child after COMMIT and prove replay plus resumed live delivery catch up.
 
 #include "kernel/realtime/events_writer.hpp"
 
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/realtime/broker.hpp"
+#include "kernel/realtime/cursor_store.hpp"
 #include "kernel/realtime/listener.hpp"
+#include "kernel/realtime/replay.hpp"
+#include "kernel/ws/conn_state.hpp"
 
+#include "../packages/advisory_lock_harness.hpp"
 #include "shared_pg_client.hpp"
 
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
+#include <cerrno>
+#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <drogon/orm/DbClient.h>
+#include <drogon/utils/coroutine.h>
 #include <expected>
 #include <json/value.h>
 #include <libpq-fe.h>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <sys/wait.h>
 #include <thread>
+#include <unistd.h>
+#include <utility>
 #include <vector>
 
 namespace ew = plinth::realtime::events_writer;
+namespace cs = plinth::realtime::cursor_store;
+namespace rp = plinth::realtime::replay;
+
+using namespace std::chrono_literals;
 
 namespace {
 
@@ -104,6 +118,146 @@ struct TestPg {
       -> std::unique_ptr<PGresult, decltype(&PQclear)> {
     return {PQexec(conn, sql.c_str()), PQclear};
   }
+
+  [[nodiscard]] auto exec_params(const std::string& sql,
+                                 const std::vector<std::string>& params) const
+      -> std::unique_ptr<PGresult, decltype(&PQclear)> {
+    std::vector<const char*> values;
+    values.reserve(params.size());
+    for (const auto& param : params) {
+      values.push_back(param.c_str());
+    }
+    return {PQexecParams(conn, sql.c_str(), static_cast<int>(values.size()),
+                         nullptr, values.data(), nullptr, nullptr, 0),
+            PQclear};
+  }
+};
+
+auto child_write(std::string_view text) -> void {
+  const char* cursor = text.data();
+  std::size_t remaining = text.size();
+  while (remaining > 0) {
+    const auto written = ::write(STDOUT_FILENO, cursor, remaining);
+    if (written > 0) {
+      cursor += written;
+      remaining -= static_cast<std::size_t>(written);
+      continue;
+    }
+    if (written < 0 && errno == EINTR) {
+      continue;
+    }
+    return;
+  }
+}
+
+auto stop_writer_after_commit() noexcept -> void {
+  child_write("READY\n");
+  while (true) {
+    (void)::pause();
+  }
+}
+
+// Run one envelope through the real production writer arm in a fresh child.
+// The child owns a post-fork DbClient; no parent pool crosses the process
+// boundary. `_Exit` in AdvisoryLockHarness intentionally owns final teardown.
+auto child_write_with_production_writer(const plinth::Config::Database& db_cfg,
+                                        std::string_view channel,
+                                        std::string_view kind,
+                                        bool wait_for_kill) -> int {
+  auto db = drogon::orm::DbClient::newPgClient(
+      plinth::lock_test::build_conninfo(db_cfg), /*connNum=*/1);
+  if (!db) {
+    child_write("DB_CLIENT_FAIL\n");
+    return 1;
+  }
+
+  ew::clear_insert_hook_for_test();
+  ew::clear_advisory_lock_hook_for_test();
+  ew::clear_pre_broker_hook_for_test();
+  ew::clear_post_commit_hook_for_test();
+  ew::reset_counters_for_test();
+  ew::set_db_client_for_test(db);
+  if (wait_for_kill) {
+    ew::set_post_commit_hook_for_test(&stop_writer_after_commit);
+  }
+
+  plinth::Config::Realtime::Events cfg;
+  ew::start(cfg);
+  auto event = plinth::realtime::DispatchedEvent{};
+  event.layer = "data";
+  event.channel = std::string{channel};
+  event.envelope = Json::Value(Json::objectValue);
+  event.envelope["layer"] = "data";
+  event.envelope["channel"] = event.channel;
+  event.envelope["kind"] = std::string{kind};
+  if (!ew::enqueue_and_drain_one_for_test(std::move(event))) {
+    child_write("WRITE_FAIL\n");
+    return 2;
+  }
+  if (wait_for_kill) {
+    child_write("HOOK_RETURNED\n");
+    return 3;
+  }
+  if (ew::writes_persisted_for_test() != 1) {
+    child_write("PERSISTENCE_FAIL\n");
+    return 4;
+  }
+  child_write("COMMITTED\n");
+  return 0;
+}
+
+struct CapturedFrames {
+  std::mutex mu;
+  std::vector<std::string> frames;
+
+  auto sink() {
+    return [this](std::string frame) {
+      std::lock_guard lock(mu);
+      frames.push_back(std::move(frame));
+    };
+  }
+
+  auto snapshot() -> std::vector<std::string> {
+    std::lock_guard lock(mu);
+    return frames;
+  }
+};
+
+struct S07DatabaseCleanup {
+  TestPg& pg;
+  std::string channel;
+  std::string user_id;
+
+  ~S07DatabaseCleanup() {
+    (void)pg.exec_params("DELETE FROM plinth.events WHERE channel = $1",
+                         {channel});
+    (void)pg.exec_params("DELETE FROM plinth.users WHERE id = $1::uuid",
+                         {user_id});
+  }
+};
+
+struct S07RuntimeCleanup {
+  bool active{true};
+
+  ~S07RuntimeCleanup() { shutdown(); }
+
+  auto shutdown() -> void {
+    if (!active) {
+      return;
+    }
+    active = false;
+    (void)ew::stop();
+    ew::set_db_client_for_test(nullptr);
+    ew::clear_insert_hook_for_test();
+    ew::clear_advisory_lock_hook_for_test();
+    ew::clear_post_commit_hook_for_test();
+    ew::clear_pre_broker_hook_for_test();
+    rp::set_db_client_for_test(nullptr);
+    cs::set_db_client_for_test(nullptr);
+    cs::clear_cache_for_test();
+    plinth::realtime::clear_handlers_for_test();
+    plinth::realtime::broker::stop();
+  }
 };
 
 auto build_dispatched(std::string_view layer, std::string_view channel)
@@ -131,6 +285,7 @@ struct Harness {
   explicit Harness(plinth::Config::Realtime::Events cfg = {}) {
     ew::clear_insert_hook_for_test();
     ew::clear_advisory_lock_hook_for_test();
+    ew::clear_post_commit_hook_for_test();
     ew::clear_pre_broker_hook_for_test();
     ew::reset_counters_for_test();
     plinth::realtime::clear_handlers_for_test();
@@ -145,6 +300,7 @@ struct Harness {
     ew::set_db_client_for_test(nullptr);
     ew::clear_insert_hook_for_test();
     ew::clear_advisory_lock_hook_for_test();
+    ew::clear_post_commit_hook_for_test();
     ew::clear_pre_broker_hook_for_test();
     plinth::realtime::clear_handlers_for_test();
     plinth::realtime::broker::stop();
@@ -352,12 +508,181 @@ TEST_CASE("S.06: gap-detected audit fires on broker-side observation",
 // ── S.07 ─────────────────────────────────────────────────────────────
 
 TEST_CASE("S.07: cursor catches up after writer crash mid-window",
-          "[realtime][events][writer][seq][integration][.skip]") {
-  // Phase 5 / 6 — needs the multi-process advisory-lock harness
-  // (ICD-0.5.4 I.02 sibling) to simulate a crashed writer + a
-  // surviving node taking over. Out of scope for Phase 2's
-  // single-process topology shift.
-  SKIP("Deferred to Phase 5/6 — multi-process failover harness");
+          "[realtime][events][writer][seq][integration][subprocess]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  const auto DB_CFG = pg_config();
+  reset_schema(DB_CFG);
+  TestPg pg{DB_CFG};
+
+  const std::string USER_ID = "00000000-0000-0000-0000-000000000034";
+  const std::string CHANNEL = "plinth:data:ext_s07.recovery";
+  const std::string BASELINE_PAYLOAD =
+      R"({"layer":"data","channel":"plinth:data:ext_s07.recovery","kind":"baseline"})";
+  S07DatabaseCleanup database_cleanup{pg, CHANNEL, USER_ID};
+
+  auto user =
+      pg.exec_params("INSERT INTO plinth.users (id, username, password_hash) "
+                     "VALUES ($1::uuid, '__s07_crash_recovery', 'x')",
+                     {USER_ID});
+  REQUIRE(PQresultStatus(user.get()) == PGRES_COMMAND_OK);
+
+  auto baseline = pg.exec_params("INSERT INTO plinth.events (channel, payload) "
+                                 "VALUES ($1, $2::jsonb) RETURNING seq",
+                                 {CHANNEL, BASELINE_PAYLOAD});
+  REQUIRE(PQresultStatus(baseline.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(baseline.get()) == 1);
+  const auto BASELINE_SEQ = std::stoll(PQgetvalue(baseline.get(), 0, 0));
+
+  auto cursor_seed = pg.exec_params(
+      "INSERT INTO plinth.user_event_cursors (user_id, last_seq) "
+      "VALUES ($1::uuid, $2::bigint)",
+      {USER_ID, std::to_string(BASELINE_SEQ)});
+  REQUIRE(PQresultStatus(cursor_seed.get()) == PGRES_COMMAND_OK);
+
+  plinth::lock_test::AdvisoryLockHarness process_harness(DB_CFG);
+  const auto victim = process_harness.run_until_ready_and_kill(
+      10s, [&](PGconn*, int /*idx*/, int /*total*/) {
+        return child_write_with_production_writer(DB_CFG, CHANNEL, "victim",
+                                                  true);
+      });
+  INFO("victim stdout: " << victim.stdout_text);
+  REQUIRE(victim.checkpoint_reached);
+  REQUIRE(victim.kill_requested);
+  REQUIRE_FALSE(victim.timed_out);
+  REQUIRE(victim.exit_code == -SIGKILL);
+  errno = 0;
+  int victim_status = 0;
+  CHECK(::waitpid(victim.pid, &victim_status, WNOHANG) == -1);
+  CHECK(errno == ECHILD);
+
+  auto after_victim =
+      pg.exec_params("SELECT seq, payload->>'kind' FROM plinth.events "
+                     "WHERE channel = $1 ORDER BY seq",
+                     {CHANNEL});
+  REQUIRE(PQresultStatus(after_victim.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(after_victim.get()) == 2);
+  const auto VICTIM_SEQ = std::stoll(PQgetvalue(after_victim.get(), 1, 0));
+  REQUIRE(VICTIM_SEQ > BASELINE_SEQ);
+  REQUIRE(std::string_view{PQgetvalue(after_victim.get(), 1, 1)} == "victim");
+
+  auto cursor_after_crash =
+      pg.exec_params("SELECT last_seq FROM plinth.user_event_cursors "
+                     "WHERE user_id = $1::uuid",
+                     {USER_ID});
+  REQUIRE(PQresultStatus(cursor_after_crash.get()) == PGRES_TUPLES_OK);
+  REQUIRE(std::stoll(PQgetvalue(cursor_after_crash.get(), 0, 0)) ==
+          BASELINE_SEQ);
+
+  auto survivor =
+      process_harness.run(1, 10s, [&](PGconn*, int /*idx*/, int /*total*/) {
+        return child_write_with_production_writer(DB_CFG, CHANNEL, "survivor",
+                                                  false);
+      });
+  REQUIRE(survivor.size() == 1);
+  INFO("survivor stdout: " << survivor[0].stdout_text);
+  REQUIRE_FALSE(survivor[0].timed_out);
+  REQUIRE(survivor[0].exit_code == 0);
+  REQUIRE(survivor[0].stdout_text.find("COMMITTED\n") != std::string::npos);
+  errno = 0;
+  int survivor_status = 0;
+  CHECK(::waitpid(survivor[0].pid, &survivor_status, WNOHANG) == -1);
+  CHECK(errno == ECHILD);
+
+  auto committed =
+      pg.exec_params("SELECT seq, payload->>'kind' FROM plinth.events "
+                     "WHERE channel = $1 ORDER BY seq",
+                     {CHANNEL});
+  REQUIRE(PQresultStatus(committed.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(committed.get()) == 3);
+  const auto SURVIVOR_SEQ = std::stoll(PQgetvalue(committed.get(), 2, 0));
+  REQUIRE(SURVIVOR_SEQ > VICTIM_SEQ);
+  REQUIRE(std::string_view{PQgetvalue(committed.get(), 2, 1)} == "survivor");
+
+  auto db = plinth::realtime_test::shared_pg_client(/*connNum=*/4);
+  REQUIRE(db);
+  cs::clear_cache_for_test();
+  plinth::Config::Realtime::Events events_cfg;
+  cs::configure(events_cfg);
+  cs::set_db_client_for_test(db);
+  rp::set_db_client_for_test(db);
+  rp::reset_audit_state_for_test();
+  plinth::realtime::clear_handlers_for_test();
+  S07RuntimeCleanup runtime_cleanup;
+  plinth::Config::Realtime::Broker broker_cfg;
+  plinth::realtime::broker::start(broker_cfg);
+  ew::set_db_client_for_test(db);
+  ew::start(events_cfg);
+
+  plinth::ws::ConnState state;
+  state.authenticated = true;
+  state.is_admin = true;
+  state.auth.user_id = USER_ID;
+  CapturedFrames captured;
+  const auto replay_result = drogon::sync_wait(rp::run_replay(
+      state, captured.sink(), BASELINE_SEQ, {CHANNEL}, events_cfg));
+
+  REQUIRE_FALSE(replay_result.aborted);
+  REQUIRE_FALSE(replay_result.resync.has_value());
+  REQUIRE(replay_result.emitted == 2);
+  REQUIRE(replay_result.up_to_seq == SURVIVOR_SEQ);
+  const auto FRAMES = captured.snapshot();
+  REQUIRE(FRAMES.size() == 3);
+  CHECK(FRAMES[0].find("\"seq\":" + std::to_string(VICTIM_SEQ)) !=
+        std::string::npos);
+  CHECK(FRAMES[1].find("\"seq\":" + std::to_string(SURVIVOR_SEQ)) !=
+        std::string::npos);
+  CHECK(FRAMES[2].find("\"type\":\"replay_done\"") != std::string::npos);
+
+  auto cursor_after_replay =
+      pg.exec_params("SELECT last_seq FROM plinth.user_event_cursors "
+                     "WHERE user_id = $1::uuid",
+                     {USER_ID});
+  REQUIRE(PQresultStatus(cursor_after_replay.get()) == PGRES_TUPLES_OK);
+  REQUIRE(std::stoll(PQgetvalue(cursor_after_replay.get(), 0, 0)) ==
+          BASELINE_SEQ);
+
+  // Prove the restarted writer resumes normal live delivery strictly after
+  // the recovered window and catches the durable cursor up through the new
+  // live seq. The hook models the broker's synchronous WS delivery pre-pass.
+  auto live_cfg = events_cfg;
+  live_cfg.cursor_flush_threshold = 1;
+  cs::configure(live_cfg);
+  std::int64_t live_seq = 0;
+  ew::set_pre_broker_hook_for_test(
+      [&](const plinth::realtime::DispatchedEvent& event) {
+        live_seq = event.envelope["seq"].asInt64();
+        event.delivered_to_users.push_back(USER_ID);
+      });
+  REQUIRE(ew::enqueue_for_test(build_dispatched("data", CHANNEL)));
+  ew::apply_drain_for_test();
+  REQUIRE(live_seq > SURVIVOR_SEQ);
+
+  auto cursor_after_live =
+      pg.exec_params("SELECT last_seq FROM plinth.user_event_cursors "
+                     "WHERE user_id = $1::uuid",
+                     {USER_ID});
+  REQUIRE(PQresultStatus(cursor_after_live.get()) == PGRES_TUPLES_OK);
+  REQUIRE(std::stoll(PQgetvalue(cursor_after_live.get(), 0, 0)) == live_seq);
+
+  REQUIRE(ew::stop());
+  runtime_cleanup.shutdown();
+
+  auto delete_events =
+      pg.exec_params("DELETE FROM plinth.events WHERE channel = $1", {CHANNEL});
+  REQUIRE(PQresultStatus(delete_events.get()) == PGRES_COMMAND_OK);
+  auto delete_user =
+      pg.exec_params("DELETE FROM plinth.users WHERE id = $1::uuid", {USER_ID});
+  REQUIRE(PQresultStatus(delete_user.get()) == PGRES_COMMAND_OK);
+  auto residue = pg.exec_params(
+      "SELECT (SELECT count(*) FROM plinth.events WHERE channel = $1) + "
+      "(SELECT count(*) FROM plinth.users WHERE id = $2::uuid) + "
+      "(SELECT count(*) FROM plinth.user_event_cursors "
+      " WHERE user_id = $2::uuid)",
+      {CHANNEL, USER_ID});
+  REQUIRE(PQresultStatus(residue.get()) == PGRES_TUPLES_OK);
+  CHECK(std::string_view{PQgetvalue(residue.get(), 0, 0)} == "0");
 }
 
 // ── S.08 ─────────────────────────────────────────────────────────────
