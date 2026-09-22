@@ -75,9 +75,58 @@
     "registration": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled"],
       "properties": {
-        "enabled": {"type": "boolean"}
+        "enabled": {
+          "description": "Legacy upgrade compatibility; only the secure false value is accepted.",
+          "const": false
+        },
+        "mode": {
+          "type": "string",
+          "enum": ["disabled", "invite", "open"]
+        },
+        "maxAccounts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "sourceAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "subjectAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "globalAttempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "windowSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400
+        },
+        "inviteTtlSeconds": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 2592000
+        },
+        "bootstrapSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {
+            "name": {
+              "type": "string",
+              "maxLength": 253,
+              "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$"
+            },
+            "key": {"$ref": "#/definitions/secretKey"}
+          }
+        }
       }
     },
     "database": {
@@ -204,6 +253,21 @@
               "type": "integer",
               "minimum": 1,
               "maximum": 2
+            },
+            "authRateAverage": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "authRateBurst": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 1000
+            },
+            "authRatePeriodSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 3600
             }
           }
         },
@@ -416,7 +480,7 @@
     {
       "if": {
         "properties": {
-          "registration": {
+          "traefik": {
             "properties": {"enabled": {"const": true}},
             "required": ["enabled"]
           }
@@ -424,8 +488,12 @@
       },
       "then": {
         "properties": {
-          "traefik": {
-            "properties": {"enabled": {"const": false}}
+          "registration": {
+            "properties": {
+              "bootstrapSecret": {
+                "properties": {"name": {"maxLength": 0}}
+              }
+            }
           }
         }
       }

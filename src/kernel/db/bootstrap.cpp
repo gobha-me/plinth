@@ -235,6 +235,31 @@ auto bootstrap_schema(const Config::Database& db_cfg,
     pg.exec("COMMIT");
   }
 
+  // Kernel-owned, idempotent upgrade for #37 invite registration. Existing
+  // retained installations skip schema.sql, so create the digest-only invite
+  // table before auth routes can accept invite-mode registrations.
+  pg.exec("BEGIN");
+  pg.exec("CREATE TABLE IF NOT EXISTS plinth.registration_invites ("
+          "id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
+          "token_hash TEXT UNIQUE NOT NULL, "
+          "created_by_user_id UUID NOT NULL REFERENCES plinth.users(id), "
+          "created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), "
+          "expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, "
+          "used_at TIMESTAMPTZ, "
+          "used_by_user_id UUID REFERENCES plinth.users(id), "
+          "CONSTRAINT chk_registration_invites_token_hash "
+          "CHECK (token_hash ~ '^[0-9a-f]{64}$'), "
+          "CONSTRAINT chk_registration_invites_expiry "
+          "CHECK (expires_at > created_at), "
+          "CONSTRAINT chk_registration_invites_use_pair "
+          "CHECK ((used_at IS NULL) = (used_by_user_id IS NULL)), "
+          "CONSTRAINT chk_registration_invites_terminal_state "
+          "CHECK (revoked_at IS NULL OR used_at IS NULL))");
+  pg.exec("CREATE INDEX IF NOT EXISTS idx_registration_invites_active_expiry "
+          "ON plinth.registration_invites(expires_at) "
+          "WHERE revoked_at IS NULL AND used_at IS NULL");
+  pg.exec("COMMIT");
+
   std::ifstream isolation_file(migrations_dir + "/extension_database.sql");
   if (!isolation_file.is_open()) {
     throw std::runtime_error(

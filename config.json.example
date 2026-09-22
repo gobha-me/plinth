@@ -11,7 +11,15 @@
   "dev_mode": false,
   "listen_host": "127.0.0.1",
   "listen_port": 8080,
-  "registration_enabled": true,
+  "registration": {
+    "mode": "disabled",
+    "max_accounts": 1000,
+    "source_attempts": 5,
+    "subject_attempts": 5,
+    "global_attempts": 100,
+    "window_seconds": 60,
+    "invite_ttl_seconds": 86400
+  },
   "node_id": "node-1",
   "browser_origin": "",
   "ws_auth_timeout_s": 5.0,

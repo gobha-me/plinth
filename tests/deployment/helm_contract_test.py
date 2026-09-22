@@ -89,7 +89,19 @@ def valid_values():
             "pullSecrets": [],
         },
         "public": {"host": "plinth.example.test", "port": 8443},
-        "registration": {"enabled": False},
+        "registration": {
+            "mode": "disabled",
+            "maxAccounts": 1000,
+            "sourceAttempts": 1000,
+            "subjectAttempts": 5,
+            "globalAttempts": 100,
+            "windowSeconds": 60,
+            "inviteTtlSeconds": 86400,
+            "bootstrapSecret": {
+                "name": "",
+                "key": "bootstrap-token",
+            },
+        },
         "database": {
             "existingSecret": "plinth-database",
             "keys": {
@@ -140,6 +152,9 @@ def valid_values():
                 "memoryRequestBodyBytes": 262144,
                 "maxInFlightRequests": 32,
                 "maxPackageInFlightRequests": 2,
+                "authRateAverage": 5,
+                "authRateBurst": 5,
+                "authRatePeriodSeconds": 60,
             },
             "forwardingTimeouts": {
                 "dialTimeout": "5s",
@@ -338,9 +353,10 @@ def verify_core_contract(items):
                 f"{variable} must reference only the declared Secret key")
     require(env.get("PLINTH_DEV_MODE", {}).get("value") in ("false", False),
             "development reset must be explicitly disabled")
-    require(env.get("PLINTH_REGISTRATION_ENABLED", {}).get("value") in (
-        "false", False
-    ), "registration must default closed in the contract fixture")
+    require(env.get("PLINTH_REGISTRATION_MODE", {}).get("value") == "disabled",
+            "registration must default closed in the contract fixture")
+    require("PLINTH_BOOTSTRAP_TOKEN" not in env,
+            "public Traefik fixture must not receive bootstrap authority")
 
     mounts = {mount["name"]: mount for mount in container.get("volumeMounts", [])}
     require(mounts.get("config", {}).get("readOnly") is True,
@@ -371,8 +387,17 @@ def verify_core_contract(items):
     require(config.get("browser_origin") == "https://plinth.example.test:8443",
             "public TLS origin must include the externally visible port")
     require(config.get("dev_mode") is False, "generated config must disable dev mode")
-    require(config.get("registration_enabled") is False,
-            "generated config must disable registration by default")
+    require(config.get("registration") == {
+        "mode": "disabled",
+        "max_accounts": 1000,
+        "source_attempts": 1000,
+        "subject_attempts": 5,
+        "global_attempts": 100,
+        "window_seconds": 60,
+        "invite_ttl_seconds": 86400,
+    }, "generated config must contain only non-secret registration policy")
+    require("bootstrap" not in json.dumps(config).lower(),
+            "bootstrap authority must never be copied into the ConfigMap")
 
     claims = all_kind(items, "PersistentVolumeClaim")
     require({claim["metadata"]["name"] for claim in claims} == {
@@ -427,9 +452,10 @@ def verify_core_contract(items):
 def verify_traefik_contract(items):
     expected_name = RELEASE + "-plinth"
     routes = all_kind(items, "IngressRoute")
-    require(len(routes) == 3, "expected separate WebSocket, package, and default routes")
-    require(len(all_kind(items, "Middleware")) == 4,
-            "expected body-limit and in-flight middlewares")
+    require(len(routes) == 4,
+            "expected separate WebSocket, package, auth, and default routes")
+    require(len(all_kind(items, "Middleware")) == 5,
+            "expected body-limit, in-flight, and auth-rate middlewares")
     transports = {
         item["metadata"]["name"]: item for item in all_kind(items, "ServersTransport")
     }
@@ -454,7 +480,8 @@ def verify_traefik_contract(items):
 
     route_by_name = {item["metadata"]["name"]: item for item in routes}
     require(set(route_by_name) == {
-        expected_name + "-ws", expected_name + "-packages", expected_name + "-http"
+        expected_name + "-ws", expected_name + "-packages",
+        expected_name + "-auth", expected_name + "-http",
     }, "Traefik route names drifted")
     for route in routes:
         require(route["metadata"].get("annotations", {}).get(
@@ -503,6 +530,26 @@ def verify_traefik_contract(items):
         ],
         "package concurrency must be enforced before request buffering",
     )
+    auth_rules = route_by_name[expected_name + "-auth"]["spec"]["routes"]
+    require(len(auth_rules) == 2,
+            "auth route must isolate exact login and registration rules")
+    expected_auth_matches = {
+        "Host(`plinth.example.test`) && Path(`/api/auth/login`) && Method(`POST`)",
+        "Host(`plinth.example.test`) && Path(`/api/auth/register`) && Method(`POST`)",
+    }
+    require({rule.get("match") for rule in auth_rules} == expected_auth_matches,
+            "auth rate limit must cover only exact POST login/register paths")
+    for rule in auth_rules:
+        require(rule.get("priority") == 250,
+                "auth rules must outrank package and default routes")
+        require(
+            [item.get("name") for item in rule.get("middlewares", [])] == [
+                expected_name + "-auth-rate",
+                expected_name + "-inflight",
+                expected_name + "-default-body",
+            ],
+            "auth rate limiting must run before concurrency and buffering",
+        )
 
     middleware_by_name = {
         item["metadata"]["name"]: item for item in all_kind(items, "Middleware")
@@ -513,6 +560,9 @@ def verify_traefik_contract(items):
     package_inflight = middleware_by_name[
         expected_name + "-package-inflight"
     ]["spec"]["inFlightReq"]
+    auth_rate = middleware_by_name[expected_name + "-auth-rate"]["spec"][
+        "rateLimit"
+    ]
     require(default_buffer.get("maxRequestBodyBytes") == 1048576,
             "default body limit drifted")
     require(package_buffer.get("maxRequestBodyBytes") == 67108864,
@@ -522,6 +572,80 @@ def verify_traefik_contract(items):
     require(inflight.get("amount") == 32, "in-flight request limit drifted")
     require(package_inflight.get("amount") == 2,
             "package in-flight limit exceeds upload scratch capacity")
+    require(auth_rate == {"average": 5, "burst": 5, "period": "60s"},
+            "auth token-bucket bounds drifted")
+
+
+def verify_bootstrap_secret_isolation(helm, directory, base):
+    values = copy.deepcopy(base)
+    values["traefik"]["enabled"] = False
+    values["registration"]["bootstrapSecret"]["name"] = "plinth-bootstrap"
+    items = documents(render(helm, directory, values, "bootstrap.yaml"))
+    stateful_set = one(items, "StatefulSet", name=RELEASE + "-plinth")
+    container = stateful_set["spec"]["template"]["spec"]["containers"][0]
+    env = {entry["name"]: entry for entry in container["env"]}
+    bootstrap_ref = env.get("PLINTH_BOOTSTRAP_TOKEN", {}).get(
+        "valueFrom", {}
+    ).get("secretKeyRef", {})
+    require(bootstrap_ref == {
+        "name": "plinth-bootstrap", "key": "bootstrap-token"
+    }, "isolated bootstrap authority must come only from the declared Secret key")
+
+
+def verify_legacy_reuse_values(helm, directory, base):
+    # Helm upgrade --reuse-values does not merge new chart defaults into the
+    # prior release's stored values. Replacing values.yaml in a chart copy
+    # exercises the same raw legacy shape against the new schema/templates.
+    legacy = copy.deepcopy(base)
+    legacy["registration"] = {"enabled": False}
+    for key in ("authRateAverage", "authRateBurst", "authRatePeriodSeconds"):
+        legacy["traefik"]["limits"].pop(key)
+
+    chart = Path(directory) / "legacy-reuse-chart"
+    shutil.copytree(CHART, chart)
+    (chart / "values.yaml").write_text(
+        yaml.safe_dump(legacy, sort_keys=False), encoding="utf-8"
+    )
+    command([helm, "lint", "--strict", chart])
+    rendered = command([
+        helm,
+        "template",
+        RELEASE,
+        chart,
+        "--namespace",
+        NAMESPACE,
+        "--kube-version",
+        "1.36.0",
+    ]).stdout
+    items = documents(rendered)
+    config = json.loads(one(
+        items, "ConfigMap", name=RELEASE + "-plinth-config"
+    )["data"]["config.json"])
+    require(config.get("registration") == {
+        "mode": "disabled",
+        "max_accounts": 1000,
+        "source_attempts": 1000,
+        "subject_attempts": 5,
+        "global_attempts": 100,
+        "window_seconds": 60,
+        "invite_ttl_seconds": 86400,
+    }, "legacy registration.enabled=false must resolve to secure defaults")
+    stateful_set = one(items, "StatefulSet", name=RELEASE + "-plinth")
+    env = {
+        entry["name"]: entry
+        for entry in stateful_set["spec"]["template"]["spec"]["containers"][0][
+            "env"
+        ]
+    }
+    require(env.get("PLINTH_REGISTRATION_MODE", {}).get("value") == "disabled",
+            "legacy registration must remain closed in the process environment")
+    require("PLINTH_BOOTSTRAP_TOKEN" not in env,
+            "legacy registration values must not create bootstrap authority")
+    auth_rate = one(
+        items, "Middleware", name=RELEASE + "-plinth-auth-rate"
+    )["spec"]["rateLimit"]
+    require(auth_rate == {"average": 5, "burst": 5, "period": "60s"},
+            "legacy Traefik values must receive bounded auth-rate defaults")
 
 
 def verify_existing_claim_and_isolated_renders(helm, directory, base):
@@ -629,6 +753,10 @@ def verify_fail_closed_inputs(helm, directory, base):
         mutate(values)
         cases.append((name, values))
 
+    def enable_legacy_registration(values):
+        values["registration"]["enabled"] = True
+        values["traefik"]["enabled"] = False
+
     add("missing-digest", lambda value: value["image"].update(digest=""))
     add("malformed-digest", lambda value: value["image"].update(digest="sha256:abcd"))
     add("tagged-repository", lambda value: value["image"].update(
@@ -664,9 +792,28 @@ def verify_fail_closed_inputs(helm, directory, base):
     add("memory-buffer-too-large", lambda value: value["traefik"]["limits"].update(
         memoryRequestBodyBytes=2097152
     ))
-    add("registration-exposed", lambda value: value["registration"].update(
-        enabled=True
+    add("registration-invalid-mode", lambda value: value["registration"].update(
+        mode="enabled"
     ))
+    add("registration-zero-account-cap", lambda value: value["registration"].update(
+        maxAccounts=0
+    ))
+    add("registration-unbounded-global-rate", lambda value: value[
+        "registration"
+    ].update(globalAttempts=100001))
+    add("registration-invalid-bootstrap-secret", lambda value: value[
+        "registration"
+    ]["bootstrapSecret"].update(name="Not A Secret"))
+    add("registration-legacy-enabled", enable_legacy_registration)
+    add("registration-bootstrap-public", lambda value: value[
+        "registration"
+    ]["bootstrapSecret"].update(name="plinth-bootstrap"))
+    add("auth-rate-zero", lambda value: value["traefik"]["limits"].update(
+        authRateAverage=0
+    ))
+    add("auth-rate-period-unbounded", lambda value: value[
+        "traefik"
+    ]["limits"].update(authRatePeriodSeconds=3601))
     add("empty-public-host", lambda value: value["public"].update(host=""))
     add("empty-traefik-peers", lambda value: value["networkPolicy"][
         "traefik"
@@ -778,6 +925,8 @@ def main():
         items = documents(rendered)
         verify_core_contract(items)
         verify_traefik_contract(items)
+        verify_bootstrap_secret_isolation(args.helm, temporary, base)
+        verify_legacy_reuse_values(args.helm, temporary, base)
         verify_existing_claim_and_isolated_renders(args.helm, temporary, base)
         verify_yaml_string_boundaries(args.helm, temporary, base)
         verify_network_peer_replacement(args.helm, temporary, base)

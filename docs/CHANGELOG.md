@@ -11,6 +11,29 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-21 — safe local registration policy
+
+- Separated first-administrator creation into a one-time,
+  `PLINTH_BOOTSTRAP_TOKEN`-authorized bootstrap endpoint; ordinary registration
+  can no longer acquire administrator membership on an empty installation.
+- Replaced the registration boolean with bounded `disabled`, `invite`, and
+  `open` modes. Single-use invites retain only token digests, and generic
+  processed responses avoid exposing username, disabled-account, invite, or
+  account-ceiling state.
+- Added pre-Argon2 source, submitted-subject-digest, and global admission windows,
+  a hard account ceiling, privacy-preserving audit, administrator invite
+  controls, and credential recovery that revokes sessions and PATs without
+  clearing deliberate account disablement.
+- Kept local identity data-minimal: username and password hash only. Disabling
+  new registration leaves existing users and credentials valid.
+- Added a digest-only invite schema upgrade, closed-by-default Helm/Compose
+  configuration, isolated Kubernetes bootstrap flow, and a per-external-source
+  Traefik authentication limiter backed by independent kernel bounds.
+
+This resolves [GitHub issue #37](https://github.com/gobha-me/plinth/issues/37).
+
+---
+
 ## 2026-09-21 — bounded crash-injection recovery coverage
 
 - Extended the shared PostgreSQL subprocess harness with a bounded READY

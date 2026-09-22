@@ -60,3 +60,24 @@ TEST_CASE("RateLimiter retry_after returns positive when limited",
   REQUIRE(wait > 0);
   REQUIRE(wait <= 60);
 }
+
+TEST_CASE("RateLimiter consume atomically admits only its configured bound",
+          "[auth][rate_limiter][unit]") {
+  plinth::auth::RateLimiter limiter(
+      {.max_attempts = 2, .window = std::chrono::seconds{60}, .max_keys = 8});
+  REQUIRE(limiter.consume("peer"));
+  REQUIRE(limiter.consume("peer"));
+  REQUIRE_FALSE(limiter.consume("peer"));
+}
+
+TEST_CASE("RateLimiter fails closed when its key bound is full",
+          "[auth][rate_limiter][unit]") {
+  plinth::auth::RateLimiter limiter(
+      {.max_attempts = 1, .window = std::chrono::hours{1}, .max_keys = 2});
+  limiter.record_failure("one");
+  limiter.record_failure("two");
+  REQUIRE(limiter.tracked_keys() == 2);
+  REQUIRE_FALSE(limiter.check("three"));
+  REQUIRE_FALSE(limiter.consume("three"));
+  REQUIRE(limiter.tracked_keys() == 2);
+}

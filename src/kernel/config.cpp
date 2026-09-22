@@ -21,6 +21,113 @@ auto env(const char* name) -> std::string {
   return val != nullptr ? std::string(val) : std::string{};
 }
 
+auto registration_mode(std::string_view value) -> Config::Registration::Mode {
+  if (value == "disabled") {
+    return Config::Registration::Mode::DISABLED;
+  }
+  if (value == "invite") {
+    return Config::Registration::Mode::INVITE;
+  }
+  if (value == "open") {
+    return Config::Registration::Mode::OPEN;
+  }
+  throw std::runtime_error("config.registration.mode_invalid");
+}
+
+auto validate_bootstrap_token(std::string_view value) -> void {
+  // Bootstrap grants the first account administrator authority. Require a
+  // generated secret rather than accepting human-scale passwords.
+  constexpr std::size_t MIN_BOOTSTRAP_TOKEN_BYTES = 32;
+  constexpr std::size_t MAX_BOOTSTRAP_TOKEN_BYTES = 256;
+  if (value.size() < MIN_BOOTSTRAP_TOKEN_BYTES ||
+      value.size() > MAX_BOOTSTRAP_TOKEN_BYTES) {
+    throw std::runtime_error("config.bootstrap_token_invalid");
+  }
+}
+
+auto bounded_registration_value(const nlohmann::json& value,
+                                std::string_view name, std::size_t minimum,
+                                std::size_t maximum) -> std::size_t {
+  if (!value.is_number_integer() && !value.is_number_unsigned()) {
+    throw std::runtime_error("config.registration." + std::string{name} +
+                             "_out_of_range");
+  }
+  long long parsed = 0;
+  try {
+    parsed = value.get<long long>();
+  } catch (const nlohmann::json::exception&) {
+    throw std::runtime_error("config.registration." + std::string{name} +
+                             "_out_of_range");
+  }
+  if (parsed < 0 || static_cast<unsigned long long>(parsed) < minimum ||
+      static_cast<unsigned long long>(parsed) > maximum) {
+    throw std::runtime_error("config.registration." + std::string{name} +
+                             "_out_of_range");
+  }
+  return static_cast<std::size_t>(parsed);
+}
+
+auto apply_registration(Config& cfg, const nlohmann::json& registration)
+    -> void {
+  if (!registration.is_object()) {
+    throw std::runtime_error("config.registration_not_object");
+  }
+  if (registration.contains("bootstrap_token") ||
+      registration.contains("bootstrapToken")) {
+    throw std::runtime_error("config.bootstrap_token_env_only");
+  }
+  for (auto it = registration.begin(); it != registration.end(); ++it) {
+    const auto& key = it.key();
+    if (key != "mode" && key != "max_accounts" && key != "source_attempts" &&
+        key != "subject_attempts" && key != "global_attempts" &&
+        key != "window_seconds" && key != "invite_ttl_seconds") {
+      throw std::runtime_error("config.registration.unknown_key");
+    }
+  }
+  if (registration.contains("mode")) {
+    if (!registration["mode"].is_string()) {
+      throw std::runtime_error("config.registration.mode_invalid");
+    }
+    cfg.registration.mode =
+        registration_mode(registration["mode"].get<std::string>());
+  }
+  if (registration.contains("max_accounts")) {
+    cfg.registration.max_accounts = bounded_registration_value(
+        registration["max_accounts"], "max_accounts", 1, 1000000);
+  }
+  if (registration.contains("source_attempts")) {
+    cfg.registration.source_attempts = bounded_registration_value(
+        registration["source_attempts"], "source_attempts", 1, 1000);
+  }
+  if (registration.contains("subject_attempts")) {
+    cfg.registration.subject_attempts = bounded_registration_value(
+        registration["subject_attempts"], "subject_attempts", 1, 1000);
+  }
+  if (registration.contains("global_attempts")) {
+    cfg.registration.global_attempts = bounded_registration_value(
+        registration["global_attempts"], "global_attempts", 1, 100000);
+  }
+  if (registration.contains("window_seconds")) {
+    cfg.registration.window_seconds = bounded_registration_value(
+        registration["window_seconds"], "window_seconds", 1, 86400);
+  }
+  if (registration.contains("invite_ttl_seconds")) {
+    cfg.registration.invite_ttl_seconds = bounded_registration_value(
+        registration["invite_ttl_seconds"], "invite_ttl_seconds", 60, 2592000);
+  }
+}
+
+auto apply_legacy_registration_enabled(Config& cfg, const nlohmann::json& value)
+    -> void {
+  if (!value.is_boolean()) {
+    throw std::runtime_error("config.registration_enabled_invalid");
+  }
+  if (value.get<bool>()) {
+    throw std::runtime_error("config.registration_enabled_true_unsafe");
+  }
+  cfg.registration.mode = Config::Registration::Mode::DISABLED;
+}
+
 auto apply_security(Config& cfg, const nlohmann::json& sec) -> void {
   if (!sec.contains("unicode_scanner") || !sec["unicode_scanner"].is_object()) {
     return;
@@ -489,8 +596,17 @@ auto apply_json(Config& cfg, const nlohmann::json& j) -> void {
   if (j.contains("listen_port")) {
     cfg.listen_port = j["listen_port"].get<uint16_t>();
   }
+  if (j.contains("registration_enabled") && j.contains("registration")) {
+    throw std::runtime_error("config.registration_legacy_conflict");
+  }
   if (j.contains("registration_enabled")) {
-    cfg.registration_enabled = j["registration_enabled"].get<bool>();
+    apply_legacy_registration_enabled(cfg, j["registration_enabled"]);
+  }
+  if (j.contains("bootstrap_token")) {
+    throw std::runtime_error("config.bootstrap_token_env_only");
+  }
+  if (j.contains("registration")) {
+    apply_registration(cfg, j["registration"]);
   }
   if (j.contains("node_id")) {
     cfg.node_id = j["node_id"].get<std::string>();
@@ -554,9 +670,29 @@ auto apply_env(Config& cfg) -> void {
     cfg.dev_mode = (v == "1" || v == "true");
   }
 
-  v = env("PLINTH_REGISTRATION_ENABLED");
+  const auto legacy_registration = env("PLINTH_REGISTRATION_ENABLED");
+  const auto registration_mode_value = env("PLINTH_REGISTRATION_MODE");
+  if (!legacy_registration.empty() && !registration_mode_value.empty()) {
+    throw std::runtime_error("config.registration_legacy_conflict");
+  }
+  if (!legacy_registration.empty()) {
+    if (legacy_registration == "1" || legacy_registration == "true") {
+      throw std::runtime_error("config.registration_enabled_true_unsafe");
+    }
+    if (legacy_registration != "0" && legacy_registration != "false") {
+      throw std::runtime_error("config.registration_enabled_invalid");
+    }
+    cfg.registration.mode = Config::Registration::Mode::DISABLED;
+  }
+
+  if (!registration_mode_value.empty()) {
+    cfg.registration.mode = registration_mode(registration_mode_value);
+  }
+
+  v = env("PLINTH_BOOTSTRAP_TOKEN");
   if (!v.empty()) {
-    cfg.registration_enabled = (v == "1" || v == "true");
+    validate_bootstrap_token(v);
+    cfg.bootstrap_token = v;
   }
 
   v = env("PLINTH_NODE_ID");

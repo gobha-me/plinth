@@ -55,7 +55,8 @@ auto make_config_projection(const Config& cfg) noexcept -> ConfigProjection {
       .node_id = cfg.node_id,
       .listen_host = cfg.listen_host,
       .listen_port = cfg.listen_port,
-      .registration_enabled = cfg.registration_enabled,
+      .registration_enabled =
+          cfg.registration.mode == Config::Registration::Mode::OPEN,
       .ws_auth_timeout_s = cfg.ws_auth_timeout_s,
       .ws_heartbeat_interval_s = cfg.ws_heartbeat_interval_s,
       .ws_heartbeat_timeout_s = cfg.ws_heartbeat_timeout_s,

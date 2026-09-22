@@ -50,6 +50,11 @@ try {
                         .end(JSON.stringify({ error: 'not_authenticated' }));
                     return;
                 }
+                if (path === '/api/auth/registration') {
+                    res.writeHead(200, { 'Content-Type': 'application/json' })
+                        .end(JSON.stringify({ mode: 'disabled' }));
+                    return;
+                }
                 const prefix = `/ext/shell/${manifest.version}/`;
                 let relative;
                 if (path.startsWith('/app/')) relative = path.slice(5) || 'index.html';
@@ -167,6 +172,50 @@ try {
         assert.deepEqual(failures, []);
         await context.close();
         console.log(`PASS ${path}: sign-in, strict CSP, versioned SDK, shared Preact demo + SDK hook`);
+    }
+
+    // The shell exposes only the fields supported by the data-minimal
+    // registration contract. Both public modes consume the generic processed
+    // response without revealing whether an account was created.
+    for (const mode of ['invite', 'open']) {
+        const context = await browser.newContext();
+        const page = await context.newPage();
+        await page.route('**/api/auth/session', route => route.fulfill({
+            status: 401, json: { error: 'not_authenticated' },
+        }));
+        await page.route('**/api/auth/registration', route => route.fulfill({
+            json: { mode },
+        }));
+        let submitted;
+        await page.route('**/api/auth/register', async route => {
+            submitted = route.request().postDataJSON();
+            await route.fulfill({ status: 202, json: { status: 'processed' } });
+        });
+        await page.goto(baseURL + '/app/');
+        await page.getByRole('button', { name: 'Create an Account', exact: true }).click();
+        await page.getByRole('heading', { name: 'Create a Plinth account', exact: true }).waitFor();
+        assert.equal(await page.locator('input[name="email"]').count(), 0);
+        assert.equal(await page.locator('input[name="real_name"]').count(), 0);
+        await page.locator('input[name="username"]').fill(`canary-${mode}`);
+        await page.locator('input[name="password"]').fill('fake-canary-password');
+        if (mode === 'invite') {
+            await page.locator('input[name="invite_token"]').fill('fake-invite-token');
+        } else {
+            assert.equal(await page.locator('input[name="invite_token"]').count(), 0);
+        }
+        await page.getByRole('button', { name: 'Create Account', exact: true }).click();
+        await page.getByRole('status').waitFor();
+        assert.equal(submitted.username, `canary-${mode}`);
+        assert.equal(submitted.password, 'fake-canary-password');
+        assert.equal(submitted.invite_token,
+            mode === 'invite' ? 'fake-invite-token' : undefined);
+        assert.deepEqual(Object.keys(submitted).sort(),
+            mode === 'invite'
+                ? ['invite_token', 'password', 'username']
+                : ['password', 'username']);
+        assert.match(await page.getByRole('status').textContent(), /Registration was processed/);
+        await context.close();
+        console.log(`PASS data-minimal ${mode} registration form and generic completion`);
     }
     // Exercise the actual boundary emission in both configured modes. Only the
     // development config response and audit sink are test-controlled.

@@ -115,12 +115,13 @@ const ERR_STRINGS = {
   missing_username:        'Username is required.',
   missing_password:        'Password is required.',
   invalid_credentials:     'Username or password is incorrect.',
-  account_disabled:        'This account is disabled.',
   username_too_short:      'Username must be at least 3 characters.',
+  username_too_long:       'Username must be at most 64 characters.',
   username_invalid_chars:  'Username may only contain letters, numbers, underscores, and hyphens.',
   password_too_short:      'Password is too short.',
-  username_taken:          'That username is already taken.',
-  registration_disabled:   'Registration is disabled on this server.',
+  password_too_long:       'Password must be at most 1024 bytes.',
+  invalid_request:         'The submitted account details are invalid.',
+  registration_unavailable:'Registration is not available.',
   session_expired:         'Your session has expired. Please sign in again.',
   session_revoked:         'Your session has expired. Please sign in again.',
   not_authenticated:       'Your session has expired. Please sign in again.',
@@ -215,8 +216,23 @@ class LoginForm extends Component {
       error: props.initialErrorCode ?? null,
       submitting: false,
       lockoutSeconds: 0,
+      registrationMode: 'disabled',
+      registering: false,
+      inviteToken: '',
+      registrationProcessed: false,
     };
     this.lockoutTimer = null;
+  }
+  componentDidMount() {
+    plinthFetch('/api/auth/registration')
+      .then(async (r) => {
+        if (r.status !== 200) return;
+        const body = await r.json();
+        if (body.mode === 'invite' || body.mode === 'open') {
+          this.setState({ registrationMode: body.mode });
+        }
+      })
+      .catch(() => {});
   }
   componentWillUnmount() {
     if (this.lockoutTimer) clearInterval(this.lockoutTimer);
@@ -279,6 +295,50 @@ class LoginForm extends Component {
       this.setState({ submitting: false, error: 'server_unreachable', password: '' });
     }
   }
+  async submitRegistration(ev) {
+    ev.preventDefault();
+    if (this.state.submitting || this.state.lockoutSeconds > 0) return;
+    this.setState({ submitting: true, error: null, registrationProcessed: false });
+    const body = {
+      username: this.state.username,
+      password: this.state.password,
+    };
+    if (this.state.registrationMode === 'invite') {
+      body.invite_token = this.state.inviteToken;
+    }
+    try {
+      const r = await plinthFetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (r.status === 202) {
+        await r.text();
+        this.setState({
+          submitting: false,
+          registering: false,
+          registrationProcessed: true,
+          password: '',
+          inviteToken: '',
+        });
+        return;
+      }
+      const responseBody = await r.json().catch(() => ({}));
+      const code = responseBody.error ?? `http_${r.status}`;
+      if (r.status === 429) {
+        const retryAfter = Number(r.headers.get('Retry-After')) || 60;
+        this.startLockout(retryAfter);
+      }
+      this.setState({
+        submitting: false,
+        error: code,
+        password: '',
+        retryAfter: Number(r.headers.get('Retry-After')) || 0,
+      });
+    } catch (_) {
+      this.setState({ submitting: false, error: 'server_unreachable', password: '' });
+    }
+  }
   render(_props, st) {
     const locked = st.lockoutSeconds > 0;
     const errorText = st.error
@@ -286,8 +346,15 @@ class LoginForm extends Component {
       : '';
     return html`
       <main>
-        <form class="login-card" onSubmit=${(e) => this.submit(e)}>
-          <h1>Sign in to Plinth</h1>
+        <form class="login-card"
+              onSubmit=${(e) => st.registering
+                ? this.submitRegistration(e)
+                : this.submit(e)}>
+          <h1>${st.registering ? 'Create a Plinth account' : 'Sign in to Plinth'}</h1>
+          ${st.registrationProcessed && !st.registering ? html`
+            <p class="login-status" role="status">
+              Registration was processed. Sign in if the account was created.
+            </p>` : null}
           <label>
             Username
             <input
@@ -299,17 +366,41 @@ class LoginForm extends Component {
           <label>
             Password
             <input
-              type="password" name="password" required autocomplete="current-password"
+              type="password" name="password" required
+              autocomplete=${st.registering ? 'new-password' : 'current-password'}
               value=${st.password}
               onInput=${(e) => this.setState({ password: e.target.value })}
               disabled=${st.submitting} />
           </label>
+          ${st.registering && st.registrationMode === 'invite' ? html`
+            <label>
+              Invite token
+              <input
+                type="text" name="invite_token" required autocomplete="off"
+                value=${st.inviteToken}
+                onInput=${(e) => this.setState({ inviteToken: e.target.value })}
+                disabled=${st.submitting} />
+            </label>` : null}
           <button type="submit" disabled=${st.submitting || locked}>
             ${locked
               ? `Try again in ${st.lockoutSeconds}s`
-              : (st.submitting ? 'Signing in…' : 'Sign In')}
+              : (st.submitting
+                ? (st.registering ? 'Submitting…' : 'Signing in…')
+                : (st.registering ? 'Create Account' : 'Sign In'))}
           </button>
           <div class="login-error">${errorText}</div>
+          ${st.registrationMode !== 'disabled' ? html`
+            <button class="auth-mode-toggle" type="button"
+                    disabled=${st.submitting}
+                    onClick=${() => this.setState({
+                      registering: !st.registering,
+                      error: null,
+                      password: '',
+                      inviteToken: '',
+                      registrationProcessed: false,
+                    })}>
+              ${st.registering ? 'Back to Sign In' : 'Create an Account'}
+            </button>` : null}
         </form>
       </main>`;
   }

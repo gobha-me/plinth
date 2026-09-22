@@ -1,3 +1,7 @@
+{{- $registration := .Values.registration | default dict -}}
+{{- $bootstrapSecret := get $registration "bootstrapSecret" | default dict -}}
+{{- $bootstrapSecretName := get $bootstrapSecret "name" | default "" -}}
+{{- $bootstrapSecretKey := get $bootstrapSecret "key" | default "bootstrap-token" -}}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -63,8 +67,15 @@ spec:
           env:
             - name: PLINTH_DEV_MODE
               value: "false"
-            - name: PLINTH_REGISTRATION_ENABLED
-              value: {{ .Values.registration.enabled | quote }}
+            - name: PLINTH_REGISTRATION_MODE
+              value: {{ get $registration "mode" | default "disabled" | quote }}
+            {{- if $bootstrapSecretName }}
+            - name: PLINTH_BOOTSTRAP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $bootstrapSecretName | quote }}
+                  key: {{ $bootstrapSecretKey | quote }}
+            {{- end }}
             - name: PLINTH_PG_HOST
               valueFrom:
                 secretKeyRef:

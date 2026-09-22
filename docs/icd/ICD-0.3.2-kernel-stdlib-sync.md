@@ -56,7 +56,7 @@ The initial projection is:
 | `"node_id"` | `Config::node_id` | string |
 | `"listen_host"` | `Config::listen_host` | string |
 | `"listen_port"` | `Config::listen_port` | number |
-| `"registration_enabled"` | `Config::registration_enabled` | boolean |
+| `"registration_enabled"` | `Config::registration.mode == OPEN` | boolean |
 | `"ws.auth_timeout_s"` | `Config::ws_auth_timeout_s` | number |
 | `"ws.heartbeat_interval_s"` | `Config::ws_heartbeat_interval_s` | number |
 | `"ws.heartbeat_timeout_s"` | `Config::ws_heartbeat_timeout_s` | number |

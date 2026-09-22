@@ -37,11 +37,10 @@ cp config.json.example config.json
 ./build/plinth serve --config config.json
 ```
 
-The example temporarily enables general registration for local development.
-Disable `registration_enabled` immediately after creating the first account.
-An empty production database permits only its first account even while general
-registration remains disabled. The example database credentials are
-development-only. See
+The example keeps ordinary registration disabled. Set a high-entropy
+`PLINTH_BOOTSTRAP_TOKEN`, then create the first administrator through
+`POST /api/auth/bootstrap`; remove the token from the process environment once
+bootstrap succeeds. The example database credentials are development-only. See
 [Configuration](docs/CONFIGURATION.md) before changing the bind address or
 deploying behind a TLS reverse proxy.
 

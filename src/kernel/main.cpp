@@ -663,8 +663,8 @@ auto main(int argc, char* argv[]) -> int {
 
         register_healthz();
         plinth::auth::configure_browser_origin(cfg.browser_origin);
-        plinth::auth::register_auth_routes(cfg.dev_mode,
-                                           cfg.registration_enabled);
+        plinth::auth::register_auth_routes(cfg.dev_mode, cfg.registration,
+                                           cfg.bootstrap_token);
         plinth::auth::register_pat_routes();
         plinth::groups::register_group_routes();
         plinth::audit::register_audit_routes();

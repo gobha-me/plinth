@@ -45,6 +45,39 @@ spec:
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
+  name: {{ include "plinth.fullname" . }}-auth
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ .Values.traefik.ingressClassName | quote }}
+spec:
+  entryPoints:
+    {{- toYaml .Values.traefik.entryPoints | nindent 4 }}
+  routes:
+    - kind: Rule
+      match: {{ printf "Host(`%s`) && Path(`/api/auth/login`) && Method(`POST`)" .Values.public.host | quote }}
+      priority: 250
+      middlewares:
+        - name: {{ include "plinth.fullname" . }}-auth-rate
+        - name: {{ include "plinth.fullname" . }}-inflight
+        - name: {{ include "plinth.fullname" . }}-default-body
+      services:
+        - {{- include "plinth.traefikService" . | nindent 10 }}
+    - kind: Rule
+      match: {{ printf "Host(`%s`) && Path(`/api/auth/register`) && Method(`POST`)" .Values.public.host | quote }}
+      priority: 250
+      middlewares:
+        - name: {{ include "plinth.fullname" . }}-auth-rate
+        - name: {{ include "plinth.fullname" . }}-inflight
+        - name: {{ include "plinth.fullname" . }}-default-body
+      services:
+        - {{- include "plinth.traefikService" . | nindent 10 }}
+  tls:
+    {{- include "plinth.traefikTLS" . | nindent 4 }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
   name: {{ include "plinth.fullname" . }}-http
   labels:
     {{- include "plinth.labels" . | nindent 4 }}

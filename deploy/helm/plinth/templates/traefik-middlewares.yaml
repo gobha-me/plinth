@@ -5,6 +5,9 @@
 {{- if gt (int .Values.traefik.limits.memoryRequestBodyBytes) (int .Values.traefik.limits.defaultRequestBodyBytes) -}}
 {{- fail "traefik.limits.memoryRequestBodyBytes must not exceed defaultRequestBodyBytes" -}}
 {{- end -}}
+{{- $authRateAverage := .Values.traefik.limits.authRateAverage | default 5 -}}
+{{- $authRateBurst := .Values.traefik.limits.authRateBurst | default 5 -}}
+{{- $authRatePeriodSeconds := .Values.traefik.limits.authRatePeriodSeconds | default 60 -}}
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -46,4 +49,16 @@ metadata:
 spec:
   inFlightReq:
     amount: {{ .Values.traefik.limits.maxPackageInFlightRequests }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "plinth.fullname" . }}-auth-rate
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  rateLimit:
+    average: {{ $authRateAverage }}
+    burst: {{ $authRateBurst }}
+    period: {{ printf "%ds" (int $authRatePeriodSeconds) }}
 {{- end }}

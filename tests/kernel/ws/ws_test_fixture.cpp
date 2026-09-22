@@ -97,7 +97,7 @@ auto test_config() -> plinth::Config {
   cfg.ws_heartbeat_interval_s = 0.5;
   cfg.ws_heartbeat_timeout_s = 0.5;
   cfg.migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
-  cfg.registration_enabled = true;
+  cfg.registration.mode = plinth::Config::Registration::Mode::OPEN;
   // 0.6.0.N HTTP fixture — point packages at a per-process tempdir so
   // POST /api/packages writes don't accumulate in the build tree, and
   // every test's reset_schema + clean clears them. The route

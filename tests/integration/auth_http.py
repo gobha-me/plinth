@@ -5,8 +5,10 @@ import argparse
 import base64
 import contextlib
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import http.client
 from http.cookies import SimpleCookie
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -20,7 +22,8 @@ import uuid
 
 
 class Kernel:
-    def __init__(self, binary, root, database, pg_env, registration_enabled,
+    def __init__(self, binary, root, database, pg_env, registration="disabled",
+                 bootstrap_token="fixture-bootstrap-authority-at-least-32-bytes",
                  configured_https_origin=False):
         self.database = database
         self.pg_env = pg_env | {"PGDATABASE": database}
@@ -32,17 +35,28 @@ class Kernel:
             self.port = probe.getsockname()[1]
         repo = Path(__file__).resolve().parents[2]
         self.config = root / "config.json"
-        config = {
+        registration_config = ({"mode": "open" if registration else "disabled"}
+                               if isinstance(registration, bool)
+                               else ({"mode": registration} if isinstance(registration, str)
+                                     else dict(registration)))
+        self.config_data = {
             "listen_host": "127.0.0.1", "listen_port": self.port,
-            "dev_mode": False, "registration_enabled": registration_enabled,
+            "dev_mode": False, "registration": registration_config,
             "database": {"pool_size": 8},
             "shell": {"enabled": False},
             "migrations_dir": str(repo / "migrations"),
             "packages": {"data_dir": str(root / "data"),
                          "staging_dir": str(root / "staging")}}
         if configured_https_origin:
-            config["browser_origin"] = f"https://127.0.0.1:{self.port}"
-        self.config.write_text(json.dumps(config))
+            self.config_data["browser_origin"] = f"https://127.0.0.1:{self.port}"
+        self.config.write_text(json.dumps(self.config_data))
+        self.bootstrap_token = bootstrap_token
+
+    def set_registration(self, registration):
+        self.config_data["registration"] = (
+            {"mode": registration} if isinstance(registration, str)
+            else dict(registration))
+        self.config.write_text(json.dumps(self.config_data))
 
     def sql(self, statement):
         return sql(self.pg_env, statement)
@@ -69,6 +83,8 @@ class Kernel:
         env.update({"PLINTH_PG_" + suffix: self.pg_env["PG" + suffix]
                     for suffix in ("HOST", "PORT", "USER", "PASSWORD", "DATABASE")})
         env.update(PLINTH_DEV_MODE="false", PLINTH_PG_POOL_SIZE="8")
+        if self.bootstrap_token is not None:
+            env["PLINTH_BOOTSTRAP_TOKEN"] = self.bootstrap_token
         with (self.root / "kernel.log").open("wb") as output:
             self.child = subprocess.Popen(
                 [str(self.binary), "serve", "--config", str(self.config)],
@@ -107,14 +123,15 @@ def sql(env, statement):
 
 
 @contextlib.contextmanager
-def running_kernel(binary, pg_env, registration_enabled,
+def running_kernel(binary, pg_env, registration="disabled",
+                   bootstrap_token="fixture-bootstrap-authority-at-least-32-bytes",
                    configured_https_origin=False):
     database = "plinth_auth_" + uuid.uuid4().hex
     sql(pg_env, f'CREATE DATABASE "{database}"')
     try:
         with tempfile.TemporaryDirectory(prefix="plinth-auth-http-") as temporary:
             kernel = Kernel(binary, Path(temporary), database, pg_env,
-                            registration_enabled, configured_https_origin)
+                            registration, bootstrap_token, configured_https_origin)
             try:
                 kernel.start()
                 yield kernel
@@ -192,16 +209,44 @@ def response_header(headers, expected_name):
     return ""
 
 
+def bootstrap_user(kernel, credentials, token=None, extra_headers=None):
+    body = dict(credentials)
+    body["bootstrap_token"] = kernel.bootstrap_token if token is None else token
+    return kernel.request("POST", "/api/auth/bootstrap", body,
+                          extra_headers=extra_headers)
+
+
+def login_auth(kernel, credentials):
+    status, body, headers = kernel.request("POST", "/api/auth/login", credentials)
+    assert status == 200, f"login returned {status}: {body}"
+    cookies = response_cookies(headers)
+    session = cookies["plinth_session"].value
+    csrf = cookies["plinth_csrf"].value
+    cookie = f"plinth_session={session}; plinth_csrf={csrf}"
+    return session, cookie, csrf
+
+
+def login_session(kernel, credentials):
+    return login_auth(kernel, credentials)[0]
+
+
+def assert_non_object_json_rejected(kernel, method, path, token=None):
+    for body in ([], "not-an-object"):
+        status, response, _ = kernel.request(method, path, body, token=token)
+        assert status == 400 and response["error"] == "invalid_request", \
+            f"{method} {path} accepted top-level {type(body).__name__}: {status} {response}"
+
+
 def csrf_contract(binary, pg_env):
-    with running_kernel(binary, pg_env, True) as kernel:
+    with running_kernel(binary, pg_env, "open") as kernel:
         origin = f"http://127.0.0.1:{kernel.port}"
         credentials = {
             "username": "csrf-primary",
             "password": "fake-password-for-csrf-test",
         }
 
-        status, _, _ = kernel.request("POST", "/api/auth/register", credentials)
-        assert status == 201, f"native registration returned {status}"
+        status, _, _ = bootstrap_user(kernel, credentials)
+        assert status == 201, f"native bootstrap returned {status}"
 
         status, body, _ = kernel.request(
             "POST", "/api/auth/login", credentials,
@@ -264,7 +309,9 @@ def csrf_contract(binary, pg_env):
             "username": "csrf-secondary",
             "password": "fake-password-for-csrf-test",
         }
-        assert kernel.request("POST", "/api/auth/register", other_credentials)[0] == 201
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/register", other_credentials)
+        assert status == 202 and body == {"status": "processed"}
         status, _, other_headers = kernel.request(
             "POST", "/api/auth/login", other_credentials)
         assert status == 200
@@ -301,15 +348,15 @@ def csrf_contract(binary, pg_env):
 
     # TLS termination is represented only by the configured public origin;
     # forwarded headers never become authority.
-    with running_kernel(binary, pg_env, True,
+    with running_kernel(binary, pg_env, "open",
                         configured_https_origin=True) as kernel:
         public_origin = f"https://127.0.0.1:{kernel.port}"
         credentials = {
             "username": "csrf-proxy",
             "password": "fake-password-for-csrf-proxy-test",
         }
-        status, _, _ = kernel.request(
-            "POST", "/api/auth/register", credentials,
+        status, _, _ = bootstrap_user(
+            kernel, credentials,
             extra_headers={"Origin": public_origin})
         assert status == 201, f"configured HTTPS origin returned {status}"
         status, body, _ = kernel.request(
@@ -323,10 +370,10 @@ def csrf_contract(binary, pg_env):
 
 
 def disabled_session(binary, pg_env):
-    with running_kernel(binary, pg_env, False) as kernel:
+    with running_kernel(binary, pg_env, "disabled") as kernel:
         credentials = {"username": "disabled-fixture", "password": "fake-password-for-auth-test"}
-        status, user, _ = kernel.request("POST", "/api/auth/register", credentials)
-        assert status == 201, f"registration returned {status}"
+        status, user, _ = bootstrap_user(kernel, credentials)
+        assert status == 201, f"bootstrap returned {status}"
         user_id = str(uuid.UUID(user["id"]))
         status, _, headers = kernel.request("POST", "/api/auth/login", credentials)
         assert status == 200, f"login returned {status}"
@@ -347,7 +394,7 @@ def disabled_session(binary, pg_env):
             assert status == 401 and body["error"] == "not_authenticated", \
                 f"disabled credential accepted or wrong rejection: {status}"
         status, body, _ = kernel.request("POST", "/api/auth/login", credentials)
-        assert status == 403 and body["error"] == "account_disabled"
+        assert status == 401 and body["error"] == "invalid_credentials"
         denied = websocket_auth(kernel, token)
         assert denied["type"] == "error" and denied["error"] == "auth_failed"
 
@@ -356,6 +403,73 @@ def disabled_session(binary, pg_env):
         for candidate in (token, pat["token"]):
             assert kernel.request("GET", "/api/auth/sessions", token=candidate)[0] == 200
         assert websocket_auth(kernel, token)["type"] == "connected"
+
+        # Existing password hashes remain login-compatible even when the
+        # submitted candidate exceeds the creation-time password ceiling.
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/login",
+            {"username": credentials["username"], "password": "x" * 1025})
+        assert status == 401 and body["error"] == "invalid_credentials", \
+            f"long login password was rejected as request shape: {status} {body}"
+
+        # Exhaust the remaining source window and require a privacy-safe audit.
+        audit_subject = "private-rate-limit-subject"
+        rate_limited = None
+        for _ in range(6):
+            result = kernel.request(
+                "POST", "/api/auth/login",
+                {"username": audit_subject, "password": "fake-wrong-password"})
+            if result[0] == 429:
+                rate_limited = result
+                break
+            assert result[0] == 401 and result[1]["error"] == "invalid_credentials"
+        assert rate_limited is not None, "login source window did not close"
+        status, body, headers = rate_limited
+        assert body["error"] == "rate_limited"
+        assert response_header(headers, "Retry-After")
+
+        deadline = time.monotonic() + 5
+        audit_detail = ""
+        while time.monotonic() < deadline:
+            audit_detail = kernel.sql(
+                "SELECT detail::text FROM plinth.audit_log "
+                "WHERE action='user.login_failed' "
+                "AND detail->>'reason'='rate_limited' "
+                "ORDER BY timestamp DESC LIMIT 1")
+            if audit_detail:
+                break
+            time.sleep(0.01)
+        assert audit_detail, "rate-limited login audit was not persisted"
+        detail = json.loads(audit_detail)
+        assert detail == {
+            "reason": "rate_limited",
+            "subject_hash": hashlib.sha256(audit_subject.encode()).hexdigest(),
+        }
+        assert audit_subject not in audit_detail
+
+    # The configured source ceiling also governs login. This is the kernel's
+    # shared proxy-hop bound in the supported Traefik topology, so it must not
+    # silently remain at the direct-deployment default of five.
+    with running_kernel(binary, pg_env,
+                        {"mode": "disabled", "source_attempts": 7}) as kernel:
+        credentials = {
+            "username": "proxy-shared-admin",
+            "password": "fake-proxy-shared-password",
+        }
+        assert bootstrap_user(kernel, credentials)[0] == 201
+        for index in range(6):
+            status, body, _ = kernel.request(
+                "POST", "/api/auth/login",
+                {"username": f"proxy-subject-{index}",
+                 "password": "fake-wrong-password"})
+            assert status == 401 and body["error"] == "invalid_credentials"
+        assert kernel.request("POST", "/api/auth/login", credentials)[0] == 200
+        status, body, headers = kernel.request(
+            "POST", "/api/auth/login",
+            {"username": "proxy-subject-final",
+             "password": "fake-wrong-password"})
+        assert status == 429 and body["error"] == "rate_limited"
+        assert response_header(headers, "Retry-After")
     print("disabled-account HTTP/session/PAT/login and fresh WebSocket checks passed", flush=True)
 
 
@@ -397,20 +511,313 @@ class InsertBarrier:
         self.close()
 
 
-def bootstrap_concurrent(binary, pg_env, enabled):
-    with running_kernel(binary, pg_env, enabled) as kernel:
-        count = 6
-        # Under the vulnerable implementation all INSERTs wait here, after
-        # their independent decisions. With the repair, the first INSERT and
-        # other registration-lock acquisitions wait. Observe the actual DB
-        # waits before releasing; elapsed sleeps never stand in for readiness.
+def assert_processed(result):
+    status, body, _ = result
+    assert status == 202 and body == {"status": "processed"}, \
+        f"registration did not use its generic response: {status} {body}"
+
+
+def registration_modes(binary, pg_env):
+    with running_kernel(binary, pg_env, "disabled") as kernel:
+        assert kernel.request("GET", "/api/auth/registration")[:2] == \
+            (200, {"mode": "disabled"})
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/register",
+            {"username": "disabled-user", "password": "fake-disabled-password"})
+        assert status == 403 and body["error"] == "registration_unavailable"
+
+    # Ordinary registration can never create or bootstrap the first account.
+    with running_kernel(binary, pg_env, "open") as kernel:
+        first = {"username": "not-an-admin", "password": "fake-open-password"}
+        assert_processed(kernel.request("POST", "/api/auth/register", first))
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "0"
+
+    with running_kernel(binary, pg_env,
+                        {"mode": "open", "max_accounts": 2}) as kernel:
+        admin = {"username": "open-admin", "password": "fake-admin-password"}
+        assert bootstrap_user(kernel, admin)[0] == 201
+        admin_session = login_session(kernel, admin)
+        for path in ("/api/auth/register", "/api/auth/bootstrap",
+                     "/api/auth/login"):
+            assert_non_object_json_rejected(kernel, "POST", path)
+        for path in ("/api/auth/recovery", "/api/auth/invites"):
+            assert_non_object_json_rejected(
+                kernel, "POST", path, token=admin_session)
+        member = {"username": "open-member", "password": "fake-member-password"}
+        assert_processed(kernel.request("POST", "/api/auth/register", member))
+        deadline = time.monotonic() + 5
+        registration_audit = ""
+        while time.monotonic() < deadline:
+            registration_audit = kernel.sql(
+                "SELECT ip_address::text||'|'||(detail->>'mode') "
+                "FROM plinth.audit_log WHERE action='user.registered' "
+                "AND user_id=(SELECT id FROM plinth.users "
+                "WHERE username='open-member') ORDER BY timestamp DESC LIMIT 1")
+            if registration_audit:
+                break
+            time.sleep(0.01)
+        audit_ip, audit_mode = registration_audit.rsplit("|", 1)
+        assert ipaddress.ip_interface(audit_ip).ip.is_loopback and audit_mode == "open", \
+            f"ordinary registration audit lost peer/mode: {registration_audit!r}"
+        member_session = login_session(kernel, member)
+        status, pat, _ = kernel.request(
+            "POST", "/api/auth/pats", {"name": "registration-policy"},
+            token=member_session)
+        assert status == 201
+
+        # Collision and account-cap rejection are indistinguishable from success.
+        assert_processed(kernel.request("POST", "/api/auth/register", member))
+        assert_processed(kernel.request(
+            "POST", "/api/auth/register",
+            {"username": "over-cap", "password": "fake-over-cap-password"}))
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "2"
+        for forbidden_field in ("email", "real_name"):
+            invalid = dict(member)
+            invalid[forbidden_field] = "not-collected"
+            status, body, _ = kernel.request("POST", "/api/auth/register", invalid)
+            assert status == 400 and body["error"] == "invalid_request"
+
+        # Turning registration off does not invalidate existing credentials.
+        kernel.set_registration("disabled")
+        kernel.stop()
+        kernel.start()
+        assert kernel.request("GET", "/api/auth/registration")[:2] == \
+            (200, {"mode": "disabled"})
+        assert kernel.request("GET", "/api/auth/sessions", token=member_session)[0] == 200
+        assert kernel.request("GET", "/api/auth/sessions", token=pat["token"])[0] == 200
+        assert kernel.request("POST", "/api/auth/login", member)[0] == 200
+
+        # Recovery revokes credentials, replaces the hash, and preserves disablement.
+        member_id = kernel.sql(
+            "SELECT id FROM plinth.users WHERE username='open-member'")
+        kernel.sql("UPDATE plinth.users SET disabled_at=NOW() "
+                   "WHERE username='open-member'")
+        recovered = {"username": member["username"],
+                     "new_password": "fake-recovered-password"}
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/recovery", recovered, token=admin_session)
+        assert status == 200 and body == {"status": "recovered"}
+        assert kernel.request("GET", "/api/auth/sessions", token=member_session)[0] == 401
+        assert kernel.request("GET", "/api/auth/sessions", token=pat["token"])[0] == 401
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/login",
+            {"username": member["username"], "password": recovered["new_password"]})
+        assert status == 401 and body["error"] == "invalid_credentials"
+        assert kernel.sql("SELECT disabled_at IS NOT NULL FROM plinth.users "
+                          "WHERE username='open-member'") == "t"
+        deadline = time.monotonic() + 5
+        recovery_detail = ""
+        while time.monotonic() < deadline:
+            recovery_detail = kernel.sql(
+                "SELECT detail::text FROM plinth.audit_log "
+                "WHERE action='auth.account.password_reset' "
+                "ORDER BY timestamp DESC LIMIT 1")
+            if recovery_detail:
+                break
+            time.sleep(0.01)
+        assert json.loads(recovery_detail) == {
+            "credentials_revoked": True,
+            "target_user_id": member_id,
+        }
+
+    with running_kernel(binary, pg_env,
+                        {"mode": "invite", "max_accounts": 3,
+                         "source_attempts": 20}) as kernel:
+        assert kernel.request("GET", "/api/auth/registration")[:2] == \
+            (200, {"mode": "invite"})
+        admin = {"username": "invite-admin", "password": "fake-admin-password"}
+        assert bootstrap_user(kernel, admin)[0] == 201
+        admin_session, admin_cookie, admin_csrf = login_auth(kernel, admin)
+        assert kernel.request("POST", "/api/auth/invites", {}, token=None)[0] in (401, 403)
+        status, invitation, _ = kernel.request(
+            "POST", "/api/auth/invites", {}, token=admin_session)
+        assert status == 201 and len(invitation["token"]) == 43
+        digest = hashlib.sha256(invitation["token"].encode()).hexdigest()
+        assert kernel.sql("SELECT token_hash FROM plinth.registration_invites WHERE id='" +
+                          invitation["id"] + "'::uuid") == digest
+        invitee = {"username": "invited-user", "password": "fake-invite-password",
+                   "invite_token": invitation["token"]}
+        assert_processed(kernel.request("POST", "/api/auth/register", invitee))
+        invitee_credentials = {key: invitee[key] for key in ("username", "password")}
+        invitee_session = login_session(kernel, invitee_credentials)
+        assert_processed(kernel.request(
+            "POST", "/api/auth/register",
+            {"username": "invite-reuse", "password": "fake-invite-password",
+             "invite_token": invitation["token"]}))
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE username='invite-reuse'") == "0"
+        status, listing, _ = kernel.request(
+            "GET", "/api/auth/invites", token=admin_session)
+        assert status == 200 and listing["invites"]
+        assert all("token" not in item and "token_hash" not in item
+                   for item in listing["invites"])
+        used = next(item for item in listing["invites"]
+                    if item["id"] == invitation["id"])
+        assert used["used_at"] is not None
+
+        # A valid non-admin bearer must fail RBAC for every operator action.
+        status, guarded, _ = kernel.request(
+            "POST", "/api/auth/invites", {}, token=admin_session)
+        assert status == 201
+        admin_hash = kernel.sql(
+            "SELECT password_hash FROM plinth.users WHERE username='invite-admin'")
+        invite_count = kernel.sql("SELECT count(*) FROM plinth.registration_invites")
+        non_admin_requests = (
+            ("POST", "/api/auth/invites", {}),
+            ("GET", "/api/auth/invites", None),
+            ("DELETE", f"/api/auth/invites/{guarded['id']}", None),
+            ("POST", "/api/auth/recovery",
+             {"username": "invite-admin", "new_password": "unauthorized-password"}),
+        )
+        for method, path, request_body in non_admin_requests:
+            status, body, _ = kernel.request(
+                method, path, request_body, token=invitee_session)
+            assert status == 403 and body["error"] == "permission_denied", \
+                f"non-admin {method} {path} returned {status}: {body}"
+        assert kernel.sql("SELECT count(*) FROM plinth.registration_invites") == invite_count
+        assert kernel.sql("SELECT revoked_at IS NULL FROM plinth.registration_invites WHERE id='" +
+                          guarded["id"] + "'::uuid") == "t"
+        assert kernel.sql(
+            "SELECT password_hash FROM plinth.users WHERE username='invite-admin'") == admin_hash
+
+        # Cookie authority must pass CSRF before any operator mutation reaches RBAC.
+        origin = f"http://127.0.0.1:{kernel.port}"
+        protected_mutations = (
+            ("POST", "/api/auth/invites", {}),
+            ("DELETE", f"/api/auth/invites/{guarded['id']}", None),
+            ("POST", "/api/auth/recovery",
+             {"username": "invite-admin", "new_password": "csrf-bypass-password"}),
+        )
+        for method, path, request_body in protected_mutations:
+            for csrf_header in (None, "wrong-csrf-token"):
+                headers = {"Origin": origin}
+                if csrf_header is not None:
+                    headers["X-Plinth-CSRF"] = csrf_header
+                status, body, _ = kernel.request(
+                    method, path, request_body, cookie=admin_cookie,
+                    extra_headers=headers)
+                assert status == 403 and body["error"] == "csrf_failed", \
+                    f"cookie {method} {path} bypassed CSRF: {status} {body}"
+        assert kernel.sql("SELECT count(*) FROM plinth.registration_invites") == invite_count
+        assert kernel.sql("SELECT revoked_at IS NULL FROM plinth.registration_invites WHERE id='" +
+                          guarded["id"] + "'::uuid") == "t"
+        assert kernel.sql(
+            "SELECT password_hash FROM plinth.users WHERE username='invite-admin'") == admin_hash
+
+        status, revoked, _ = kernel.request(
+            "POST", "/api/auth/invites", {"ttl_seconds": 60}, token=admin_session)
+        assert status == 201
+        status, body, _ = kernel.request(
+            "DELETE", f"/api/auth/invites/{revoked['id']}", token=admin_session)
+        assert status == 200 and body == {"status": "revoked"}
+        assert_processed(kernel.request(
+            "POST", "/api/auth/register",
+            {"username": "revoked-invite", "password": "fake-invite-password",
+             "invite_token": revoked["token"]}))
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE username='revoked-invite'") == "0"
+
+        # Reusing one invite concurrently can commit exactly one account/use.
+        racing_users = [
+            {"username": f"racing-invite-{index}",
+             "password": "fake-racing-password",
+             "invite_token": guarded["token"]}
+            for index in range(2)
+        ]
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            pending = [workers.submit(
+                kernel.request, "POST", "/api/auth/register", candidate)
+                for candidate in racing_users]
+            results = [item.result(timeout=15) for item in pending]
+        for result in results:
+            assert_processed(result)
+        assert kernel.sql(
+            "SELECT count(*) FROM plinth.users WHERE username IN "
+            "('racing-invite-0','racing-invite-1')") == "1"
+        assert kernel.sql(
+            "SELECT count(*) FROM plinth.registration_invites i "
+            "JOIN plinth.users u ON u.id=i.used_by_user_id "
+            f"WHERE i.id='{guarded['id']}'::uuid AND i.used_at IS NOT NULL AND "
+            "u.username IN ('racing-invite-0','racing-invite-1')") == "1"
+
+        # Invite mode honors the same total-account ceiling without consuming
+        # an otherwise valid invite or revealing the reason to the caller.
+        status, capped, _ = kernel.request(
+            "POST", "/api/auth/invites", {}, token=admin_session)
+        assert status == 201
+        assert_processed(kernel.request(
+            "POST", "/api/auth/register",
+            {"username": "invite-over-cap", "password": "fake-cap-password",
+             "invite_token": capped["token"]}))
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE username='invite-over-cap'") == "0"
+        assert kernel.sql("SELECT used_at IS NULL FROM plinth.registration_invites WHERE id='" +
+                          capped["id"] + "'::uuid") == "t"
+
+    with running_kernel(binary, pg_env,
+                        {"mode": "open", "source_attempts": 2,
+                         "subject_attempts": 2, "global_attempts": 100,
+                         "window_seconds": 60}) as kernel:
+        admin = {"username": "rate-admin", "password": "fake-rate-password"}
+        assert bootstrap_user(kernel, admin)[0] == 201
+        assert_processed(kernel.request("POST", "/api/auth/register", admin))
+        assert_processed(kernel.request("POST", "/api/auth/register", admin))
+        status, body, headers = kernel.request("POST", "/api/auth/register", admin)
+        assert status == 429 and body["error"] == "rate_limited"
+        assert response_header(headers, "Retry-After")
+    print("disabled, open, invite, recovery, privacy, cap, and rate controls passed",
+          flush=True)
+
+
+def bootstrap_security(binary, pg_env):
+    with running_kernel(binary, pg_env, "disabled", bootstrap_token=None) as kernel:
+        status, body, _ = kernel.request(
+            "POST", "/api/auth/bootstrap",
+            {"bootstrap_token": "unconfigured", "username": "denied-admin",
+             "password": "fake-denied-password"})
+        assert status == 403 and body["error"] == "bootstrap_denied"
+
+    with running_kernel(binary, pg_env, "disabled") as kernel:
+        credentials = {"username": "denied-admin", "password": "fake-denied-password"}
+        for request_body in (
+                credentials,
+                {**credentials, "bootstrap_token": "wrong-bootstrap-authority"}):
+            status, body, _ = kernel.request(
+                "POST", "/api/auth/bootstrap", request_body)
+            assert status == 403 and body["error"] == "bootstrap_denied"
+
+    # Bootstrap admission precedes secret comparison. Prove the independent
+    # source and global windows by exhausting each with denied requests, then
+    # showing that even a valid secret cannot reach authorization.
+    rate_cases = (
+        ("source", {"mode": "disabled", "source_attempts": 2,
+                    "global_attempts": 100}),
+        ("global", {"mode": "disabled", "source_attempts": 100,
+                    "global_attempts": 2}),
+    )
+    for label, registration in rate_cases:
+        with running_kernel(binary, pg_env, registration) as kernel:
+            credentials = {"username": f"{label}-limited-admin",
+                           "password": "fake-bootstrap-password"}
+            denied = {**credentials, "bootstrap_token": "x" * 32}
+            for _ in range(2):
+                status, body, _ = kernel.request(
+                    "POST", "/api/auth/bootstrap", denied)
+                assert status == 403 and body["error"] == "bootstrap_denied"
+            status, body, headers = bootstrap_user(kernel, credentials)
+            assert status == 429 and body["error"] == "rate_limited", \
+                f"bootstrap {label} limiter ran after authorization: {status} {body}"
+            assert response_header(headers, "Retry-After")
+            assert kernel.sql(
+                "SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "0"
+
+    with running_kernel(binary, pg_env, "disabled") as kernel:
+        count = 2
         with ThreadPoolExecutor(max_workers=count) as workers:
             with InsertBarrier(kernel):
-                pending = [workers.submit(kernel.request, "POST", "/api/auth/register",
-                                          {"username": f"bootstrap-{index}",
-                                           "password": "fake-concurrent-password"})
-                           for index in range(count)]
-                deadline = time.monotonic() + 4
+                pending = [workers.submit(
+                    bootstrap_user, kernel,
+                    {"username": f"bootstrap-{index}",
+                     "password": "fake-concurrent-password"})
+                    for index in range(count)]
+                deadline = time.monotonic() + 8
                 while True:
                     waiting = int(kernel.sql(
                         "SELECT count(*) FROM pg_stat_activity WHERE "
@@ -420,39 +827,22 @@ def bootstrap_concurrent(binary, pg_env, enabled):
                     if waiting == count:
                         break
                     assert not any(item.done() for item in pending), \
-                        "registration completed before the database barrier released"
+                        "bootstrap completed before the database barrier released"
                     assert time.monotonic() < deadline, \
-                        f"only {waiting}/{count} registrations reached the database barrier"
-                    time.sleep(0.01)  # Poll an explicit database-state condition.
+                        f"only {waiting}/{count} bootstraps reached the database barrier"
+                    time.sleep(0.01)
             results = [item.result(timeout=12) for item in pending]
-        statuses = sorted(result[0] for result in results)
-        expected = [201] * count if enabled else [201] + [403] * (count - 1)
-        administrators = kernel.sql(
+        assert sorted(result[0] for result in results) == [201, 409]
+        assert [result[1]["error"] for result in results if result[0] == 409] == \
+            ["bootstrap_closed"]
+        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "1"
+        assert kernel.sql(
             "SELECT count(*) FROM plinth.group_members gm JOIN plinth.groups g "
-            "ON g.id=gm.group_id WHERE g.name='admin'")
-        assert statuses == expected, \
-            f"concurrent registration statuses: {statuses}; administrators={administrators}"
-        assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == \
-            str(count if enabled else 1)
-        assert administrators == "1", \
-            "concurrent bootstrap did not create exactly one administrator"
-        for status, body, _ in results:
-            if status == 403:
-                assert body["error"] == "registration_disabled"
-        # The committed winner is usable, not just a membership without a user.
-        winner = kernel.sql("SELECT u.username FROM plinth.users u JOIN plinth.group_members gm "
-                            "ON gm.user_id=u.id JOIN plinth.groups g ON g.id=gm.group_id "
-                            "WHERE g.name='admin'")
-        assert kernel.request("POST", "/api/auth/login",
-                              {"username": winner, "password": "fake-concurrent-password"})[0] == 200
-    print(f"six concurrent registrations, registration_enabled={enabled}: one administrator", flush=True)
+            "ON g.id=gm.group_id WHERE g.name='admin'") == "1"
 
-
-def bootstrap_rollback(binary, pg_env):
-    # Cover both the membership statement and the final COMMIT. Neither may
-    # publish a user/201 before the administrator membership is durable.
+    # Neither a statement failure nor a failed COMMIT may publish a user/201.
     for deferred in (False, True):
-        with running_kernel(binary, pg_env, False) as kernel:
+        with running_kernel(binary, pg_env, "disabled") as kernel:
             kernel.sql("CREATE FUNCTION public.reject_fixture_membership() RETURNS trigger "
                        "LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture membership failure'; "
                        "END $$")
@@ -464,34 +854,35 @@ def bootstrap_rollback(binary, pg_env):
                 kernel.sql("CREATE TRIGGER reject_fixture_membership BEFORE INSERT "
                            "ON plinth.group_members FOR EACH ROW "
                            "EXECUTE FUNCTION public.reject_fixture_membership()")
-            credentials = {"username": "recoverable-bootstrap", "password": "fake-recovery-password"}
-            status, body, _ = kernel.request("POST", "/api/auth/register", credentials)
+            credentials = {"username": "recoverable-bootstrap",
+                           "password": "fake-recovery-password"}
+            status, body, _ = bootstrap_user(kernel, credentials)
             assert status == 500 and body["error"] == "internal_error", \
                 f"failed bootstrap unexpectedly returned {status}"
-            # An error may initiate rollback asynchronously; wait for the
-            # transaction lock on users to be released before observing state.
+            assert credentials["username"] not in (
+                kernel.root / "kernel.log").read_text(errors="replace"), \
+                "failed bootstrap leaked its submitted username to the kernel log"
             kernel.sql("BEGIN; SET LOCAL lock_timeout='5s'; "
                        "LOCK TABLE plinth.users IN SHARE MODE; COMMIT")
-            assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "0", \
-                "failed bootstrap left an unprivileged first user"
+            assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "0"
             assert kernel.sql("SELECT count(*) FROM plinth.group_members") == "0"
             kernel.sql("DROP TRIGGER reject_fixture_membership ON plinth.group_members; "
                        "DROP FUNCTION public.reject_fixture_membership()")
-            status, user, _ = kernel.request("POST", "/api/auth/register", credentials)
+            status, user, _ = bootstrap_user(kernel, credentials)
             assert status == 201, f"bootstrap retry returned {status}"
             user_id = str(uuid.UUID(user["id"]))
             assert kernel.sql("SELECT count(*) FROM plinth.group_members gm JOIN plinth.groups g "
                               "ON g.id=gm.group_id WHERE g.name='admin' AND "
                               f"gm.user_id='{user_id}'::uuid") == "1"
-    print("membership and COMMIT failures roll back bootstrap and allow a usable retry", flush=True)
+    print("bootstrap authorization, concurrency, close, and rollback checks passed",
+          flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, required=True)
-    parser.add_argument("--scenario", choices=["disabled-session", "bootstrap-disabled",
-                                               "bootstrap-enabled", "bootstrap-rollback",
-                                               "csrf"], required=True)
+    parser.add_argument("--scenario", choices=["disabled-session", "registration-modes",
+                                               "bootstrap-security", "csrf"], required=True)
     args = parser.parse_args()
     if not os.environ.get("PLINTH_PG_HOST"):
         print("PostgreSQL fixture is not configured")
@@ -504,10 +895,10 @@ def main():
         disabled_session(binary, pg_env)
     elif args.scenario == "csrf":
         csrf_contract(binary, pg_env)
-    elif args.scenario == "bootstrap-rollback":
-        bootstrap_rollback(binary, pg_env)
+    elif args.scenario == "registration-modes":
+        registration_modes(binary, pg_env)
     else:
-        bootstrap_concurrent(binary, pg_env, args.scenario == "bootstrap-enabled")
+        bootstrap_security(binary, pg_env)
     return 0
 
 

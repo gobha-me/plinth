@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace plinth {
 
@@ -32,7 +33,21 @@ struct Config {
   bool dev_mode = false;
   std::string listen_host = "127.0.0.1";
   uint16_t listen_port = 8080;
-  bool registration_enabled = false;
+  struct Registration {
+    enum class Mode : std::uint8_t { DISABLED, INVITE, OPEN };
+
+    Mode mode = Mode::DISABLED;
+    std::size_t max_accounts = 1000;
+    std::size_t source_attempts = 5;
+    std::size_t subject_attempts = 5;
+    std::size_t global_attempts = 100;
+    std::size_t window_seconds = 60;
+    std::size_t invite_ttl_seconds = 86400;
+  } registration;
+
+  // Runtime bootstrap authority is accepted from PLINTH_BOOTSTRAP_TOKEN only.
+  // It must never be placed in JSON configuration or a Kubernetes ConfigMap.
+  std::string bootstrap_token;
   std::string node_id = "node-1";
 
   // WebSocket connection lifecycle (per ICD-0.1.6).
@@ -235,6 +250,16 @@ struct Config {
   Shell shell;
 };
 
+[[nodiscard]] constexpr auto registration_mode_name(
+    Config::Registration::Mode mode) noexcept -> std::string_view {
+  switch (mode) {
+    case Config::Registration::Mode::DISABLED: return "disabled";
+    case Config::Registration::Mode::INVITE: return "invite";
+    case Config::Registration::Mode::OPEN: return "open";
+  }
+  return "disabled";
+}
+
 struct PackageSizeLimits {
   std::size_t package_bytes;
   std::size_t request_body_bytes;
@@ -253,7 +278,8 @@ auto load_config() -> Config;
 // An explicitly named file must exist, be readable, and contain a JSON object.
 // Env vars: PLINTH_PG_HOST, PLINTH_PG_PORT, PLINTH_PG_USER,
 //           PLINTH_PG_PASSWORD, PLINTH_PG_DATABASE, PLINTH_PG_POOL_SIZE,
-//           PLINTH_DEV_MODE, PLINTH_MIGRATIONS_DIR
+//           PLINTH_DEV_MODE, PLINTH_MIGRATIONS_DIR,
+//           PLINTH_REGISTRATION_MODE, PLINTH_BOOTSTRAP_TOKEN
 auto load_config(const std::string& config_path) -> Config;
 
 } // namespace plinth

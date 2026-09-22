@@ -2,6 +2,7 @@
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
+#include <cstddef>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -41,7 +42,7 @@ static auto set_env(const char* name, const char* value) -> void {
 }
 
 // Env vars that load_config reads — must be cleared for unit tests
-static constexpr std::array<const char*, 10> PLINTH_ENV_VARS = {
+static constexpr std::array<const char*, 12> PLINTH_ENV_VARS = {
     "PLINTH_PG_HOST",
     "PLINTH_PG_PORT",
     "PLINTH_PG_USER",
@@ -51,6 +52,8 @@ static constexpr std::array<const char*, 10> PLINTH_ENV_VARS = {
     "PLINTH_MIGRATIONS_DIR",
     "PLINTH_DEV_MODE",
     "PLINTH_REGISTRATION_ENABLED",
+    "PLINTH_REGISTRATION_MODE",
+    "PLINTH_BOOTSTRAP_TOKEN",
     "PLINTH_NODE_ID"};
 
 // RAII guard: saves and clears PLINTH_* env vars, restores on destruction
@@ -68,6 +71,9 @@ struct EnvGuard {
   }
 
   ~EnvGuard() {
+    for (const auto* name : PLINTH_ENV_VARS) {
+      unsetenv(name);
+    }
     for (const auto& [name, val] : saved) {
       setenv(name.c_str(), val.c_str(), 1);
     }
@@ -97,7 +103,15 @@ TEST_CASE("Config defaults are correct", "[config][unit]") {
   REQUIRE(cfg.dev_mode == false);
   REQUIRE(cfg.listen_host == "127.0.0.1");
   REQUIRE(cfg.listen_port == 8080);
-  REQUIRE(cfg.registration_enabled == false);
+  REQUIRE(cfg.registration.mode ==
+          plinth::Config::Registration::Mode::DISABLED);
+  REQUIRE(cfg.registration.max_accounts == 1000);
+  REQUIRE(cfg.registration.source_attempts == 5);
+  REQUIRE(cfg.registration.subject_attempts == 5);
+  REQUIRE(cfg.registration.global_attempts == 100);
+  REQUIRE(cfg.registration.window_seconds == 60);
+  REQUIRE(cfg.registration.invite_ttl_seconds == 86400);
+  REQUIRE(cfg.bootstrap_token.empty());
   REQUIRE(cfg.node_id == "node-1");
 }
 
@@ -248,7 +262,8 @@ TEST_CASE("PLINTH_DEV_MODE=1 also works", "[config][unit]") {
   REQUIRE(cfg.dev_mode == true);
 }
 
-TEST_CASE("registration_enabled and node_id from JSON", "[config][unit]") {
+TEST_CASE("legacy false registration config remains fail closed",
+          "[config][registration][unit]") {
   EnvGuard guard;
 
   nlohmann::json j = {{"registration_enabled", false}, {"node_id", "node-42"}};
@@ -257,18 +272,115 @@ TEST_CASE("registration_enabled and node_id from JSON", "[config][unit]") {
   auto cfg = plinth::load_config(path);
   remove_file(path);
 
-  REQUIRE(cfg.registration_enabled == false);
+  REQUIRE(cfg.registration.mode ==
+          plinth::Config::Registration::Mode::DISABLED);
   REQUIRE(cfg.node_id == "node-42");
 }
 
-TEST_CASE("PLINTH_REGISTRATION_ENABLED env var", "[config][unit]") {
+TEST_CASE("legacy registration true is rejected",
+          "[config][registration][unit]") {
   EnvGuard guard;
+  auto path = write_temp_config({{"registration_enabled", true}});
+  REQUIRE_THROWS_WITH(plinth::load_config(path),
+                      "config.registration_enabled_true_unsafe");
+  remove_file(path);
+
+  set_env("PLINTH_REGISTRATION_ENABLED", "true");
+  REQUIRE_THROWS_WITH(plinth::load_config(),
+                      "config.registration_enabled_true_unsafe");
+}
+
+TEST_CASE("legacy and current registration configuration cannot be mixed",
+          "[config][registration][unit]") {
+  EnvGuard guard;
+  auto path = write_temp_config({{"registration_enabled", false},
+                                 {"registration", {{"mode", "disabled"}}}});
+  REQUIRE_THROWS_WITH(plinth::load_config(path),
+                      "config.registration_legacy_conflict");
+  remove_file(path);
 
   set_env("PLINTH_REGISTRATION_ENABLED", "false");
-  auto cfg = plinth::load_config();
-  set_env("PLINTH_REGISTRATION_ENABLED", nullptr);
+  set_env("PLINTH_REGISTRATION_MODE", "disabled");
+  REQUIRE_THROWS_WITH(plinth::load_config(),
+                      "config.registration_legacy_conflict");
+}
 
-  REQUIRE(cfg.registration_enabled == false);
+TEST_CASE("registration modes and bounds load from JSON",
+          "[config][registration][unit]") {
+  EnvGuard guard;
+
+  auto path = write_temp_config({{"registration",
+                                  {{"mode", "invite"},
+                                   {"max_accounts", 234},
+                                   {"source_attempts", 6},
+                                   {"subject_attempts", 7},
+                                   {"global_attempts", 123},
+                                   {"window_seconds", 90},
+                                   {"invite_ttl_seconds", 7200}}}});
+  auto cfg = plinth::load_config(path);
+  remove_file(path);
+
+  REQUIRE(cfg.registration.mode == plinth::Config::Registration::Mode::INVITE);
+  REQUIRE(plinth::registration_mode_name(cfg.registration.mode) == "invite");
+  REQUIRE(cfg.registration.max_accounts == 234);
+  REQUIRE(cfg.registration.source_attempts == 6);
+  REQUIRE(cfg.registration.subject_attempts == 7);
+  REQUIRE(cfg.registration.global_attempts == 123);
+  REQUIRE(cfg.registration.window_seconds == 90);
+  REQUIRE(cfg.registration.invite_ttl_seconds == 7200);
+}
+
+TEST_CASE("registration settings reject unsafe values",
+          "[config][registration][unit]") {
+  EnvGuard guard;
+  const std::array invalid{
+      nlohmann::json{{"mode", "unknown"}},
+      nlohmann::json{{"max_accounts", 0}},
+      nlohmann::json{{"source_attempts", 1001}},
+      nlohmann::json{{"subject_attempts", -1}},
+      nlohmann::json{{"global_attempts", 100001}},
+      nlohmann::json{{"window_seconds", 86401}},
+      nlohmann::json{{"invite_ttl_seconds", 59}},
+      nlohmann::json{{"mode", "disabled"}, {"unexpected", 1}},
+  };
+  for (const auto& registration : invalid) {
+    auto path = write_temp_config({{"registration", registration}});
+    REQUIRE_THROWS_AS(plinth::load_config(path), std::runtime_error);
+    remove_file(path);
+  }
+}
+
+TEST_CASE("registration environment overrides mode and keeps bootstrap secret "
+          "out of JSON",
+          "[config][registration][unit]") {
+  EnvGuard guard;
+  set_env("PLINTH_REGISTRATION_MODE", "open");
+  set_env("PLINTH_BOOTSTRAP_TOKEN",
+          "fake-bootstrap-token-from-secret-at-least-32-bytes");
+  auto cfg = plinth::load_config();
+  REQUIRE(cfg.registration.mode == plinth::Config::Registration::Mode::OPEN);
+  REQUIRE(cfg.bootstrap_token ==
+          "fake-bootstrap-token-from-secret-at-least-32-bytes");
+
+  for (const auto size : {std::size_t{31}, std::size_t{257}}) {
+    INFO("bootstrap token bytes=" << size);
+    const std::string invalid_token(size, 'x');
+    set_env("PLINTH_BOOTSTRAP_TOKEN", invalid_token.c_str());
+    REQUIRE_THROWS_WITH(plinth::load_config(),
+                        "config.bootstrap_token_invalid");
+  }
+  set_env("PLINTH_BOOTSTRAP_TOKEN", nullptr);
+
+  auto path = write_temp_config({{"bootstrap_token", "must-not-load"}});
+  REQUIRE_THROWS_WITH(plinth::load_config(path),
+                      "config.bootstrap_token_env_only");
+  remove_file(path);
+
+  path = write_temp_config(
+      {{"registration", {{"bootstrap_token", "must-not-load"}}}});
+  REQUIRE_THROWS_WITH(plinth::load_config(path),
+                      "config.bootstrap_token_env_only");
+  remove_file(path);
 }
 
 TEST_CASE("PLINTH_NODE_ID env var", "[config][unit]") {

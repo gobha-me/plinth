@@ -157,6 +157,9 @@ auto validate_password(const std::string& password)
   if (password.size() < 8) {
     return "password_too_short";
   }
+  if (password.size() > 1024) {
+    return "password_too_long";
+  }
   return std::nullopt;
 }
 

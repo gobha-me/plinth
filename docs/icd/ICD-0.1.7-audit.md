@@ -110,10 +110,13 @@ This is the canonical list of all audit actions and their required detail fields
 
 | Action | Detail Fields | Trigger |
 |--------|---------------|---------|
-| `user.registered` | `{username}` | New user account created |
+| `user.registered` | `{mode: "bootstrap"\|"invite"\|"open", first_user?: bool}` | New user account created |
 | `user.login` | `{username, success: bool, auth_type: "session"}` | Login attempt (success or failure) |
-| `user.login_failed` | `{username, reason: "invalid_credentials"\|"account_disabled"\|"rate_limited"}` | Failed login attempt |
+| `user.login_failed` | `{subject_hash, reason: "user_not_found"\|"wrong_password"\|"account_disabled"\|"rate_limited"}` | Failed login attempt; the submitted username is not recorded |
 | `user.logout` | `{username}` | User logged out |
+| `auth.invite.created` | `{invite_id}` | Administrator created a one-use registration invite |
+| `auth.invite.revoked` | `{invite_id}` | Administrator revoked an unused registration invite |
+| `auth.account.password_reset` | `{target_user_id, credentials_revoked: true}` | Administrator reset an account password and revoked its sessions and PATs |
 | `session.revoked` | `{session_id, revoked_by: user_id}` | Session manually revoked |
 | `pat.created` | `{pat_id, name, expires_at}` | PAT created (never include raw token) |
 | `pat.revoked` | `{pat_id, name, revoked_by: user_id}` | PAT revoked |
