@@ -31,7 +31,8 @@ auto method_in(std::string_view block) -> std::string {
 auto require_filter_order(std::string_view block, std::string_view path)
     -> void {
   INFO(path);
-  if (path == "/api/auth/login" || path == "/api/auth/register") {
+  if (path == "/api/auth/bootstrap" || path == "/api/auth/login" ||
+      path == "/api/auth/register") {
     REQUIRE(block.contains("PublicOriginFilter"));
     return;
   }
@@ -94,8 +95,12 @@ TEST_CASE("every mutating API route declares the CSRF contract",
   }
 
   const std::set<Route> expected{
+      {"Post", "/api/auth/bootstrap"},
       {"Post", "/api/auth/register"},
       {"Post", "/api/auth/login"},
+      {"Post", "/api/auth/invites"},
+      {"Delete", "/api/auth/invites/{id}"},
+      {"Post", "/api/auth/recovery"},
       {"Post", "/api/auth/logout"},
       {"Delete", "/api/auth/session/{id}"},
       {"Post", "/api/auth/pats"},

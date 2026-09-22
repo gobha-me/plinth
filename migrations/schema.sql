@@ -44,6 +44,31 @@ CREATE INDEX idx_users_is_test_user
     ON plinth.users(id)
     WHERE is_test_user = true;
 
+-- Registration invitations contain only a digest of the one-time bearer
+-- token. The raw token is returned to its creator once and is never persisted.
+CREATE TABLE plinth.registration_invites (
+    id                 UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    token_hash         TEXT        UNIQUE NOT NULL,
+    created_by_user_id UUID        NOT NULL REFERENCES plinth.users(id),
+    created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at         TIMESTAMPTZ NOT NULL,
+    revoked_at         TIMESTAMPTZ,
+    used_at            TIMESTAMPTZ,
+    used_by_user_id    UUID        REFERENCES plinth.users(id),
+    CONSTRAINT chk_registration_invites_token_hash
+        CHECK (token_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT chk_registration_invites_expiry
+        CHECK (expires_at > created_at),
+    CONSTRAINT chk_registration_invites_use_pair
+        CHECK ((used_at IS NULL) = (used_by_user_id IS NULL)),
+    CONSTRAINT chk_registration_invites_terminal_state
+        CHECK (revoked_at IS NULL OR used_at IS NULL)
+);
+
+CREATE INDEX idx_registration_invites_active_expiry
+    ON plinth.registration_invites(expires_at)
+    WHERE revoked_at IS NULL AND used_at IS NULL;
+
 CREATE TABLE plinth.sessions (
     id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID        NOT NULL REFERENCES plinth.users(id),

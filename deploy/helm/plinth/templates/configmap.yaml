@@ -1,8 +1,24 @@
+{{- $registration := .Values.registration | default dict -}}
+{{- if and (hasKey $registration "enabled") (get $registration "enabled") -}}
+{{- fail "legacy registration.enabled=true is unsupported; select registration.mode explicitly" -}}
+{{- end -}}
+{{- $bootstrapSecret := get $registration "bootstrapSecret" | default dict -}}
+{{- $bootstrapSecretName := get $bootstrapSecret "name" | default "" -}}
+{{- if and .Values.traefik.enabled (ne $bootstrapSecretName "") -}}
+{{- fail "registration.bootstrapSecret.name must be empty while traefik.enabled=true" -}}
+{{- end -}}
 {{- $config := dict
       "dev_mode" false
       "listen_host" "0.0.0.0"
       "listen_port" 8080
-      "registration_enabled" .Values.registration.enabled
+      "registration" (dict
+        "mode" (get $registration "mode" | default "disabled")
+        "max_accounts" (get $registration "maxAccounts" | default 1000)
+        "source_attempts" (get $registration "sourceAttempts" | default 1000)
+        "subject_attempts" (get $registration "subjectAttempts" | default 5)
+        "global_attempts" (get $registration "globalAttempts" | default 100)
+        "window_seconds" (get $registration "windowSeconds" | default 60)
+        "invite_ttl_seconds" (get $registration "inviteTtlSeconds" | default 86400))
       "packages" (dict
         "data_dir" "/var/lib/plinth/data"
         "staging_dir" "/var/lib/plinth/data/staging") -}}

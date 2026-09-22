@@ -149,6 +149,7 @@ TEST_CASE("bootstrap_schema dev_mode creates tables",
   // Verify core tables exist
   REQUIRE(table_exists(db, "migrations"));
   REQUIRE(table_exists(db, "users"));
+  REQUIRE(table_exists(db, "registration_invites"));
   REQUIRE(table_exists(db, "sessions"));
   REQUIRE(table_exists(db, "audit_log"));
   REQUIRE(table_exists(db, "realtime_outbox"));
@@ -255,6 +256,36 @@ TEST_CASE("bootstrap_schema non-dev skips existing schema",
   // Second run: should skip (no error)
   REQUIRE_NOTHROW(plinth::db::bootstrap_schema(db, migrations_dir, false));
   REQUIRE(table_exists(db, "users"));
+  REQUIRE(table_exists(db, "registration_invites"));
+
+  drop_plinth_schema(db);
+}
+
+TEST_CASE("bootstrap_schema upgrades an existing install with invite storage",
+          "[bootstrap][integration][registration]") {
+  if (!pg_available()) {
+    SKIP("PG not available (set PLINTH_PG_HOST to enable)");
+  }
+
+  auto db = pg_config();
+  auto migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
+  drop_plinth_schema(db);
+  plinth::db::bootstrap_schema(db, migrations_dir, false);
+
+  auto conninfo = "host=" + db.host + " port=" + std::to_string(db.port) +
+                  " dbname=" + db.database + " user=" + db.user +
+                  " password=" + db.password;
+  PGconn* conn = PQconnectdb(conninfo.c_str());
+  REQUIRE(PQstatus(conn) == CONNECTION_OK);
+  auto* dropped = PQexec(conn, "DROP TABLE plinth.registration_invites");
+  REQUIRE(PQresultStatus(dropped) == PGRES_COMMAND_OK);
+  PQclear(dropped);
+  PQfinish(conn);
+  REQUIRE_FALSE(table_exists(db, "registration_invites"));
+
+  REQUIRE_NOTHROW(plinth::db::bootstrap_schema(db, migrations_dir, false));
+  REQUIRE(table_exists(db, "registration_invites"));
+  REQUIRE_NOTHROW(plinth::db::bootstrap_schema(db, migrations_dir, false));
 
   drop_plinth_schema(db);
 }

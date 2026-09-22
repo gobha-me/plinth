@@ -136,17 +136,23 @@ response-header budget instead of the ordinary 60-second budget. Exceeding that
 proxy budget does not cancel server-side work: treat the outcome as
 indeterminate, inspect package state, and never retry blindly.
 
-Traefik forwards client-address headers, but Plinth currently records and
-throttles the socket peer address. Behind a conventional proxy this is the
-Traefik Pod address: five failed logins within 60 seconds can therefore affect
-all clients sharing that peer, and audit rows do not contain the original
-client address. Treat the audit address as the proxy hop. The chart's body and
-in-flight limits do not provide per-client brute-force protection. Operators
-that require per-client controls must place a separately managed trusted edge
-limiter ahead of Traefik.
-Do not configure Plinth to trust arbitrary forwarded headers; a future narrowly
-scoped trusted-proxy contract must land before those headers become an identity
-source.
+Exact high-priority `POST /api/auth/login` and `POST /api/auth/register` routes
+apply a dedicated Traefik token bucket before the ordinary in-flight and body
+limits. It defaults to five requests per 60 seconds with a burst of five;
+`traefik.limits.authRateAverage`, `authRateBurst`, and
+`authRatePeriodSeconds` are schema-bounded to positive finite values. Traefik's
+default source criterion is its request remote address, not a caller-selected
+forwarded header. If another proxy sits ahead of Traefik, its address may become
+the shared source unless that separate trust boundary is reviewed explicitly.
+
+Plinth still records and throttles its socket peer, which is the Traefik Pod in
+this topology. The chart therefore sets the bounded kernel proxy-hop ceiling to
+1000, while the edge keeps its five-request per-external-source window. Treat
+application audit addresses as the proxy hop. The edge
+limiter independently protects Argon2 admission by external source, while the
+kernel retains submitted-subject-digest and global-window bounds. Do not configure
+Plinth to trust arbitrary forwarded headers; a future narrowly scoped
+trusted-proxy contract must land before those headers become an identity source.
 
 ## Storage and Pod security
 
@@ -290,6 +296,10 @@ enabled route before upgrading. Export the release's current operator values so
 the render includes existing-claim names, Secret-key mappings, selectors, and
 other reviewed overrides:
 
+Remove `registration.bootstrapSecret.name` and restart successfully before
+enabling Traefik. The chart rejects public exposure while a bootstrap Secret is
+selected.
+
 ```bash
 host='plinth.example'
 tls_secret='plinth-example-tls'
@@ -335,16 +345,36 @@ After installation, require all of the following before exposing DNS:
 7. a SIGTERM restart exits the old container with status zero inside the
    60-second grace period and the replacement mounts the same package state.
 
-Create the first administrator only through a trusted path. With an empty user
-table, Plinth permits that first account even while general registration is
-disabled; subsequent registration remains disabled. Port-forwarding the
-ClusterIP Service from an administrator workstation avoids temporarily exposing
-registration to the Internet. The chart schema refuses a Traefik-enabled render
-when `registration.enabled=true`.
+Create the first administrator only through the secret-authorized bootstrap
+route. Generate a high-entropy value in an operator-owned Kubernetes Secret,
+set `registration.bootstrapSecret.name` to that Secret and
+`registration.bootstrapSecret.key` to its key (default `bootstrap-token`), and
+keep `registration.mode=disabled`. The chart projects only that key into
+`PLINTH_BOOTSTRAP_TOKEN`; it never copies the value into Helm values or the
+ConfigMap. Port-forwarding the ClusterIP Service from an administrator
+workstation keeps the bootstrap exchange off the public Traefik route:
 
 ```bash
 kubectl --namespace "$namespace" port-forward service/plinth 8080:8080
 ```
+
+Send `POST /api/auth/bootstrap` with JSON fields `bootstrap_token`, `username`,
+and `password`. The sole winner receives `201`; a wrong or missing secret gets
+`403 bootstrap_denied`. After the first real user exists, an attempt with the
+still-configured valid authority gets `409 bootstrap_closed`; after the secret
+is removed, later attempts get `403 bootstrap_denied`. Remove the bootstrap secret from the workload and
+perform a normal bounded restart immediately after success. The value must not
+be placed in Helm values, a ConfigMap, an image, a command line, or logs.
+
+For a public canary, select `invite` or `open` only after bootstrap and retain
+the chart's dedicated authentication rate-limit, in-flight, body-size, TLS, and
+exact-Origin protections. `invite` stores only one-way token digests and is the
+preferred bounded admission mode. `open` is additionally bounded by source,
+submitted-subject-digest, global-window, and total-account limits. Plinth never trusts
+forwarded headers for application identity; the Traefik limiter owns the actual
+external source address while the kernel provides independent subject/global
+bounds. Switching registration back to `disabled` and restarting does not
+invalidate existing users, sessions, PATs, or WebSocket credentials.
 
 ## Upgrade and rollback
 
@@ -377,6 +407,13 @@ helm upgrade "$release" deploy/helm/plinth \
 kubectl --namespace "$namespace" rollout status statefulset/plinth \
   --timeout 5m
 ```
+
+The current chart accepts a stored prior-release
+`registration.enabled=false` value and supplies closed, bounded defaults for
+the newer registration and authentication-rate fields during `--reuse-values`.
+It rejects legacy `registration.enabled=true`; migrate that intent explicitly
+to `registration.mode=invite` or `open` only after bootstrap and exposure
+review.
 
 ## Removal
 

@@ -78,7 +78,7 @@ with `passHostHeader: true`; upstream or controller-wide middleware must not
 rewrite `Host`. Plinth does not trust `Forwarded` or `X-Forwarded-*` headers for
 browser authority.
 
-Three routes keep their limits independent:
+Four route groups keep their limits independent:
 
 - `/ws/events` has no buffering or in-flight middleware, so an upgraded socket
   cannot consume an ordinary-request concurrency slot.
@@ -86,6 +86,13 @@ Three routes keep their limits independent:
   two-request concurrency limit applied before buffering, and a separate
   15-minute response-header budget for long migrations. Two accepted 51 MiB
   multipart bodies fit within the 128 MiB upload scratch volume.
+- Exact `POST /api/auth/login` and `POST /api/auth/register` routes receive a
+  dedicated per-source Traefik token bucket before the ordinary in-flight and
+  body limits. It defaults to five requests per 60 seconds with a burst of
+  five; tune the bounded `traefik.limits.authRate*` values only after reviewing
+  the application-level source, subject, and global limits. The chart raises
+  the kernel source ceiling to 1000 because the kernel sees the shared Traefik
+  Pod; the edge bucket remains the per-external-source control.
 - Other HTTP requests receive the smaller 1 MiB bound plus the in-flight limit.
 
 Ordinary HTTP and WebSocket handshakes use the shorter backend transport;
@@ -95,11 +102,18 @@ any HTTP-to-HTTPS redirect at the controller boundary.
 
 ## First administrator
 
-The chart rejects `registration.enabled=true` together with Traefik exposure.
-For first bootstrap, keep registration disabled, keep Traefik disabled, and
-use a local port-forward. An empty Plinth database permits creation of the
-first administrator without enabling general registration. Enable Traefik only
-after that administrator exists.
+For first bootstrap, keep `registration.mode=disabled`, keep Traefik disabled,
+set `registration.bootstrapSecret.name` to an existing Secret, and use a local
+port-forward. The selected Secret key is projected only into
+`PLINTH_BOOTSTRAP_TOKEN`; it is not copied into the ConfigMap or Helm release
+values. Remove the Secret reference after the first administrator exists.
+The chart rejects any nonempty bootstrap Secret name while Traefik exposure is
+enabled, so bootstrap authority cannot be published accidentally.
+
+Upgrades using `--reuse-values` accept the prior chart's
+`registration.enabled=false` shape and resolve every missing registration
+field to the current closed, bounded defaults. The legacy value `true` remains
+invalid; select `registration.mode=invite` or `open` explicitly after bootstrap.
 
 ## Storage, replacement, and removal
 

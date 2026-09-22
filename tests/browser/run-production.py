@@ -139,7 +139,7 @@ def main():
                 "database": {"pool_size": 4},
                 "migrations_dir": runtime.migrations_dir(repo),
                 "listen_host": "127.0.0.1", "listen_port": port,
-                "dev_mode": False, "registration_enabled": False,
+                "dev_mode": False, "registration": {"mode": "disabled"},
                 "packages": {"data_dir": runtime.path(root, root / "data"),
                              "staging_dir": runtime.path(
                                  root, root / "data" / "staging")},

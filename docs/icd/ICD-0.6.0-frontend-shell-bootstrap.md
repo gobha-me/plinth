@@ -345,11 +345,9 @@ and dispatches the request body via `fetch`.
    the server's `Set-Cookie` header). The shell:
    - Re-issues `GET /api/auth/session` to populate user-context state.
    - On 200, transitions to the authenticated frame.
-3. **400 / 401**: the shell extracts `body.error` (one of
-   `missing_username`, `missing_password`, `invalid_credentials`,
-   `account_disabled`, `username_too_short`, `username_invalid_chars`,
-   `password_too_short`, `username_taken`, `registration_disabled`
-   per ICD-0.1.2) and renders the corresponding string into the
+3. **400 / 401**: the shell extracts `body.error` (normally
+   `missing_username`, `missing_password`, `invalid_request`, or
+   `invalid_credentials` per ICD-0.1.2) and renders the corresponding string into the
    inline error region. The form remains; the password field is
    cleared.
 4. **429** (`rate_limited`): the shell shows the rate-limit message
@@ -376,13 +374,14 @@ The shell **must** issue every kernel-API fetch with
 | `missing_username` | "Username is required." |
 | `missing_password` | "Password is required." |
 | `invalid_credentials` | "Username or password is incorrect." |
-| `account_disabled` | "This account is disabled." |
 | `rate_limited` | "Too many attempts. Try again in {retry_after} seconds." |
 | `username_too_short` | "Username must be at least 3 characters." |
+| `username_too_long` | "Username must be at most 64 characters." |
 | `username_invalid_chars` | "Username may only contain letters, numbers, underscores, and hyphens." |
 | `password_too_short` | "Password is too short." |
-| `username_taken` | "That username is already taken." |
-| `registration_disabled` | "Registration is disabled on this server." |
+| `password_too_long` | "Password must be at most 1024 bytes." |
+| `invalid_request` | "The submitted account details are invalid." |
+| `registration_unavailable` | "Registration is not available." |
 | any other code | "Sign-in failed. ({code})" — the code is shown verbatim so kernel-side audit can correlate. |
 
 Localization is out of scope for 0.6.0; strings ship hard-coded in

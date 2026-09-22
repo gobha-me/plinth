@@ -94,6 +94,8 @@ class Harness:
         self.cookies = self.root / "cookies.txt"
         self.values_path = self.root / "values.yaml"
         self.traefik_config = self.root / "traefik-config.yaml"
+        self.bootstrap_secret_name = "plinth-bootstrap"
+        self.bootstrap_token = secrets.token_urlsafe(48)
         self.local_tag = f"127.0.0.1:{self.registry_port}/plinth:candidate"
         self.internal_repository = f"k3d-{self.registry}:5000/plinth"
         self.candidate_digest = ""
@@ -397,6 +399,19 @@ service:
         }
         self.apply_json(database_secret)
 
+        bootstrap_secret = {
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": {
+                "name": self.bootstrap_secret_name,
+                "namespace": self.namespace,
+                "labels": {"plinth.gobha.me/test": "issue36"},
+            },
+            "type": "Opaque",
+            "stringData": {"bootstrap-token": self.bootstrap_token},
+        }
+        self.apply_json(bootstrap_secret)
+
         postgres = {
             "apiVersion": "v1",
             "kind": "List",
@@ -467,7 +482,14 @@ service:
             "--timeout=180s", timeout=200,
         )
 
-    def values(self, *, registration, nonce, traefik_enabled):
+    def values(
+        self, *, registration, nonce, traefik_enabled,
+        bootstrap_secret_name="",
+    ):
+        require(
+            not bootstrap_secret_name or not traefik_enabled,
+            "bootstrap authority must never be configured with Traefik exposure",
+        )
         return {
             "image": {
                 "repository": self.internal_repository,
@@ -476,7 +498,19 @@ service:
                 "pullSecrets": [],
             },
             "public": {"host": self.host, "port": self.https_port},
-            "registration": {"enabled": registration},
+            "registration": {
+                "mode": "open" if registration else "disabled",
+                "maxAccounts": 1000,
+                "sourceAttempts": 1000,
+                "subjectAttempts": 5,
+                "globalAttempts": 100,
+                "windowSeconds": 60,
+                "inviteTtlSeconds": 86400,
+                "bootstrapSecret": {
+                    "name": bootstrap_secret_name,
+                    "key": "bootstrap-token",
+                },
+            },
             "database": {
                 "existingSecret": "plinth-database",
                 "keys": {
@@ -568,7 +602,10 @@ service:
         # bootstrapped through a local API-server port-forward before any
         # Internet-facing Traefik object exists.
         self.write_values(self.values(
-            registration=False, nonce="install", traefik_enabled=False
+            registration=False,
+            nonce="install",
+            traefik_enabled=False,
+            bootstrap_secret_name=self.bootstrap_secret_name,
         ))
         self.helm(
             "upgrade", "--install", self.release, CHART,
@@ -668,8 +705,8 @@ service:
     def origin(self):
         return f"https://{self.host}:{self.https_port}"
 
-    def bootstrap_admin(self):
-        """Create the first administrator through the isolated Service only."""
+    def isolated_bootstrap_request(self):
+        """POST bootstrap authority through a local port-forward without logging it."""
         port = free_port()
         process = subprocess.Popen(
             [
@@ -704,37 +741,45 @@ service:
             else:
                 raise RuntimeError("kubectl port-forward did not become ready")
 
-            credentials = json.dumps({
+            payload = json.dumps({
+                "bootstrap_token": self.bootstrap_token,
                 "username": "issue36-admin",
                 "password": "fake-password-for-issue36!",
             })
+            request_path = self.root / ("bootstrap-request-" + secrets.token_hex(4))
+            descriptor = os.open(
+                request_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as request_file:
+                request_file.write(payload)
             output = self.root / "bootstrap-response"
             origin = f"http://127.0.0.1:{port}"
-            result = self.run(
-                [
-                    "curl", "--silent", "--show-error",
-                    "--output", output, "--write-out", "%{http_code}",
-                    "--request", "POST",
-                    "--header", "Content-Type: application/json",
-                    "--header", "Origin: " + origin,
-                    "--data-binary", credentials,
-                    origin + "/api/auth/register",
-                ],
-                check=False,
-                timeout=30,
-            )
-            body = (
-                output.read_text(encoding="utf-8", errors="replace")
-                if output.exists()
-                else ""
-            )
-            require(
-                result.returncode == 0 and result.stdout.strip() == "201",
-                "isolated first-administrator bootstrap failed: "
-                + result.stdout.strip()
-                + " "
-                + body,
-            )
+            try:
+                result = self.run(
+                    [
+                        "curl", "--silent", "--show-error",
+                        "--output", output, "--write-out", "%{http_code}",
+                        "--request", "POST",
+                        "--header", "Content-Type: application/json",
+                        "--header", "Origin: " + origin,
+                        "--data-binary", "@" + str(request_path),
+                        origin + "/api/auth/bootstrap",
+                    ],
+                    check=False,
+                    timeout=30,
+                )
+            finally:
+                request_path.unlink(missing_ok=True)
+            body = output.read_text(
+                encoding="utf-8", errors="replace"
+            ) if output.exists() else ""
+            try:
+                response_error = json.loads(body).get("error", "")
+            except (json.JSONDecodeError, AttributeError):
+                response_error = "invalid_json"
+            return result.returncode, result.stdout.strip(), response_error
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -743,6 +788,75 @@ service:
                 except subprocess.TimeoutExpired:
                     process.kill()
                     process.communicate(timeout=5)
+
+    def bootstrap_admin(self):
+        """Create the first administrator through the isolated Service only."""
+        code, status, response_error = self.isolated_bootstrap_request()
+        require(
+            code == 0 and status == "201",
+            "isolated first-administrator bootstrap failed: "
+            f"status={status} error={response_error}",
+        )
+
+    def remove_bootstrap_authority(self):
+        """Restart isolated without bootstrap authority before public exposure."""
+        old_pod = self.active_pod()
+        old_runtime = self.container_runtime_identity(old_pod)
+        old_exit = self.start_container_exit_watch(*old_runtime)
+        self.write_values(self.values(
+            registration=False,
+            nonce="bootstrap-removed",
+            traefik_enabled=False,
+        ))
+        started = time.monotonic()
+        self.helm(
+            "upgrade", self.release, CHART,
+            "--namespace", self.namespace,
+            "--values", self.values_path,
+            "--atomic", "--wait", "--timeout", "5m",
+            timeout=330,
+        )
+        elapsed = time.monotonic() - started
+        require(elapsed < 330,
+                f"bootstrap-authority restart exceeded bound: {elapsed:.1f}s")
+        old_status = self.finish_container_exit_watch(old_exit)
+        replacement = self.active_pod()
+        require(
+            replacement["metadata"]["uid"] != old_pod["metadata"]["uid"],
+            "removing bootstrap authority did not replace the isolated Pod",
+        )
+        self.verify_ordered_transition(old_status, replacement)
+        container = replacement["spec"]["containers"][0]
+        env_names = {item["name"] for item in container.get("env", [])}
+        require("PLINTH_BOOTSTRAP_TOKEN" not in env_names,
+                "replacement Pod retained bootstrap authority")
+
+        exposed = self.kubectl(
+            "get", "ingressroute.traefik.io,middleware.traefik.io,"
+            "serverstransport.traefik.io",
+            "-n", self.namespace,
+            "-l", f"app.kubernetes.io/instance={self.release}",
+            "-o", "name",
+        )
+        require(not exposed.stdout.strip(),
+                "bootstrap-authority restart created Traefik exposure")
+        self.kubectl(
+            "delete", "secret/" + self.bootstrap_secret_name,
+            "-n", self.namespace, "--wait=true", "--timeout=30s",
+            timeout=40,
+        )
+        absent = self.kubectl(
+            "get", "secret/" + self.bootstrap_secret_name,
+            "-n", self.namespace, check=False,
+        )
+        require(absent.returncode != 0 and "NotFound" in absent.stderr,
+                "task-owned bootstrap Secret survived authority removal")
+        code, status, response_error = self.isolated_bootstrap_request()
+        require(
+            code == 0 and status == "403" and response_error == "bootstrap_denied",
+            "removed bootstrap authority remained usable: "
+            f"status={status} error={response_error}",
+        )
 
     def enable_public_route(self):
         old_pod = self.active_pod()
@@ -872,7 +986,7 @@ service:
             "/api/auth/register", data=wrong_credentials, origin=self.origin
         )
         require(
-            code == 0 and status == "403" and "registration_disabled" in body,
+            code == 0 and status == "403" and "registration_unavailable" in body,
             f"public registration was not closed after bootstrap: {status} {body}",
         )
 
@@ -1306,7 +1420,7 @@ service:
         code, status, body = self.curl(
             "/api/auth/register", data=credentials, origin=self.origin
         )
-        require(code == 0 and status == "403" and "registration_disabled" in body,
+        require(code == 0 and status == "403" and "registration_unavailable" in body,
                 f"registration did not close after rollout: {status} {body}")
 
     def verify_clean_removal(self):
@@ -1553,6 +1667,7 @@ service:
         self.create_namespace_dependencies()
         self.install_chart()
         self.bootstrap_admin()
+        self.remove_bootstrap_authority()
         self.enable_public_route()
         self.verify_runtime_boundary()
         claims, pod_uid = self.verify_restart()

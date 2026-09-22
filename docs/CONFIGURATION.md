@@ -19,20 +19,82 @@ defaults that bind only to `127.0.0.1` and disable account registration.
 
 ## First administrator
 
-The first registered account becomes an administrator. An empty user table
-permits that first account even when general registration is disabled. Keep
-Plinth bound to loopback while bootstrapping it:
+First-administrator bootstrap is separate from ordinary registration. Before
+starting Plinth for the first time, generate a high-entropy one-time secret and
+provide it only through `PLINTH_BOOTSTRAP_TOKEN`. It must contain 32–256 bytes;
+generate it from a cryptographically secure random source (for example,
+`openssl rand -hex 32`). Do not put it in JSON, a
+command line, an image, or source control. With Plinth still reachable only
+through a trusted path, send:
 
-1. copy and edit `config.json.example`;
-2. leave `listen_host` as `127.0.0.1` and set
-   `registration_enabled` to `false` (the development example defaults to
-   `true` and must be changed);
-3. start Plinth and register the first account locally;
-4. confirm that subsequent registration is disabled; and
-5. place a TLS reverse proxy in front of Plinth before allowing
-   traffic from another host.
+```http
+POST /api/auth/bootstrap
+Content-Type: application/json
 
-Do not expose a registration-enabled instance to an untrusted network.
+{"bootstrap_token":"<secret>","username":"admin","password":"<password>"}
+```
+
+The winning request creates the user and administrator membership atomically
+and returns `201`. A missing, wrong, or unconfigured secret returns
+`403 bootstrap_denied`; after any real user exists an attempt with the still
+configured valid authority returns `409 bootstrap_closed`. Removing the
+authority makes later attempts return `403 bootstrap_denied`. Concurrent
+requests cannot create multiple first
+administrators. Remove `PLINTH_BOOTSTRAP_TOKEN` and restart immediately after
+success. Ordinary `/api/auth/register` requests never receive administrator
+membership and cannot bootstrap an empty installation.
+
+## Local registration
+
+Registration defaults to disabled and is configured as a bounded policy:
+
+```json
+{
+  "registration": {
+    "mode": "disabled",
+    "max_accounts": 1000,
+    "source_attempts": 5,
+    "subject_attempts": 5,
+    "global_attempts": 100,
+    "window_seconds": 60,
+    "invite_ttl_seconds": 86400
+  }
+}
+```
+
+- `disabled` rejects new registration with `registration_unavailable`.
+- `invite` requires an unexpired, unrevoked, single-use invite. Only a SHA-256
+  digest is stored; the raw 43-character token is returned once when an
+  administrator creates it.
+- `open` admits registration without an invite, subject to the same bounds.
+
+Every syntactically valid invite/open submission returns
+`202 {"status":"processed"}` whether it created an account or was rejected.
+This prevents the public response from disclosing an existing or disabled
+username, invite validity, or the account ceiling. Source, submitted-subject-digest,
+and global attempt limits are enforced before Argon2; `max_accounts` is a hard
+total ceiling. The source and subject settings also configure login admission,
+and the source/global settings protect bootstrap attempts. Reverse-proxy
+deployments must pair a high bounded proxy-hop source ceiling with a trusted
+per-external-source edge limiter, as the supported Helm chart does. Invalid
+JSON, unknown fields, and attempts to submit `email` or
+`real_name` return `400`. Username and password hash are the only
+user-supplied identity data Plinth stores for a local account.
+
+Administrators create, list, and revoke invites through
+`POST`/`GET /api/auth/invites` and `DELETE /api/auth/invites/{id}`. Credential
+recovery uses `POST /api/auth/recovery`; it replaces the password hash and
+revokes every session and PAT for the target account, but deliberately does not
+clear `disabled_at`. Recovery serializes with login and PAT issuance for that
+account, so credentials admitted under the old authority cannot remain valid
+after recovery returns. Plinth has no email-based reset and no automatic
+persistent account lock, because either would require extra personal data or
+provide a targeted denial-of-service primitive.
+
+Changing the mode to `disabled` requires a normal restart and affects only new
+registration. Existing users can still log in, and existing valid sessions,
+PATs, and WebSocket credentials remain valid unless the account itself is
+disabled or the credential is independently revoked or expired.
 
 ## Environment variables
 
@@ -46,7 +108,8 @@ The following variables override file and built-in values:
 - `PLINTH_PG_POOL_SIZE`
 - `PLINTH_MIGRATIONS_DIR`
 - `PLINTH_DEV_MODE`
-- `PLINTH_REGISTRATION_ENABLED`
+- `PLINTH_REGISTRATION_MODE` (`disabled`, `invite`, or `open`)
+- `PLINTH_BOOTSTRAP_TOKEN` (bootstrap authority only; never stored)
 - `PLINTH_NODE_ID`
 
 Production secrets belong in the deployment environment or its secret manager,

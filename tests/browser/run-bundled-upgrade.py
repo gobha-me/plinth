@@ -64,7 +64,7 @@ def main():
                 port = probe.getsockname()[1]
             config = root / "config.json"
             config.write_text(json.dumps({"database": {"pool_size": 4},
-                "dev_mode": False, "registration_enabled": False,
+                "dev_mode": False, "registration": {"mode": "disabled"},
                 "listen_host": "127.0.0.1", "listen_port": port,
                 "migrations_dir": runtime.migrations_dir(repo),
                 "packages": {"data_dir": runtime.path(root, root / "data"),

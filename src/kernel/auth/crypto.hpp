@@ -29,7 +29,8 @@ auto sha256_hex(const std::string& input) -> std::string;
 auto validate_username(const std::string& username)
     -> std::optional<std::string>;
 
-// Validate password: minimum 8 characters.
+// Validate password: 8-1024 bytes. The upper bound is enforced before
+// Argon2 so an unauthenticated caller cannot force unbounded input work.
 // Returns the error code string if invalid, or nullopt if valid.
 auto validate_password(const std::string& password)
     -> std::optional<std::string>;

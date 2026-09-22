@@ -31,9 +31,11 @@ services:
       PLINTH_PG_USER: plinth
       PLINTH_PG_PASSWORD: plinth
       PLINTH_PG_DATABASE: plinth
-      # Loopback-only host publication above makes this suitable for the
-      # documented first-admin bootstrap. Disable it after registration.
-      PLINTH_REGISTRATION_ENABLED: "true"
+      # Generate this in the invoking environment (for example with
+      # `openssl rand -hex 32`) and remove it after bootstrap. Empty means no
+      # bootstrap authority; Compose never ships a predictable default token.
+      PLINTH_BOOTSTRAP_TOKEN: "${PLINTH_BOOTSTRAP_TOKEN:-}"
+      PLINTH_REGISTRATION_MODE: "disabled"
     volumes:
       - plinth_data:/var/lib/plinth/data
       - plinth_logs:/var/lib/plinth/logs

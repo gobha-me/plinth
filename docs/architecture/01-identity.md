@@ -27,30 +27,79 @@ top of that philosophy).
 - Local user accounts (username + argon2id password hash)
 - Session tokens (HTTP-only cookies for web, bearer tokens for API)
 - Personal Access Tokens (PATs) for programmatic access
-- Bootstrap tokens for sidecar registration (planned by
+- Sidecar-enrollment tokens, unrelated to account bootstrap (planned by
   [#63](https://github.com/gobha-me/plinth/issues/63))
 
 **No OAuth provider built into kernel.** OAuth can be an extension.
 
 **K8s JWT validation (conditional, not implemented).** A future design may
 validate service account JWTs for sidecar auto-registration. Sidecars
-in the same namespace present their JWT instead of a bootstrap token.
+in the same namespace present their JWT instead of a sidecar-enrollment token.
 Trust-by-proximity: "you're in my namespace, I trust you to register."
 This is a kernel capability (trust boundary), not a package.
 
 See `ICD-0.1.2-auth-sessions.md` and `ICD-0.1.3-pats.md` for full
 contracts.
 
-First-user creation and admin membership commit in one advisory-lock-
+First-administrator bootstrap and later registration are separate authorities.
+`POST /api/auth/bootstrap` is usable only when the process received
+`PLINTH_BOOTSTRAP_TOKEN` (a generated 32–256-byte secret), the request supplies that secret, and no real user
+exists. First-user creation and admin membership commit in one advisory-lock-
 serialized transaction. Concurrent bootstrap attempts cannot create multiple
 first administrators, and success is not published before commit
-acknowledgment. Session and PAT validation both fail closed for disabled users.
+acknowledgment. The token is never accepted by the ordinary registration
+route, persisted, logged, returned, or exposed through configuration APIs.
+
+Later registration is controlled by the operator-selected `disabled`,
+`invite`, or `open` mode. It never grants administrator membership. Invite
+tokens are single-use 256-bit values; the database stores only their SHA-256
+digests. Syntactically valid invite/open requests deliberately return the same
+`202 {"status":"processed"}` whether an account was created or rejected, so
+the endpoint does not disclose usernames, disabled accounts, invite validity,
+or the account ceiling. Admission applies bounded source, submitted-subject digest,
+and global windows before Argon2, plus a total-account ceiling.
+
+There is no automatic persistent account lock: a subject-wide lock would let
+an attacker deny access to a known user. Login retains bounded source throttling;
+administrators may intentionally disable an account and may recover a local
+credential through the authenticated recovery route. Recovery changes the
+password hash and revokes sessions and PATs but does not clear `disabled_at`.
+Recovery, login session issuance, and PAT issuance serialize on the user's
+database row and revalidate authority under that lock, so a completed recovery
+cannot leave a credential admitted under the old authority valid.
+Neither registration nor recovery collects email addresses, real names,
+security questions, or other profile/recovery data.
+
+Changing registration mode affects only future registration admission. It
+does not invalidate users, sessions, PATs, or WebSocket authority. Session and
+PAT validation both continue to fail closed for deliberately disabled users.
 WebSocket credentials and rule snapshots use the bounded renewal contract in
 `architecture/websocket-authority.md` rather than connection-lifetime caching.
-The broader local-registration policy remains owned by
-[#37](https://github.com/gobha-me/plinth/issues/37).
 
-### 1.1 User Record (summary)
+### 1.1 Registration HTTP contract
+
+- `POST /api/auth/bootstrap` accepts `bootstrap_token`, `username`, and
+  `password`. A winner receives the ordinary `201` user representation;
+  missing, wrong, or unconfigured authority receives `403 bootstrap_denied`,
+  and a non-empty real-user set receives `409 bootstrap_closed`.
+- `GET /api/auth/registration` publishes only the active registration `mode`.
+- `POST /api/auth/register` accepts `username`, `password`, and an optional
+  `invite_token`. Disabled mode returns `403 registration_unavailable`; an
+  exhausted admission window returns `429 rate_limited`; all other
+  syntactically valid invite/open outcomes return the generic `202` result.
+- `POST` and `GET /api/auth/invites` and
+  `DELETE /api/auth/invites/{id}` require an authenticated administrator.
+  Creation returns the raw token exactly once. Listing exposes metadata only.
+- `POST /api/auth/recovery` requires an authenticated administrator and accepts
+  `username` plus `new_password`. It returns `200 {"status":"recovered"}`
+  after atomically replacing the hash and revoking sessions and PATs.
+
+Public login, bootstrap, and registration use the exact-origin policy described
+in §3. Administrator mutations use session, CSRF, and RBAC filters in that
+order. Passwords, bootstrap/invite tokens, and submitted rejected usernames
+must not appear in logs or audit detail.
+
+### 1.2 User Record (summary)
 
 The kernel owns one identity table, `plinth.users`, storing the base
 identity record: user id (UUID), username, password hash (argon2id),
@@ -209,11 +258,13 @@ the browser CSRF contract.
 
 The current unsafe-route inventory is:
 
-- public exact-origin only: `POST /api/auth/register`,
-  `POST /api/auth/login`;
+- public exact-origin only: `POST /api/auth/bootstrap`,
+  `POST /api/auth/register`, and `POST /api/auth/login`;
 - authenticated CSRF: `POST /api/auth/logout`,
   `DELETE /api/auth/session/{id}`, `POST /api/auth/pats`, and
   `DELETE /api/auth/pats/{id}`;
+- administrator CSRF plus RBAC: `POST /api/auth/invites`,
+  `DELETE /api/auth/invites/{id}`, and `POST /api/auth/recovery`;
 - administrator CSRF plus RBAC: `POST /api/groups`, `PUT` and `DELETE`
   `/api/groups/{id}`, and `POST`/`DELETE` membership and rule subresources;
 - package CSRF plus RBAC: `POST /api/packages` and `PATCH`/`DELETE`
@@ -234,13 +285,13 @@ the current cookie session clear both cookies. A new login rotates both values.
 Missing, malformed, cross-session, and cross-origin requests share one generic
 non-cacheable `403 csrf_failed` response.
 
-Login and registration cannot require a pre-session token. They accept a
-missing Origin only from a request with no browser fetch/cookie signals and
-otherwise require the same exact-origin check. They never enable credentialed
-CORS.
-Login, registration, health, and frontend assets are intentionally public and
-do not synthesize authority. `UserContext::anonymous()` is the reserved context
-for a future explicitly public RBAC-gated surface:
+Login, bootstrap, and registration cannot require a pre-session CSRF token.
+They accept a missing Origin only from a request with no browser fetch/cookie
+signals and otherwise require the same exact-origin check. They never enable
+credentialed CORS. Bootstrap additionally requires its process-local operator
+secret. Login, registration status/submission, health, and frontend assets are
+intentionally public and do not synthesize authority. `UserContext::anonymous()`
+is the reserved context for a future explicitly public RBAC-gated surface:
 
 - User ID: `null` (sentinel, not a real user)
 - Groups: `{"everyone"}` only

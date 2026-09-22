@@ -36,10 +36,10 @@ runs independently of the plinth kernel toolchain.
 - A running `plinth` kernel with PG backing (docker-compose postgres
   is fine for local testing; the tests fixture in `docker/docker-compose.yml`
   gives you PG on `localhost:5432`).
-- An **admin user** seeded into that kernel. The simplest path:
-  start plinth with `registration_enabled=false` in config, then
-  `POST /api/auth/register` once — the first user is auto-granted
-  `kernel.admin` via `ensure_first_user_admin`. See
+- An **admin user** seeded into that kernel. Start Plinth with ordinary
+  registration disabled and a high-entropy `PLINTH_BOOTSTRAP_TOKEN`, then call
+  `POST /api/auth/bootstrap` once with that token, username, and password.
+  Remove the token from the environment after bootstrap. See
   [`docs/architecture/01-identity.md`](../docs/architecture/01-identity.md).
 
 ### Easy tier (1 min, low concurrency, smoke)

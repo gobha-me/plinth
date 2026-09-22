@@ -13,6 +13,7 @@ namespace {
 
 using Callback = std::function<void(const drogon::HttpResponsePtr&)>;
 using SharedCb = std::shared_ptr<Callback>;
+using TransactionPtr = std::shared_ptr<drogon::orm::Transaction>;
 
 auto share(Callback&& cb) -> SharedCb {
   return std::make_shared<Callback>(std::move(cb));
@@ -84,62 +85,118 @@ auto handle_create_pat(const drogon::HttpRequestPtr& req, Callback&& callback)
   auto cb = share(std::move(callback));
   const auto& ctx_val = ctx.value();
 
-  // Helper lambda to perform the INSERT
+  // Serialize issuance with account recovery, then revalidate the
+  // authenticating session after acquiring the user's row lock.
   auto do_insert = [db, ctx_val, name, token_hash, token_prefix, full_token,
                     expires_at, ip, cb]() {
     auto sql =
         expires_at.empty()
             ? std::string{"INSERT INTO plinth.pats "
                           "(user_id, name, token_hash, token_prefix) "
-                          "VALUES ($1::uuid, $2, $3, $4) "
+                          "SELECT s.user_id, $4, $5, $6 FROM plinth.sessions s "
+                          "JOIN plinth.users u ON u.id=s.user_id "
+                          "WHERE s.id=$1::uuid AND s.user_id=$2::uuid "
+                          "AND s.token_hash=$3 AND s.revoked_at IS NULL "
+                          "AND s.expires_at>NOW() AND u.disabled_at IS NULL "
                           "RETURNING id, created_at, expires_at"}
             : std::string{
                   "INSERT INTO plinth.pats "
                   "(user_id, name, token_hash, token_prefix, expires_at) "
-                  "VALUES ($1::uuid, $2, $3, $4, $5::timestamptz) "
+                  "SELECT s.user_id, $4, $5, $6, $7::timestamptz "
+                  "FROM plinth.sessions s JOIN plinth.users u "
+                  "ON u.id=s.user_id WHERE s.id=$1::uuid "
+                  "AND s.user_id=$2::uuid AND s.token_hash=$3 "
+                  "AND s.revoked_at IS NULL AND s.expires_at>NOW() "
+                  "AND u.disabled_at IS NULL "
                   "RETURNING id, created_at, expires_at"};
 
-    auto on_success = [ctx_val, name, full_token, ip,
-                       cb](const drogon::orm::Result& result) {
-      auto row = result[0];
-      auto pat_id = row["id"].as<std::string>();
-
-      Json::Value detail;
-      detail["pat_name"] = name;
-      detail["pat_id"] = pat_id;
-      plinth::log::audit("pat.created", detail,
-                         {.user_id = ctx_val.user_id,
-                          .session_id = ctx_val.session_id,
-                          .ip_address = ip});
-
-      Json::Value body;
-      body["id"] = pat_id;
-      body["name"] = name;
-      body["token"] = full_token;
-      body["created_at"] = row["created_at"].as<std::string>();
-      if (!row["expires_at"].isNull()) {
-        body["expires_at"] = row["expires_at"].as<std::string>();
+    db->newTransactionAsync([ctx_val, name, token_hash, token_prefix,
+                             full_token, expires_at, ip, cb,
+                             sql = std::move(sql)](const TransactionPtr& tx) {
+      if (!tx) {
+        (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                         "Failed to create PAT"));
+        return;
       }
-
-      auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
-      resp->setStatusCode(drogon::k201Created);
-      harden_auth_response(resp, true);
-      (*cb)(resp);
-    };
-
-    auto on_error = [cb](const drogon::orm::DrogonDbException& e) {
-      spdlog::error("PAT insert failed: {}", e.base().what());
-      (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
-                       "Failed to create PAT"));
-    };
-
-    if (expires_at.empty()) {
-      db->execSqlAsync(sql, on_success, on_error, ctx_val.user_id, name,
-                       token_hash, token_prefix);
-    } else {
-      db->execSqlAsync(sql, on_success, on_error, ctx_val.user_id, name,
-                       token_hash, token_prefix, expires_at);
-    }
+      tx->setTimeout(5.0);
+      auto on_error = [cb](const drogon::orm::DrogonDbException& error) {
+        spdlog::error("PAT issuance transaction failed: {}",
+                      error.base().what());
+        (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                         "Failed to create PAT"));
+      };
+      tx->execSqlAsync(
+          "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+          [tx, ctx_val, name, token_hash, token_prefix, full_token, expires_at,
+           ip, cb, sql, on_error](const drogon::orm::Result&) {
+            tx->execSqlAsync(
+                "SELECT id FROM plinth.users WHERE id=$1::uuid FOR UPDATE",
+                [tx, ctx_val, name, token_hash, token_prefix, full_token,
+                 expires_at, ip, cb, sql,
+                 on_error](const drogon::orm::Result&) {
+                  auto on_success = [tx, ctx_val, name, full_token, ip,
+                                     cb](const drogon::orm::Result& result) {
+                    if (result.empty()) {
+                      tx->rollback();
+                      (*cb)(json_error(drogon::k401Unauthorized,
+                                       "not_authenticated",
+                                       "Not authenticated"));
+                      return;
+                    }
+                    const auto pat_id = result[0]["id"].as<std::string>();
+                    const auto created_at =
+                        result[0]["created_at"].as<std::string>();
+                    const auto returned_expiry =
+                        result[0]["expires_at"].isNull()
+                            ? std::string{}
+                            : result[0]["expires_at"].as<std::string>();
+                    tx->setCommitCallback([ctx_val, name, full_token, ip, cb,
+                                           pat_id, created_at,
+                                           returned_expiry](bool committed) {
+                      if (!committed) {
+                        (*cb)(json_error(drogon::k500InternalServerError,
+                                         "internal_error",
+                                         "Failed to create PAT"));
+                        return;
+                      }
+                      Json::Value detail;
+                      detail["pat_name"] = name;
+                      detail["pat_id"] = pat_id;
+                      plinth::log::audit("pat.created", detail,
+                                         {.user_id = ctx_val.user_id,
+                                          .session_id = ctx_val.session_id,
+                                          .ip_address = ip});
+                      Json::Value body;
+                      body["id"] = pat_id;
+                      body["name"] = name;
+                      body["token"] = full_token;
+                      body["created_at"] = created_at;
+                      if (!returned_expiry.empty()) {
+                        body["expires_at"] = returned_expiry;
+                      }
+                      auto response =
+                          drogon::HttpResponse::newHttpJsonResponse(body);
+                      response->setStatusCode(drogon::k201Created);
+                      harden_auth_response(response, true);
+                      (*cb)(response);
+                    });
+                  };
+                  if (expires_at.empty()) {
+                    tx->execSqlAsync(sql, on_success, on_error,
+                                     ctx_val.session_id, ctx_val.user_id,
+                                     ctx_val.token_hash, name, token_hash,
+                                     token_prefix);
+                  } else {
+                    tx->execSqlAsync(sql, on_success, on_error,
+                                     ctx_val.session_id, ctx_val.user_id,
+                                     ctx_val.token_hash, name, token_hash,
+                                     token_prefix, expires_at);
+                  }
+                },
+                on_error, ctx_val.user_id);
+          },
+          on_error);
+    });
   };
 
   // If expires_at is provided, validate format and ensure it's in the future

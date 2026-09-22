@@ -14,6 +14,16 @@ This generic result applies to every protected route. Issue #31 implements the
 currently missing outcome and regression coverage; it does not change token,
 cookie, expiry, or revocation semantics.
 
+**Current contract amendment (2026-09-21):** Issue #37 separates the
+secret-authorized first-administrator bootstrap from later local registration.
+Registration has `disabled`, `invite`, and `open` modes, generic processed
+responses, digest-only one-use invites, and bounded source, submitted-subject-digest,
+global, and total-account admission. Plinth intentionally has no persistent
+automatic account lock, because it would let an attacker lock a known user;
+administrator recovery replaces a password and revokes credentials without
+clearing an intentional account disable. Local identity continues to collect
+only username and password hash—never email or real name.
+
 ---
 
 ## Overview
@@ -80,33 +90,85 @@ All error responses in this ICD use:
 
 ## Endpoints
 
+### POST /api/auth/bootstrap
+
+**Authentication:** The process must have received `PLINTH_BOOTSTRAP_TOKEN`,
+containing a generated 32–256-byte secret, and the JSON `bootstrap_token` must
+match it. Exact-origin filtering still
+applies to browser-shaped requests. This secret is bootstrap authority, not a
+session or reusable API credential.
+
+**Request:** `bootstrap_token`, `username`, and `password`, with no additional
+identity fields.
+
+**Response:** `201` with the user representation after user creation and admin
+membership commit atomically. Missing, wrong, or unconfigured authority returns
+`403 bootstrap_denied`. Once any non-test user exists, an attempt with valid
+configured bootstrap authority returns `409 bootstrap_closed`; after the secret
+is removed, attempts return `403 bootstrap_denied`.
+
+The secret is sourced only from the environment. It is never persisted, logged,
+returned, exposed through `config.get`, or accepted by `/api/auth/register`.
+
+### GET /api/auth/registration
+
+**Authentication:** None. Returns only `{ "mode": "disabled|invite|open" }`.
+
 ### POST /api/auth/register
 
-**Authentication:** None (public). Can be disabled via config after first user.
+**Authentication:** None (public exact-origin contract).
 
 **Request**
 ```json
 {
   "username": "alice",
-  "password": "correct-horse-battery-staple"
+  "password": "correct-horse-battery-staple",
+  "invite_token": "optional-in-invite-mode"
 }
 ```
 
-**Response (201)**
+`invite_token` is required for admission in `invite` mode and ignored in
+`open` mode; unknown fields—including `email` and `real_name`—are rejected.
+Plinth does not collect them.
+
+**Response (202)**
 ```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "username": "alice",
-  "created_at": "2026-04-14T12:00:00Z"
-}
+{"status":"processed"}
 ```
 
-**Error codes:** `username_too_short`, `username_invalid_chars`, `password_too_short`, `username_taken`, `registration_disabled`
+Every syntactically valid invite/open request returns this response whether an
+account was created or rejected because of username state, invite state, or the
+total-account ceiling. Disabled mode returns `403 registration_unavailable`;
+an exhausted attempt window returns `429 rate_limited`. Syntax and field errors
+return `400`, but never disclose stored account or invite state.
 
 **Side effects:**
-- Row inserted into `plinth.users`
-- First user created is added to the `admin` group (via direct table insert compatible with 0.1.4 RBAC design — no other group logic permitted)
-- Audit entry: `user.registered`
+- A permitted request inserts a non-admin row into `plinth.users`.
+- Invite mode consumes exactly one digest-only invite in the same transaction.
+- Successful creation emits `user.registered` with the created user id and
+  mode, without passwords, raw tokens, or the submitted username. Invite and
+  recovery operator mutations are audited against the administrator context.
+
+### Administrator registration controls
+
+- `POST /api/auth/invites` accepts optional `ttl_seconds` and returns
+  `201 {id, token, expires_at}`. The raw 43-character base64url token is returned
+  once; only its SHA-256 digest is stored.
+- `GET /api/auth/invites` returns `id`, `created_at`, `expires_at`, `revoked_at`,
+  and `used_at`, never the token or digest.
+- `DELETE /api/auth/invites/{id}` returns `200 {"status":"revoked"}`.
+- `POST /api/auth/recovery` accepts `username` and `new_password`, returning
+  `200 {"status":"recovered"}` after replacing the hash and revoking every
+  session and PAT. Recovery, login session issuance, and PAT issuance serialize
+  on the target user's database row and revalidate authority after acquiring
+  that lock, so no credential admitted under the old password or session can
+  escape a completed recovery. It does not clear `disabled_at`; an unknown user
+  may return `404` because this route is administrator-only. Password hashing
+  uses the same process-wide two-slot memory admission as login and
+  registration.
+
+All four administrator operations require authenticated `kernel.admin`;
+mutating cookie calls apply CSRF after session authentication and before RBAC.
 
 ### POST /api/auth/login
 
@@ -124,9 +186,10 @@ All error responses in this ICD use:
 
 **Set-Cookie:** `plinth_session=<raw_token>; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=86400`
 
-**Error codes:** `missing_username`, `missing_password`, `invalid_credentials`, `account_disabled`, `rate_limited`
+**Error codes:** `missing_username`, `missing_password`, `invalid_credentials`, `rate_limited`
 
-**Side effects:** Session row created, audit `user.login` (success or failure), rate limit (5 failed attempts/IP/minute).
+**Side effects:** Session row created, audit `user.login` (success) or
+`user.login_failed`, and bounded pre-Argon2 source/subject attempt admission.
 
 ### POST /api/auth/logout
 
@@ -195,11 +258,19 @@ All error responses in this ICD use:
 ## Security Constraints (Non-Negotiable)
 
 1. Argon2id verification **must** be constant-time. Always run a dummy hash when username is not found.
-2. Login rate limiting: 5 failed attempts per IP per minute → 429 `rate_limited` with `retry_after`.
+2. Login and registration use bounded source controls. Registration additionally
+   uses submitted-subject-digest and global attempt windows plus `max_accounts`; all
+   admission checks run before Argon2. Limits cannot be configured as unlimited.
 3. Tokens: 256-bit CSPRNG entropy. Never log raw tokens or passwords.
 4. Cookie flags: `HttpOnly`, `Secure` (except localhost dev_mode), `SameSite=Strict`.
-5. First-user bootstrap becomes `admin` group member. Registration is disabled after first user unless config re-enables it.
+5. Only the secret-authorized bootstrap route creates the first administrator.
+   Ordinary registration never grants admin membership, including on an empty
+   database.
 6. `disabled_at` prevents both login and re-registration with the same username.
+7. Unknown, wrong-password, and disabled-account login attempts share
+   `invalid_credentials`; the login endpoint never discloses disabled state.
+   There is no subject-wide automatic lock.
+8. Changing registration mode never invalidates an existing user or credential.
 
 ---
 
@@ -208,7 +279,8 @@ All error responses in this ICD use:
 - Integration of sessions with the capability registry (0.2.x). These remain permanent kernel HTTP routes.
 - RBAC permission checks on auth endpoints (deferred to 0.1.5).
 - Any extension-provided authentication (OAuth, etc.) — explicitly forbidden per ARCHITECTURE §3.1.
-- Sliding expiry, “remember me” long-lived tokens, or password reset flows.
+- Sliding expiry, “remember me” long-lived tokens, or end-user/email-based
+  password reset flows. Administrator credential recovery is the only reset.
 - Any change to token format, hashing, or cookie name.
 
 ---
@@ -220,7 +292,13 @@ All error responses in this ICD use:
 **Exit:**
 - All listed endpoints implemented and exercised in Catch2 tests.
 - All error codes returned with correct standardized shape.
-- First-user bootstrap verified (auto-added to admin group).
+- Secret-authorized first-user bootstrap verified (auto-added to admin group),
+  with the ordinary registration route unable to bootstrap.
+- Disabled, invite, and open registration modes, one-time invite races, generic
+  enumeration-resistant results, pre-Argon2 bounds, and the account ceiling are
+  exercised through production HTTP handlers.
+- Disabling registration is verified not to invalidate login, sessions, PATs,
+  or WebSocket credentials.
 - Session validation middleware passes tests for both cookie and Bearer paths.
 - No passwords or raw tokens ever appear in logs or audit entries.
 - CI green, tests pass with both dev_mode and migration paths.
@@ -232,4 +310,5 @@ All error responses in this ICD use:
 
 - Session sliding expiry (consider after 0.7).
 - Long-lived “remember me” tokens (new token type, post-1.0).
-- Password reset (admin-only or extension-owned).
+- End-user password reset and recovery-factor enrollment (post-1.0; would
+  require a separately approved privacy and authority contract).

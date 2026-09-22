@@ -12,10 +12,22 @@ public:
   port: 443
 
 registration:
-  # The first account can bootstrap through kubectl port-forward while this
-  # remains false. The chart refuses to expose general registration through
-  # Traefik.
-  enabled: false
+  mode: disabled
+  maxAccounts: 1000
+  # Traefik owns the external per-source five-request window. The kernel sees
+  # the shared proxy Pod, so keep its independent proxy-hop ceiling high enough
+  # that one edge client cannot lock out every other client.
+  sourceAttempts: 1000
+  subjectAttempts: 5
+  globalAttempts: 100
+  windowSeconds: 60
+  inviteTtlSeconds: 86400
+  # Optional existing Secret containing one-time first-administrator authority.
+  # The token is injected directly into the process environment and is never
+  # copied into the generated ConfigMap.
+  bootstrapSecret:
+    name: ""
+    key: bootstrap-token
 
 database:
   # The chart never renders database credentials. This Secret must already
@@ -74,6 +86,11 @@ traefik:
     maxInFlightRequests: 64
     # At most two package bodies may occupy the 128 MiB upload scratch volume.
     maxPackageInFlightRequests: 2
+    # The exact login and registration routes share a per-source token bucket.
+    # Five tokens refill each minute, with at most five immediately available.
+    authRateAverage: 5
+    authRateBurst: 5
+    authRatePeriodSeconds: 60
   forwardingTimeouts:
     dialTimeout: 5s
     responseHeaderTimeout: 60s

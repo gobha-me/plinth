@@ -193,7 +193,7 @@ TEST_CASE("stdlib: config.get returns whitelisted keys and null otherwise",
   cfg.dev_mode = true;
   cfg.node_id = "test-node";
   cfg.listen_port = 9999;
-  cfg.registration_enabled = false;
+  cfg.registration.mode = Config::Registration::Mode::DISABLED;
   cfg.ws_auth_timeout_s = 4.5;
   // secrets populated so we can assert they do NOT leak out:
   cfg.db.password = "super-secret";
