@@ -39,26 +39,32 @@ std::unique_ptr<RateLimiter> registration_subject_limiter;
 std::unique_ptr<RateLimiter> registration_global_limiter;
 std::unique_ptr<RateLimiter> bootstrap_source_limiter;
 std::unique_ptr<RateLimiter> bootstrap_global_limiter;
-std::atomic<unsigned int> active_registration_hashes{0};
+std::atomic<unsigned int> active_password_hashes{0};
 
-constexpr unsigned int MAX_REGISTRATION_HASHES = 2;
+constexpr unsigned int MAX_PASSWORD_HASHES = 2;
+
+auto try_acquire_password_hash_slot() -> bool {
+  auto current = active_password_hashes.load(std::memory_order_relaxed);
+  while (current < MAX_PASSWORD_HASHES) {
+    if (active_password_hashes.compare_exchange_weak(
+            current, current + 1, std::memory_order_acquire,
+            std::memory_order_relaxed)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+auto release_password_hash_slot() -> void {
+  active_password_hashes.fetch_sub(1, std::memory_order_release);
+}
 
 class HashPermit {
  public:
-  HashPermit() {
-    auto current = active_registration_hashes.load(std::memory_order_relaxed);
-    while (current < MAX_REGISTRATION_HASHES) {
-      if (active_registration_hashes.compare_exchange_weak(
-              current, current + 1, std::memory_order_acquire,
-              std::memory_order_relaxed)) {
-        acquired_ = true;
-        break;
-      }
-    }
-  }
+  HashPermit() : acquired_(try_acquire_password_hash_slot()) {}
   ~HashPermit() {
     if (acquired_) {
-      active_registration_hashes.fetch_sub(1, std::memory_order_release);
+      release_password_hash_slot();
     }
   }
   HashPermit(const HashPermit&) = delete;
@@ -778,6 +784,11 @@ auto handle_recovery(const drogon::HttpRequestPtr& req, Callback&& callback)
   const auto ctx = get_auth_context(req);
   const auto ip = get_client_ip(req);
   auto cb = share(std::move(callback));
+  HashPermit permit;
+  if (!permit.acquired()) {
+    (*cb)(rate_limited_response("Recovery is busy", 1));
+    return;
+  }
   const auto password_hash = hash_password(password);
   drogon::app().getDbClient()->newTransactionAsync(
       [username, password_hash, cb, ctx, ip](const TransactionPtr& tx) {
@@ -786,49 +797,68 @@ auto handle_recovery(const drogon::HttpRequestPtr& req, Callback&& callback)
                            "Recovery failed"));
           return;
         }
+        tx->setTimeout(5.0);
+        auto on_error = [cb](const drogon::orm::DrogonDbException&) {
+          spdlog::error("account recovery transaction failed");
+          (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                           "Recovery failed"));
+        };
         tx->execSqlAsync(
-            "WITH target AS (UPDATE plinth.users SET password_hash=$2 "
-            "WHERE username=$1 RETURNING id), "
-            "revoked_sessions AS (UPDATE plinth.sessions SET revoked_at=NOW() "
-            "WHERE user_id IN (SELECT id FROM target) AND revoked_at IS NULL), "
-            "revoked_pats AS (UPDATE plinth.pats SET revoked_at=NOW() WHERE "
-            "user_id IN (SELECT id FROM target) AND revoked_at IS NULL) "
-            "SELECT id FROM target",
-            [tx, cb, ctx, ip](const drogon::orm::Result& result) {
-              if (result.empty()) {
-                tx->rollback();
-                (*cb)(json_error(drogon::k404NotFound, "user_not_found",
-                                 "User not found"));
-                return;
-              }
-              const auto target_user_id = result[0]["id"].as<std::string>();
-              tx->setCommitCallback([cb, ctx, target_user_id,
-                                     ip](bool committed) {
-                if (!committed) {
-                  (*cb)(json_error(drogon::k500InternalServerError,
-                                   "internal_error", "Recovery failed"));
-                  return;
-                }
-                Json::Value detail;
-                detail["credentials_revoked"] = true;
-                detail["target_user_id"] = target_user_id;
-                plinth::log::audit("auth.account.password_reset", detail,
-                                   {.user_id = ctx ? ctx->user_id : "",
-                                    .session_id = ctx ? ctx->session_id : "",
-                                    .ip_address = ip});
-                Json::Value body;
-                body["status"] = "recovered";
-                auto response = drogon::HttpResponse::newHttpJsonResponse(body);
-                harden_auth_response(response, true);
-                (*cb)(response);
-              });
+            "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            [tx, username, password_hash, cb, ctx, ip,
+             on_error](const drogon::orm::Result&) {
+              tx->execSqlAsync(
+                  "SELECT id FROM plinth.users WHERE username=$1 FOR UPDATE",
+                  [tx, password_hash, cb, ctx, ip,
+                   on_error](const drogon::orm::Result& target) {
+                    if (target.empty()) {
+                      tx->rollback();
+                      (*cb)(json_error(drogon::k404NotFound, "user_not_found",
+                                       "User not found"));
+                      return;
+                    }
+                    const auto target_user_id =
+                        target[0]["id"].as<std::string>();
+                    tx->execSqlAsync(
+                        "WITH target AS (UPDATE plinth.users SET "
+                        "password_hash=$2 WHERE id=$1::uuid RETURNING id), "
+                        "revoked_sessions AS (UPDATE plinth.sessions SET "
+                        "revoked_at=NOW() WHERE user_id=$1::uuid AND "
+                        "revoked_at IS NULL), revoked_pats AS (UPDATE "
+                        "plinth.pats SET revoked_at=NOW() WHERE "
+                        "user_id=$1::uuid AND revoked_at IS NULL) "
+                        "SELECT id FROM target",
+                        [tx, cb, ctx, target_user_id,
+                         ip](const drogon::orm::Result&) {
+                          tx->setCommitCallback([cb, ctx, target_user_id,
+                                                 ip](bool committed) {
+                            if (!committed) {
+                              (*cb)(json_error(drogon::k500InternalServerError,
+                                               "internal_error",
+                                               "Recovery failed"));
+                              return;
+                            }
+                            Json::Value detail;
+                            detail["credentials_revoked"] = true;
+                            detail["target_user_id"] = target_user_id;
+                            plinth::log::audit(
+                                "auth.account.password_reset", detail,
+                                {.user_id = ctx ? ctx->user_id : "",
+                                 .session_id = ctx ? ctx->session_id : "",
+                                 .ip_address = ip});
+                            Json::Value body;
+                            body["status"] = "recovered";
+                            auto response =
+                                drogon::HttpResponse::newHttpJsonResponse(body);
+                            harden_auth_response(response, true);
+                            (*cb)(response);
+                          });
+                        },
+                        on_error, target_user_id, password_hash);
+                  },
+                  on_error, username);
             },
-            [cb](const drogon::orm::DrogonDbException&) {
-              spdlog::error("account recovery failed");
-              (*cb)(json_error(drogon::k500InternalServerError,
-                               "internal_error", "Recovery failed"));
-            },
-            username, password_hash);
+            on_error);
       });
 }
 
@@ -930,8 +960,6 @@ auto handle_login(const drogon::HttpRequestPtr& req, Callback&& callback,
           return;
         }
 
-        login_subject_limiter->reset(subject);
-
         // Generate session token
         auto raw_token = generate_token();
         auto token_hash = sha256_hex(raw_token);
@@ -945,43 +973,107 @@ auto handle_login(const drogon::HttpRequestPtr& req, Callback&& callback,
           return;
         }
 
-        db->execSqlAsync(
-            "INSERT INTO plinth.sessions "
-            "(user_id, token_hash, user_agent, ip_address) "
-            "VALUES ($1::uuid, $2, $3, $4::inet) "
-            "RETURNING id, expires_at",
-            [user_id, username, raw_token, csrf_token = std::move(csrf_token),
-             ip, dev_mode, cb](const drogon::orm::Result& sess_result) {
-              auto sess_row = sess_result[0];
-              auto session_id = sess_row["id"].as<std::string>();
-              auto expires_at = sess_row["expires_at"].as<std::string>();
-
-              Json::Value detail;
-              detail["username"] = username;
-              plinth::log::audit("user.login", detail,
-                                 {.user_id = user_id,
-                                  .session_id = session_id,
-                                  .ip_address = ip});
-
-              Json::Value body;
-              body["user"]["id"] = user_id;
-              body["user"]["username"] = username;
-              body["session"]["id"] = session_id;
-              body["session"]["expires_at"] = expires_at;
-
-              auto resp = drogon::HttpResponse::newHttpJsonResponse(body);
-              resp->setStatusCode(drogon::k200OK);
-              set_session_cookie(resp, raw_token, dev_mode);
-              add_csrf_cookie(resp, csrf_token, dev_mode);
-              harden_auth_response(resp, true);
-              (*cb)(resp);
-            },
-            [cb](const drogon::orm::DrogonDbException&) {
-              spdlog::error("session insert failed");
-              (*cb)(json_error(drogon::k500InternalServerError,
-                               "internal_error", "Login failed"));
-            },
-            user_id, token_hash, user_agent, ip);
+        db->newTransactionAsync([user_id, username,
+                                 verified_hash = std::move(password_hash),
+                                 raw_token, token_hash,
+                                 csrf_token = std::move(csrf_token), user_agent,
+                                 ip, subject, dev_mode,
+                                 cb](const TransactionPtr& tx) mutable {
+          if (!tx) {
+            (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                             "Login failed"));
+            return;
+          }
+          tx->setTimeout(5.0);
+          auto on_error = [cb](const drogon::orm::DrogonDbException&) {
+            spdlog::error("session issuance transaction failed");
+            (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                             "Login failed"));
+          };
+          tx->execSqlAsync(
+              "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+              [tx, user_id, username, verified_hash = std::move(verified_hash),
+               raw_token, token_hash, csrf_token = std::move(csrf_token),
+               user_agent, ip, subject, dev_mode, cb,
+               on_error](const drogon::orm::Result&) mutable {
+                tx->execSqlAsync(
+                    "SELECT id FROM plinth.users WHERE id=$1::uuid "
+                    "FOR UPDATE",
+                    [tx, user_id, username,
+                     verified_hash = std::move(verified_hash), raw_token,
+                     token_hash, csrf_token = std::move(csrf_token), user_agent,
+                     ip, subject, dev_mode, cb,
+                     on_error](const drogon::orm::Result&) mutable {
+                      tx->execSqlAsync(
+                          "INSERT INTO plinth.sessions "
+                          "(user_id, token_hash, user_agent, ip_address) "
+                          "SELECT id, $2, $3, $4::inet FROM plinth.users "
+                          "WHERE id=$1::uuid AND password_hash=$5 "
+                          "AND disabled_at IS NULL "
+                          "RETURNING id, expires_at",
+                          [tx, user_id, username, raw_token,
+                           csrf_token = std::move(csrf_token), ip, subject,
+                           dev_mode,
+                           cb](const drogon::orm::Result& session) mutable {
+                            if (session.empty()) {
+                              tx->rollback();
+                              Json::Value detail;
+                              detail["subject_hash"] = subject;
+                              detail["reason"] = "credentials_changed";
+                              plinth::log::audit("user.login_failed", detail,
+                                                 {.user_id = user_id,
+                                                  .session_id = "",
+                                                  .ip_address = ip});
+                              (*cb)(json_error(drogon::k401Unauthorized,
+                                               "invalid_credentials",
+                                               "Invalid username or password"));
+                              return;
+                            }
+                            const auto session_id =
+                                session[0]["id"].as<std::string>();
+                            const auto expires_at =
+                                session[0]["expires_at"].as<std::string>();
+                            tx->setCommitCallback([user_id, username, raw_token,
+                                                   csrf_token =
+                                                       std::move(csrf_token),
+                                                   ip, subject, session_id,
+                                                   expires_at, dev_mode,
+                                                   cb](bool committed) mutable {
+                              if (!committed) {
+                                (*cb)(json_error(
+                                    drogon::k500InternalServerError,
+                                    "internal_error", "Login failed"));
+                                return;
+                              }
+                              login_subject_limiter->reset(subject);
+                              Json::Value detail;
+                              detail["username"] = username;
+                              plinth::log::audit("user.login", detail,
+                                                 {.user_id = user_id,
+                                                  .session_id = session_id,
+                                                  .ip_address = ip});
+                              Json::Value body;
+                              body["user"]["id"] = user_id;
+                              body["user"]["username"] = username;
+                              body["session"]["id"] = session_id;
+                              body["session"]["expires_at"] = expires_at;
+                              auto response =
+                                  drogon::HttpResponse::newHttpJsonResponse(
+                                      body);
+                              response->setStatusCode(drogon::k200OK);
+                              set_session_cookie(response, raw_token, dev_mode);
+                              add_csrf_cookie(response, csrf_token, dev_mode);
+                              harden_auth_response(response, true);
+                              (*cb)(response);
+                            });
+                          },
+                          on_error, user_id, token_hash, user_agent, ip,
+                          verified_hash);
+                    },
+                    on_error, user_id);
+              },
+              on_error);
+        });
       },
       [cb](const drogon::orm::DrogonDbException&) {
         spdlog::error("user lookup failed");
@@ -1239,6 +1331,22 @@ auto handle_list_sessions(const drogon::HttpRequestPtr& req,
 } // namespace
 
 // ── Public API ───────────────────────────────────────────────────────
+
+namespace test_seam {
+
+auto try_acquire_password_hash_slot() -> bool {
+  return plinth::auth::try_acquire_password_hash_slot();
+}
+
+auto release_password_hash_slot() -> void {
+  plinth::auth::release_password_hash_slot();
+}
+
+auto active_password_hash_slots() -> unsigned int {
+  return active_password_hashes.load(std::memory_order_acquire);
+}
+
+} // namespace test_seam
 
 auto register_auth_routes(bool dev_mode,
                           const Config::Registration& registration,

@@ -85,9 +85,11 @@ Administrators create, list, and revoke invites through
 `POST`/`GET /api/auth/invites` and `DELETE /api/auth/invites/{id}`. Credential
 recovery uses `POST /api/auth/recovery`; it replaces the password hash and
 revokes every session and PAT for the target account, but deliberately does not
-clear `disabled_at`. Plinth has no email-based reset and no automatic persistent
-account lock, because either would require extra personal data or provide a
-targeted denial-of-service primitive.
+clear `disabled_at`. Recovery serializes with login and PAT issuance for that
+account, so credentials admitted under the old authority cannot remain valid
+after recovery returns. Plinth has no email-based reset and no automatic
+persistent account lock, because either would require extra personal data or
+provide a targeted denial-of-service primitive.
 
 Changing the mode to `disabled` requires a normal restart and affects only new
 registration. Existing users can still log in, and existing valid sessions,

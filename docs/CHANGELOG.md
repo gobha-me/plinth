@@ -22,8 +22,10 @@ tag list (`git tag -l`).
   account-ceiling state.
 - Added pre-Argon2 source, submitted-subject-digest, and global admission windows,
   a hard account ceiling, privacy-preserving audit, administrator invite
-  controls, and credential recovery that revokes sessions and PATs without
-  clearing deliberate account disablement.
+  controls, and credential recovery that serializes per account with login and
+  PAT issuance, then revokes sessions and PATs without clearing deliberate
+  account disablement. Every password hash operation shares the same bounded
+  two-slot memory admission.
 - Kept local identity data-minimal: username and password hash only. Disabling
   new registration leaves existing users and credentials valid.
 - Added a digest-only invite schema upgrade, closed-by-default Helm/Compose

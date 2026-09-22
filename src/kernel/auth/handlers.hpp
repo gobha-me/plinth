@@ -6,6 +6,16 @@
 
 namespace plinth::auth {
 
+namespace test_seam {
+
+// Deterministic coverage for the process-wide Argon2 memory admission bound.
+// Production code acquires the same slots before every password hash/verify.
+auto try_acquire_password_hash_slot() -> bool;
+auto release_password_hash_slot() -> void;
+auto active_password_hash_slots() -> unsigned int;
+
+} // namespace test_seam
+
 // Register authentication routes (bootstrap, registration policy/invites,
 // login, recovery, logout, sessions). Bootstrap and ordinary registration are
 // separate transactions; only the secret-authorized bootstrap may grant the

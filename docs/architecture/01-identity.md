@@ -64,6 +64,9 @@ an attacker deny access to a known user. Login retains bounded source throttling
 administrators may intentionally disable an account and may recover a local
 credential through the authenticated recovery route. Recovery changes the
 password hash and revokes sessions and PATs but does not clear `disabled_at`.
+Recovery, login session issuance, and PAT issuance serialize on the user's
+database row and revalidate authority under that lock, so a completed recovery
+cannot leave a credential admitted under the old authority valid.
 Neither registration nor recovery collects email addresses, real names,
 security questions, or other profile/recovery data.
 

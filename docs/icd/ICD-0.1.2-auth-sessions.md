@@ -159,8 +159,13 @@ return `400`, but never disclose stored account or invite state.
 - `DELETE /api/auth/invites/{id}` returns `200 {"status":"revoked"}`.
 - `POST /api/auth/recovery` accepts `username` and `new_password`, returning
   `200 {"status":"recovered"}` after replacing the hash and revoking every
-  session and PAT. It does not clear `disabled_at`; an unknown user may return
-  `404` because this route is administrator-only.
+  session and PAT. Recovery, login session issuance, and PAT issuance serialize
+  on the target user's database row and revalidate authority after acquiring
+  that lock, so no credential admitted under the old password or session can
+  escape a completed recovery. It does not clear `disabled_at`; an unknown user
+  may return `404` because this route is administrator-only. Password hashing
+  uses the same process-wide two-slot memory admission as login and
+  registration.
 
 All four administrator operations require authenticated `kernel.admin`;
 mutating cookie calls apply CSRF after session authentication and before RBAC.

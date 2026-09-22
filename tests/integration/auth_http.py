@@ -511,6 +511,184 @@ class InsertBarrier:
         self.close()
 
 
+class RecoveryUpdateBarrier:
+    """Hold recovery after its user-row lock but before credential revocation."""
+    LOCK_KEY = 370037
+
+    def __init__(self, kernel, user_id):
+        self.kernel = kernel
+        self.user_id = str(uuid.UUID(user_id))
+        self.child = None
+
+    def __enter__(self):
+        self.kernel.sql(
+            "CREATE FUNCTION public.auth_recovery_update_barrier() "
+            "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM "
+            f"pg_advisory_xact_lock({self.LOCK_KEY}); RETURN NEW; END $$")
+        self.kernel.sql(
+            "CREATE TRIGGER auth_recovery_update_barrier BEFORE UPDATE OF "
+            "password_hash ON plinth.users FOR EACH ROW WHEN "
+            f"(OLD.id = '{self.user_id}'::uuid) EXECUTE FUNCTION "
+            "public.auth_recovery_update_barrier()")
+        self.child = subprocess.Popen(
+            ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
+            env=self.kernel.pg_env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            self.child.stdin.write(
+                "SELECT 'recovery-barrier-ready' FROM (SELECT "
+                f"pg_advisory_lock({self.LOCK_KEY})) AS locked;\n")
+            self.child.stdin.flush()
+            with selectors.DefaultSelector() as ready:
+                ready.register(self.child.stdout, selectors.EVENT_READ)
+                assert ready.select(timeout=5), "recovery barrier did not become ready"
+                assert self.child.stdout.readline().strip() == \
+                    "recovery-barrier-ready"
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def wait_for_recovery(self):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            waiting = int(self.kernel.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE "
+                "datname=current_database() AND wait_event_type='Lock' AND "
+                "query LIKE 'WITH target AS (UPDATE plinth.users SET%'") or "0")
+            if waiting == 1:
+                return
+            time.sleep(0.01)
+        raise AssertionError("recovery did not reach the database barrier")
+
+    def wait_for_issuers(self):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            waiting = int(self.kernel.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE "
+                "datname=current_database() AND wait_event_type='Lock' AND "
+                "query LIKE 'SELECT id FROM plinth.users WHERE id=%FOR UPDATE%'"
+            ) or "0")
+            if waiting == 2:
+                return
+            time.sleep(0.01)
+        raise AssertionError("credential issuers did not wait behind recovery")
+
+    def close(self):
+        if self.child is not None:
+            try:
+                self.child.communicate(
+                    f"SELECT pg_advisory_unlock({self.LOCK_KEY});\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                self.child.kill()
+                self.child.communicate(timeout=5)
+                raise AssertionError("recovery barrier did not release") from None
+            assert self.child.returncode == 0, "recovery barrier failed"
+            self.child = None
+        self.kernel.sql(
+            "DROP TRIGGER IF EXISTS auth_recovery_update_barrier ON plinth.users; "
+            "DROP FUNCTION IF EXISTS public.auth_recovery_update_barrier()")
+
+    def __exit__(self, *_):
+        self.close()
+
+
+class CredentialInsertBarrier:
+    """Hold credential insertion after the issuer owns the user's row lock."""
+    TARGETS = {
+        "sessions": (370038, "session"),
+        "pats": (370039, "pat"),
+    }
+
+    def __init__(self, kernel, table, user_id):
+        if table not in self.TARGETS:
+            raise ValueError(f"unsupported credential table: {table}")
+        self.kernel = kernel
+        self.table = table
+        self.user_id = str(uuid.UUID(user_id))
+        self.lock_key, self.label = self.TARGETS[table]
+        self.function = f"auth_{self.label}_insert_barrier"
+        self.trigger = self.function
+        self.child = None
+
+    def __enter__(self):
+        try:
+            self.kernel.sql(
+                f"CREATE FUNCTION public.{self.function}() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM "
+                f"pg_advisory_xact_lock({self.lock_key}); RETURN NEW; END $$")
+            self.kernel.sql(
+                f"CREATE TRIGGER {self.trigger} BEFORE INSERT ON "
+                f"plinth.{self.table} FOR EACH ROW WHEN "
+                f"(NEW.user_id = '{self.user_id}'::uuid) EXECUTE FUNCTION "
+                f"public.{self.function}()")
+            self.child = subprocess.Popen(
+                ["psql", "-XqAt", "-v", "ON_ERROR_STOP=1"],
+                env=self.kernel.pg_env, stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.child.stdin.write(
+                f"SELECT '{self.label}-insert-barrier-ready' FROM (SELECT "
+                f"pg_advisory_lock({self.lock_key})) AS locked;\n")
+            self.child.stdin.flush()
+            with selectors.DefaultSelector() as ready:
+                ready.register(self.child.stdout, selectors.EVENT_READ)
+                assert ready.select(timeout=5), \
+                    f"{self.label} insert barrier did not become ready"
+                assert self.child.stdout.readline().strip() == \
+                    f"{self.label}-insert-barrier-ready"
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def wait_for_insert(self):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            waiting = int(self.kernel.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE "
+                "datname=current_database() AND wait_event_type='Lock' AND "
+                f"query LIKE 'INSERT INTO plinth.{self.table} %'") or "0")
+            if waiting == 1:
+                return
+            time.sleep(0.01)
+        raise AssertionError(
+            f"{self.label} issuance did not reach the database barrier")
+
+    def wait_for_recovery(self):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            waiting = int(self.kernel.sql(
+                "SELECT count(*) FROM pg_stat_activity WHERE "
+                "datname=current_database() AND wait_event_type='Lock' AND "
+                "query LIKE 'SELECT id FROM plinth.users WHERE username=%FOR UPDATE%'"
+            ) or "0")
+            if waiting == 1:
+                return
+            time.sleep(0.01)
+        raise AssertionError("recovery did not wait behind credential issuance")
+
+    def close(self):
+        try:
+            if self.child is not None:
+                self.child.communicate(
+                    f"SELECT pg_advisory_unlock({self.lock_key});\n", timeout=5)
+                assert self.child.returncode == 0, \
+                    f"{self.label} insert barrier failed"
+        except subprocess.TimeoutExpired:
+            self.child.kill()
+            self.child.communicate(timeout=5)
+            raise AssertionError(
+                f"{self.label} insert barrier did not release") from None
+        finally:
+            self.child = None
+            self.kernel.sql(
+                f"DROP TRIGGER IF EXISTS {self.trigger} ON plinth.{self.table}; "
+                f"DROP FUNCTION IF EXISTS public.{self.function}()")
+
+    def __exit__(self, *_):
+        self.close()
+
+
 def assert_processed(result):
     status, body, _ = result
     assert status == 202 and body == {"status": "processed"}, \
@@ -532,8 +710,10 @@ def registration_modes(binary, pg_env):
         assert_processed(kernel.request("POST", "/api/auth/register", first))
         assert kernel.sql("SELECT count(*) FROM plinth.users WHERE NOT is_test_user") == "0"
 
-    with running_kernel(binary, pg_env,
-                        {"mode": "open", "max_accounts": 2}) as kernel:
+    with running_kernel(
+            binary, pg_env,
+            {"mode": "open", "max_accounts": 2,
+             "source_attempts": 100, "subject_attempts": 100}) as kernel:
         admin = {"username": "open-admin", "password": "fake-admin-password"}
         assert bootstrap_user(kernel, admin)[0] == 201
         admin_session = login_session(kernel, admin)
@@ -578,7 +758,8 @@ def registration_modes(binary, pg_env):
             assert status == 400 and body["error"] == "invalid_request"
 
         # Turning registration off does not invalidate existing credentials.
-        kernel.set_registration("disabled")
+        kernel.set_registration({"mode": "disabled", "source_attempts": 100,
+                                 "subject_attempts": 100})
         kernel.stop()
         kernel.start()
         assert kernel.request("GET", "/api/auth/registration")[:2] == \
@@ -587,9 +768,116 @@ def registration_modes(binary, pg_env):
         assert kernel.request("GET", "/api/auth/sessions", token=pat["token"])[0] == 200
         assert kernel.request("POST", "/api/auth/login", member)[0] == 200
 
-        # Recovery revokes credentials, replaces the hash, and preserves disablement.
+        # Recovery owns the user row before revoking credentials. Login and
+        # PAT issuance that were admitted under the old authority must wait,
+        # revalidate after recovery commits, and fail without inserting a row.
         member_id = kernel.sql(
             "SELECT id FROM plinth.users WHERE username='open-member'")
+        raced_recovery = {
+            "username": member["username"],
+            "new_password": "fake-race-recovered-password",
+        }
+        with ThreadPoolExecutor(max_workers=3) as workers:
+            with RecoveryUpdateBarrier(kernel, member_id) as barrier:
+                recovery_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/recovery",
+                    raced_recovery, admin_session)
+                barrier.wait_for_recovery()
+                login_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/login", member)
+                pat_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/pats",
+                    {"name": "raced-pat"}, member_session)
+                barrier.wait_for_issuers()
+            recovery_result = recovery_pending.result(timeout=12)
+            login_result = login_pending.result(timeout=12)
+            pat_result = pat_pending.result(timeout=12)
+        assert recovery_result[:2] == (200, {"status": "recovered"})
+        assert login_result[0] == 401 and \
+            login_result[1]["error"] == "invalid_credentials"
+        assert pat_result[0] == 401 and \
+            pat_result[1]["error"] == "not_authenticated"
+        assert kernel.sql(
+            f"SELECT count(*) FROM plinth.sessions WHERE user_id='{member_id}'::uuid "
+            "AND revoked_at IS NULL") == "0"
+        assert kernel.sql(
+            f"SELECT count(*) FROM plinth.pats WHERE user_id='{member_id}'::uuid "
+            "AND revoked_at IS NULL") == "0"
+        raced_credentials = {
+            "username": member["username"],
+            "password": raced_recovery["new_password"],
+        }
+        raced_session = login_session(kernel, raced_credentials)
+        assert kernel.request(
+            "GET", "/api/auth/sessions", token=raced_session)[0] == 200
+
+        # The inverse ordering is also linearizable: a login that already owns
+        # the user row commits first, then recovery acquires it and revokes the
+        # exact newly-issued session before reporting success.
+        login_first_recovery = {
+            "username": member["username"],
+            "new_password": "fake-login-first-recovered-password",
+        }
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            with CredentialInsertBarrier(kernel, "sessions", member_id) as barrier:
+                login_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/login", raced_credentials)
+                barrier.wait_for_insert()
+                recovery_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/recovery",
+                    login_first_recovery, admin_session)
+                barrier.wait_for_recovery()
+            login_result = login_pending.result(timeout=12)
+            recovery_result = recovery_pending.result(timeout=12)
+        assert login_result[0] == 200, \
+            f"issuer-first login returned {login_result[0]}: {login_result[1]}"
+        assert recovery_result[:2] == (200, {"status": "recovered"})
+        issued_session_id = str(uuid.UUID(login_result[1]["session"]["id"]))
+        issued_session = response_cookies(login_result[2])["plinth_session"].value
+        assert kernel.sql(
+            "SELECT revoked_at IS NOT NULL FROM plinth.sessions WHERE id="
+            f"'{issued_session_id}'::uuid") == "t"
+        assert kernel.request(
+            "GET", "/api/auth/sessions", token=issued_session)[0] == 401
+
+        login_first_credentials = {
+            "username": member["username"],
+            "password": login_first_recovery["new_password"],
+        }
+        pat_race_session = login_session(kernel, login_first_credentials)
+
+        # PAT issuance follows the same inverse ordering independently: its
+        # insert commits while holding the user row, and waiting recovery then
+        # revokes the exact returned PAT and its authenticating session.
+        pat_first_recovery = {
+            "username": member["username"],
+            "new_password": "fake-pat-first-recovered-password",
+        }
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            with CredentialInsertBarrier(kernel, "pats", member_id) as barrier:
+                pat_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/pats",
+                    {"name": "issuer-first-pat"}, pat_race_session)
+                barrier.wait_for_insert()
+                recovery_pending = workers.submit(
+                    kernel.request, "POST", "/api/auth/recovery",
+                    pat_first_recovery, admin_session)
+                barrier.wait_for_recovery()
+            pat_result = pat_pending.result(timeout=12)
+            recovery_result = recovery_pending.result(timeout=12)
+        assert pat_result[0] == 201, \
+            f"issuer-first PAT returned {pat_result[0]}: {pat_result[1]}"
+        assert recovery_result[:2] == (200, {"status": "recovered"})
+        issued_pat_id = str(uuid.UUID(pat_result[1]["id"]))
+        assert kernel.sql(
+            "SELECT revoked_at IS NOT NULL FROM plinth.pats WHERE id="
+            f"'{issued_pat_id}'::uuid") == "t"
+        assert kernel.request(
+            "GET", "/api/auth/sessions", token=pat_result[1]["token"])[0] == 401
+        assert kernel.request(
+            "GET", "/api/auth/sessions", token=pat_race_session)[0] == 401
+
+        # Recovery revokes credentials, replaces the hash, and preserves disablement.
         kernel.sql("UPDATE plinth.users SET disabled_at=NOW() "
                    "WHERE username='open-member'")
         recovered = {"username": member["username"],
@@ -598,6 +886,7 @@ def registration_modes(binary, pg_env):
             "POST", "/api/auth/recovery", recovered, token=admin_session)
         assert status == 200 and body == {"status": "recovered"}
         assert kernel.request("GET", "/api/auth/sessions", token=member_session)[0] == 401
+        assert kernel.request("GET", "/api/auth/sessions", token=raced_session)[0] == 401
         assert kernel.request("GET", "/api/auth/sessions", token=pat["token"])[0] == 401
         status, body, _ = kernel.request(
             "POST", "/api/auth/login",
