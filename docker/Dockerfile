@@ -1,18 +1,18 @@
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS debian-snapshot
+FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS debian-snapshot
 
 # The base image records these snapshot timestamps as comments while using the
 # mutable Debian mirrors. Make the timestamps authoritative. Snapshot metadata
 # and packages remain authenticated by Debian's archive keyring over HTTP.
 RUN printf '%s\n' \
       'Types: deb' \
-      'URIs: http://snapshot.debian.org/archive/debian/20260824T000000Z' \
+      'URIs: http://snapshot.debian.org/archive/debian/20260918T000000Z' \
       'Suites: bookworm bookworm-updates' \
       'Components: main' \
       'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
       'Check-Valid-Until: no' \
       '' \
       'Types: deb' \
-      'URIs: http://snapshot.debian.org/archive/debian-security/20260824T000000Z' \
+      'URIs: http://snapshot.debian.org/archive/debian-security/20260918T000000Z' \
       'Suites: bookworm-security' \
       'Components: main' \
       'Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg' \
@@ -26,7 +26,7 @@ FROM debian-snapshot AS build-base
 ARG PLINTH_VERSION=0.6.5
 ARG PLINTH_REVISION=0000000000000000000000000000000000000000
 ARG PLINTH_RELEASE=0
-ARG SOURCE_DATE_EPOCH=1787529600
+ARG SOURCE_DATE_EPOCH=1789689600
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -80,7 +80,7 @@ FROM debian-snapshot AS runtime
 ARG PLINTH_VERSION=0.6.5
 ARG PLINTH_REVISION=0000000000000000000000000000000000000000
 ARG PLINTH_RELEASE=0
-ARG SOURCE_DATE_EPOCH=1787529600
+ARG SOURCE_DATE_EPOCH=1789689600
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates=20250419~deb12u1 \
