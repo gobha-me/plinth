@@ -9,8 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <drogon/WebSocketConnection.h>
+#include <functional>
 #include <json/value.h>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -75,6 +77,12 @@ namespace test_seam {
 // before the next TEST_CASE to avoid cross-test leakage.
 auto set_live_buffer_cap_override(std::size_t cap) -> void;
 auto clear_live_buffer_cap_override() -> void;
+
+// Test seam — called on the connection's owning loop after replay
+// buffering state is installed. The callback must not block that loop.
+// Clear it before the test fixture shuts down.
+auto set_post_replay_setup_hook_for_test(
+    std::function<void(const std::vector<std::string>&)> hook) -> void;
 
 } // namespace test_seam
 

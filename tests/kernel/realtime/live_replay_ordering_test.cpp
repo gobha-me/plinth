@@ -16,13 +16,16 @@
 #include "kernel/auth/crypto.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/rbac/subscribe_rule.hpp"
 #include "kernel/realtime/broker.hpp"
 #include "kernel/realtime/cursor_store.hpp"
 #include "kernel/ws/conn_state.hpp"
+#include "kernel/ws/subscriptions.hpp"
 
 #include "shared_pg_client.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -31,10 +34,12 @@
 #include <cstdlib>
 #include <drogon/orm/DbClient.h>
 #include <drogon/utils/coroutine.h>
+#include <future>
 #include <libpq-fe.h>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -247,6 +252,7 @@ struct LiveReplayWsHarness {
     namespace br = plinth::realtime::broker;
     namespace cs = plinth::realtime::cursor_store;
     plinth::ws_test::clear_live_buffer_cap_override();
+    plinth::ws::test_seam::set_post_replay_setup_hook_for_test({});
     ew::stop();
     ew::set_db_client_for_test(nullptr);
     ew::clear_pre_broker_hook_for_test();
@@ -260,6 +266,78 @@ struct LiveReplayWsHarness {
   auto operator=(const LiveReplayWsHarness&) -> LiveReplayWsHarness& = delete;
   LiveReplayWsHarness(LiveReplayWsHarness&&) = delete;
   auto operator=(LiveReplayWsHarness&&) -> LiveReplayWsHarness& = delete;
+};
+
+// The replay's first SELECT cannot complete while this transaction holds
+// ACCESS EXCLUSIVE on events. The WebSocket loop stays free to process the
+// five live deliveries; releasing the transaction lets replay finish.
+struct ScopedReplayQueryBarrier {
+  plinth::ws_test::TestPg& pg;
+  bool active{false};
+
+  explicit ScopedReplayQueryBarrier(plinth::ws_test::TestPg& connection)
+      : pg(connection) {}
+
+  [[nodiscard]] static auto command_ok(
+      const std::unique_ptr<PGresult, decltype(&PQclear)>& r) -> bool {
+    return r && PQresultStatus(r.get()) == PGRES_COMMAND_OK;
+  }
+
+  auto hold() -> bool {
+    if (!command_ok(pg.exec("BEGIN"))) {
+      return false;
+    }
+    active = true;
+    return command_ok(pg.exec("SET LOCAL lock_timeout = '3s'")) &&
+           command_ok(
+               pg.exec("LOCK TABLE plinth.events IN ACCESS EXCLUSIVE MODE"));
+  }
+
+  auto release() -> bool {
+    if (!active) {
+      return true;
+    }
+    const auto OK = command_ok(pg.exec("ROLLBACK"));
+    if (OK) {
+      active = false;
+    }
+    return OK;
+  }
+
+  ~ScopedReplayQueryBarrier() {
+    if (active) {
+      (void)release();
+    }
+  }
+  ScopedReplayQueryBarrier(const ScopedReplayQueryBarrier&) = delete;
+  auto operator=(const ScopedReplayQueryBarrier&)
+      -> ScopedReplayQueryBarrier& = delete;
+};
+
+struct ScopedReplaySetupSignal {
+  std::shared_ptr<std::promise<void>> ready =
+      std::make_shared<std::promise<void>>();
+  std::shared_ptr<std::atomic<bool>> signaled =
+      std::make_shared<std::atomic<bool>>(false);
+  std::future<void> future = ready->get_future();
+
+  explicit ScopedReplaySetupSignal(std::string_view channel) {
+    plinth::ws::test_seam::set_post_replay_setup_hook_for_test(
+        [ready = ready, signaled = signaled, channel = std::string{channel}](
+            const std::vector<std::string>& granted) {
+          if (std::find(granted.begin(), granted.end(), channel) !=
+                  granted.end() &&
+              !signaled->exchange(true, std::memory_order_acq_rel)) {
+            ready->set_value();
+          }
+        });
+  }
+  ~ScopedReplaySetupSignal() {
+    plinth::ws::test_seam::set_post_replay_setup_hook_for_test({});
+  }
+  ScopedReplaySetupSignal(const ScopedReplaySetupSignal&) = delete;
+  auto operator=(const ScopedReplaySetupSignal&)
+      -> ScopedReplaySetupSignal& = delete;
 };
 
 // L.03/L.04/L.05 frame inspector — captures (type, seq) tuples in
@@ -625,12 +703,8 @@ TEST_CASE("L.05: live_buffer overflow forces resync",
   }
   auto cfg = plinth::ws_test::test_config();
   plinth::ws_test::reset_schema(cfg.db);
-  // Tiny chunk size makes the replay coro do many small paginated
-  // SELECTs back-to-back, each taking ~2 ms. With 200 events and
-  // chunk=10 → 20 chunks × ~2 ms = ~40 ms replay window. That's
-  // well wider than the test thread's <1 ms dispatch_for_test
-  // calls, so all 5 deliver_to_conn lambdas reliably land while
-  // replay_in_flight=true.
+  // Exercise the production pagination path, but hold its first query
+  // behind a scoped database lock instead of relying on query duration.
   plinth::Config::Realtime::Events ecfg;
   ecfg.replay_max_rows_per_chunk = 10;
   LiveReplayWsHarness h(ecfg);
@@ -653,13 +727,16 @@ TEST_CASE("L.05: live_buffer overflow forces resync",
   plinth::ws_test::insert_session(pg, user_id, token);
 
   plinth::ws_test::WsTestClient client;
-
   REQUIRE(client.connect(2s));
   Json::Value auth;
   auth["type"] = "auth";
   auth["token"] = token;
   client.send_json(auth);
   REQUIRE(client.receive_json(3s).has_value());
+
+  ScopedReplayQueryBarrier replay_query_barrier(pg);
+  REQUIRE(replay_query_barrier.hold());
+  ScopedReplaySetupSignal setup_ready(CHANNEL);
 
   Json::Value sub;
   sub["type"] = "subscribe";
@@ -672,22 +749,15 @@ TEST_CASE("L.05: live_buffer overflow forces resync",
   REQUIRE(sub_ack.has_value());
   REQUIRE((*sub_ack)["type"].asString() == "subscribed");
 
-  // Brief sleep to win the post_replay_setup race: the ack lands
-  // before the queueInLoop'd setup lambda runs in some scheduler
-  // orderings, and we need replay_in_flight=true at deliver time.
-  // 5 ms is well below the chunk_size=10 + 200-event replay window
-  // (~40 ms) so we stay firmly inside the buffering region.
-  std::this_thread::sleep_for(5ms);
-
-  client.pause_drain();
+  // The ack can precede the queued setup callback. Wait for that exact
+  // callback, with a bound, while the replay SELECT remains blocked.
+  REQUIRE(setup_ready.future.wait_for(3s) == std::future_status::ready);
 
   // Fire 5 live events via `broker::dispatch_for_test` — this
-  // queues 5 deliver_to_conn lambdas directly to the conn loop
-  // from the test thread (~µs each), MUCH faster than going
-  // through the writer's PG INSERT path (~1 ms each). With
-  // chunk_size=10 the replay coro is still mid-paginated
-  // SELECT loop; deliver_1..4 buffer (cap=4), deliver_5 →
-  // `buf.size() >= cap` at publish.cpp:132 →
+  // queues 5 deliver_to_conn lambdas directly to the conn loop.
+  // The first replay SELECT is still blocked by the transaction;
+  // deliver_1..4 buffer (cap=4), deliver_5 →
+  // `buf.size() >= cap` in publish.cpp →
   // `handle_buffer_overflow` flips the abort flag, clears the
   // buffer, and emits resync(reason=live_buffer_overflow).
   for (int i = 0; i < 5; ++i) {
@@ -696,29 +766,16 @@ TEST_CASE("L.05: live_buffer overflow forces resync",
     (void)plinth::realtime::broker::dispatch_for_test(ev);
   }
 
-  // Allow conn loop to process deliver lambdas + emit resync.
-  std::this_thread::sleep_for(500ms);
-  client.resume_drain();
-
-  // Drain: some replay frames + resync(live_buffer_overflow). Replay
-  // aborts mid-flight so replay_done may or may not be sent; the
-  // load-bearing assertion is on the resync presence + reason.
-  bool resync_seen = false;
-  std::string resync_reason;
-  for (int i = 0; i < 600; ++i) {
-    auto f = client.receive_json(2s);
-    if (!f.has_value()) {
-      break;
-    }
-    const auto& t = (*f)["type"].asString();
-    if (t == "resync") {
-      resync_seen = true;
-      resync_reason = (*f)["reason"].asString();
-      break;
-    }
-  }
-  CHECK(resync_seen);
-  CHECK(resync_reason == "live_buffer_overflow");
+  // The exact overflow resync must arrive before releasing the DB
+  // barrier. A completed replay cannot make this assertion pass.
+  auto resync = client.receive_json(3s);
+  REQUIRE(resync.has_value());
+  REQUIRE((*resync)["type"].asString() == "resync");
+  REQUIRE((*resync)["reason"].asString() == "live_buffer_overflow");
+  REQUIRE(replay_query_barrier.release());
+  // Overflow is emitted before the blocked replay coroutine unwinds.
+  // Drain its owned task before the harness clears the shared DB client.
+  REQUIRE(plinth::lifecycle::async_tasks().drain(3s));
 
   plinth::ws_test::clear_live_buffer_cap_override();
 }

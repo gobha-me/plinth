@@ -40,6 +40,8 @@ constexpr std::size_t LIVE_CAP_SENTINEL_NONE = static_cast<std::size_t>(-1);
 // process-static atomic backing the test seam, only mutated via
 // `set_live_buffer_cap_override`.
 std::atomic<std::size_t> g_live_cap_override{LIVE_CAP_SENTINEL_NONE};
+std::mutex g_replay_setup_hook_mu;
+std::function<void(const std::vector<std::string>&)> g_replay_setup_hook;
 
 auto peer_ip(const drogon::WebSocketConnectionPtr& conn) -> std::string {
   return conn->peerAddr().toIp();
@@ -144,6 +146,14 @@ auto post_replay_setup(
         for (const auto& ch : granted) {
           s->replay_in_flight[ch] = true;
           s->live_buffer[ch];
+        }
+        std::function<void(const std::vector<std::string>&)> hook;
+        {
+          std::lock_guard lock(g_replay_setup_hook_mu);
+          hook = g_replay_setup_hook;
+        }
+        if (hook) {
+          hook(granted);
         }
       });
 }
@@ -617,6 +627,12 @@ auto set_live_buffer_cap_override(std::size_t cap) -> void {
 
 auto clear_live_buffer_cap_override() -> void {
   g_live_cap_override.store(LIVE_CAP_SENTINEL_NONE, std::memory_order_release);
+}
+
+auto set_post_replay_setup_hook_for_test(
+    std::function<void(const std::vector<std::string>&)> hook) -> void {
+  std::lock_guard lock(g_replay_setup_hook_mu);
+  g_replay_setup_hook = std::move(hook);
 }
 
 } // namespace test_seam
