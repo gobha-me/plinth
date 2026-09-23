@@ -1291,7 +1291,7 @@ service:
         watcher = {
             "node": node, "container_id": container_id, "token": token,
             "process": process, "node_pid": None, "status": None,
-            "last": None, "stderr": "", "sentinels": {},
+            "last": None, "stderr": "", "sentinels": {}, "target_exits": [],
             "header_ready": threading.Event(), "status_ready": threading.Event(),
         }
         self._exit_watchers.append(watcher)
@@ -1310,6 +1310,16 @@ service:
                     continue
                 if event.get("container_id") != container_id:
                     continue
+                # Keep a bounded, target-only diagnostic for exit events that
+                # fail the init/status/time contract. CRI GC can erase the
+                # container before a postmortem inspect is possible.
+                watcher["target_exits"].append({
+                    "id": event.get("id"),
+                    "exit_status": event.get("exit_status", 0),
+                    "exited_at": event.get("exited_at"),
+                    "pid": event.get("pid"),
+                })
+                del watcher["target_exits"][:-8]
                 sentinel = watcher["sentinels"].get(event.get("id"))
                 if sentinel is not None and event.get("exit_status", 0) == 0:
                     sentinel.set()
@@ -1438,6 +1448,7 @@ service:
         require(
             status is not None and status.get("state") == "CONTAINER_EXITED",
             "containerd exit observer did not see the terminated Plinth init: "
+            + f"target exits={watcher['target_exits']!r}; "
             + repr(watcher["last"]) + " " + watcher["stderr"],
         )
         require(status.get("exitCode") == 0,
