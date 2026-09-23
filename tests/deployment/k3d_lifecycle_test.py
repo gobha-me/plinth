@@ -75,6 +75,48 @@ def free_port():
         return probe.getsockname()[1]
 
 
+def _containerd_task_exit_event(line):
+    """Decode one `k3s ctr events` line, whose timestamp contains spaces."""
+    marker = " k8s.io /tasks/exit "
+    if marker not in line:
+        return None
+    try:
+        event = json.loads(line.split(marker, 1)[1])
+    except json.JSONDecodeError:
+        return None
+    return event if isinstance(event, dict) else None
+
+
+def parse_containerd_exit_event(line, expected_container_id):
+    """Return a CRI-compatible status for only the target container's init exit."""
+    event = _containerd_task_exit_event(line)
+    if event is None or event.get("container_id") != expected_container_id \
+            or event.get("id") != expected_container_id:
+        return None
+    # TaskExit is proto3: encoding/json omits the zero-valued exit_status.
+    exit_code = event.get("exit_status", 0)
+    finished_at = event.get("exited_at")
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int) \
+            or exit_code < 0 or not isinstance(finished_at, str):
+        return None
+    timestamp = re.fullmatch(
+        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,9})?Z",
+        finished_at,
+    )
+    if timestamp is None:
+        return None
+    try:
+        datetime.strptime(timestamp.group(1), "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return {
+        "state": "CONTAINER_EXITED",
+        "exitCode": exit_code,
+        "finishedAt": finished_at,
+        "id": expected_container_id,
+    }
+
+
 class Harness:
     def __init__(self, args):
         token = secrets.token_hex(4)
@@ -105,6 +147,7 @@ class Harness:
         self.chart_installed = False
         self.cleanup_complete = False
         self.failed = False
+        self._exit_watchers = []
         self.env = os.environ.copy()
         self.env["KUBECONFIG"] = str(self.kubeconfig)
 
@@ -1234,48 +1277,168 @@ service:
         return node, container_id.removeprefix("containerd://")
 
     def start_container_exit_watch(self, node, container_id):
-        """Observe the short-lived CRI exit record before kubelet garbage collection."""
+        """Subscribe to containerd before exit; CRI records may be GC'd at once."""
         self.inspect_running_container(node, container_id)
-        observed = {"status": None, "last": None}
-        stop = threading.Event()
-        ready = threading.Event()
+        token = secrets.token_hex(8)
+        process = subprocess.Popen(
+            ["docker", "exec", "-e", f"PLINTH_EXIT_WATCH_TOKEN={token}",
+             node, "sh", "-ec",
+             "printf 'PLINTH_WATCH_PID=%s\\n' \"$$\"; "
+             "exec k3s ctr --namespace k8s.io events"],
+            cwd=ROOT, env=self.env, text=True, bufsize=1,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        watcher = {
+            "node": node, "container_id": container_id, "token": token,
+            "process": process, "node_pid": None, "status": None,
+            "last": None, "stderr": "", "sentinels": {},
+            "header_ready": threading.Event(), "status_ready": threading.Event(),
+        }
+        self._exit_watchers.append(watcher)
 
-        def watch():
-            while not stop.is_set():
-                try:
-                    inspected = self.run(
-                        ["docker", "exec", node, "crictl", "inspect", container_id],
-                        check=False, timeout=3,
+        def read_events():
+            for line in process.stdout:
+                if line.startswith("PLINTH_WATCH_PID="):
+                    raw = line.removeprefix("PLINTH_WATCH_PID=").strip()
+                    if raw.isdecimal():
+                        watcher["node_pid"] = int(raw)
+                        watcher["header_ready"].set()
+                    continue
+                event = _containerd_task_exit_event(line)
+                if event is None:
+                    watcher["last"] = line.strip()[:300]
+                    continue
+                if event.get("container_id") != container_id:
+                    continue
+                sentinel = watcher["sentinels"].get(event.get("id"))
+                if sentinel is not None and event.get("exit_status", 0) == 0:
+                    sentinel.set()
+                status = parse_containerd_exit_event(line, container_id)
+                if status is not None:
+                    watcher["status"] = status
+                    watcher["status_ready"].set()
+            if watcher["status"] is None:
+                watcher["last"] = "containerd event stream closed: " + str(watcher["last"])
+            watcher["header_ready"].set()
+            watcher["status_ready"].set()
+
+        def read_errors():
+            for line in process.stderr:
+                watcher["stderr"] = (watcher["stderr"] + line)[-1000:]
+
+        watcher["reader"] = threading.Thread(target=read_events, daemon=True)
+        watcher["error_reader"] = threading.Thread(target=read_errors, daemon=True)
+        watcher["reader"].start()
+        watcher["error_reader"].start()
+        try:
+            require(watcher["header_ready"].wait(5) and watcher["node_pid"] is not None,
+                    "containerd exit observer did not start: " + watcher["stderr"])
+            # A PID header only proves the client was launched. An exec child
+            # exit from this exact container proves its subscription is live.
+            for attempt in range(5):
+                sentinel_id = f"plinth-watch-{token}-{attempt}"
+                seen = threading.Event()
+                watcher["sentinels"][sentinel_id] = seen
+                probe = self.run(
+                    ["docker", "exec", node, "k3s", "ctr", "--namespace",
+                     "k8s.io", "tasks", "exec", "--exec-id", sentinel_id,
+                     container_id, "/bin/true"],
+                    check=False, timeout=10,
+                )
+                require(probe.returncode == 0,
+                        "containerd exit observer probe failed: "
+                        + probe.stderr[:500])
+                if seen.wait(2):
+                    return watcher
+                require(process.poll() is None,
+                        "containerd exit observer closed before readiness: "
+                        + watcher["stderr"])
+            raise AssertionError(
+                "containerd exit observer never saw its readiness probe: "
+                + str(watcher["last"]) + " " + watcher["stderr"]
+            )
+        except BaseException:
+            self._stop_container_exit_watch(watcher)
+            raise
+
+    def _stop_container_exit_watch(self, watcher):
+        """Stop both the node-side ctr client and the host Docker exec client."""
+        process = watcher["process"]
+        node_pid = watcher["node_pid"]
+        stop_error = None
+
+        def node_client(*action):
+            # Exit 1 means this PID is gone or was reused by another process.
+            # Never signal a process without its task-specific environment tag.
+            return self.run(
+                ["docker", "exec", watcher["node"], "sh", "-ec",
+                 "if ! test -r \"/proc/$1/environ\"; then exit 1; fi; "
+                 "tr '\\000' '\\n' < \"/proc/$1/environ\" "
+                 "| grep -Fx -- \"PLINTH_EXIT_WATCH_TOKEN=$2\" >/dev/null "
+                 "|| exit 1; " + " ".join(action),
+                 "sh", str(node_pid), watcher["token"]],
+                check=False, timeout=10,
+            )
+
+        try:
+            if node_pid is not None:
+                stopped = node_client('kill -TERM "$1"')
+                if stopped.returncode not in (0, 1):
+                    stop_error = (
+                        "task-owned containerd event client could not be stopped: "
+                        + stopped.stderr[:500]
                     )
-                    if inspected.returncode == 0:
-                        status = json.loads(inspected.stdout)["status"]
-                        observed["last"] = status
-                        if status.get("state") == "CONTAINER_EXITED":
-                            observed["status"] = status
-                            ready.set()
-                            return
-                    else:
-                        observed["last"] = inspected.stderr.strip()
-                except (json.JSONDecodeError, subprocess.TimeoutExpired) as error:
-                    observed["last"] = str(error)
-                ready.set()
-                stop.wait(0.05)
-
-        thread = threading.Thread(target=watch, daemon=True)
-        thread.start()
-        require(ready.wait(5), "CRI exit watcher did not become ready")
-        return observed, stop, thread
+        except subprocess.TimeoutExpired as error:
+            stop_error = "containerd event client stop timed out: " + str(error)
+        try:
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                if node_pid is not None:
+                    try:
+                        forced = node_client('kill -KILL "$1"')
+                        if forced.returncode not in (0, 1):
+                            stop_error = (
+                                "task-owned containerd event client force-stop failed: "
+                                + forced.stderr[:500]
+                            )
+                    except subprocess.TimeoutExpired as error:
+                        stop_error = "containerd event client force-stop timed out: " + str(error)
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            if node_pid is not None:
+                try:
+                    still_alive = node_client("true")
+                    if still_alive.returncode == 0:
+                        stop_error = "task-owned containerd event client remains alive"
+                    elif still_alive.returncode != 1:
+                        stop_error = (
+                            "containerd event client absence check failed: "
+                            + still_alive.stderr[:500]
+                        )
+                except subprocess.TimeoutExpired as error:
+                    stop_error = "containerd event client absence check timed out: " + str(error)
+        finally:
+            watcher["reader"].join(5)
+            watcher["error_reader"].join(5)
+            if watcher["reader"].is_alive() or watcher["error_reader"].is_alive():
+                stop_error = stop_error or "containerd exit observer reader did not stop"
+            if stop_error is None and watcher in self._exit_watchers:
+                self._exit_watchers.remove(watcher)
+        require(stop_error is None, stop_error)
 
     def finish_container_exit_watch(self, watcher):
-        observed, stop, thread = watcher
-        thread.join(15)
-        stop.set()
-        thread.join(5)
-        status = observed["status"]
+        watcher["status_ready"].wait(15)
+        self._stop_container_exit_watch(watcher)
+        status = watcher["status"]
         require(
             status is not None and status.get("state") == "CONTAINER_EXITED",
-            "CRI exit watcher did not observe the terminated Plinth container: "
-            + repr(observed["last"]),
+            "containerd exit observer did not see the terminated Plinth init: "
+            + repr(watcher["last"]) + " " + watcher["stderr"],
         )
         require(status.get("exitCode") == 0,
                 f"Plinth container did not exit cleanly: {status}")
@@ -1598,6 +1761,11 @@ service:
         if self.cleanup_complete:
             return
         errors = []
+        for watcher in list(self._exit_watchers):
+            try:
+                self._stop_container_exit_watch(watcher)
+            except (RuntimeError, AssertionError) as error:
+                errors.append("containerd exit observer cleanup failed: " + str(error))
         if self.cluster_created and self.kubeconfig.is_file():
             if self.chart_installed:
                 result = self.helm(
