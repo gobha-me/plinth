@@ -181,6 +181,44 @@ jobs:
           python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes min
           python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes max
 
+      - name: Build the previous exact runtime revision for recovery validation
+        if: ${{ matrix.arch == 'amd64' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The coordinated dependency candidate immediately precedes #37.
+          # Its distinct source revision exercises a real image transition;
+          # the recovery test restores its matched state before rollback.
+          previous_revision=253f6e1a3cdb89e13a7e9cff4330f0f950d01de6
+          git merge-base --is-ancestor "$previous_revision" HEAD
+          previous_source="$RUNNER_TEMP/plinth-previous-$GITHUB_RUN_ID"
+          git worktree add --detach "$previous_source" "$previous_revision"
+          previous_version=$(git show "$previous_revision:VERSION" | tr -d '\r\n')
+          previous_epoch=$(git show -s --format=%ct "$previous_revision")
+          docker build --pull --platform linux/amd64 \
+            --target runtime \
+            --build-arg "PLINTH_VERSION=$previous_version" \
+            --build-arg "PLINTH_REVISION=$previous_revision" \
+            --build-arg "SOURCE_DATE_EPOCH=$previous_epoch" \
+            --build-arg PLINTH_RELEASE=0 \
+            --label "org.opencontainers.image.version=$previous_version" \
+            --label "org.opencontainers.image.revision=$previous_revision" \
+            --tag "plinth-runtime:previous-$GITHUB_RUN_ID" \
+            --file "$previous_source/docker/Dockerfile" "$previous_source"
+
+      - name: Exercise matched backup, fresh restore, upgrade, rollback, and signals
+        if: ${{ matrix.arch == 'amd64' }}
+        env:
+          PLINTH_DEPLOYMENT_TOOLS_DIR: /tmp/plinth-deployment-tools/bin
+        run: |
+          set -euo pipefail
+          export PATH="$PLINTH_DEPLOYMENT_TOOLS_DIR:$PATH"
+          python3 tests/deployment/k3d_recovery_test.py \
+            --image "plinth-runtime:amd64-$GITHUB_RUN_ID" \
+            --previous-image "plinth-runtime:previous-$GITHUB_RUN_ID" \
+            --previous-chart "$RUNNER_TEMP/plinth-previous-$GITHUB_RUN_ID/deploy/helm/plinth" \
+            --kubernetes max
+
   release_preflight:
     name: Validate immutable release identity
     if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}

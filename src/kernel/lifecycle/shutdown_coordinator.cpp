@@ -223,6 +223,9 @@ auto ShutdownCoordinator::run_graph() -> ShutdownResult {
       };
 
   accepting.store(false, std::memory_order_release);
+  // Observable drain boundary for deployed-process lifecycle verification.
+  // Already admitted requests may still complete before dependent state closes.
+  spdlog::info("shutdown: ingress gate closed");
   if (!run_bounded("close_ingress", hooks.close_ingress) ||
       !run_bounded("drain_http_requests",
                    [this](std::chrono::milliseconds timeout_in) {
