@@ -33,7 +33,9 @@ NODE_BROWSER = r"""
 import { chromium } from 'playwright';
 import { createInterface } from 'node:readline';
 
-const browser = await chromium.launch({headless: true});
+const browser = await chromium.launch({headless: true,
+  args: ['--no-proxy-server',
+         '--host-resolver-rules=MAP plinth.test 127.0.0.1']});
 const context = await browser.newContext({ignoreHTTPSErrors: true});
 await context.addCookies([
   {name: 'plinth_session', value: process.env.PLINTH_RECOVERY_SESSION,
@@ -74,7 +76,7 @@ for await (const line of commands) {
       method: 'POST',
       headers: {'Content-Type': 'application/json',
                 'X-Plinth-CSRF': document.cookie.match(/(?:^|; )plinth_csrf=([^;]+)/)?.[1] || ''},
-      body: JSON.stringify({args: {key: 'recovery_blocked', value: 'after'}}),
+      body: JSON.stringify({args: {key: 'recovery_blocked'}}),
     }).then(response => response.status)).catch(error => error.name);
     console.log('issued');
   } else if (line.trim() === 'stop') {
@@ -369,7 +371,8 @@ class RecoveryHarness(Harness):
         ).stdout.strip()
         require(active == "1.2.3", "restored package active pointer drifted")
 
-    def _binary_command(self, argv, *, output=None, input_path=None, timeout=120):
+    def _binary_command(self, argv, *, stage, output=None, input_path=None,
+                        timeout=120):
         require((output is None) != (input_path is None),
                 "binary transfer needs one input or output file")
         stream = None
@@ -388,9 +391,15 @@ class RecoveryHarness(Harness):
                     stdin=stream, stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE, timeout=timeout,
                 )
-            require(result.returncode == 0,
-                    f"binary transfer failed with exit {result.returncode}: "
-                    + " ".join(str(part) for part in argv[:3]))
+            if result.returncode != 0:
+                diagnostic = self.root / f"transfer-{stage}.stderr"
+                descriptor = os.open(diagnostic, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                     0o600)
+                with os.fdopen(descriptor, "wb") as error_file:
+                    error_file.write(result.stderr)
+                raise AssertionError(
+                    f"binary transfer {stage} failed with exit "
+                    f"{result.returncode}; stderr retained privately until cleanup")
         finally:
             if stream is not None:
                 stream.close()
@@ -451,7 +460,7 @@ class RecoveryHarness(Harness):
             path = self.root / (name + ".backup")
             self._binary_command(
                 [self.args.kubectl, "exec", "-n", self.namespace, pgpod,
-                 "--", *command], output=path,
+                 "--", *command], stage=f"backup-{name}", output=path,
             )
             require(path.stat().st_size > 100, f"{name} backup is empty")
             artifacts[name] = path
@@ -463,7 +472,7 @@ class RecoveryHarness(Harness):
                     [self.args.kubectl, "exec", "-n", self.namespace, helper,
                      "--", "tar", "-C", "/" + kind, "--numeric-owner",
                      "-cf", "-", "."],
-                    output=path,
+                    stage=f"backup-{kind}", output=path,
                 )
                 require(path.stat().st_size > 100, f"{kind} backup is empty")
                 artifacts[kind] = path
@@ -579,13 +588,13 @@ class RecoveryHarness(Harness):
             [self.args.kubectl, "exec", "-i", "-n", self.namespace, pod,
              "--", "psql", "-X", "-v", "ON_ERROR_STOP=1", "-U",
              RESTORE_ADMIN, "-d", RESTORE_ADMIN],
-            input_path=artifacts["globals"],
+            stage="restore-globals", input_path=artifacts["globals"],
         )
         self._binary_command(
             [self.args.kubectl, "exec", "-i", "-n", self.namespace, pod,
              "--", "pg_restore", "-U", RESTORE_ADMIN, "-d", RESTORE_ADMIN,
-             "--create", "--exit-on-error", "-"],
-            input_path=artifacts["database"],
+             "--create", "--exit-on-error"],
+            stage="restore-database", input_path=artifacts["database"],
         )
         require(self.sql("SELECT current_database()") == "plinth",
                 "database restore did not create Plinth database")
@@ -596,7 +605,7 @@ class RecoveryHarness(Harness):
                     [self.args.kubectl, "exec", "-i", "-n", self.namespace,
                      helper, "--", "tar", "-C", "/" + kind,
                      "--numeric-owner", "-xpf", "-"],
-                    input_path=artifacts[kind],
+                    stage=f"restore-{kind}", input_path=artifacts[kind],
                 )
         finally:
             self.remove_helper(helper)
@@ -674,7 +683,7 @@ class RecoveryHarness(Harness):
                 raise AssertionError(f"unexpected browser marker: {line!r}")
         raise TimeoutError(f"browser did not report {marker}")
 
-    def _wait_sql(self, statement, expected, timeout=15):
+    def _wait_sql(self, statement, expected, *, stage, timeout=15):
         deadline = time.monotonic() + timeout
         last = None
         while time.monotonic() < deadline:
@@ -682,7 +691,8 @@ class RecoveryHarness(Harness):
             if last == expected:
                 return
             time.sleep(0.1)
-        raise AssertionError(f"database barrier did not reach {expected}: {last}")
+        raise AssertionError(
+            f"database barrier {stage} did not reach {expected}: {last}")
 
     def _wait_restarted(self, old_container_id):
         deadline = time.monotonic() + 120
@@ -738,14 +748,23 @@ class RecoveryHarness(Harness):
         )
         self.sql(
             "INSERT INTO ext_shell.user_preferences(user_id,key,value) "
-            f"VALUES ('{user}'::uuid,'recovery_blocked','\"before\"'::jsonb) "
+            f"VALUES ('{user}'::uuid,'recovery_blocked','\"before\"'::jsonb), "
+            f"('{user}'::uuid,'recovery_control','true'::jsonb) "
             "ON CONFLICT (user_id,key) DO UPDATE SET value=EXCLUDED.value"
         )
+        code, status, body = self.curl(
+            "/api/cap/shell.preferences.set",
+            data=json.dumps({"args": {"key": "recovery_control"}}),
+            origin=self.origin, csrf=True, use_cookies=True,
+        )
+        require(code == 0 and status == "200" and
+                json.loads(body).get("value", {}).get("deleted") is True,
+                f"control preference deletion failed with HTTP {status}")
         self._wait_sql(
             "SELECT (coalesce(max(seq),0) > " + prior_seq + ")::int "
             "FROM plinth.events WHERE channel="
             "'plinth:data:ext_shell.user_preferences'",
-            "1", timeout=20,
+            "1", stage="seed-event", timeout=20,
         )
         before_seq = self.sql(
             "SELECT coalesce(max(seq),0) FROM plinth.events "
@@ -786,7 +805,7 @@ class RecoveryHarness(Harness):
                 "SELECT count(*) FROM pg_stat_activity "
                 "WHERE datname=current_database() AND state='idle in transaction' "
                 "AND query LIKE 'LOCK TABLE ext_shell.user_preferences%'",
-                "1",
+                "1", stage="held-lock",
             )
             browser.stdin.write("begin\n")
             browser.stdin.flush()
@@ -794,8 +813,8 @@ class RecoveryHarness(Harness):
             self._wait_sql(
                 "SELECT count(*) FROM pg_stat_activity "
                 "WHERE datname=current_database() AND wait_event_type='Lock' "
-                "AND query LIKE 'INSERT INTO ext_shell.user_preferences%'",
-                "1",
+                "AND query LIKE 'DELETE FROM ext_shell.user_preferences%'",
+                "1", stage="blocked-browser-write",
             )
             watcher = self.start_container_exit_watch(*old_runtime)
             sent = time.monotonic()
@@ -833,15 +852,15 @@ class RecoveryHarness(Harness):
             self.verify_ordered_transition(old_status, new)
             self.wait_for_https()
             self._wait_sql(
-                "SELECT value::text FROM ext_shell.user_preferences "
+                "SELECT count(*) FROM ext_shell.user_preferences "
                 f"WHERE user_id='{user}'::uuid AND key='recovery_blocked'",
-                '"after"', timeout=20,
+                "0", stage="committed-preference-deletion", timeout=20,
             )
             self._wait_sql(
                 "SELECT (coalesce(max(seq),0) > " + before_seq + ")::int "
                 "FROM plinth.events WHERE channel="
                 "'plinth:data:ext_shell.user_preferences'",
-                "1", timeout=20,
+                "1", stage="committed-event", timeout=20,
             )
             final_seq = self.sql(
                 "SELECT coalesce(max(seq),0) FROM plinth.events "
@@ -858,6 +877,7 @@ class RecoveryHarness(Harness):
                     "browser replay did not deliver the one durable write")
             self.verify_login()
         finally:
+            primary_failure = sys.exc_info()[0] is not None
             if lock is not None:
                 try:
                     lock.stdin.write("ROLLBACK;\n\\q\n")
@@ -872,12 +892,22 @@ class RecoveryHarness(Harness):
                 try:
                     browser.stdin.write("stop\n")
                     browser.stdin.flush()
-                    browser.communicate(timeout=10)
+                    _, browser_errors = browser.communicate(timeout=10)
                 except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
                     browser.kill()
-                    browser.communicate(timeout=5)
-            require(browser.returncode == 0,
-                    f"deployed browser failed during {signame}")
+                    _, browser_errors = browser.communicate(timeout=5)
+            else:
+                _, browser_errors = browser.communicate(timeout=5)
+            if browser.returncode != 0:
+                diagnostic = self.root / f"browser-{signame}.stderr"
+                descriptor = os.open(diagnostic, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                                     0o600)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as error_file:
+                    error_file.write(browser_errors)
+                if not primary_failure:
+                    raise AssertionError(
+                        f"deployed browser failed during {signame}; "
+                        "stderr retained privately until cleanup")
 
     def cleanup(self):
         if self.cleanup_complete:

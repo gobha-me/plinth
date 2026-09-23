@@ -186,10 +186,31 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The coordinated dependency candidate immediately precedes #37.
-          # Its distinct source revision exercises a real image transition;
-          # the recovery test restores its matched state before rollback.
-          previous_revision=253f6e1a3cdb89e13a7e9cff4330f0f950d01de6
+          # Use the newest prior stable tag once one exists. Tag ancestry alone
+          # does not prove a published or attested runtime release. The
+          # #109 fallback proves prerelease revision mechanics only; it is not
+          # published-release upgrade or rollback evidence.
+          current_revision=$(git rev-parse HEAD)
+          previous_revision=
+          previous_identity=
+          while IFS= read -r release_tag; do
+            [[ "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            release_version=${release_tag#v}
+            if [ "$(printf '%s\n' 0.6.6 "$release_version" | sort -V | head -n1)" != 0.6.6 ]; then
+              continue
+            fi
+            release_revision=$(git rev-parse "$release_tag^{commit}")
+            if [ "$release_revision" != "$current_revision" ]; then
+              previous_revision=$release_revision
+              previous_identity=$release_tag
+              break
+            fi
+          done < <(git tag --merged HEAD --list 'v*' --sort=-v:refname)
+          if [ -z "$previous_revision" ]; then
+            previous_revision=253f6e1a3cdb89e13a7e9cff4330f0f950d01de6
+            previous_identity='prerelease #109 fallback'
+          fi
+          echo "Recovery predecessor: $previous_identity ($previous_revision)"
           git merge-base --is-ancestor "$previous_revision" HEAD
           previous_source="$RUNNER_TEMP/plinth-previous-$GITHUB_RUN_ID"
           git worktree add --detach "$previous_source" "$previous_revision"
