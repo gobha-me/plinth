@@ -74,6 +74,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client python3-yaml
 
+      - name: Verify container exit event matching
+        run: python3 tests/deployment/containerd_exit_event_test.py
+
       - name: Verify the effective Docker context policy
         run: python3 tests/tools/docker_context_test.py
 
