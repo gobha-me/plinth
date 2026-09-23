@@ -76,7 +76,7 @@ def free_port():
 
 
 def _containerd_task_exit_event(line):
-    """Decode one `k3s ctr events` line, whose timestamp contains spaces."""
+    """Decode one `ctr events` line, whose timestamp contains spaces."""
     marker = " k8s.io /tasks/exit "
     if marker not in line:
         return None
@@ -1284,7 +1284,7 @@ service:
             ["docker", "exec", "-e", f"PLINTH_EXIT_WATCH_TOKEN={token}",
              node, "sh", "-ec",
              "printf 'PLINTH_WATCH_PID=%s\\n' \"$$\"; "
-             "exec k3s ctr --namespace k8s.io events"],
+             "exec ctr --namespace k8s.io events"],
             cwd=ROOT, env=self.env, text=True, bufsize=1,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -1340,7 +1340,7 @@ service:
                 seen = threading.Event()
                 watcher["sentinels"][sentinel_id] = seen
                 probe = self.run(
-                    ["docker", "exec", node, "k3s", "ctr", "--namespace",
+                    ["docker", "exec", node, "ctr", "--namespace",
                      "k8s.io", "tasks", "exec", "--exec-id", sentinel_id,
                      container_id, "/bin/true"],
                     check=False, timeout=10,
