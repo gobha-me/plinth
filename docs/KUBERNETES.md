@@ -376,27 +376,118 @@ external source address while the kernel provides independent subject/global
 bounds. Switching registration back to `disabled` and restarting does not
 invalidate existing users, sessions, PATs, or WebSocket credentials.
 
+## Matched backup and fresh-namespace recovery
+
+Treat the PostgreSQL database and data claim as one recovery point. PostgreSQL
+contains users, sessions, grants, package and migration records, realtime
+cursors, and all `ext_*` schemas, including shell preferences and downstream
+extension data. The data claim contains package version directories and their
+`active` symlinks. A PostgreSQL transaction cannot atomically commit a
+filesystem symlink change, so independently timed database and volume copies
+can describe different installed packages. The log claim is separately
+persistent and should be archived with the same recovery set for audit and
+diagnosis; it is not a substitute for either authoritative data source.
+
+Use this sequence for an operator-controlled recovery point:
+
+1. Record the exact running image digest and its source revision, the matching
+   chart revision, reviewed Helm values, PostgreSQL major version and required
+   extensions, Secret key mappings, claim names, and public origin. Store
+   database credentials and any exported Secret values separately under backup
+   access controls; do not put them in a plaintext manifest or Helm values.
+2. Disable the Traefik route and verify that public requests no longer reach
+   Plinth. Scale the StatefulSet to zero. Observe the exact old container exit
+   with status zero within the 60-second Pod grace period; a deleted Pod alone
+   does not prove a clean drain. Stop any other writer to this dedicated
+   database or data claim before continuing. A timeout or nonzero exit makes
+   the recovery point suspect and requires investigation before capture.
+3. Capture the required PostgreSQL roles and globals, then a logical dump of
+   the dedicated database, including `plinth` and every extension schema. The
+   extension login roles and event trigger are part of the restore contract;
+   a database-only dump does not recreate cluster-global roles. On an isolated
+   PostgreSQL instance, capture the complete globals set. On a shared cluster,
+   have its administrator inventory the database owner and every role named by
+   the dump, including `plinth.extension_database_credentials.role_name` and
+   any legacy package-role aliases. Cross-check distinct role references in
+   `pg_shdepend` for this database OID (`refclassid='pg_authid'::regclass`),
+   `pg_database.datdba`, and the dump's ownership, ACL, and default-privilege
+   entries. Account for every name before exporting role definitions; an
+   unexpected role or tablespace dependency stops a Plinth-scoped backup.
+   Export only the role definitions,
+   memberships, and settings needed by this database; do not treat an
+   unfiltered `pg_dumpall --globals-only` output as a Plinth-scoped backup or
+   replay it into another shared cluster. If a required role is also used by
+   another database, coordinate a cluster-level recovery instead of restoring
+   or rewriting that role independently. Extension login role names depend on
+   the database name and can collide in a shared PostgreSQL cluster. Protect
+   the globals and database dumps as credentials:
+   `plinth.extension_database_credentials`, password hashes, sessions, and
+   role secrets are included.
+4. With Plinth still stopped, archive the complete data claim, preserving
+   numeric ownership, permissions, symlinks, and relative paths. Archive the
+   log claim separately. Do not copy PostgreSQL's live data directory as a
+   replacement for a database dump, and do not follow package `active`
+   symlinks while archiving. Write checksums, byte counts, capture time, and
+   the exact image/chart/database identity into a versioned manifest that
+   names every member of this recovery set. Verify each archived checksum
+   before calling the backup usable.
+
+Test recovery in a fresh namespace with a fresh isolated PostgreSQL instance.
+Keep the public route disabled and do not start a Plinth Pod during restore.
+Restore only the reviewed required PostgreSQL globals first and the matching
+database second; reject missing roles, extension objects, or restore errors.
+Provision new data
+and log claims, restore their archived trees with ownership and symlinks intact,
+and remove the temporary restore Pod before installation. Set
+`persistence.data.existingClaim` and `persistence.logs.existingClaim` to those
+claim names, recreate the operator-owned database Secret with the recorded key
+mapping, and install the chart from the recorded source revision with the
+recorded image digest.
+Restoring into an already running Plinth instance or reusing a database/claim
+being written by another instance is unsupported.
+
+Before exposing the recovered instance, compare active package rows with
+`extensions/<name>/<version>` directories and `active` symlinks; a mismatch
+requires the stopped-state reconciliation described in
+`docs/bundled-shell-upgrade.md`. Then verify a retained user can log in, group
+membership and effective grants survive, installed package routes and
+capabilities resolve to the expected versions, shell preferences and a
+downstream extension row retain their values, and realtime reconnect/replay
+starts from the retained cursor. Confirm `/healthz`, the running image ID,
+Host/Origin enforcement, and WebSocket upgrade before restoring the public
+route. Record the observed results alongside the backup manifest.
+
 ## Upgrade and rollback
 
-Before an upgrade, back up PostgreSQL and both persistent claims, verify the new
-release digest and attestations, and read the release notes for storage or
-schema changes. Upgrade only the digest value and wait for the sequential
-replacement to finish. Verify the exact running digest, health response, TLS
-authority checks, WebSocket connection, installed package state, and old Pod's
-clean exit.
+Before an upgrade, create and verify a matched recovery point as above. Verify
+the new release digest and attestation, obtain its matching chart source, and
+read its release notes for storage or schema changes. Change only the intended
+image/chart version and reviewed values, then wait for the sequential
+replacement. Verify the old Pod exited cleanly before the successor started,
+the exact new digest is running, and health, TLS authority, WebSocket, user,
+grant, preference, package, and downstream-data checks still pass. A rollout
+nonce that replaces a Pod with the same digest proves replacement behavior,
+not a version upgrade.
 
 Changing a tag without changing the digest is not an upgrade. Rolling back the
 container digest does not roll back PostgreSQL or persistent package state;
-perform a rollback only when the release explicitly declares that state
-backward-compatible, otherwise restore the matched database and volume backup.
-Never run two versions concurrently against one database or claim.
+revert to the prior digest and its matching chart only when the release
+explicitly declares the resulting database and package state backward
+compatible. Otherwise isolate ingress, stop the new Pod cleanly, and restore
+the matched pre-upgrade database and claims into a fresh namespace before
+starting the prior version. Writes committed after that recovery point are not
+part of the restored state. Package `SUPERSEDED` retention is not an image or
+data rollback mechanism. Never run two versions concurrently against one
+database or claim. A source build or unreleased candidate does not establish
+supported version-pair upgrade or rollback evidence.
 
-Apply an upgrade by changing only the exact digest and retaining all other
-reviewed values. `--reuse-values` avoids accidentally resetting selectors or
-existing-claim names, but inspect `helm get values` first because it also
-retains every historical operator override:
+From the verified target release's chart checkout, apply the new exact digest
+and retain all other reviewed values. `--reuse-values` avoids accidentally
+resetting selectors or existing-claim names, but inspect `helm get values`
+first because it also retains every historical operator override:
 
 ```bash
+# Run from the target image's verified source revision.
 new_digest='sha256:REPLACE_WITH_NEW_RELEASE_DIGEST'
 helm get values "$release" --namespace "$namespace"
 helm upgrade "$release" deploy/helm/plinth \
@@ -414,6 +505,18 @@ the newer registration and authentication-rate fields during `--reuse-values`.
 It rejects legacy `registration.enabled=true`; migrate that intent explicitly
 to `registration.mode=invite` or `open` only after bootstrap and exposure
 review.
+
+Exercise both shutdown signals through the deployed, direct-PID-1 process in a
+disposable namespace. Keep a browser WebSocket and realtime subscription
+active, and arrange an accepted database-backed operation with a durable result
+that can be checked after restart. For SIGTERM, delete the Pod;
+for SIGINT, send the signal to PID 1 inside the Pod as the same numeric user.
+Observe the exact old container through the container runtime before it is
+garbage-collected. Require exit status zero within the 60-second grace period,
+no second active Plinth container against the same database/claim, and a ready
+replacement with the committed database result and realtime replay intact.
+Repeat each signal with active work; `/healthz` alone does not prove drain or
+durability.
 
 ## Removal
 
