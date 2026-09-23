@@ -11,7 +11,7 @@ from k3d_lifecycle_test import Harness, parse_containerd_exit_event
 
 CONTAINER_ID = "a" * 64
 OTHER_ID = "b" * 64
-EXITED_AT = "2026-09-23T19:00:00.123456789Z"
+EXITED_AT = {"seconds": 1790193734, "nanos": 337219263}
 PREFIX = "2026-09-23 19:00:00.123456789 +0000 UTC"
 
 
@@ -29,7 +29,23 @@ class ContainerdExitEventTest(unittest.TestCase):
         self.assertIsNotNone(status)
         self.assertEqual(status["state"], "CONTAINER_EXITED")
         self.assertEqual(status["exitCode"], 0)
+        self.assertEqual(Harness.timestamp_ns(status, "finishedAt"),
+                         1790193734337219263)
+
+    def test_rfc3339_timestamp_remains_accepted(self):
+        status = parse_containerd_exit_event(
+            event(exited_at="2026-09-23T19:00:00.123456789Z"), CONTAINER_ID)
+        self.assertIsNotNone(status)
         self.assertGreater(Harness.timestamp_ns(status, "finishedAt"), 0)
+
+    def test_missing_or_invalid_protobuf_timestamp_is_rejected(self):
+        for timestamp in ({}, {"seconds": True}, {"seconds": 0},
+                          {"seconds": 1, "nanos": -1},
+                          {"seconds": 1, "nanos": 1_000_000_000},
+                          {"seconds": 1, "nanos": True}):
+            with self.subTest(timestamp=timestamp):
+                self.assertIsNone(parse_containerd_exit_event(
+                    event(exited_at=timestamp), CONTAINER_ID))
 
     def test_nonzero_init_exit_is_observed_not_recast_as_success(self):
         status = parse_containerd_exit_event(

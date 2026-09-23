@@ -97,17 +97,29 @@ def parse_containerd_exit_event(line, expected_container_id):
     exit_code = event.get("exit_status", 0)
     finished_at = event.get("exited_at")
     if isinstance(exit_code, bool) or not isinstance(exit_code, int) \
-            or exit_code < 0 or not isinstance(finished_at, str):
+            or exit_code < 0:
         return None
-    timestamp = re.fullmatch(
-        r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,9})?Z",
-        finished_at,
-    )
-    if timestamp is None:
-        return None
-    try:
-        datetime.strptime(timestamp.group(1), "%Y-%m-%dT%H:%M:%S")
-    except ValueError:
+    if isinstance(finished_at, dict):
+        # The pinned K3s ctr uses encoding/json for protobuf timestamps.
+        seconds = finished_at.get("seconds")
+        nanos = finished_at.get("nanos", 0)
+        if isinstance(seconds, bool) or not isinstance(seconds, int) \
+                or seconds <= 0 or isinstance(nanos, bool) \
+                or not isinstance(nanos, int) or not 0 <= nanos < 1_000_000_000:
+            return None
+        finished_at = seconds * 1_000_000_000 + nanos
+    elif isinstance(finished_at, str):
+        timestamp = re.fullmatch(
+            r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d{1,9})?Z",
+            finished_at,
+        )
+        if timestamp is None:
+            return None
+        try:
+            datetime.strptime(timestamp.group(1), "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+    else:
         return None
     return {
         "state": "CONTAINER_EXITED",
