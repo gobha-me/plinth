@@ -644,6 +644,7 @@ add_executable(plinth_tests
   tests/kernel/js/eval_test.cpp
   tests/kernel/js/runtime_pool_test.cpp
   tests/kernel/js/stdlib_test.cpp
+  tests/kernel/js/crypto_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
   tests/kernel/js/async_bridge_fixture.cpp
   tests/kernel/js/db_batch_test.cpp
@@ -848,6 +849,14 @@ set_tests_properties(plinth_tests_js
              LABELS "needs_pg"
              TIMEOUT 300)
 
+# A named, bounded sanitizer smoke: a missing corpus must fail rather than
+# disappearing inside the larger JS group. This is DB-free and uses the
+# same test binary and RuntimePool setup as the grouped JS test.
+add_test(NAME plinth_tests_crypto_corpus
+  COMMAND plinth_tests "[js][stdlib][crypto][corpus]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_crypto_corpus PROPERTIES TIMEOUT 90)
+
 # A single connection exposes accidental transactions opened by batch queries.
 add_test(NAME plinth_tests_batch_transaction
   COMMAND plinth_tests "[batch-transaction]"
@@ -972,8 +981,9 @@ if(PLINTH_DEVELOPER_TEST_DISCOVERY)
   catch_discover_tests(plinth_tests TEST_PREFIX "dev.")
 endif()
 
-# ─── libFuzzer harness (opt-in via -DPLINTH_FUZZ=ON, Clang only) ──
-# CI wiring is tracked as ROADMAP 0.2.1.1. Local-only for now.
+# ─── parser libFuzzer harness (opt-in via -DPLINTH_FUZZ=ON, Clang only) ──
+# The QuickJS crypto corpus above is a separate deterministic CTest target
+# exercised by sanitizer CI. This parser-only libFuzzer target remains local.
 option(PLINTH_FUZZ "Build libFuzzer harnesses (Clang only)" OFF)
 if(PLINTH_FUZZ)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
@@ -992,9 +1002,8 @@ if(PLINTH_FUZZ)
     target_link_options(plinth_fuzz_parser PRIVATE
       -fsanitize=fuzzer,address,undefined)
   else()
-    message(STATUS
-      "PLINTH_FUZZ=ON requires Clang; skipping fuzz targets (compiler is "
-      "${CMAKE_CXX_COMPILER_ID}).")
+    message(FATAL_ERROR
+      "PLINTH_FUZZ=ON requires Clang; compiler is ${CMAKE_CXX_COMPILER_ID}")
   endif()
 endif()
 
