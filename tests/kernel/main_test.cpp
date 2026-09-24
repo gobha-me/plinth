@@ -16,6 +16,8 @@
 #include "realtime/shared_pg_client.hpp"
 #include "test_process.hpp"
 
+#include <trantor/utils/Logger.h>
+
 #include <array>
 #include <chrono>
 #include <csignal>
@@ -113,6 +115,10 @@ auto install_signal_handlers() noexcept -> void {
 
 auto main(int argc, char* argv[]) -> int {
   install_signal_handlers();
+  // The test fixtures can create PostgreSQL event-loop threads before their
+  // HTTP/WS server starts. Configure Trantor once, before any such thread
+  // can read its process-global log level.
+  trantor::Logger::setLogLevel(trantor::Logger::kWarn);
   int result = Catch::Session().run(argc, argv);
   if (!plinth::test_process::run_shutdowns()) {
     std::fputs("plinth_tests: lifecycle coordinator shutdown failed\n", stderr);

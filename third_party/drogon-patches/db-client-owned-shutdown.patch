@@ -29,7 +29,7 @@ index 8df675e0..5f7208b0 100644
       * @brief Enable auto-batch mode.
       * This feature is available only for PostgreSQL 14+ version and the
 diff --git a/orm_lib/src/DbClientImpl.cc b/orm_lib/src/DbClientImpl.cc
-index 61fe2503..02201ea5 100644
+index 61fe2503..81504252 100644
 --- a/orm_lib/src/DbClientImpl.cc
 +++ b/orm_lib/src/DbClientImpl.cc
 @@ -30,6 +30,7 @@
@@ -107,7 +107,7 @@ index 61fe2503..02201ea5 100644
 +                                                    std::defer_lock);
 +    if (unbounded)
 +        shutdownLock.lock();
-+    else if (!shutdownLock.try_lock_until(deadline))
++    else if (!shutdownLock.try_lock_for(deadline - std::chrono::steady_clock::now()))
 +        return false;
 +    if (shutdownComplete_)
 +        return true;

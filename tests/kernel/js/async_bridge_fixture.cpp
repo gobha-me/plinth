@@ -139,10 +139,7 @@ auto start_drogon(bool with_db) -> void {
     throw std::runtime_error("RBAC worker registry could not start");
   }
   shutdown->install_ingress_gate();
-  drogon::app()
-      .setLogPath("")
-      .setLogLevel(trantor::Logger::kWarn)
-      .disableSigtermHandling();
+  drogon::app().setLogPath("").disableSigtermHandling();
 
   drogon::app().getLoop()->queueInLoop([]() { g_ready.store(true); });
   g_thread = std::thread([]() { drogon::app().run(); });

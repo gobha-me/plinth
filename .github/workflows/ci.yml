@@ -241,3 +241,74 @@ jobs:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure --parallel 1
+
+  tsan:
+    name: clang-21 / TSan realtime and lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
+        env:
+          POSTGRES_USER: plinth
+          POSTGRES_PASSWORD: plinth
+          POSTGRES_DB: plinth_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U plinth -d plinth_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies and LLVM 21 TSan runtime
+        run: |
+          set -euo pipefail
+          .github/scripts/install-llvm.sh 21
+          sudo apt-get install -y \
+            build-essential cmake pkg-config git ca-certificates \
+            libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
+            libargon2-dev nodejs postgresql-client libclang-rt-21-dev
+
+      - name: Confirm PostgreSQL test fixture is usable
+        env:
+          PGHOST: 127.0.0.1
+          PGPORT: "5432"
+          PGUSER: plinth
+          PGPASSWORD: plinth
+          PGDATABASE: plinth_test
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -tAc 'SELECT 1' | grep -qx '1'
+
+      - name: Configure TSan
+        env:
+          CC: clang-21
+          CXX: clang++-21
+        run: >-
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DPLINTH_TSAN=ON
+
+      - name: Build
+        run: cmake --build build --parallel 2 --target plinth_tests
+
+      # The wrapper checks exit status, positive assertions, and no SKIP.
+      # These exact selectors run serially; 10x active-timer exits and short-
+      # deadline replay/JS-stress cases are not claimed as TSan-covered here.
+      - name: Focused TSan tests
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 7'
+          ctest --test-dir build --output-on-failure --parallel 1 -R '^plinth_tsan_'

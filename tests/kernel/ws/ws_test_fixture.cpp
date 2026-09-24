@@ -89,13 +89,23 @@ auto test_config() -> plinth::Config {
   cfg.listen_host = "127.0.0.1";
   cfg.listen_port = TEST_PORT;
   cfg.node_id = "test-node";
-  // Short timeouts so tests don't wait 30+ seconds.
+  // Short timeouts so tests don't wait 30+ seconds. Instrumented TSan DB
+  // work can exceed the usual one-second handshake budget; only the test
+  // fixture gets a longer auth timer, not production listeners.
   if (const auto* origin = std::getenv("PLINTH_TEST_WS_BROWSER_ORIGIN")) {
     cfg.ws_browser_origin = origin;
   }
+#if defined(PLINTH_TSAN_TEST)
+  cfg.ws_auth_timeout_s = 10.0;
+  // I.01 checks data delivery, not heartbeat deadlines. Leave enough time
+  // for instrumented DB/WS work without disabling heartbeat in production.
+  cfg.ws_heartbeat_interval_s = 10.0;
+  cfg.ws_heartbeat_timeout_s = 10.0;
+#else
   cfg.ws_auth_timeout_s = 1.0;
   cfg.ws_heartbeat_interval_s = 0.5;
   cfg.ws_heartbeat_timeout_s = 0.5;
+#endif
   cfg.migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
   cfg.registration.mode = plinth::Config::Registration::Mode::OPEN;
   // 0.6.0.N HTTP fixture — point packages at a per-process tempdir so
@@ -308,7 +318,6 @@ auto start_test_server() -> void {
 
   drogon::app()
       .setLogPath("")
-      .setLogLevel(trantor::Logger::kWarn)
       .setClientMaxBodySize(package_limits.request_body_bytes)
       .addListener(cfg.listen_host, cfg.listen_port)
       .setThreadNum(2)
@@ -402,10 +411,17 @@ WsTestClient::~WsTestClient() {
   // destructor-driven teardown path is always loop-threaded.
   auto* loop = drogon::app().getLoop();
   auto client_copy = client; // shared_ptr copy outlives `this`
+  drogon::WebSocketConnectionPtr connection_copy;
+  {
+    std::lock_guard lock(mu);
+    connection_copy = std::move(connection);
+  }
   std::promise<void> done;
   auto done_fut = done.get_future();
-  loop->queueInLoop([client_copy, &done]() {
+  loop->queueInLoop([client_copy, connection_copy = std::move(connection_copy),
+                     &done]() mutable {
     client_copy->stop();
+    connection_copy.reset(); // Drogon connection destruction stays on its loop
     done.set_value();
   });
   done_fut.wait();
@@ -417,6 +433,7 @@ auto WsTestClient::connect(
   struct Completion {
     std::promise<bool> result;
     std::atomic<bool> delivered{false};
+    drogon::WebSocketConnectionPtr connection;
   };
   auto completion = std::make_shared<Completion>();
   auto future = completion->result.get_future();
@@ -430,8 +447,11 @@ auto WsTestClient::connect(
   client->connectToServer(
       req, [completion](drogon::ReqResult result,
                         const drogon::HttpResponsePtr& /*response*/,
-                        const drogon::WebSocketClientPtr& /*websocket*/) {
+                        const drogon::WebSocketClientPtr& websocket) {
         if (!completion->delivered.exchange(true)) {
+          if (result == drogon::ReqResult::Ok) {
+            completion->connection = websocket->getConnection();
+          }
           completion->result.set_value(result == drogon::ReqResult::Ok);
         }
       });
@@ -441,22 +461,27 @@ auto WsTestClient::connect(
   const bool ok = future.get();
   {
     std::lock_guard lock(mu);
-    connected = ok;
+    connection = ok ? std::move(completion->connection) : nullptr;
   }
   return ok;
 }
 
 auto WsTestClient::send_json(const Json::Value& v) -> void {
-  if (!connected) {
+  drogon::WebSocketConnectionPtr conn;
+  {
+    std::lock_guard lock(mu);
+    if (closed) {
+      return;
+    }
+    conn = connection;
+  }
+  if (!conn) {
     return;
   }
   Json::StreamWriterBuilder b;
   b["indentation"] = "";
   auto payload = Json::writeString(b, v);
-  auto conn = client->getConnection();
-  if (conn && conn->connected()) {
-    conn->send(payload);
-  }
+  conn->send(payload);
 }
 
 auto WsTestClient::receive_json(std::chrono::milliseconds timeout)

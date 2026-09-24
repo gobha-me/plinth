@@ -484,7 +484,8 @@ auto RuntimePool::shutdown(std::chrono::milliseconds timeout) -> bool {
   std::unique_lock shutdown_lock(shutdown_mutex, std::defer_lock);
   if (unbounded) {
     shutdown_lock.lock();
-  } else if (!shutdown_lock.try_lock_until(deadline)) {
+  } else if (!shutdown_lock.try_lock_for(deadline -
+                                         std::chrono::steady_clock::now())) {
     return false;
   }
 

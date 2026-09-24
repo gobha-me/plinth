@@ -38,15 +38,15 @@ constexpr int POLL_TIMEOUT_MS = 1000;
 //
 // The listener thread is owned by an optional<jthread>. start/stop are
 // serialized by a plain mutex so that accidental double-start or
-// start-during-stop is safe. The eventfd is created by start_listener
-// and closed by the thread on exit — start/stop only write to it (stop
-// writes a wake byte, start reads the fd only to pass to the thread).
+// start-during-stop is safe. start_listener creates the eventfd, and
+// stop_listener closes it only after the worker has exited and joined.
+// A timed-out stop retains the fd so a later stop can wake the worker.
 
 // lifecycle mutex; cannot be const.
 std::mutex lifecycle_mutex;
 // thread; optional engaged while running.
 std::optional<std::jthread> listener_thread;
-// co-owned by start (creates) + thread (closes on exit).
+// Owned by the lifecycle coordinator under lifecycle_mutex.
 int wakeup_fd = -1;
 std::mutex listener_exit_mutex;
 std::condition_variable listener_exit_cv;
@@ -453,7 +453,6 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
   if (conn != nullptr) {
     PQfinish(conn);
   }
-  ::close(wake_fd);
   spdlog::info("realtime listener: stopped");
   return !database_operations.cancellation_failed();
 }
@@ -550,6 +549,7 @@ auto stop_listener(std::chrono::milliseconds timeout) -> bool {
     }
   }
   listener_thread.reset(); // completion barrier makes this join immediate
+  ::close(wakeup_fd); // only the stopping owner closes, after the worker joins
   wakeup_fd = -1;
   return listener_clean;
 }
