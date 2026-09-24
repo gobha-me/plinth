@@ -20,9 +20,11 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
 using plinth::Config;
@@ -40,9 +42,18 @@ namespace {
 // logger set as the spdlog default.
 class CapturingSink : public spdlog::sinks::base_sink<std::mutex> {
  public:
+  struct Record {
+    spdlog::level::level_enum level;
+    std::string payload;
+  };
+
   [[nodiscard]] auto messages() -> std::vector<std::string> {
     std::lock_guard<std::mutex> g(this->mutex_);
     return lines;
+  }
+  [[nodiscard]] auto records() -> std::vector<Record> {
+    std::lock_guard<std::mutex> g(this->mutex_);
+    return raw_records;
   }
   [[nodiscard]] auto contains(std::string_view needle) -> bool {
     std::lock_guard<std::mutex> g(this->mutex_);
@@ -56,11 +67,15 @@ class CapturingSink : public spdlog::sinks::base_sink<std::mutex> {
     spdlog::memory_buf_t formatted;
     formatter_->format(m, formatted);
     lines.emplace_back(formatted.data(), formatted.size());
+    raw_records.push_back(
+        {.level = m.level,
+         .payload = std::string{m.payload.data(), m.payload.size()}});
   }
   auto flush_() -> void override {}
 
  private:
   std::vector<std::string> lines;
+  std::vector<Record> raw_records;
 };
 
 // Swap in a capturing spdlog default logger for the duration of a
@@ -89,6 +104,12 @@ class ScopedDefaultLogger {
 auto make_pool(const Config& cfg, int pool_size = 1) -> RuntimePool {
   return {/*ext=*/nullptr, default_runtime_limits(), cfg, pool_size};
 }
+
+struct ContextLease {
+  RuntimePool& pool;
+  BridgeContext* context;
+  ~ContextLease() { pool.destroy(context); }
+};
 
 } // namespace
 
@@ -137,6 +158,64 @@ TEST_CASE("stdlib: log.* forwards to plinth::log at the right level",
   }
 
   pool.destroy(bc);
+}
+
+TEST_CASE("stdlib: log bindings preserve bytes and reject unserializable ctx",
+          "[js][stdlib][log][regression]") {
+  auto sink = std::make_shared<CapturingSink>();
+  ScopedDefaultLogger logger(sink);
+  Config cfg{};
+  auto pool = make_pool(cfg);
+  BridgeContext* context = pool.acquire();
+  REQUIRE(context != nullptr);
+  ContextLease lease{pool, context};
+
+  constexpr std::array levels{
+      std::pair{"debug", spdlog::level::debug},
+      std::pair{"info", spdlog::level::info},
+      std::pair{"warn", spdlog::level::warn},
+      std::pair{"error", spdlog::level::err},
+  };
+  for (const auto& [level, expected_level] : levels) {
+    const auto before = sink->records().size();
+    const std::string script =
+        "typeof log." + std::string{level} + "(String.fromCharCode(65, 0, 66))";
+    const auto result = eval_on_context(*context, script);
+    REQUIRE(result.has_value());
+    REQUIRE(result->asString() == "undefined");
+    const auto records = sink->records();
+    REQUIRE(records.size() == before + 1);
+    CHECK(records.back().level == expected_level);
+    CHECK(records.back().payload == std::string{"A\0B", 3});
+  }
+
+  const auto before = sink->records().size();
+  const auto cyclic =
+      eval_on_context(*context, "const cycle = {x: 1}; cycle.self = cycle; "
+                                "log.info('ctx-probe', cycle)");
+  REQUIRE_FALSE(cyclic.has_value());
+  CHECK(cyclic.error().kind == EvalErrorKind::RUNTIME_ERROR);
+  CHECK(cyclic.error().message.find("TypeError") != std::string::npos);
+  CHECK(sink->records().size() == before);
+
+  const auto throwing = eval_on_context(
+      *context,
+      "log.info('ctx-probe', {toJSON() { throw new Error('probe-toJSON'); }})");
+  REQUIRE_FALSE(throwing.has_value());
+  CHECK(throwing.error().kind == EvalErrorKind::RUNTIME_ERROR);
+  CHECK(throwing.error().message.find("probe-toJSON") != std::string::npos);
+  CHECK(sink->records().size() == before);
+
+  const auto undefined_ctx = eval_on_context(
+      *context, "log.info('ctx-probe', {toJSON() { return undefined; }})");
+  REQUIRE_FALSE(undefined_ctx.has_value());
+  CHECK(undefined_ctx.error().kind == EvalErrorKind::RUNTIME_ERROR);
+  CHECK(undefined_ctx.error().message.find("TypeError") != std::string::npos);
+  CHECK(sink->records().size() == before);
+
+  const auto after = eval_on_context(*context, "1 + 1");
+  REQUIRE(after.has_value());
+  CHECK(after->asInt() == 2);
 }
 
 // [0.3.3.3] ICD-0.3.2 §Security Constraint 5 — `log.*` MUST NOT

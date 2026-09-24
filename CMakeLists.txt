@@ -414,10 +414,18 @@ install(FILES
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "QuickJS vendoring (ICD-0.3.0) is Linux-only for now.")
 endif()
+# The pinned QuickJS-ng revision leaks a temporary string reference when
+# JS_ToCStringLen2 cannot allocate its UTF-8 conversion. Apply the narrow fix
+# on fresh population and skip it on reconfigure when already present.
+set(PLINTH_QUICKJS_CSTRING_PATCH
+    ${CMAKE_SOURCE_DIR}/third_party/quickjs-patches/cstring-conversion-failure-leak.patch)
 FetchContent_Declare(
   quickjs
   GIT_REPOSITORY https://github.com/quickjs-ng/quickjs.git
   GIT_TAG 3c051980ab7e783dfbfb1c70c014ce5e05ecf24c
+  PATCH_COMMAND sh -c
+    "git apply --reverse --check '${PLINTH_QUICKJS_CSTRING_PATCH}' 2>/dev/null \
+     || git apply --whitespace=nowarn '${PLINTH_QUICKJS_CSTRING_PATCH}'"
 )
 FetchContent_GetProperties(quickjs)
 if(NOT quickjs_POPULATED)
@@ -644,6 +652,7 @@ add_executable(plinth_tests
   tests/kernel/js/eval_test.cpp
   tests/kernel/js/runtime_pool_test.cpp
   tests/kernel/js/stdlib_test.cpp
+  tests/kernel/js/quickjs_cstring_oom_test.cpp
   tests/kernel/js/crypto_corpus_test.cpp
   tests/kernel/js/crypto_numeric_regression_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -863,6 +872,16 @@ add_test(NAME plinth_tests_crypto_numeric_regression
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_crypto_numeric_regression
   PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_tests_log_regression
+  COMMAND plinth_tests "[js][stdlib][log][regression]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_log_regression PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_tests_quickjs_cstring_oom
+  COMMAND plinth_tests "[js][quickjs][cstring-oom]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_quickjs_cstring_oom PROPERTIES TIMEOUT 30)
 
 # A single connection exposes accidental transactions opened by batch queries.
 add_test(NAME plinth_tests_batch_transaction

@@ -34,7 +34,7 @@ Behavior:
 - Forwards to `plinth::log::debug/info/warn/error` (see `src/kernel/logging.hpp`) verbatim.
 - `ctx` is serialized to a single-line JSON string and appended as `" ctx={...}"` — spdlog does not understand structured args out of the box in the Plinth code, so a string append is the simplest fit.
 - `ctx` omitted → no suffix.
-- Return value: `undefined`. Never throws.
+- Successful calls return `undefined`. Omitted, `undefined`, and `null` `ctx` values add no suffix. A non-string `msg` or other non-object `ctx` throws `TypeError`. JSON serialization errors from `ctx` propagate; a `ctx` whose `toJSON()` returns `undefined` throws `TypeError`. QuickJS string conversion failures propagate as JS exceptions. No log record is emitted when a call fails.
 
 ### `config.get(key)`
 
@@ -95,7 +95,7 @@ Every host-registered function follows one consistent argument-checking pattern.
 | `number` out of declared range | caller-specific bound | `RangeError: <argname> out of range [lo, hi]` |
 | `boolean` slot | `bool` | `TypeError: expected boolean at arg N` |
 | `Uint8Array` slot | `std::span<const uint8_t>` view over the typed-array buffer | `TypeError: expected Uint8Array at arg N` |
-| `object` slot (`log.*` ctx) | recursively converted to `Json::Value` (same helper used by the existing capability dispatcher) | `TypeError` only if non-object supplied where object required |
+| `object` slot (`log.*` ctx) | serialized by QuickJS `JSON.stringify` and appended as text; `null` and `undefined` omit the suffix | `TypeError` for other non-object or non-serializable-to-JSON value; serialization exceptions propagate |
 | missing optional arg | default or omission | — |
 | extra args | silently ignored (match Node.js convention — still log at `log.debug` level in a 0.3.2 debug flag, optional) | — |
 
