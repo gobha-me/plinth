@@ -231,16 +231,17 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 2
 
-      - name: Focused QuickJS crypto sanitizer corpus
+      - name: Focused QuickJS synchronous-binding sanitizer corpora
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: |
           set -euo pipefail
-          ctest --test-dir build -N -R '^plinth_tests_crypto_corpus$' |
-            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build -N -R \
+            '^plinth_tests_(crypto|log|config)_corpus$' |
+            grep -Ex 'Total Tests: 3'
           ctest --test-dir build --output-on-failure -R \
-            '^plinth_tests_crypto_corpus$'
+            '^plinth_tests_(crypto|log|config)_corpus$'
 
       - name: Focused QuickJS crypto numeric sanitizer regression
         env:
