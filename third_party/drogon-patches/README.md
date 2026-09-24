@@ -69,3 +69,9 @@ The controlled loop cleanup signal is deadline-aware; the immediately following
 standard `std::thread::join()` has no timed form and relies on the process
 watchdog for its absolute bound. The patch must be reviewed and replayed when
 updating Drogon; current upstream still has the same callback ownership shape.
+The shutdown mutex uses `try_lock_for(deadline - steady_clock::now())` so the
+same absolute bound also compiles under Clang 21 TSan with libstdc++ 14.
+That libstdc++ release's `timed_mutex::try_lock_until(steady_clock)` path
+instantiates a clock-lock overload disabled by TSan (GCC PR121496). The
+relative call takes its supported fallback with the remaining steady-clock
+budget, rather than resetting the configured timeout.

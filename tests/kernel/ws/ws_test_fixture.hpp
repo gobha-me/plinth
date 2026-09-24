@@ -136,13 +136,13 @@ class WsTestClient {
 
  private:
   drogon::WebSocketClientPtr client;
+  drogon::WebSocketConnectionPtr connection; // captured on Drogon's loop
   mutable std::mutex mu;
   std::condition_variable cv;
   std::deque<Json::Value> inbox;
   std::deque<std::string> paused_raw; // protected by mu
   FrameInspector inspector;           // protected by mu
   std::atomic<bool> drain_paused{false};
-  bool connected{false};
   bool closed{false};
 };
 

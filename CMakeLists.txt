@@ -81,12 +81,28 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ─── Sanitizers (opt-in via -DPLINTH_SANITIZERS=ON) ──────────
+# ─── Sanitizers (opt-in; mutually exclusive) ──────────
 option(PLINTH_SANITIZERS "Enable AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
+option(PLINTH_TSAN "Enable ThreadSanitizer (Clang 21 on Linux x86_64)" OFF)
+if(PLINTH_SANITIZERS AND PLINTH_TSAN)
+  message(FATAL_ERROR "PLINTH_SANITIZERS and PLINTH_TSAN are mutually exclusive")
+endif()
 if(PLINTH_SANITIZERS)
   message(STATUS "Sanitizers enabled: address,undefined")
   add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
   add_link_options(-fsanitize=address,undefined)
+endif()
+if(PLINTH_TSAN)
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+     NOT CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 21 OR
+     CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 22 OR
+     NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
+     NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64)$")
+    message(FATAL_ERROR "PLINTH_TSAN requires Clang 21 on Linux x86_64")
+  endif()
+  message(STATUS "Sanitizer enabled: thread")
+  add_compile_options(-fsanitize=thread -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=thread)
 endif()
 
 # Pass full git version string to source
@@ -895,6 +911,44 @@ add_test(NAME plinth_tests_ws_authority
           --binary $<TARGET_FILE:plinth>)
 set_tests_properties(plinth_tests_ws_authority PROPERTIES
   LABELS "needs_pg" SKIP_RETURN_CODE 77 TIMEOUT 180)
+
+# Keep TSan runs narrowly scoped and in separate Catch processes. The JS and
+# WebSocket fixtures each own a process-lifetime Drogon instance, and their
+# schema resets must not overlap. The production shutdown case covers both
+# signals and accepted WebSocket writes; the 10x active-timer stress case and
+# short-deadline replay/JS-stress cases remain outside this bounded lane.
+if(PLINTH_TSAN)
+  target_compile_definitions(plinth_tests PRIVATE PLINTH_TSAN_TEST=1)
+  function(add_plinth_tsan_case name selector timeout_seconds)
+    math(EXPR ctest_timeout_seconds "${timeout_seconds} + 10")
+    add_test(NAME plinth_tsan_${name}
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/.github/scripts/verify_tsan_case.py
+        --binary $<TARGET_FILE:plinth_tests>
+        --case "${selector}"
+        --timeout ${timeout_seconds}
+      WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+    set_tests_properties(plinth_tsan_${name} PROPERTIES
+      RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
+      LABELS "needs_pg;tsan"
+      TIMEOUT ${ctest_timeout_seconds})
+  endfunction()
+
+  add_plinth_tsan_case(listener_notify
+    "R.01 listener delivers valid NOTIFY to handler" 180)
+  add_plinth_tsan_case(listener_stop_barrier
+    "R.05 stop_listener barriers on in-flight handler dispatch" 180)
+  add_plinth_tsan_case(realtime_full_chain
+    "I.01: full chain — listener -> writer -> cursor -> WS client" 180)
+  add_plinth_tsan_case(js_concurrent_query
+    "async_bridge: 10 concurrent contexts each run independent query" 180)
+  add_plinth_tsan_case(js_query_audit
+    "async_bridge: F.23 two threads query and audit independently" 180)
+  add_plinth_tsan_case(production_durable_shutdown
+    "production shutdown persists and replays the last extension write" 480)
+  add_plinth_tsan_case(production_partial_startup
+    "partial startup uses bounded coordinator teardown" 180)
+endif()
 
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s
 # main loop, so `[js][async]` tests now share `plinth_tests_js`'s

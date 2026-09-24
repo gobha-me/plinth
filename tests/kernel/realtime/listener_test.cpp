@@ -13,12 +13,14 @@
 //                      [realtime][integration].
 
 #include "kernel/config.hpp"
+#include "kernel/db/bootstrap.hpp"
 #include "kernel/realtime/listener.hpp"
 
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <future>
 #include <libpq-fe.h>
@@ -91,6 +93,22 @@ auto pg_available() -> bool {
   PQfinish(conn);
   return ok;
 }
+
+auto reset_listener_schema(const plinth::Config::Database& db) -> void {
+  plinth::db::bootstrap_schema(db,
+                               std::string{CMAKE_SOURCE_DIR} + "/migrations",
+                               /*dev_mode=*/true);
+}
+
+struct ScopedListener {
+  ~ScopedListener() {
+    if (!plinth::realtime::stop_listener()) {
+      std::fputs("plinth_tests: listener cleanup failed\n", stderr);
+      std::_Exit(EXIT_FAILURE);
+    }
+    plinth::realtime::clear_handlers_for_test();
+  }
+};
 
 struct SidePg {
   PGconn* conn = nullptr;
@@ -346,6 +364,8 @@ TEST_CASE("R.01 listener delivers valid NOTIFY to handler",
   if (!pg_available()) {
     SKIP("PG not available — set PLINTH_PG_HOST + friends to run");
   }
+  auto db = pg_config();
+  reset_listener_schema(db);
   plinth::realtime::clear_handlers_for_test();
 
   std::mutex mu;
@@ -359,10 +379,10 @@ TEST_CASE("R.01 listener delivers valid NOTIFY to handler",
         cv.notify_all();
       });
 
-  auto db = pg_config();
   plinth::Config::Realtime::Listener lcfg;
   lcfg.reconnect_backoff_ms = 200;
   plinth::realtime::start_listener(db, lcfg);
+  ScopedListener cleanup;
   settle_listen();
 
   SidePg side{db};
@@ -389,6 +409,8 @@ TEST_CASE("R.03 listener reconnects after PG connection killed",
   if (!pg_available()) {
     SKIP("PG not available — set PLINTH_PG_HOST + friends to run");
   }
+  auto db = pg_config();
+  reset_listener_schema(db);
   plinth::realtime::clear_handlers_for_test();
 
   std::mutex mu;
@@ -402,10 +424,10 @@ TEST_CASE("R.03 listener reconnects after PG connection killed",
         cv.notify_all();
       });
 
-  auto db = pg_config();
   plinth::Config::Realtime::Listener lcfg;
   lcfg.reconnect_backoff_ms = 200;
   plinth::realtime::start_listener(db, lcfg);
+  ScopedListener cleanup;
   settle_listen();
 
   // Kill every backend application_name matching the listener's
@@ -451,6 +473,8 @@ TEST_CASE("R.05 stop_listener barriers on in-flight handler dispatch",
   if (!pg_available()) {
     SKIP("PG not available — set PLINTH_PG_HOST + friends to run");
   }
+  auto db = pg_config();
+  reset_listener_schema(db);
   plinth::realtime::clear_handlers_for_test();
 
   std::atomic<bool> handler_started{false};
@@ -462,10 +486,10 @@ TEST_CASE("R.05 stop_listener barriers on in-flight handler dispatch",
         handler_finished.store(true);
       });
 
-  auto db = pg_config();
   plinth::Config::Realtime::Listener lcfg;
   lcfg.reconnect_backoff_ms = 200;
   plinth::realtime::start_listener(db, lcfg);
+  ScopedListener cleanup;
   settle_listen();
 
   SidePg side{db};

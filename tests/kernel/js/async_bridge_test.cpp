@@ -11,7 +11,7 @@
 //     ICD-0.3.3 §Tests C.12–C.15 amendment (0.3.3.3)
 //   * Group D — Concurrency — D.16 10 contexts, D.17 10×5-query
 //   * Group E — audit.* — E.18–E.22 (E.22 shim-gated)
-//   * Group F — TSan smoke — F.23 deferred to the 0.5.x TSan CI job
+//   * Group F — TSan smoke — F.23 two concurrent db.query + audit.log paths
 //
 // Case coverage (ICD-0.3.4 §Tests):
 //   * Group G — cap.call correctness — G.24 Tier 1 stub, G.25 not_found,
@@ -39,6 +39,7 @@
 #include "kernel/logging.hpp"
 
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <drogon/utils/coroutine.h>
 #include <json/value.h>
@@ -694,6 +695,56 @@ TEST_CASE("async_bridge: 10 contexts x 5-query Promise.all fan-out",
   }
   for (auto& t : workers) {
     t.join();
+  }
+  for (auto* bc : slots) {
+    pool.destroy(bc);
+  }
+
+  REQUIRE(successes.load() == N);
+}
+
+// ─── Group F — TSan smoke (ICD §Tests F.23) ────────────────────────
+
+TEST_CASE("async_bridge: F.23 two threads query and audit independently",
+          "[js][async][db][audit][group_f][tsan]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  ensure_drogon_with_db_running();
+  reset_schema(test_config().db);
+
+  constexpr int N = 2;
+  RuntimePool pool(/*ext=*/nullptr, default_runtime_limits(), test_config(), N);
+  std::vector<BridgeContext*> slots;
+  slots.reserve(N);
+  for (int i = 0; i < N; ++i) {
+    slots.push_back(pool.acquire());
+  }
+
+  // Each worker owns a distinct context. Start the two sync_wait calls
+  // together so TSan observes the query and audit dispatch paths under
+  // concurrent execution, without a wall-clock assumption.
+  std::barrier<> start(N);
+  std::atomic<int> successes{0};
+  std::vector<std::thread> workers;
+  workers.reserve(N);
+  for (auto* bc : slots) {
+    workers.emplace_back([bc, &start, &successes] {
+      start.arrive_and_wait();
+      auto r = drogon::sync_wait(run_on_context(*bc, R"(
+        (async () => {
+          const result = await db.query('SELECT 1 AS x');
+          await audit.log('ext.test.f23', {value: result.rows[0].x});
+          return result.rows[0].x;
+        })()
+      )"));
+      if (r.value.has_value() && r.value->asInt() == 1) {
+        successes.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  }
+  for (auto& worker : workers) {
+    worker.join();
   }
   for (auto* bc : slots) {
     pool.destroy(bc);
