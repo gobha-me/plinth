@@ -242,6 +242,17 @@ jobs:
           ctest --test-dir build --output-on-failure -R \
             '^plinth_tests_crypto_corpus$'
 
+      - name: Focused QuickJS crypto numeric sanitizer regression
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_crypto_numeric_regression$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --output-on-failure -R \
+            '^plinth_tests_crypto_numeric_regression$'
+
       - name: Test
         env:
           PLINTH_PG_HOST: 127.0.0.1
