@@ -119,6 +119,13 @@ multiple heartbeat replies, disconnect/reconnect without duplicate channel
 requests, unsubscribe while another channel stays connected, and terminal
 expired-session authentication. It never mocks the WebSocket transport.
 
+The same command checks shell preference create, conflict-update, and delete
+through the production capability. Each write must produce its own durable
+`plinth:data:ext_shell.user_preferences` event, reach a live browser SDK
+subscriber without a refresh, and replay to a second browser session. The
+synthetic user gets a test-only subscribe grant; normal users do not receive
+this table-wide channel by default.
+
 The same `--realtime` run also invokes `test:launcher-production`. That test
 uses a separate synthetic admin session to install the built `valid-install`
 package through the real multipart API, load its versioned panel module, then
