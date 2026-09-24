@@ -69,7 +69,7 @@ export default async function preferences_set({ key, value }, ctx) {
         throw { code: 'payload_too_large',
                 message: 'value exceeds 64 KiB serialised limit' };
     }
-    await db.query(
+    await db.exec(
         'INSERT INTO ext_shell.user_preferences (user_id, key, value) ' +
         'VALUES ($1, $2, $3::jsonb) ' +
         'ON CONFLICT (user_id, key) DO UPDATE ' +
