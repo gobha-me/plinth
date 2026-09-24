@@ -623,6 +623,9 @@ add_executable(plinth_tests
   tests/kernel/groups/groups_integration_test.cpp
   tests/kernel/groups/rbac_integration_test.cpp
   tests/kernel/rbac/enforcement_test.cpp
+  tests/kernel/rbac/property_graph_test.cpp
+  tests/kernel/rbac/property_http_test.cpp
+  tests/kernel/rbac/property_ownership_test.cpp
   tests/kernel/rbac/anonymous_identity_test.cpp
   tests/kernel/rbac/rule_registrar_test.cpp
   tests/kernel/rbac/rbac_manifest_test.cpp
