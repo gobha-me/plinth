@@ -114,16 +114,16 @@ auto audit_log(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
   if (!JS_IsObject(args[1]) || JS_IsArray(args[1]) || JS_IsNull(args[1])) {
     return JS_ThrowTypeError(ctx, "audit.log: payload must be a plain object");
   }
-  const char* et_cs = JS_ToCString(ctx, args[0]);
+  std::size_t event_type_len = 0;
+  const char* et_cs = JS_ToCStringLen(ctx, &event_type_len, args[0]);
   if (et_cs == nullptr) {
     return JS_EXCEPTION;
   }
-  std::string event_type(et_cs);
+  std::string event_type(et_cs, event_type_len);
   JS_FreeCString(ctx, et_cs);
   if (event_type.empty()) {
     return JS_ThrowTypeError(ctx, "audit.log: event_type must be non-empty");
   }
-
   // Convert payload to Json::Value via the shared helper.
   auto payload_or = detail::js_to_json(ctx, args[1]);
   if (!payload_or.has_value()) {
@@ -154,6 +154,10 @@ auto audit_log(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
   if (!starts_with(event_type, "ext.")) {
     return reject_inline(ctx, "audit.invalid_prefix",
                          "extension audit events must start with 'ext.<id>.'");
+  }
+  if (event_type.find('\0') != std::string::npos) {
+    return reject_inline(ctx, "audit.invalid_prefix",
+                         "extension audit event_type must not contain NUL");
   }
   // Reserved-field check.
   auto bad_key = find_reserved_payload_key(payload);

@@ -102,11 +102,12 @@ auto try_convert_string(JSContext* ctx, JSValueConst v)
   if (!JS_IsString(v)) {
     return std::nullopt;
   }
-  const char* s = JS_ToCString(ctx, v);
+  std::size_t len = 0;
+  const char* s = JS_ToCStringLen(ctx, &len, v);
   if (s == nullptr) {
     return std::nullopt;
   }
-  Json::Value out{std::string{s}};
+  Json::Value out{std::string{s, len}};
   JS_FreeCString(ctx, s);
   return out;
 }
@@ -160,6 +161,11 @@ auto convert_param(JSContext* ctx, JSValueConst v, std::size_t idx,
     return true;
   }
   if (auto r = try_convert_string(ctx, v); r.has_value()) {
+    if (r->asString().find('\0') != std::string::npos) {
+      JS_ThrowTypeError(ctx, "db: TEXT parameter at index %zu contains NUL",
+                        idx);
+      return false;
+    }
     out = std::move(*r);
     return true;
   }
@@ -265,14 +271,18 @@ auto db_query(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
   if (args.empty() || !JS_IsString(args[0])) {
     return JS_ThrowTypeError(ctx, "db.query: sql must be a string");
   }
-  const char* sql_cs = JS_ToCString(ctx, args[0]);
+  std::size_t sql_len = 0;
+  const char* sql_cs = JS_ToCStringLen(ctx, &sql_len, args[0]);
   if (sql_cs == nullptr) {
     return JS_EXCEPTION;
   }
-  std::string sql(sql_cs);
+  std::string sql(sql_cs, sql_len);
   JS_FreeCString(ctx, sql_cs);
   if (sql.empty()) {
     return JS_ThrowTypeError(ctx, "db.query: sql must be non-empty");
+  }
+  if (sql.find('\0') != std::string::npos) {
+    return JS_ThrowTypeError(ctx, "db.query: sql must not contain NUL");
   }
   std::vector<Json::Value> params;
   if (args.size() >= 2 && !convert_params(ctx, args[1], params)) {
@@ -331,14 +341,18 @@ auto db_exec(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
   if (args.empty() || !JS_IsString(args[0])) {
     return JS_ThrowTypeError(ctx, "db.exec: sql must be a string");
   }
-  const char* sql_cs = JS_ToCString(ctx, args[0]);
+  std::size_t sql_len = 0;
+  const char* sql_cs = JS_ToCStringLen(ctx, &sql_len, args[0]);
   if (sql_cs == nullptr) {
     return JS_EXCEPTION;
   }
-  std::string sql(sql_cs);
+  std::string sql(sql_cs, sql_len);
   JS_FreeCString(ctx, sql_cs);
   if (sql.empty()) {
     return JS_ThrowTypeError(ctx, "db.exec: sql must be non-empty");
+  }
+  if (sql.find('\0') != std::string::npos) {
+    return JS_ThrowTypeError(ctx, "db.exec: sql must not contain NUL");
   }
   std::vector<Json::Value> params;
   if (args.size() >= 2 && !convert_params(ctx, args[1], params)) {

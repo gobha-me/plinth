@@ -95,11 +95,12 @@ auto cap_call(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
   if (args.empty() || !JS_IsString(args[0])) {
     return JS_ThrowTypeError(ctx, "cap.call: signature must be a string");
   }
-  const char* sig_cs = JS_ToCString(ctx, args[0]);
+  std::size_t sig_len = 0;
+  const char* sig_cs = JS_ToCStringLen(ctx, &sig_len, args[0]);
   if (sig_cs == nullptr) {
     return JS_EXCEPTION;
   }
-  std::string signature(sig_cs);
+  std::string signature(sig_cs, sig_len);
   JS_FreeCString(ctx, sig_cs);
   if (signature.empty()) {
     return JS_ThrowTypeError(ctx, "cap.call: signature must be non-empty");
