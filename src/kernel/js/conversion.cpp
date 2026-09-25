@@ -5,6 +5,7 @@
 
 #include "kernel/js/conversion.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <json/value.h>
@@ -126,7 +127,8 @@ auto js_plain_object_to_json(JSContext* ctx, JSValueConst obj, int depth)
   }
   Json::Value out{Json::objectValue};
   for (uint32_t i = 0; i < tab_len; ++i) {
-    const char* key = JS_AtomToCString(ctx, tab[i].atom);
+    std::size_t key_len = 0;
+    const char* key = JS_AtomToCStringLen(ctx, &key_len, tab[i].atom);
     JSValue val = JS_GetProperty(ctx, obj, tab[i].atom);
     if (key == nullptr || JS_IsException(val)) {
       if (key != nullptr) {
@@ -137,7 +139,7 @@ auto js_plain_object_to_json(JSContext* ctx, JSValueConst obj, int depth)
       return fail("js_to_json: property read failed");
     }
     auto child = js_to_json_rec(ctx, val, depth + 1);
-    std::string key_copy{key};
+    std::string key_copy{key, key_len};
     JS_FreeCString(ctx, key);
     JS_FreeValue(ctx, val);
     if (!child.has_value()) {
@@ -179,11 +181,12 @@ auto js_to_json_rec(JSContext* ctx, JSValueConst v, int depth)
     return fail("js_to_json: number coercion failed");
   }
   if (JS_IsString(v)) {
-    const char* s = JS_ToCString(ctx, v);
+    std::size_t len = 0;
+    const char* s = JS_ToCStringLen(ctx, &len, v);
     if (s == nullptr) {
       return fail("js_to_json: string coercion failed");
     }
-    Json::Value out{std::string{s}};
+    Json::Value out{std::string{s, len}};
     JS_FreeCString(ctx, s);
     return out;
   }

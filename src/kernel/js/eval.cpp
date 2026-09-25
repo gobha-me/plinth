@@ -177,7 +177,8 @@ auto js_plain_object_to_json(JSContext* ctx, JSValueConst obj, int depth)
     // `tab_len` entries; indexing it is the documented QuickJS
     // iteration pattern. We free the whole block via
     // JS_FreePropertyEnum before returning.
-    const char* key = JS_AtomToCString(ctx, tab[i].atom);
+    std::size_t key_len = 0;
+    const char* key = JS_AtomToCStringLen(ctx, &key_len, tab[i].atom);
     JSValue val = JS_GetProperty(ctx, obj, tab[i].atom);
     if (key == nullptr || JS_IsException(val)) {
       if (key != nullptr) {
@@ -188,7 +189,7 @@ auto js_plain_object_to_json(JSContext* ctx, JSValueConst obj, int depth)
       return conv_fail("js_to_json: property read failed");
     }
     ConvOutcome child = js_to_json(ctx, val, depth + 1);
-    std::string key_copy{key};
+    std::string key_copy{key, key_len};
     JS_FreeCString(ctx, key);
     JS_FreeValue(ctx, val);
     if (!child.ok) {
@@ -229,11 +230,12 @@ auto js_to_json(JSContext* ctx, JSValueConst v, int depth) -> ConvOutcome {
     return conv_fail("js_to_json: number coercion failed");
   }
   if (JS_IsString(v)) {
-    const char* s = JS_ToCString(ctx, v);
+    std::size_t len = 0;
+    const char* s = JS_ToCStringLen(ctx, &len, v);
     if (s == nullptr) {
       return conv_fail("js_to_json: string coercion failed");
     }
-    ConvOutcome out{.value = Json::Value{std::string{s}}};
+    ConvOutcome out{.value = Json::Value{std::string{s, len}}};
     JS_FreeCString(ctx, s);
     return out;
   }
