@@ -655,6 +655,8 @@ add_executable(plinth_tests
   tests/kernel/js/quickjs_cstring_oom_test.cpp
   tests/kernel/js/crypto_corpus_test.cpp
   tests/kernel/js/crypto_numeric_regression_test.cpp
+  tests/kernel/js/log_corpus_test.cpp
+  tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
   tests/kernel/js/async_bridge_fixture.cpp
   tests/kernel/js/db_batch_test.cpp
@@ -882,6 +884,16 @@ add_test(NAME plinth_tests_quickjs_cstring_oom
   COMMAND plinth_tests "[js][quickjs][cstring-oom]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_quickjs_cstring_oom PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_tests_log_corpus
+  COMMAND plinth_tests "[js][stdlib][log][corpus]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_log_corpus PROPERTIES TIMEOUT 90)
+
+add_test(NAME plinth_tests_config_corpus
+  COMMAND plinth_tests "[js][stdlib][config][corpus]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_config_corpus PROPERTIES TIMEOUT 90)
 
 # A single connection exposes accidental transactions opened by batch queries.
 add_test(NAME plinth_tests_batch_transaction
