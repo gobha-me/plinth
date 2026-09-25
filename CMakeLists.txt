@@ -655,6 +655,7 @@ add_executable(plinth_tests
   tests/kernel/js/quickjs_cstring_oom_test.cpp
   tests/kernel/js/crypto_corpus_test.cpp
   tests/kernel/js/crypto_numeric_regression_test.cpp
+  tests/kernel/js/json_nul_preservation_test.cpp
   tests/kernel/js/log_corpus_test.cpp
   tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -884,6 +885,11 @@ add_test(NAME plinth_tests_quickjs_cstring_oom
   COMMAND plinth_tests "[js][quickjs][cstring-oom]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_quickjs_cstring_oom PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_tests_json_nul_regression
+  COMMAND plinth_tests "[js][conversion][nul-regression]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_json_nul_regression PROPERTIES TIMEOUT 30)
 
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
