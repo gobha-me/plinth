@@ -32,12 +32,13 @@ auto build_log_line(JSContext* ctx, std::span<const JSValue> args,
     err = JS_ThrowTypeError(ctx, "log: expected string at arg 0");
     return false;
   }
-  const char* msg = JS_ToCString(ctx, args[0]);
+  std::size_t msg_len = 0;
+  const char* msg = JS_ToCStringLen(ctx, &msg_len, args[0]);
   if (msg == nullptr) {
     err = JS_EXCEPTION; // already thrown by QuickJS
     return false;
   }
-  out.assign(msg);
+  out.assign(msg, msg_len);
   JS_FreeCString(ctx, msg);
 
   if (args.size() >= 2 && !JS_IsUndefined(args[1]) && !JS_IsNull(args[1])) {
@@ -51,12 +52,20 @@ auto build_log_line(JSContext* ctx, std::span<const JSValue> args,
       err = JS_EXCEPTION;
       return false;
     }
-    const char* s = JS_ToCString(ctx, json_str);
-    if (s != nullptr) {
-      out.append(" ctx=");
-      out.append(s);
-      JS_FreeCString(ctx, s);
+    if (JS_IsUndefined(json_str)) {
+      err = JS_ThrowTypeError(ctx, "log: ctx must serialize to JSON");
+      return false;
     }
+    std::size_t json_len = 0;
+    const char* s = JS_ToCStringLen(ctx, &json_len, json_str);
+    if (s == nullptr) {
+      JS_FreeValue(ctx, json_str);
+      err = JS_EXCEPTION; // already thrown by QuickJS
+      return false;
+    }
+    out.append(" ctx=");
+    out.append(s, json_len);
+    JS_FreeCString(ctx, s);
     JS_FreeValue(ctx, json_str);
   }
   return true;

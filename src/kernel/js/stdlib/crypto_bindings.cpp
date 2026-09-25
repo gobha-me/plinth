@@ -14,6 +14,7 @@
 #include <quickjs.h>
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -154,15 +155,20 @@ auto crypto_random_bytes(JSContext* ctx, JSValue /*this_val*/, int argc,
     return JS_ThrowTypeError(ctx,
                              "crypto.randomBytes: expected integer at arg 0");
   }
-  int32_t n = 0;
-  if (JS_ToInt32(ctx, &n, args[0]) != 0) {
+  double requested = 0;
+  if (JS_ToFloat64(ctx, &requested, args[0]) != 0) {
     return JS_EXCEPTION;
   }
-  if (n < RANDOM_BYTES_MIN || n > RANDOM_BYTES_MAX) {
+  if (!std::isfinite(requested) || std::trunc(requested) != requested) {
+    return JS_ThrowTypeError(ctx,
+                             "crypto.randomBytes: expected integer at arg 0");
+  }
+  if (requested < RANDOM_BYTES_MIN || requested > RANDOM_BYTES_MAX) {
     return JS_ThrowRangeError(ctx,
                               "crypto.randomBytes: n out of range [%d, %d]",
                               RANDOM_BYTES_MIN, RANDOM_BYTES_MAX);
   }
+  const int n = static_cast<int>(requested);
   std::vector<uint8_t> buf(static_cast<std::size_t>(n));
   if (RAND_bytes(buf.data(), n) != 1) {
     return JS_ThrowInternalError(ctx, "crypto.randomBytes: RNG failure");

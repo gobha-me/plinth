@@ -1,0 +1,21 @@
+Free the temporary JS string if JS_ToCStringLen2 cannot allocate its
+UTF-8 conversion. The pinned QuickJS-ng revision otherwise leaks the
+value on this out-of-memory path.
+
+Upstreamable against quickjs-ng commit
+3c051980ab7e783dfbfb1c70c014ce5e05ecf24c.
+---
+ quickjs.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -4536,6 +4536,7 @@ const char *JS_ToCStringLen2(JSContext *ctx, size_t *plen, JSValueConst val1,
+         *plen = str_new->len;
+     return (const char *)str8(str_new);
+ fail:
++    JS_FreeValue(ctx, val);
+     if (plen)
+         *plen = 0;
+     return NULL;
