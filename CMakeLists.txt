@@ -656,6 +656,7 @@ add_executable(plinth_tests
   tests/kernel/js/crypto_corpus_test.cpp
   tests/kernel/js/crypto_numeric_regression_test.cpp
   tests/kernel/js/json_nul_preservation_test.cpp
+  tests/kernel/js/conversion_corpus_test.cpp
   tests/kernel/js/log_corpus_test.cpp
   tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -890,6 +891,11 @@ add_test(NAME plinth_tests_json_nul_regression
   COMMAND plinth_tests "[js][conversion][nul-regression]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_json_nul_regression PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_tests_conversion_corpus
+  COMMAND plinth_tests "[js][conversion][corpus]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_conversion_corpus PROPERTIES TIMEOUT 90)
 
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
