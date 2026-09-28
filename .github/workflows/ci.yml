@@ -53,6 +53,9 @@ jobs:
       - name: Check formatting
         run: tools/format.sh --check
 
+      - name: Verify the focused Catch2 case gate
+        run: python3 -m unittest tests.tools.verify_catch_case_test
+
       - name: Check licenses, dependency pins, and SBOM
         run: tools/public_readiness.py
 
