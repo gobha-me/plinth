@@ -14,6 +14,7 @@
 #include "kernel/config.hpp"
 
 #include <json/value.h>
+#include <libpq-fe.h>
 
 #include <chrono>
 #include <functional>
@@ -87,5 +88,13 @@ auto stop_listener(std::chrono::milliseconds timeout = std::chrono::seconds{5})
 // Used by R.08, R.09, R.10 in Slice 4.
 auto apply_notification_for_test(std::string_view channel,
                                  std::string_view payload_json) -> bool;
+
+// Test seam — copied into the owned worker at start, then called synchronously
+// after successful normal outbox scans. The PGconn is borrowed only for the
+// callback; never retain it or use it from another thread. Install/clear only
+// while stopped; an active listener rejects changes without modifying its hook.
+using PostOutboxScanHook = std::function<void(PGconn&)>;
+[[nodiscard]] auto set_post_outbox_scan_hook_for_test(PostOutboxScanHook hook)
+    -> bool;
 
 } // namespace plinth::realtime

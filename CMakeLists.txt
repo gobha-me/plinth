@@ -957,6 +957,19 @@ set_tests_properties(plinth_tests_pg
              LABELS "needs_pg"
              TIMEOUT 300)
 
+# Reuse the focused case verifier's exit/positive-assertion/no-skip contract.
+add_test(NAME plinth_tests_buffered_realtime_hints
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/.github/scripts/verify_tsan_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "realtime listener drains buffered self-notifications before polling"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_buffered_realtime_hints
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             TIMEOUT 40)
+
 # Repeated production boots need their own aggregate budget under sanitizers.
 # Keep the per-process lifecycle bounds unchanged and serialize both groups
 # against the shared PostgreSQL fixture, including when CTest runs in parallel.

@@ -14,8 +14,10 @@
 
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/realtime/listener.hpp"
 
+#include <array>
 #include <atomic>
 #include <catch2/catch_test_macros.hpp>
 #include <chrono>
@@ -23,9 +25,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <future>
+#include <json/writer.h>
 #include <libpq-fe.h>
 #include <memory>
 #include <mutex>
+#include <poll.h>
 #include <string>
 #include <thread>
 #include <vector>
@@ -358,6 +362,113 @@ TEST_CASE("R.10 multi-handler — all handlers invoked in registration order",
 }
 
 // ── PG-gated integration tests (R.01 / R.03 / R.05) ────────────────
+
+TEST_CASE("realtime listener drains buffered self-notifications before polling",
+          "[realtime][integration][buffered-notify]") {
+  using namespace std::chrono_literals;
+  if (!pg_available()) {
+    SKIP("PG not available — set PLINTH_PG_HOST + friends to run");
+  }
+  REQUIRE(plinth::realtime::stop_listener());
+  const auto db = pg_config();
+  reset_listener_schema(db);
+  plinth::realtime::clear_handlers_for_test();
+
+  struct State {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool emitted = false; // accessed only by the listener-owned callback
+    bool injected = false;
+    bool enqueue_ok = false;
+    bool socket_idle = false;
+    std::chrono::steady_clock::time_point injected_at;
+    std::chrono::steady_clock::time_point last_received_at;
+    std::vector<plinth::realtime::DispatchedEvent> received;
+  };
+  const auto state = std::make_shared<State>();
+  struct Cleanup {
+    ~Cleanup() {
+      if (!plinth::realtime::stop_listener() ||
+          !plinth::realtime::set_post_outbox_scan_hook_for_test({})) {
+        std::fputs("plinth_tests: buffered-notify cleanup failed\n", stderr);
+        std::_Exit(EXIT_FAILURE);
+      }
+      plinth::realtime::clear_handlers_for_test();
+    }
+  } cleanup;
+
+  std::array<Json::Value, 2> expected;
+  std::array<std::string, 2> payloads;
+  Json::StreamWriterBuilder writer;
+  writer["indentation"] = "";
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    auto& envelope = expected[index];
+    envelope["layer"] = "data";
+    envelope["channel"] = index == 0 ? "plinth:data:ext_buffered.a"
+                                     : "plinth:data:ext_buffered.b";
+    envelope["payload"]["index"] = static_cast<int>(index);
+    payloads[index] = Json::writeString(writer, envelope);
+  }
+  REQUIRE(plinth::realtime::set_post_outbox_scan_hook_for_test(
+      [state, payloads](PGconn& conn) {
+        if (state->emitted) {
+          return;
+        }
+        state->emitted = true;
+        bool ok = true;
+        for (const auto& payload : payloads) {
+          const std::array<const char*, 1> values{payload.c_str()};
+          std::unique_ptr<PGresult, decltype(&PQclear)> result{
+              plinth::db::exec_params(
+                  &conn, "SELECT plinth.enqueue_realtime_event($1::jsonb)", 1,
+                  nullptr, values.data(), nullptr, nullptr, 0),
+              PQclear};
+          ok = ok && PQresultStatus(result.get()) == PGRES_TUPLES_OK &&
+               PQntuples(result.get()) == 1;
+        }
+        // PostgreSQL sends self-NOTIFY before ReadyForQuery. The completed
+        // queries above have absorbed both hints into libpq, not the socket.
+        pollfd socket{.fd = PQsocket(&conn), .events = POLLIN, .revents = 0};
+        const bool socket_idle = ::poll(&socket, 1, 0) == 0;
+        {
+          std::lock_guard lock(state->mu);
+          state->enqueue_ok = ok;
+          state->socket_idle = socket_idle;
+          state->injected_at = std::chrono::steady_clock::now();
+          state->injected = true;
+        }
+        state->cv.notify_all();
+      }));
+  plinth::realtime::register_handler([state](const auto& event) {
+    {
+      std::lock_guard lock(state->mu);
+      state->received.push_back(event);
+      state->last_received_at = std::chrono::steady_clock::now();
+    }
+    state->cv.notify_all();
+  });
+  plinth::realtime::start_listener(db, make_test_listener_cfg());
+  CHECK_FALSE(plinth::realtime::set_post_outbox_scan_hook_for_test({}));
+  {
+    std::unique_lock lock(state->mu);
+    REQUIRE(state->cv.wait_for(lock, 500ms, [&] { return state->injected; }));
+    REQUIRE(state->enqueue_ok);
+    REQUIRE(state->socket_idle);
+    const auto deadline = state->injected_at + 500ms;
+    INFO("received=" << state->received.size());
+    REQUIRE(state->cv.wait_until(lock, deadline,
+                                 [&] { return state->received.size() >= 2; }));
+    REQUIRE(state->last_received_at <= deadline);
+  }
+  REQUIRE(plinth::realtime::stop_listener());
+  REQUIRE(state->received.size() == expected.size());
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    CHECK(state->received[index].layer == "data");
+    CHECK(state->received[index].channel ==
+          expected[index]["channel"].asString());
+    CHECK(state->received[index].envelope == expected[index]);
+  }
+}
 
 TEST_CASE("R.01 listener delivers valid NOTIFY to handler",
           "[realtime][integration]") {

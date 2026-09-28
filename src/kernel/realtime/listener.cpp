@@ -46,6 +46,8 @@ constexpr int POLL_TIMEOUT_MS = 1000;
 std::mutex lifecycle_mutex;
 // thread; optional engaged while running.
 std::optional<std::jthread> listener_thread;
+// Configured only while stopped and copied into the owned worker at start.
+PostOutboxScanHook post_outbox_scan_hook;
 // Owned by the lifecycle coordinator under lifecycle_mutex.
 int wakeup_fd = -1;
 std::mutex listener_exit_mutex;
@@ -254,7 +256,8 @@ auto drain_outbox(PGconn* conn, std::int64_t& cursor, bool& delivery_failed)
 }
 
 auto drain_notifications(PGconn* conn, std::string_view marker = {},
-                         bool* marker_seen = nullptr) -> bool {
+                         bool* marker_seen = nullptr, bool* hint_seen = nullptr)
+    -> bool {
   if (PQconsumeInput(conn) == 0) {
     spdlog::warn("realtime listener: PQconsumeInput failed: {}",
                  PQerrorMessage(conn));
@@ -282,6 +285,9 @@ auto drain_notifications(PGconn* conn, std::string_view marker = {},
     // Ordinary NOTIFY payloads are untrusted wake hints. The caller scans the
     // protected outbox after draining the socket; accepting envelope data here
     // would let any database login forge kernel realtime events.
+    if (channel == WIRE_CHANNEL && hint_seen != nullptr) {
+      *hint_seen = true;
+    }
     (void)payload;
   }
   return true;
@@ -370,11 +376,21 @@ auto wait_for_reconnect(int wake_fd, int backoff_ms) -> void {
 }
 
 auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
-                  int wake_fd, int backoff_ms) -> bool {
+                  int wake_fd, int backoff_ms,
+                  const PostOutboxScanHook& post_scan) -> bool {
   plinth::db::OperationScope database_operations{tok, std::chrono::seconds{5}};
   PGconn* conn = nullptr;
   std::optional<std::int64_t> outbox_cursor;
   bool delivery_lost = false;
+  auto scan_outbox = [&] {
+    if (!drain_outbox(conn, *outbox_cursor, delivery_lost)) {
+      return false;
+    }
+    if (post_scan) {
+      post_scan(*conn);
+    }
+    return true;
+  };
   while (!tok.stop_requested()) {
     DrainState requested;
     {
@@ -408,11 +424,29 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
         wait_for_reconnect(wake_fd, backoff_ms);
         continue;
       }
-      if (!drain_outbox(conn, *outbox_cursor, delivery_lost)) {
+      if (!scan_outbox()) {
         PQfinish(conn);
         conn = nullptr;
         continue;
       }
+    }
+
+    // Queries can absorb NOTIFY into libpq's internal queue and leave the
+    // socket unreadable. Check that queue before polling, then rescan only the
+    // authoritative outbox. Continue through this boundary again because the
+    // scan itself can absorb another hint after its snapshot was taken.
+    bool hint_seen = false;
+    if (!drain_notifications(conn, {}, nullptr, &hint_seen)) {
+      PQfinish(conn);
+      conn = nullptr;
+      continue;
+    }
+    if (hint_seen) {
+      if (!scan_outbox()) {
+        PQfinish(conn);
+        conn = nullptr;
+      }
+      continue;
     }
 
     std::array<pollfd, 2> fds{};
@@ -445,7 +479,7 @@ auto run_listener(const std::stop_token& tok, const Config::Database& db_cfg,
     // Scan on every poll tick as well as every wake. NOTIFY is only a latency
     // hint, so forged, lost, or coalesced notifications cannot affect event
     // authority or recovery.
-    if (!drain_outbox(conn, *outbox_cursor, delivery_lost)) {
+    if (!scan_outbox()) {
       PQfinish(conn);
       conn = nullptr;
     }
@@ -498,15 +532,17 @@ auto start_listener(const Config::Database& db_cfg,
     listener_exited = false;
     listener_clean = true;
   }
-  listener_thread.emplace([db_cfg, fd, backoff_ms](const std::stop_token& tok) {
-    bool clean = run_listener(tok, db_cfg, fd, backoff_ms);
-    {
-      std::lock_guard exit_lock(listener_exit_mutex);
-      listener_exited = true;
-      listener_clean = clean;
-    }
-    listener_exit_cv.notify_all();
-  });
+  listener_thread.emplace(
+      [db_cfg, fd, backoff_ms,
+       post_scan = post_outbox_scan_hook](const std::stop_token& tok) {
+        bool clean = run_listener(tok, db_cfg, fd, backoff_ms, post_scan);
+        {
+          std::lock_guard exit_lock(listener_exit_mutex);
+          listener_exited = true;
+          listener_clean = clean;
+        }
+        listener_exit_cv.notify_all();
+      });
 }
 
 auto drain_listener(std::chrono::milliseconds timeout) -> bool {
@@ -561,6 +597,15 @@ auto apply_notification_for_test(std::string_view channel,
     return false;
   }
   return dispatch(*ev);
+}
+
+auto set_post_outbox_scan_hook_for_test(PostOutboxScanHook hook) -> bool {
+  std::lock_guard lock(lifecycle_mutex);
+  if (listener_thread.has_value()) {
+    return false;
+  }
+  post_outbox_scan_hook = std::move(hook);
+  return true;
 }
 
 } // namespace plinth::realtime
