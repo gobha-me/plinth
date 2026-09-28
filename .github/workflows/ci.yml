@@ -354,6 +354,58 @@ jobs:
           ctest --test-dir build --output-on-failure -R \
             '^plinth_tests_audit_authority$'
 
+      - name: WebSocket close ownership and registry sanitizer regressions
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_ws_close_ownership$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --output-on-failure --parallel 1 -R \
+            '^plinth_tests_ws_close_ownership$'
+          build/plinth_tests '[ws][registry]' --list-tests --reporter xml \
+            > registry-inventory.xml
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import subprocess
+          import xml.etree.ElementTree as ET
+          expected = {
+              'RegistryKey equality',
+              'register_connection on empty slot installs',
+              'register_connection on occupied slot returns displaced',
+              'unregister_connection ignores stale entries',
+              'session and PAT keys with same id are distinct',
+              'for_each sees all registered connections',
+              'displacement retains target metadata after concurrent context release',
+              'registry releases owners on their loop before acknowledging shutdown',
+              'registry retains owners if their loop was not published',
+              'registry closes connections on owner loops with bounded retry',
+          }
+          names = [case.findtext('Name') for case in
+                   ET.parse('registry-inventory.xml').getroot().findall('TestCase')]
+          if len(names) != 10 or set(names) != expected:
+              raise SystemExit(f'registry fixture inventory mismatch: {names!r}')
+          inventory = json.loads(subprocess.run(
+              ['ctest', '--test-dir', 'build', '--show-only=json-v1'],
+              check=True, capture_output=True, text=True).stdout)
+          gates = [test for test in inventory['tests']
+                   if test['name'] == 'plinth_tests_ws_registry']
+          if len(gates) != 1:
+              raise SystemExit('registry CTest gate missing or duplicated')
+          command = gates[0].get('command', [])
+          if (len(command) != 2 or command[1] != '[ws][registry]' or
+                  Path(command[0]).resolve() != Path('build/plinth_tests').resolve()):
+              raise SystemExit(f'registry CTest command mismatch: {command!r}')
+          PY
+          ctest --test-dir build -N -R '^plinth_tests_ws_registry$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --verbose --parallel 1 -R \
+            '^plinth_tests_ws_registry$' | tee registry-tests.log
+          grep -E 'All tests passed \([1-9][0-9]* assertions in 10 test cases\)' \
+            registry-tests.log
+
       - name: Test
         env:
           PLINTH_PG_HOST: 127.0.0.1
@@ -433,5 +485,5 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:exitcode=66
         run: |
           set -euo pipefail
-          ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 7'
+          ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 8'
           ctest --test-dir build --output-on-failure --parallel 1 -R '^plinth_tsan_'

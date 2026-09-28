@@ -857,6 +857,24 @@ add_test(NAME plinth_tests_pure
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
 
+# The ordinary groups exclude [ws] unit cases. Keep map, displacement and
+# bounded owner-release coverage positive alongside the exact close gate.
+add_test(NAME plinth_tests_ws_registry
+  COMMAND plinth_tests "[ws][registry]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_ws_registry PROPERTIES TIMEOUT 40)
+
+set(PLINTH_WS_CLOSE_OWNER_CASE
+    "registry closes connections on owner loops with bounded retry")
+add_test(NAME plinth_tests_ws_close_ownership
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "${PLINTH_WS_CLOSE_OWNER_CASE}"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_ws_close_ownership PROPERTIES TIMEOUT 40)
+
 set(PLINTH_GROUPED_JS_SELECTOR
     "[js] ~[batch-transaction] ~[isolated-logger]")
 
@@ -1073,6 +1091,18 @@ if(PLINTH_TSAN)
     "production shutdown persists and replays the last extension write" 480)
   add_plinth_tsan_case(production_partial_startup
     "partial startup uses bounded coordinator teardown" 180)
+
+  # Real EventLoopThread scheduling with a fake connection: no database or
+  # process-lifetime Drogon fixture is needed for this owner-affinity oracle.
+  add_test(NAME plinth_tsan_ws_close_ownership
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${PLINTH_WS_CLOSE_OWNER_CASE}"
+      --timeout 30
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tsan_ws_close_ownership PROPERTIES
+    LABELS "tsan" TIMEOUT 40)
 endif()
 
 # 0.5.5.2 closed the back-pressure spin race in `run_on_context`'s

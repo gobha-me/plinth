@@ -47,13 +47,14 @@ auto production_shutdown_hooks() -> ShutdownHooks {
   return ShutdownHooks{
       .close_ingress =
           [](std::chrono::milliseconds timeout) {
+            const auto deadline = std::chrono::steady_clock::now() + timeout;
             async_tasks().close_admission();
             plinth::packages::asset_server::cancel_all_registrations();
             auto& registry = plinth::ws::ConnectionRegistry::instance();
-            if (!registry.cancel_all_timers(timeout)) {
+            if (!registry.cancel_all_timers(remaining_until(deadline)) ||
+                !registry.close_all_connections(remaining_until(deadline))) {
               return false;
             }
-            registry.close_all_connections();
             plinth::ws::ConnectionRegistry::initiate_shutdown();
             return true;
           },
