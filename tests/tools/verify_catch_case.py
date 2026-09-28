@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Require one real, passing Catch2 case in the focused TSan CI lane."""
+"""Require one real, passing Catch2 case in focused sanitizer/image gates."""
 
 import argparse
 import os
@@ -39,11 +39,11 @@ def main() -> int:
         try:
             stdout, stderr = process.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            print("TSan case output pipe remained open after group kill", file=sys.stderr)
+            print("Catch2 case output pipe remained open after group kill", file=sys.stderr)
             return 1
         sys.stdout.write(stdout)
         sys.stderr.write(stderr)
-        print(f"TSan case timed out after {args.timeout}s", file=sys.stderr)
+        print(f"Catch2 case timed out after {args.timeout}s", file=sys.stderr)
         return 1
 
     sys.stdout.write(stdout)
@@ -51,15 +51,15 @@ def main() -> int:
 
     output = stdout + stderr
     if process.returncode != 0:
-        print(f"TSan case exited with status {process.returncode}", file=sys.stderr)
+        print(f"Catch2 case exited with status {process.returncode}", file=sys.stderr)
         return 1
     if re.search(r"\bskipped\b|No test cases matched", output, re.IGNORECASE):
-        print("TSan case skipped or did not match", file=sys.stderr)
+        print("Catch2 case skipped or did not match", file=sys.stderr)
         return 1
     if not re.search(
         r"All tests passed \([1-9][0-9,]* assertions? in 1 test case\)", output
     ):
-        print("TSan case did not report one passing case with assertions", file=sys.stderr)
+        print("Catch2 case did not report one passing case with assertions", file=sys.stderr)
         return 1
     return 0
 

@@ -960,7 +960,7 @@ set_tests_properties(plinth_tests_pg
 # Reuse the focused case verifier's exit/positive-assertion/no-skip contract.
 add_test(NAME plinth_tests_buffered_realtime_hints
   COMMAND ${Python3_EXECUTABLE}
-    ${CMAKE_SOURCE_DIR}/.github/scripts/verify_tsan_case.py
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
     --binary $<TARGET_FILE:plinth_tests>
     --case "realtime listener drains buffered self-notifications before polling"
     --timeout 30
@@ -1030,7 +1030,7 @@ if(PLINTH_TSAN)
     math(EXPR ctest_timeout_seconds "${timeout_seconds} + 10")
     add_test(NAME plinth_tsan_${name}
       COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_SOURCE_DIR}/.github/scripts/verify_tsan_case.py
+        ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
         --binary $<TARGET_FILE:plinth_tests>
         --case "${selector}"
         --timeout ${timeout_seconds}
