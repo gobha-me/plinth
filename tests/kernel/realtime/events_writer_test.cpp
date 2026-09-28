@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <drogon/orm/DbClient.h>
 #include <expected>
@@ -152,6 +153,7 @@ auto build_dispatched(std::string_view layer, std::string_view channel)
 struct Harness {
   drogon::orm::DbClientPtr db;
   explicit Harness(plinth::Config::Realtime::Events cfg = {}) {
+    REQUIRE_FALSE(ew::is_running_for_test());
     ew::clear_insert_hook_for_test();
     ew::clear_advisory_lock_hook_for_test();
     ew::reset_counters_for_test();
@@ -169,7 +171,14 @@ struct Harness {
     ew::start(cfg);
   }
   ~Harness() {
-    ew::stop();
+    // False also reports the intentional sticky INSERT failure in E.05.
+    // Only a joined writer permits releasing its hooks and DB dependencies.
+    (void)ew::stop();
+    if (ew::is_running_for_test()) {
+      std::fputs("events writer fixture teardown left owned work running\n",
+                 stderr);
+      std::_Exit(EXIT_FAILURE);
+    }
     ew::set_db_client_for_test(nullptr);
     ew::clear_insert_hook_for_test();
     ew::clear_advisory_lock_hook_for_test();
@@ -297,7 +306,9 @@ TEST_CASE("E.05: PG INSERT failure routes through audit pipeline",
   CHECK(ew::writes_persisted_for_test() == 0);
   CHECK(count_events_rows(pg) == 0);
   CHECK_FALSE(ew::stop());
+  CHECK_FALSE(ew::is_running_for_test());
   CHECK_FALSE(ew::stop());
+  CHECK_FALSE(ew::is_running_for_test());
 }
 
 // ── E.06 ─────────────────────────────────────────────────────────────
@@ -387,7 +398,7 @@ TEST_CASE("E.08: stop() drains the queue before joining",
 
 // ── E.09 ─────────────────────────────────────────────────────────────
 
-TEST_CASE("E.09: shutdown drain timeout audits the dropped count",
+TEST_CASE("E.09: shutdown timeout preserves owned work until clean retry",
           "[realtime][events][writer][integration]") {
   if (!pg_available()) {
     SKIP("PG not available");
@@ -395,28 +406,55 @@ TEST_CASE("E.09: shutdown drain timeout audits the dropped count",
   reset_schema(pg_config());
   plinth::Config::Realtime::Events cfg;
   cfg.write_queue_size = 1000;
-  cfg.shutdown_drain_ms = 100;
   cfg.enabled = true;
   Harness h{cfg};
 
-  // Insert hook that sleeps long enough to exceed the drain budget
-  // on the very first envelope. Subsequent entries get audited as
-  // shutdown_timeout drops.
+  // Preserve the 100 ms effective fault budget through stop's explicit
+  // argument. The existing default config independently bounds clean retry.
+  // This synthetic INSERT delay is fault injection, not a readiness sleep.
+  // Shared state remains owned by any in-flight hook after the failed stop.
+  auto inject_delay = std::make_shared<std::atomic<bool>>(true);
   ew::set_insert_hook_for_test(
-      [](const std::string&,
-         const Json::Value&) -> std::expected<std::int64_t, std::string> {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+      [inject_delay](const std::string&, const Json::Value&)
+          -> std::expected<std::int64_t, std::string> {
+        if (inject_delay->load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
         return 1;
       });
 
-  for (int i = 0; i < 10; ++i) {
+  constexpr std::uint64_t N = 10;
+  for (std::uint64_t i = 0; i < N; ++i) {
     REQUIRE(ew::enqueue_for_test(
         build_dispatched("data", "plinth:data:ext_e09.t")));
   }
-  // Harness destructor invokes stop() with the 100 ms budget. The
-  // first INSERT eats the budget (200 ms) and the remaining 9 are
-  // dropped.
-  REQUIRE(ew::queue_size_for_test() == 10);
+  REQUIRE(ew::queue_size_for_test() == N);
+
+  CHECK_FALSE(ew::stop(std::chrono::milliseconds(100)));
+  CHECK(ew::is_running_for_test());
+  CHECK(ew::queue_size_for_test() > 0);
+  CHECK(ew::queue_size_for_test() < N);
+  CHECK_FALSE(ew::enqueue_for_test(
+      build_dispatched("data", "plinth:data:ext_e09.rejected")));
+
+  // Timeout retains the queue and owner. Finish every admitted write while
+  // the original hook and DB are alive; do not turn a retry into dropped work.
+  inject_delay->store(false, std::memory_order_release);
+  REQUIRE(ew::stop());
+  CHECK_FALSE(ew::is_running_for_test());
+  CHECK(ew::queue_size_for_test() == 0);
+  CHECK(ew::writes_persisted_for_test() == N);
+  CHECK(ew::stop());
+
+  // A clean retry must also make the next fixture's start/admission viable.
+  ew::start(cfg);
+  REQUIRE(ew::is_running_for_test());
+  REQUIRE(ew::enqueue_for_test(
+      build_dispatched("data", "plinth:data:ext_e09.restart")));
+  REQUIRE(ew::stop());
+  CHECK_FALSE(ew::is_running_for_test());
+  CHECK(ew::queue_size_for_test() == 0);
+  CHECK(ew::writes_persisted_for_test() == N + 1);
 }
 
 // ── E.10 ─────────────────────────────────────────────────────────────

@@ -259,6 +259,22 @@ jobs:
           ctest --test-dir build --output-on-failure --parallel 1 -R \
             '^plinth_tests_buffered_realtime_hints$'
 
+      - name: Writer timeout ownership sanitizer regression
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_writer_timeout_ownership$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --output-on-failure --parallel 1 -R \
+            '^plinth_tests_writer_timeout_ownership$'
+
       - name: Focused QuickJS synchronous-binding sanitizer corpora
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1

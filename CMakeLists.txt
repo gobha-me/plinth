@@ -970,6 +970,18 @@ set_tests_properties(plinth_tests_buffered_realtime_hints
              LABELS "needs_pg"
              TIMEOUT 40)
 
+add_test(NAME plinth_tests_writer_timeout_ownership
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "E.09: shutdown timeout preserves owned work until clean retry"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_writer_timeout_ownership
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             TIMEOUT 40)
+
 # Repeated production boots need their own aggregate budget under sanitizers.
 # Keep the per-process lifecycle bounds unchanged and serialize both groups
 # against the shared PostgreSQL fixture, including when CTest runs in parallel.
