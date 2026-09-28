@@ -359,7 +359,7 @@ TEST_CASE("async_bridge: audit.log writes a row",
 
   auto pool = make_pool();
   auto result =
-      eval_async(pool, "audit.log('ext.test.foo', {bar: 1}).then(() => 'ok')");
+      eval_async(pool, "audit.log('ext.host.foo', {bar: 1}).then(() => 'ok')");
   REQUIRE(result.value.has_value());
   REQUIRE(result.value->asString() == "ok");
   // The audit row lands via spdlog's async sink; we can't synchronously
@@ -394,7 +394,7 @@ TEST_CASE("async_bridge: audit.log with reserved payload field rejects",
           "[js][async][audit][group_e]") {
   auto pool = make_pool();
   const auto* src = R"(
-        audit.log('ext.test.foo', {user_id: 'x'}).catch(e => e.code)
+        audit.log('ext.host.foo', {user_id: 'x'}).catch(e => e.code)
     )";
   auto result = eval_async(pool, src);
   REQUIRE(result.value.has_value());
@@ -414,7 +414,7 @@ TEST_CASE(
   plinth::log::test_reset_ready(); // flips g_audit_ready false
   auto pool = make_pool();
   const auto* src = R"(
-        audit.log('ext.test.foo', {x: 1}).catch(e => e.code)
+        audit.log('ext.host.foo', {x: 1}).catch(e => e.code)
     )";
   auto result = eval_async(pool, src);
   REQUIRE(result.value.has_value());
@@ -446,7 +446,7 @@ TEST_CASE(
     "[js][async][audit][sync_misuse]") {
   auto pool = make_pool();
   auto result =
-      eval_async(pool, "try { audit.log('ext.test.foo'); 'no-throw' } "
+      eval_async(pool, "try { audit.log('ext.host.foo'); 'no-throw' } "
                        "catch (e) { e.message }");
   REQUIRE(result.value.has_value());
   REQUIRE(result.value->asString().find("expected") != std::string::npos);
@@ -464,7 +464,7 @@ TEST_CASE("async_bridge: max_concurrent_async_ops=0 rejects with "
   // The binding enqueues; the loop's per-op check rejects before
   // dispatch.
   auto* bc = pool.acquire();
-  auto result = drive(*bc, "audit.log('ext.test.foo', {}).catch(e => e.code)");
+  auto result = drive(*bc, "audit.log('ext.host.foo', {}).catch(e => e.code)");
   pool.destroy(bc);
   REQUIRE(result.value.has_value());
   REQUIRE(result.value->asString() == "async.concurrency_limit");
@@ -734,7 +734,7 @@ TEST_CASE("async_bridge: F.23 two threads query and audit independently",
       auto r = drogon::sync_wait(run_on_context(*bc, R"(
         (async () => {
           const result = await db.query('SELECT 1 AS x');
-          await audit.log('ext.test.f23', {value: result.rows[0].x});
+          await audit.log('ext.host.f23', {value: result.rows[0].x});
           return result.rows[0].x;
         })()
       )"));

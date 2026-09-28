@@ -19,6 +19,30 @@ guard documented in
 The bridge still sets an extension-local path for name resolution, but access
 control must remain correct if that path is changed by extension SQL.
 
+## Audit authority amendment (2026-09-28)
+
+`audit.log` derives its owner from the executing callee's
+`BridgeContext::extension_name`, even when `Extension*` is null. An empty
+name uses the audit-only owner `host`; this does not mutate the context or
+assign an extension identity to anonymous host database pools. After the
+existing argument conversion, policy precedence is: cancelled context,
+kernel-reserved prefix, malformed non-`ext.` prefix, embedded NUL, exact
+`ext.<owner>.` prefix, reserved root fields, trusted enrichment, enqueue.
+The exact owner boundary requires the trailing dot; it adds no suffix or
+package-name grammar. Cross-owner events reject with `audit.invalid_prefix`.
+The existing non-`ext.` and embedded-NUL rejection messages are unchanged.
+
+All seven caller-supplied reserved **root** keys reject regardless of their
+values, including values equal to the trusted ones. Only after this gate
+does the binding add `extension_id = owner` and `call_depth = bc.call_depth`
+to its owned JSON payload. These fields persist in the audit row's `detail`,
+not new columns. The enriched payload moves into `AsyncOp` together with
+the existing user/session/IP snapshots. Detached dispatch does not reread
+mutable context identity or depth. User/session/IP remain existing row
+columns, and node_id/timestamp remain writer-owned row columns. This
+amendment does not change schema, writer acknowledgement, fire-and-forget
+semantics, plain-object validation, or recursive payload policy.
+
 ## Overview
 
 This ICD defines the **async bridge** for Plinth's QuickJS integration: the coroutine dispatch loop that translates JS `await` into Drogon `co_await`, the JS promise↔C++ callback plumbing, and the first two async kernel-API namespaces — `db.*` and `audit.*`.
@@ -355,7 +379,10 @@ Lives in `src/kernel/js/stdlib/audit_bindings.cpp`, registered in `inject_kernel
 
 ### Reserved Prefix Policy
 
-Extensions MUST prefix their event types with `ext.<extension_id>.` — the `<extension_id>` comes from the extension's manifest (`architecture/05-extensions.md §1`). Since 0.3.3 does not yet wire the extension installer (0.4.x), the bridge uses the string held on `BridgeContext::extension` (or `"host"` when `extension == nullptr`, the test-driver case).
+Extensions MUST prefix their event types with `ext.<extension_id>.` — the
+current authority is `BridgeContext::extension_name`, as specified by the
+audit authority amendment above. A null `Extension*` does not override a
+named executing callee; only an empty name uses the audit-only `host` fallback.
 
 Kernel-reserved prefixes (canonical list from ICD-0.1.7 §Audit Event Catalog):
 
@@ -380,17 +407,17 @@ Calling with a malformed prefix (does not start with `ext.`) rejects with:
 
 ### Non-Forgeable Provenance
 
-These fields on the audit row are filled by the kernel from `BridgeContext`; JS callers **cannot override them**:
+These fields are kernel-owned; JS callers **cannot override them**:
 
 - `user_id` — from `bc.user.user_id` (once the BridgeContext is wired to a UserContext via 0.3.4; in 0.3.3 test drivers, populated from the driver-provided `UserContext`)
 - `session_id` — from `bc.user.session_id`
 - `ip_address` — from `bc.user.ip_address`
-- `extension_id` — from `bc.extension` (or `"host"` for direct test-driver execution)
+- `extension_id` — in `detail`, from `bc.extension_name` (or `"host"` only when the name is empty), snapshotted at enqueue
 - `node_id` — from `plinth::Config::node_id`
-- `call_depth` — from `bc.call_depth`
+- `call_depth` — in `detail`, from `bc.call_depth`, snapshotted at enqueue
 - `timestamp` — from `NOW()` at PG-insert time (per ICD-0.1.7 table schema)
 
-If the JS `payload` contains any of the keys `user_id`, `session_id`, `ip_address`, `extension_id`, `node_id`, `call_depth`, `timestamp`, **the promise rejects** with:
+If the JS `payload` contains any of the root keys `user_id`, `session_id`, `ip_address`, `extension_id`, `node_id`, `call_depth`, `timestamp`, **the promise rejects** with:
 
 ```
 { code: "audit.reserved_field", message: "payload contains non-forgeable field: <field>" }
@@ -563,7 +590,7 @@ Measured on the CI builder image, runtime pre-initialized. Informational targets
 
 - `db.query("SELECT 1")` round trip (single row, empty params): **≤ 2 ms** (dominated by PG round trip, not bridge overhead).
 - Bridge overhead alone (measured against a mock async op that resolves immediately): **≤ 50 μs** per op.
-- `audit.log("ext.test.foo", {})` round trip: **≤ 100 μs** (async sink-bound, not PG-bound).
+- `audit.log("ext.host.foo", {})` host-driver round trip: **≤ 100 μs** (async sink-bound, not PG-bound).
 - Cancellation cascade to `EvalError`: **≤ 5.1 s** worst case (5 s drain + teardown).
 
 ---
@@ -635,10 +662,10 @@ Test file: `tests/kernel/js/async_bridge_test.cpp` (one file per ICD-0.3.2 prece
 
 **Group E — `audit.*` (this ICD's unique surface):**
 
-18. `audit.log("ext.test.foo", {bar: 1})` resolves; the `plinth.audit_log` row exists with `action = "ext.test.foo"`, `detail->>'bar' = '1'`, `user_id / session_id / node_id` filled by kernel.
+18. Host-driver `audit.log("ext.host.foo", {bar: 1})` resolves; the `plinth.audit_log` row exists with `action = "ext.host.foo"`, `detail->>'bar' = '1'`, trusted `detail.extension_id / detail.call_depth`, and `user_id / session_id / node_id` columns filled by kernel.
 19. `audit.log("user.login", {...})` (kernel-reserved prefix) rejects with `{code: "audit.reserved_prefix"}`.
 20. `audit.log("malformed", {...})` rejects with `{code: "audit.invalid_prefix"}`.
-21. `audit.log("ext.test.foo", {user_id: "00000000-..."})` rejects with `{code: "audit.reserved_field"}`.
+21. Host-driver `audit.log("ext.host.foo", {user_id: "00000000-..."})` rejects with `{code: "audit.reserved_field"}`.
 22. `audit.log(...)` called before `plinth::log::init()` rejects with `{code: "audit.not_ready"}` (runnable via a test-only `plinth::log::test_reset_ready()` helper — lives under `PLINTH_JS_TEST_SHIMS`).
 
 **Group F — ThreadSanitizer smoke:**

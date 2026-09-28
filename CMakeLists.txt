@@ -658,6 +658,7 @@ add_executable(plinth_tests
   tests/kernel/js/json_nul_preservation_test.cpp
   tests/kernel/js/conversion_corpus_test.cpp
   tests/kernel/js/host_string_boundary_test.cpp
+  tests/kernel/js/audit_authority_regression_test.cpp
   tests/kernel/js/log_corpus_test.cpp
   tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -928,6 +929,11 @@ add_test(NAME plinth_tests_host_string_boundary
   COMMAND plinth_tests "[js][stdlib][host-string-boundary]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_host_string_boundary PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_tests_audit_authority
+  COMMAND plinth_tests "[js][audit][authority-regression]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_audit_authority PROPERTIES TIMEOUT 30)
 
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"

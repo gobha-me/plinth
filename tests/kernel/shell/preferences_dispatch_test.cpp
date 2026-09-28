@@ -689,6 +689,8 @@ TEST_CASE("A.01: boundary audit dispatch writes sanitized identity",
   REQUIRE(stored["error_message"] == "boom");
   REQUIRE(stored["error_stack"] == "stack");
   REQUIRE(stored["component_path"] == "App/Demo");
+  REQUIRE(stored["extension_id"] == "shell");
+  REQUIRE(stored["call_depth"] == 1);
   REQUIRE_FALSE(stored.isMember("user_id"));
 }
 

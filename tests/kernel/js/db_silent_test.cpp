@@ -240,7 +240,7 @@ TEST_CASE("S.03: silent=true does not suppress `audit.log` — both rows fire",
   auto pool = make_pool(cfg);
   auto r = eval_as(pool, "silent_s03",
                    "(async () => {"
-                   "  await audit.log('ext.test.marker', {k: 1});"
+                   "  await audit.log('ext.silent_s03.marker', {k: 1});"
                    "  await db.exec(\"INSERT INTO ext_silent_s03.notes(body) "
                    "                    VALUES('x')\","
                    "                [], {silent: true});"
@@ -249,9 +249,9 @@ TEST_CASE("S.03: silent=true does not suppress `audit.log` — both rows fire",
   REQUIRE(r.value.has_value());
 
   REQUIRE(wait_for_audit(pg, "db.silent.used", "silent_s03", 1));
-  // The audit.log call emits action="ext.test.marker" unconditionally;
+  // The audit.log call emits action="ext.silent_s03.marker";
   // any count ≥ 1 verifies the side-channel is independent of silent.
-  REQUIRE(pg.count_audit_any("ext.test.marker") >= 1);
+  REQUIRE(pg.count_audit_any("ext.silent_s03.marker") >= 1);
 }
 
 // ─── S.04 ─────────────────────────────────────────────────────────
