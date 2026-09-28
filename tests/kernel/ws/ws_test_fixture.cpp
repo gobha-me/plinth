@@ -1,4 +1,5 @@
 #include "ws_test_fixture.hpp"
+#include "listener_readiness.hpp"
 
 #include "kernel/auth/crypto.hpp"
 #include "kernel/cap/api_cap.hpp"
@@ -23,6 +24,7 @@
 
 #include "../test_process.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <cstdlib>
@@ -32,6 +34,7 @@
 #include <json/reader.h>
 #include <json/writer.h>
 #include <stdexcept>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace plinth::ws_test {
@@ -223,8 +226,15 @@ namespace {
 std::once_flag g_server_once;
 std::thread g_server_thread;
 std::atomic<bool> g_server_ready{false};
+std::atomic<bool> g_server_thread_owned{false};
+std::mutex g_startup_mu;
+std::shared_ptr<detail::ListenerReadiness> g_listener_readiness;
+std::shared_ptr<ServerStartupControl> g_startup_control;
 
 auto start_test_server() -> void {
+  if (g_server_thread_owned.load()) {
+    throw std::runtime_error("Drogon test server startup already failed");
+  }
   // 0.6.3.N — `cfg` must outlive this function so the
   // `extensions::init_registry(cfg)` call below can stash a stable
   // pointer that `create_pool` reads on every later install event.
@@ -255,9 +265,29 @@ auto start_test_server() -> void {
                                cfg.db.database, cfg.db.user, cfg.db.password,
                                cfg.db.pool_size);
   auto shutdown = std::make_shared<plinth::lifecycle::ShutdownCoordinator>();
-  plinth::test_process::register_shutdown([shutdown] {
-    if (!g_server_ready.load()) {
+  auto readiness = std::make_shared<detail::ListenerReadiness>(2, TEST_PORT);
+  std::shared_ptr<ServerStartupControl> startup_control;
+  {
+    std::lock_guard lock(g_startup_mu);
+    g_listener_readiness = readiness;
+    startup_control = g_startup_control;
+  }
+  plinth::test_process::register_shutdown([shutdown, readiness,
+                                           startup_control] {
+    if (!g_server_thread_owned.load()) {
       return;
+    }
+    // Failed startup still owns a running thread and initialized dependencies.
+    // Stop publishing readiness and settle borrowed-FD acknowledgements while
+    // their listeners/loops are alive, BEFORE the production shutdown graph.
+    g_server_ready.store(false);
+    readiness->cancel();
+    if (startup_control) {
+      startup_control->release();
+    }
+    if (!readiness->drain_until(std::chrono::steady_clock::now() +
+                                std::chrono::seconds{5})) {
+      throw std::runtime_error("test listener acknowledgements did not drain");
     }
     auto result = shutdown->quiesce();
     if (!result.clean) {
@@ -267,6 +297,7 @@ auto start_test_server() -> void {
     if (g_server_thread.joinable()) {
       g_server_thread.join();
     }
+    g_server_thread_owned.store(false);
     shutdown->finish_after_drogon();
   });
   if (!plinth::packages::rbac_test::start_async_workers()) {
@@ -323,23 +354,133 @@ auto start_test_server() -> void {
       .setThreadNum(2)
       .disableSigtermHandling();
 
-  // Drogon signals "ready" from its main loop; capture it here.
-  drogon::app().getLoop()->queueInLoop([]() { g_server_ready.store(true); });
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  drogon::app().setBeforeListenSockOptCallback([readiness, startup_control,
+                                                deadline](int fd) {
+    auto* owner = trantor::EventLoop::getEventLoopOfCurrentThread();
+    if (owner == nullptr || owner->index() >= 2 ||
+        drogon::app().getIOLoop(owner->index()) != owner) {
+      readiness->fail("listener is not on a configured IO owner");
+      return;
+    }
+    // Acceptor::listen() calls this on its owner BEFORE listen(). The ack
+    // must be queued, never inline; both configured IO owners must finish.
+    readiness->before_listen(fd, owner, owner->index());
+    if (startup_control &&
+        !startup_control->hold_before_listen(fd, owner->index(), deadline)) {
+      readiness->fail("controlled listener startup deadline expired");
+    }
+  });
 
-  g_server_thread = std::thread([]() { drogon::app().run(); });
+  if (startup_control) {
+    // This is the old premature ready-marker position, retained only as an
+    // observation in the isolated regression. It no longer publishes ready.
+    drogon::app().getLoop()->queueInLoop(
+        [startup_control] { startup_control->mark_main_loop(); });
+  }
 
-  // Wait up to 5s for the ready signal.
-  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!g_server_ready.load() &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  // Publish owner responsibility before the new thread can reach either
+  // before-listen callback. Roll back only if no thread was constructed.
+  g_server_thread_owned.store(true);
+  try {
+    g_server_thread = std::thread([]() { drogon::app().run(); });
+  } catch (...) {
+    g_server_thread_owned.store(false);
+    readiness->cancel();
+    if (startup_control) {
+      startup_control->release();
+    }
+    throw;
   }
-  if (!g_server_ready.load()) {
-    throw std::runtime_error("Drogon test server failed to start");
+
+  // The existing five-second startup budget now measures actual listen acks.
+  if (!readiness->wait_until(deadline)) {
+    if (startup_control) {
+      startup_control->release();
+    }
+    throw std::runtime_error("Drogon test server failed to start: " +
+                             readiness->snapshot().error);
   }
+  g_server_ready.store(true);
 }
 
 } // namespace
+
+auto ServerStartupControl::hold_before_listen(
+    int fd, std::size_t owner, std::chrono::steady_clock::time_point deadline)
+    -> bool {
+  int accepting = -1;
+  socklen_t size = sizeof(accepting);
+  const bool nonaccepting =
+      ::getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &size) == 0 &&
+      size == sizeof(accepting) && accepting == 0;
+  std::unique_lock lock(mu);
+  if (owner >= 2 || std::ranges::find(owners, owner) != owners.end() ||
+      !nonaccepting) {
+    failed = true;
+    released = true;
+  } else {
+    owners.push_back(owner);
+    ++nonaccepting_sockets;
+  }
+  cv.notify_all();
+  if (!cv.wait_until(lock, deadline, [this] { return released; })) {
+    failed = true;
+    released = true;
+    cv.notify_all();
+  }
+  return !failed;
+}
+
+auto ServerStartupControl::mark_main_loop() -> void {
+  std::lock_guard lock(mu);
+  main_marker = true;
+  cv.notify_all();
+}
+
+auto ServerStartupControl::release() -> void {
+  std::lock_guard lock(mu);
+  released = true;
+  cv.notify_all();
+}
+
+auto ServerStartupControl::wait_held_until(
+    std::chrono::steady_clock::time_point deadline) -> bool {
+  std::unique_lock lock(mu);
+  return cv.wait_until(lock, deadline,
+                       [this] {
+                         return failed || (main_marker && owners.size() == 2);
+                       }) &&
+         !failed && !released;
+}
+
+auto ServerStartupControl::snapshot() const -> Snapshot {
+  std::lock_guard lock(mu);
+  return {owners.size(), nonaccepting_sockets, main_marker, released, failed};
+}
+
+auto install_server_startup_control(
+    std::shared_ptr<ServerStartupControl> control) -> void {
+  std::lock_guard lock(g_startup_mu);
+  if (g_server_thread_owned.load() || g_listener_readiness) {
+    throw std::runtime_error(
+        "startup control requires a fresh fixture process");
+  }
+  g_startup_control = std::move(control);
+}
+
+auto server_startup_snapshot() -> ServerStartupSnapshot {
+  std::shared_ptr<detail::ListenerReadiness> readiness;
+  {
+    std::lock_guard lock(g_startup_mu);
+    readiness = g_listener_readiness;
+  }
+  const auto state =
+      readiness ? readiness->snapshot() : detail::ListenerReadinessSnapshot{};
+  return {g_server_thread_owned.load(), g_server_ready.load(), state.failed,
+          state.acknowledgements, state.pending};
+}
 
 auto test_server_port() -> uint16_t {
   std::call_once(g_server_once, []() { start_test_server(); });
@@ -434,6 +575,8 @@ auto WsTestClient::connect(
     std::promise<bool> result;
     std::atomic<bool> delivered{false};
     drogon::WebSocketConnectionPtr connection;
+    std::chrono::steady_clock::time_point started{
+        std::chrono::steady_clock::now()};
   };
   auto completion = std::make_shared<Completion>();
   auto future = completion->result.get_future();
@@ -446,16 +589,31 @@ auto WsTestClient::connect(
   // its completion and never accesses this fixture or a caller's stack.
   client->connectToServer(
       req, [completion](drogon::ReqResult result,
-                        const drogon::HttpResponsePtr& /*response*/,
+                        const drogon::HttpResponsePtr& response,
                         const drogon::WebSocketClientPtr& websocket) {
         if (!completion->delivered.exchange(true)) {
           if (result == drogon::ReqResult::Ok) {
             completion->connection = websocket->getConnection();
+          } else {
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - completion->started);
+            // No URL, headers, tokens, frame bodies or arbitrary error text.
+            // Status 0 means no response was provided, not an HTTP status.
+            plinth::log::warn(
+                "ws_test: first connect result={} ({}) elapsed_ms={} "
+                "http_status={}",
+                static_cast<int>(result), drogon::to_string_view(result),
+                elapsed.count(),
+                response ? static_cast<int>(response->statusCode()) : 0);
           }
           completion->result.set_value(result == drogon::ReqResult::Ok);
         }
       });
   if (future.wait_for(timeout) != std::future_status::ready) {
+    plinth::log::warn("ws_test: first connect callback deadline expired "
+                      "after_ms={}",
+                      timeout.count());
     return false;
   }
   const bool ok = future.get();

@@ -20,6 +20,16 @@ The coordinator executes these nodes in order:
    - Disable extension asset routes.
    - Cancel WebSocket timers, initiate normal WebSocket closes, and close the
      connection registry to later mutation.
+   - Registry admission is sealed atomically before freezing one close batch.
+     Both the connection-status check and normal close run on each entry's
+     immutable captured IO loop, not on the coordinator thread. Timer
+     cancellation and close acknowledgements share this node's remaining
+     deadline. A timeout retains the same queued batch for retry; missing loops
+     fail closed, and failed/broken acknowledgements remain reported failures.
+     Callback-held connection/state owners are released on-loop before their
+     acknowledgement. Remaining registry owners are released at node 10. This
+     confirms close initiation, not receipt of the peer's FIN or database
+     persistence.
 2. `drain_http_requests`
    - Wait for every HTTP handler admitted before the ingress gate closed to
      produce its response. A pre-handling fallback rejects requests that raced
@@ -198,3 +208,8 @@ pool is owned by Drogon; each accepted completion holds an async task lease.
 Closing ingress cancels authority timers and invalidates their deadlines before
 async work drains. The one-second callback/statement timeouts bound blocked
 renewals without keeping the connection's event loop alive indefinitely.
+
+The registered-connection close barrier does not add pre-authentication
+connections to the registry or redesign late authentication acceptance/timer
+admission. Those adjacent paths keep their existing authority and async-task
+protocols; this repair does not claim complete coverage of all timer families.
