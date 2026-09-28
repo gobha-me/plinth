@@ -11,9 +11,10 @@
 // `ext.shell.frontend.boundary.caught`. The action name comes from this
 // handler — never from the caller's `detail` — so panels cannot forge
 // other audit kinds even with a hand-crafted body. The non-forgeable
-// identity payload (`user_id`, `session_id`, `extension_id`,
-// `node_id`, `timestamp`) is filled by the audit binding from the
-// kernel-bound BridgeContext per `audit_bindings.cpp:44-56`.
+// caller user/session/IP is snapshotted by the audit binding into owned
+// AsyncOp fields. The binding adds trusted `extension_id: 'shell'` and
+// `call_depth` to owned JSON detail at enqueue from the executing callee's
+// BridgeContext; node_id and timestamp remain writer-owned row columns.
 //
 // Implementation deviations from ICD §6.4 + §11 + §A.4 (recorded in §17):
 //
@@ -39,8 +40,8 @@
 //
 //   3. The action name is `ext.shell.frontend.boundary.caught`, not
 //      `frontend.boundary.caught` per ICD §9.1. Reason: the
-//      `audit.log()` host binding requires the `ext.` prefix on every
-//      extension audit (`audit_bindings.cpp:168-173`); `frontend.*`
+//      `audit.log()` host binding requires the exact executing callee's
+//      `ext.shell.` prefix on shell audits; `frontend.*`
 //      would be rejected with `audit.invalid_prefix`. The effective
 //      taxonomy is identical — `ext.shell.*` namespace conveys the
 //      same provenance — and consumers (admin dashboards, log
@@ -59,7 +60,7 @@ const COMPONENT_LIMIT = 8192;
 const APPLICATION_LIMIT = 64;
 const PANEL_LIMIT = 64;
 
-// Reserved payload keys per audit_bindings.cpp:52-54 (RESERVED_PAYLOAD_KEYS).
+// Reserved root payload keys per audit_bindings.cpp (RESERVED_PAYLOAD_KEYS).
 // Stripping them ensures the client cannot smuggle them past the binding
 // (which rejects payloads containing any of these with audit.reserved_field).
 const RESERVED_KEYS = [

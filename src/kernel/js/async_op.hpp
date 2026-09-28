@@ -97,10 +97,14 @@ struct AsyncOp {
   std::vector<Json::Value> sql_params; // DB_QUERY, DB_EXEC (optional)
   bool silent = false;          // DB_EXEC; carried for 0.5.x realtime hook
   std::string audit_event_type; // AUDIT_WRITE
-  Json::Value audit_payload;    // AUDIT_WRITE
+  // AUDIT_WRITE owned detail, including trusted extension_id and call_depth
+  // added at enqueue after rejecting caller-supplied reserved root keys.
+  // Detached dispatch consumes this snapshot without rereading the BC.
+  Json::Value audit_payload;
   // AUDIT_WRITE identity snapshot. The binding captures these on the owning
   // JS loop before the operation moves to a detached worker, so audit rows
-  // cannot lose or substitute the authenticated caller identity.
+  // cannot lose or substitute the authenticated caller identity. These
+  // remain row columns; node_id/timestamp stay writer-owned columns.
   std::string audit_user_id;
   std::string audit_session_id;
   std::string audit_ip_address;

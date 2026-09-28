@@ -14,10 +14,15 @@
 //      prefix) → reject with audit.reserved_prefix.
 //   4. Invalid-prefix check (event_type doesn't start with "ext.")
 //      → reject with audit.invalid_prefix.
-//   5. Reserved-field check (payload contains user_id/session_id/
+//   5. Embedded NUL check → reject with audit.invalid_prefix.
+//   6. Exact owner-prefix check (ext.<bc.extension_name>., or ext.host.
+//      for an unnamed host context) → reject with audit.invalid_prefix.
+//   7. Reserved root-field check (payload contains user_id/session_id/
 //      ip_address/extension_id/node_id/call_depth/timestamp) → reject
 //      with audit.reserved_field.
-//   6. g_audit_ready gate is checked at dispatch time (Step 8) — not
+//   8. Snapshot trusted extension_id and call_depth into the owned JSON
+//      detail, then enqueue it alongside the existing caller snapshots.
+//   9. g_audit_ready gate is checked at dispatch time (Step 8) — not
 //      here — so the audit.not_ready rejection path is exercised by a
 //      separate code path. The binding always enqueues if the
 //      validation gauntlet passes.
@@ -46,9 +51,10 @@ namespace {
 constexpr std::array<std::string_view, 6> KERNEL_RESERVED_PREFIXES = {
     "user.", "session.", "pat.", "group.", "rbac.", "capability."};
 
-// Non-forgeable payload keys — the kernel fills these from the
-// BridgeContext at dispatch time. Presence of any in the JS payload
-// rejects with audit.reserved_field per ICD §Non-Forgeable Provenance.
+// Caller-supplied root keys reject unconditionally, even with matching
+// values. After this gate, extension_id and call_depth are added to the
+// owned detail at enqueue; caller identity is separately snapshotted on
+// AsyncOp, while node_id and timestamp remain writer-owned row columns.
 constexpr std::array<std::string_view, 7> RESERVED_PAYLOAD_KEYS = {
     "user_id", "session_id", "ip_address", "extension_id",
     "node_id", "call_depth", "timestamp"};
@@ -159,6 +165,17 @@ auto audit_log(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
     return reject_inline(ctx, "audit.invalid_prefix",
                          "extension audit event_type must not contain NUL");
   }
+  // The executing callee's name is authoritative even when Extension* is
+  // null. The audit-only host fallback does not rename the BridgeContext
+  // or change anonymous host database admission.
+  const std::string owner =
+      bc->extension_name.empty() ? "host" : bc->extension_name;
+  const std::string owner_prefix = "ext." + owner + ".";
+  if (!starts_with(event_type, owner_prefix)) {
+    return reject_inline(ctx, "audit.invalid_prefix",
+                         "extension audit events must start with '" +
+                             owner_prefix + "'");
+  }
   // Reserved-field check.
   auto bad_key = find_reserved_payload_key(payload);
   if (!bad_key.empty()) {
@@ -166,6 +183,12 @@ auto audit_log(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
                          std::string{"payload contains non-forgeable field: "} +
                              std::string{bad_key});
   }
+
+  // Enrich only after rejecting every caller-supplied reserved root key.
+  // This owned enqueue snapshot travels to the detached dispatch path;
+  // the worker must not reread mutable BridgeContext authority or depth.
+  payload["extension_id"] = owner;
+  payload["call_depth"] = bc->call_depth;
 
   // All validation passed — enqueue the AsyncOp.
   std::array<JSValue, 2> resolving{};

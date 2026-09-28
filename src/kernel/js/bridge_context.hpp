@@ -85,6 +85,9 @@ struct BridgeContext {
   // 0.4.4 extension-install seed is the authoritative populator; the
   // kernel-internal host-eval path leaves this empty, matching
   // ICD-0.5.0 §`pubsub.*` JS Stdlib → BridgeContext extension identity.
+  // This name is also the executing callee's audit authority, independent
+  // of the optional Extension*. audit.log uses "host" only as a local
+  // fallback when this is empty, without renaming anonymous DB contexts.
   std::string extension_name;
 
   // --- Resource tracking ---
@@ -101,7 +104,8 @@ struct BridgeContext {
 
   // Call depth is carried here for future cap.call-from-JS wiring
   // (ICD-0.3.4); the capability dispatcher already owns the enforcement
-  // check — see ICD-0.2.2 §Call Depth Tracking.
+  // check — see ICD-0.2.2 §Call Depth Tracking. audit.log snapshots this
+  // depth into owned detail at enqueue, not from a detached worker.
   int call_depth = 0;
   int max_call_depth = 8;
 
