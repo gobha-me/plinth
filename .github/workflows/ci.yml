@@ -231,6 +231,18 @@ jobs:
       - name: Build
         run: cmake --build build --parallel 2
 
+      - name: Isolated logger capture inventory and sanitizer oracles
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R \
+            '^plinth_tests_(logger_capture_(inventory|isolated)|log_oracle)$' |
+            grep -Ex 'Total Tests: 3'
+          ctest --test-dir build --output-on-failure --parallel 1 -R \
+            '^plinth_tests_(logger_capture_(inventory|isolated)|log_oracle)$'
+
       - name: Focused QuickJS synchronous-binding sanitizer corpora
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1

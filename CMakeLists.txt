@@ -856,8 +856,34 @@ add_test(NAME plinth_tests_pure
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
 
+set(PLINTH_GROUPED_JS_SELECTOR
+    "[js] ~[batch-transaction] ~[isolated-logger]")
+
+# spdlog's default free APIs cannot overlap a default-logger replacement.
+# These five synchronous capture fixtures must run before any background
+# database/event-loop fixture is initialized in their process.
+add_test(NAME plinth_tests_logger_capture_inventory
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/logger_capture_inventory_test.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --grouped-selector "${PLINTH_GROUPED_JS_SELECTOR}"
+    --ctest-command ${CMAKE_CTEST_COMMAND}
+    --build-dir ${CMAKE_BINARY_DIR}
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_logger_capture_inventory PROPERTIES TIMEOUT 90)
+
+add_test(NAME plinth_tests_logger_capture_isolated
+  COMMAND plinth_tests "[isolated-logger]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_logger_capture_isolated PROPERTIES TIMEOUT 120)
+
+add_test(NAME plinth_tests_log_oracle
+  COMMAND plinth_tests "[js][stdlib][log][oracle]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_log_oracle PROPERTIES TIMEOUT 30)
+
 add_test(NAME plinth_tests_js
-  COMMAND plinth_tests "[js] ~[batch-transaction]"
+  COMMAND plinth_tests "${PLINTH_GROUPED_JS_SELECTOR}"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_js
   PROPERTIES RESOURCE_LOCK plinth_pg_schema
