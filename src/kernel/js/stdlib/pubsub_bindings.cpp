@@ -108,11 +108,12 @@ auto pubsub_publish(JSContext* ctx, JSValue /*this_val*/, int argc,
     return JS_ThrowTypeError(ctx, "pubsub.publish: channel must be a string");
   }
 
-  const char* ch_cs = JS_ToCString(ctx, args[0]);
+  std::size_t channel_len = 0;
+  const char* ch_cs = JS_ToCStringLen(ctx, &channel_len, args[0]);
   if (ch_cs == nullptr) {
     return JS_EXCEPTION;
   }
-  std::string channel(ch_cs);
+  std::string channel(ch_cs, channel_len);
   JS_FreeCString(ctx, ch_cs);
 
   // Convert payload via the shared js_to_json helper.
@@ -210,11 +211,12 @@ auto pubsub_unsubscribe_trampoline(JSContext* ctx, JSValueConst /*this_val*/,
   // func_data is a QuickJS-managed array; wrap as span to keep the
   // `[0]` read in bounds-safe API.
   auto data_span = std::span<const JSValueConst>{func_data, 1};
-  const char* ch_cs = JS_ToCString(ctx, data_span.front());
+  std::size_t channel_len = 0;
+  const char* ch_cs = JS_ToCStringLen(ctx, &channel_len, data_span.front());
   if (ch_cs == nullptr) {
     return JS_UNDEFINED;
   }
-  std::string channel(ch_cs);
+  std::string channel(ch_cs, channel_len);
   JS_FreeCString(ctx, ch_cs);
 
   // Enqueue a sync AsyncOp so the actual deregistration happens on
@@ -285,11 +287,12 @@ auto pubsub_subscribe(JSContext* ctx, JSValue /*this_val*/, int argc,
                              "pubsub.subscribe: handler must be a function");
   }
 
-  const char* ch_cs = JS_ToCString(ctx, args[0]);
+  std::size_t channel_len = 0;
+  const char* ch_cs = JS_ToCStringLen(ctx, &channel_len, args[0]);
   if (ch_cs == nullptr) {
     return JS_EXCEPTION;
   }
-  std::string channel(ch_cs);
+  std::string channel(ch_cs, channel_len);
   JS_FreeCString(ctx, ch_cs);
 
   BridgeContext* bc = get_bc(ctx);
