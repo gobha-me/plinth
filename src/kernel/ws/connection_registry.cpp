@@ -228,12 +228,75 @@ auto ConnectionRegistry::cancel_all_timers(std::chrono::milliseconds timeout)
   return true;
 }
 
-auto ConnectionRegistry::close_all_connections() -> void {
-  for_each([](const drogon::WebSocketConnectionPtr& conn) {
-    if (conn != nullptr && conn->connected()) {
-      conn->shutdown(drogon::CloseCode::kEndpointGone, "server shutdown");
+auto ConnectionRegistry::close_all_connections(
+    std::chrono::milliseconds timeout) -> bool {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  std::vector<std::shared_future<void>> pending;
+  std::exception_ptr enqueue_failure;
+  {
+    std::lock_guard lock(mu);
+    // Seal before freezing the batch, under the same admission mutex. A retry
+    // must inspect retained completions, even after initiate_shutdown gates
+    // ordinary snapshots or a concurrent close callback unregisters its entry.
+    sealed = true;
+    if (!close_started) {
+      for (const auto& [_, entry] : conns) {
+        if (entry.loop == nullptr) {
+          return false;
+        }
+      }
+      closes.reserve(conns.size());
+      close_started = true;
+      try {
+        for (const auto& [_, entry] : conns) {
+          auto done = std::make_shared<std::promise<void>>();
+          closes.push_back(done->get_future().share());
+          auto owned = entry;
+          auto* loop = owned.loop;
+          // Move the entire copy, rather than leaving a coordinator-thread
+          // snapshot that could become the last owner after unregister.
+          loop->queueInLoop([owned = std::move(owned), done]() mutable {
+            std::exception_ptr failure;
+            try {
+              if (owned.conn != nullptr && owned.conn->connected()) {
+                // Drogon's shutdown also reads TCP status before scheduling
+                // its TCP close. Both accesses must remain on this IO loop.
+                owned.conn->shutdown(drogon::CloseCode::kEndpointGone,
+                                     "server shutdown");
+              }
+            } catch (...) {
+              failure = std::current_exception();
+            }
+            owned.conn.reset();
+            owned.state.reset();
+            if (failure) {
+              done->set_exception(failure);
+            } else {
+              done->set_value();
+            }
+          });
+        }
+      } catch (...) {
+        // Some earlier callbacks may already be queued. Keep the single batch
+        // and its failure sticky instead of duplicating closes on a retry.
+        close_enqueue_failure = std::current_exception();
+      }
     }
-  });
+    pending = closes;
+    enqueue_failure = close_enqueue_failure;
+  }
+  if (enqueue_failure) {
+    std::rethrow_exception(enqueue_failure);
+  }
+  for (const auto& done : pending) {
+    if (done.wait_until(deadline) != std::future_status::ready) {
+      return false;
+    }
+    // Readiness alone also accepts a broken promise or a throwing close.
+    // get() preserves and reports the failure on every subsequent retry.
+    done.get();
+  }
+  return true;
 }
 
 } // namespace plinth::ws

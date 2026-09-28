@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <drogon/WebSocketConnection.h>
+#include <exception>
 #include <functional>
 #include <future>
 #include <memory>
@@ -118,10 +119,15 @@ class ConnectionRegistry {
   [[nodiscard]] auto cancel_all_timers(
       std::chrono::milliseconds timeout = std::chrono::seconds{5}) -> bool;
 
-  // Initiate a normal close on every currently registered WebSocket before
-  // Drogon stops its listeners. Must run before initiate_shutdown(), which
-  // deliberately disables registry iteration.
-  auto close_all_connections() -> void;
+  // Seal admission and initiate each registered connection's normal close on
+  // its immutable owner loop. Call from the coordinator, not an IO loop, while
+  // those loops remain alive. One deadline bounds the whole batch. Timeout
+  // retains pending callbacks/completions; retries never issue another close.
+  // Callback-held owners are released on-loop before success is acknowledged.
+  // Missing loops return false; failed/broken acknowledgements throw, so the
+  // coordinator reports failure without destroying downstream dependencies.
+  [[nodiscard]] auto close_all_connections(std::chrono::milliseconds timeout)
+      -> bool;
 
   // Prefer ConnectionRegistry::instance() in production code. The
   // default constructor is public to let unit tests exercise the map
@@ -131,6 +137,9 @@ class ConnectionRegistry {
  private:
   mutable std::mutex mu;
   bool sealed{false};
+  bool close_started{false};
+  std::exception_ptr close_enqueue_failure;
+  std::vector<std::shared_future<void>> closes;
   std::vector<std::shared_future<void>> releases;
   std::unordered_map<RegistryKey, RegistryEntry, RegistryKeyHash> conns;
 };
