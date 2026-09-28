@@ -266,6 +266,55 @@ struct Failure {
   std::string signature;
 };
 
+auto record_diagnostic(std::size_t before, std::span<const Record> records)
+    -> std::string {
+  std::ostringstream message;
+  message << " before=" << before << " after=" << records.size() << " delta=";
+  if (records.size() >= before) {
+    message << '+' << records.size() - before;
+  } else {
+    message << '-' << before - records.size();
+  }
+  // Report levels and byte counts, not arbitrary background payloads that
+  // could contain sensitive data. Bound the diagnostic as well as the corpus.
+  constexpr std::size_t MAX_DIAGNOSTIC_RECORDS = 4;
+  std::size_t reported = 0;
+  for (std::size_t index = before;
+       index < records.size() && reported < MAX_DIAGNOSTIC_RECORDS;
+       ++index, ++reported) {
+    message << " record[" << index
+            << "] level=" << static_cast<int>(records[index].level)
+            << " payload_bytes=" << records[index].payload.size();
+  }
+  return message.str();
+}
+
+auto record_discrepancy(const CorpusCase& item, std::size_t before,
+                        std::span<const Record> records)
+    -> std::optional<Failure> {
+  if (expected_result(item.kind) != "ok") {
+    if (records.size() != before) {
+      return Failure{"rejected call emitted a log record" +
+                         record_diagnostic(before, records),
+                     "rejected-log"};
+    }
+    return std::nullopt;
+  }
+  if (records.size() != before + 1) {
+    return Failure{"accepted call did not emit exactly one record" +
+                       record_diagnostic(before, records),
+                   "count"};
+  }
+  const std::string payload =
+      utf8(item.codepoints) +
+      std::string{expected_suffix(item.kind, item.variant)};
+  if (records.back().level != item.expected_level ||
+      records.back().payload != payload) {
+    return Failure{"record level or raw payload mismatch", "payload"};
+  }
+  return std::nullopt;
+}
+
 auto discrepancy(plinth::js::BridgeContext& context, RecordSink& sink,
                  const CorpusCase& item) -> std::optional<Failure> {
   const auto before = sink.snapshot().size();
@@ -280,24 +329,7 @@ auto discrepancy(plinth::js::BridgeContext& context, RecordSink& sink,
     return Failure{"expected status " + std::string{wanted} + ", got " + actual,
                    "status"};
   }
-  const auto records = sink.snapshot();
-  if (wanted != "ok") {
-    if (records.size() != before) {
-      return Failure{"rejected call emitted a log record", "rejected-log"};
-    }
-    return std::nullopt;
-  }
-  if (records.size() != before + 1) {
-    return Failure{"accepted call did not emit exactly one record", "count"};
-  }
-  const std::string payload =
-      utf8(item.codepoints) +
-      std::string{expected_suffix(item.kind, item.variant)};
-  if (records.back().level != item.expected_level ||
-      records.back().payload != payload) {
-    return Failure{"record level or raw payload mismatch", "payload"};
-  }
-  return std::nullopt;
+  return record_discrepancy(item, before, sink.snapshot());
 }
 
 auto shrink(CorpusCase item, std::string_view signature, RecordSink& sink)
@@ -329,8 +361,39 @@ auto shrink(CorpusCase item, std::string_view signature, RecordSink& sink)
 
 } // namespace
 
+TEST_CASE("QuickJS log record oracle rejects malformed captures",
+          "[js][stdlib][log][oracle]") {
+  const CorpusCase accepted{.level = "debug",
+                            .expected_level = spdlog::level::debug,
+                            .kind = Kind::omitted,
+                            .variant = 0,
+                            .codepoints = {'A', 0, 'B'}};
+  const Record prior{spdlog::level::info, "prior"};
+  const Record correct{spdlog::level::debug, std::string{"A\0B", 3}};
+  const auto failure_signature = [&accepted](std::vector<Record> records) {
+    const auto failure = record_discrepancy(accepted, 1, records);
+    REQUIRE(failure.has_value());
+    return failure->signature;
+  };
+  const std::vector<Record> valid{prior, correct};
+  REQUIRE_FALSE(record_discrepancy(accepted, 1, valid).has_value());
+  CHECK(failure_signature({prior}) == "count");
+  CHECK(failure_signature({prior, correct, correct}) == "count");
+  CHECK(failure_signature({prior, {spdlog::level::err, correct.payload}}) ==
+        "payload");
+  CHECK(failure_signature({prior, {correct.level, "A"}}) == "payload");
+
+  auto rejected = accepted;
+  rejected.kind = Kind::wrong_context;
+  const std::vector<Record> unchanged{prior};
+  REQUIRE_FALSE(record_discrepancy(rejected, 1, unchanged).has_value());
+  const auto failure = record_discrepancy(rejected, 1, valid);
+  REQUIRE(failure.has_value());
+  CHECK(failure->signature == "rejected-log");
+}
+
 TEST_CASE("QuickJS log callbacks have a bounded deterministic corpus",
-          "[js][stdlib][log][corpus]") {
+          "[js][stdlib][log][corpus][isolated-logger]") {
   INFO("seed_count=" << SEEDS.size() << " cases_per_seed=" << CASES_PER_SEED
                      << " max_codepoints=" << MAX_MESSAGE_CODEPOINTS
                      << " max_context_depth=" << MAX_CONTEXT_DEPTH

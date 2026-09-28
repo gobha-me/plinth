@@ -116,7 +116,7 @@ struct ContextLease {
 // ─── [0.3.2] Milestone Test 1 — log.* ────────────────────────────────
 
 TEST_CASE("stdlib: log.* forwards to plinth::log at the right level",
-          "[js][stdlib][log]") {
+          "[js][stdlib][log][isolated-logger]") {
   auto sink = std::make_shared<CapturingSink>();
   ScopedDefaultLogger guard(sink);
 
@@ -161,7 +161,7 @@ TEST_CASE("stdlib: log.* forwards to plinth::log at the right level",
 }
 
 TEST_CASE("stdlib: log bindings preserve bytes and reject unserializable ctx",
-          "[js][stdlib][log][regression]") {
+          "[js][stdlib][log][regression][isolated-logger]") {
   auto sink = std::make_shared<CapturingSink>();
   ScopedDefaultLogger logger(sink);
   Config cfg{};
@@ -225,7 +225,7 @@ TEST_CASE("stdlib: log bindings preserve bytes and reject unserializable ctx",
 // whatever the caller puts in the ctx payload is emitted verbatim.
 TEST_CASE("stdlib: log.* preserves caller-supplied ctx and does not inject "
           "kernel fields",
-          "[js][stdlib][log][security]") {
+          "[js][stdlib][log][security][isolated-logger]") {
   auto sink = std::make_shared<CapturingSink>();
   ScopedDefaultLogger guard(sink);
 

@@ -32,6 +32,9 @@ class DockerContextTest(unittest.TestCase):
             included = context / "src" / "included.cpp"
             included.parent.mkdir()
             included.write_text("included\n", encoding="utf-8")
+            case_verifier = context / "tests" / "tools" / "verify_catch_case.py"
+            case_verifier.parent.mkdir(parents=True)
+            shutil.copy2(ROOT / "tests" / "tools" / "verify_catch_case.py", case_verifier)
             shell_config = context / "client" / "shell" / "config.json"
             shell_config.parent.mkdir(parents=True)
             shell_config.write_text("{}\n", encoding="utf-8")
@@ -52,6 +55,8 @@ class DockerContextTest(unittest.TestCase):
                 context / "AGENTS.override.md",
                 context / "tests" / "browser" / "node_modules" / "module.js",
                 context / "tests" / "__pycache__" / "module.pyc",
+                context / ".github" / "scripts" / "verify_tsan_case.py",
+                context / ".github" / "workflows" / "ci.yml",
             )
             for path in sensitive:
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,6 +76,10 @@ class DockerContextTest(unittest.TestCase):
 
             exported = output / "context"
             self.assertTrue((exported / "src" / "included.cpp").is_file())
+            self.assertEqual(
+                (exported / case_verifier.relative_to(context)).read_bytes(),
+                case_verifier.read_bytes(),
+            )
             self.assertTrue(
                 (exported / "client" / "shell" / "config.json").is_file()
             )

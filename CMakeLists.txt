@@ -856,8 +856,34 @@ add_test(NAME plinth_tests_pure
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
 
+set(PLINTH_GROUPED_JS_SELECTOR
+    "[js] ~[batch-transaction] ~[isolated-logger]")
+
+# spdlog's default free APIs cannot overlap a default-logger replacement.
+# These five synchronous capture fixtures must run before any background
+# database/event-loop fixture is initialized in their process.
+add_test(NAME plinth_tests_logger_capture_inventory
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/logger_capture_inventory_test.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --grouped-selector "${PLINTH_GROUPED_JS_SELECTOR}"
+    --ctest-command ${CMAKE_CTEST_COMMAND}
+    --build-dir ${CMAKE_BINARY_DIR}
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_logger_capture_inventory PROPERTIES TIMEOUT 90)
+
+add_test(NAME plinth_tests_logger_capture_isolated
+  COMMAND plinth_tests "[isolated-logger]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_logger_capture_isolated PROPERTIES TIMEOUT 120)
+
+add_test(NAME plinth_tests_log_oracle
+  COMMAND plinth_tests "[js][stdlib][log][oracle]"
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_log_oracle PROPERTIES TIMEOUT 30)
+
 add_test(NAME plinth_tests_js
-  COMMAND plinth_tests "[js] ~[batch-transaction]"
+  COMMAND plinth_tests "${PLINTH_GROUPED_JS_SELECTOR}"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_js
   PROPERTIES RESOURCE_LOCK plinth_pg_schema
@@ -931,6 +957,31 @@ set_tests_properties(plinth_tests_pg
              LABELS "needs_pg"
              TIMEOUT 300)
 
+# Reuse the focused case verifier's exit/positive-assertion/no-skip contract.
+add_test(NAME plinth_tests_buffered_realtime_hints
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "realtime listener drains buffered self-notifications before polling"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_buffered_realtime_hints
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             TIMEOUT 40)
+
+add_test(NAME plinth_tests_writer_timeout_ownership
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "E.09: shutdown timeout preserves owned work until clean retry"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_writer_timeout_ownership
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             TIMEOUT 40)
+
 # Repeated production boots need their own aggregate budget under sanitizers.
 # Keep the per-process lifecycle bounds unchanged and serialize both groups
 # against the shared PostgreSQL fixture, including when CTest runs in parallel.
@@ -991,7 +1042,7 @@ if(PLINTH_TSAN)
     math(EXPR ctest_timeout_seconds "${timeout_seconds} + 10")
     add_test(NAME plinth_tsan_${name}
       COMMAND ${Python3_EXECUTABLE}
-        ${CMAKE_SOURCE_DIR}/.github/scripts/verify_tsan_case.py
+        ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
         --binary $<TARGET_FILE:plinth_tests>
         --case "${selector}"
         --timeout ${timeout_seconds}

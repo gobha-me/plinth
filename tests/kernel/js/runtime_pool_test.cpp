@@ -306,7 +306,7 @@ TEST_CASE("RuntimePool shutdown retains caller-held contexts for retry",
 // taken. Side effects (slot not returned to free_list; active_count
 // drops) are asserted as the secondary proof.
 TEST_CASE("RuntimePool release on cancelled context routes to destroy",
-          "[js][pool][security]") {
+          "[js][pool][security][isolated-logger]") {
   auto sink = std::make_shared<CapturingSink>();
   ScopedDefaultLogger guard(sink);
 
