@@ -7,6 +7,7 @@
 #include <fstream>
 #include <limits>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unistd.h>
@@ -198,21 +199,35 @@ TEST_CASE("Config partial JSON — missing fields keep defaults",
 }
 
 TEST_CASE("Env vars override JSON config", "[config][unit]") {
-  nlohmann::json j = {{"database", {{"host", "from-json"}, {"port", 1111}}}};
+  const auto snapshot = [](const char* name) -> std::optional<std::string> {
+    const auto* value = std::getenv(name);
+    return value != nullptr ? std::optional<std::string>{value} : std::nullopt;
+  };
+  const auto inherited_host = snapshot("PLINTH_PG_HOST");
+  const auto inherited_port = snapshot("PLINTH_PG_PORT");
+  plinth::Config cfg;
+  {
+    // This case shares a process with PG fixtures. Restore inherited values,
+    // including absent/empty values, instead of silently disabling later cases.
+    EnvGuard guard;
+    nlohmann::json j = {{"database", {{"host", "from-json"}, {"port", 1111}}}};
 
-  auto path = write_temp_config(j);
+    auto path = write_temp_config(j);
 
-  // Set env var overrides
-  set_env("PLINTH_PG_HOST", "from-env");
-  set_env("PLINTH_PG_PORT", "2222");
+    // Set env var overrides
+    set_env("PLINTH_PG_HOST", "from-env");
+    set_env("PLINTH_PG_PORT", "2222");
 
-  auto cfg = plinth::load_config(path);
+    cfg = plinth::load_config(path);
 
-  // Clean up
-  set_env("PLINTH_PG_HOST", nullptr);
-  set_env("PLINTH_PG_PORT", nullptr);
-  remove_file(path);
+    // Clean up
+    set_env("PLINTH_PG_HOST", nullptr);
+    set_env("PLINTH_PG_PORT", nullptr);
+    remove_file(path);
+  }
 
+  REQUIRE(snapshot("PLINTH_PG_HOST") == inherited_host);
+  REQUIRE(snapshot("PLINTH_PG_PORT") == inherited_port);
   REQUIRE(cfg.db.host == "from-env"); // env wins over json
   REQUIRE(cfg.db.port == 2222);       // env wins over json
 }
