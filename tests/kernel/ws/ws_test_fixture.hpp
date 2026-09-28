@@ -70,6 +70,48 @@ auto make_admin(TestPg& pg, const std::string& user_id) -> void;
 // Starts the server lazily on first call.
 auto test_server_port() -> uint16_t;
 
+// Only the isolated fresh-process startup regression installs this control,
+// before the singleton starts. Heap ownership survives assertion unwinding.
+class ServerStartupControl {
+ public:
+  struct Snapshot {
+    std::size_t held_owners{0};
+    std::size_t nonaccepting_sockets{0};
+    bool main_marker{false};
+    bool released{false};
+    bool failed{false};
+  };
+
+  auto hold_before_listen(int fd, std::size_t owner,
+                          std::chrono::steady_clock::time_point deadline)
+      -> bool;
+  auto mark_main_loop() -> void;
+  auto release() -> void;
+  [[nodiscard]] auto wait_held_until(
+      std::chrono::steady_clock::time_point deadline) -> bool;
+  [[nodiscard]] auto snapshot() const -> Snapshot;
+
+ private:
+  mutable std::mutex mu;
+  std::condition_variable cv;
+  std::vector<std::size_t> owners;
+  std::size_t nonaccepting_sockets{0};
+  bool main_marker{false};
+  bool released{false};
+  bool failed{false};
+};
+
+auto install_server_startup_control(
+    std::shared_ptr<ServerStartupControl> control) -> void;
+struct ServerStartupSnapshot {
+  bool thread_owned{false};
+  bool ready{false};
+  bool failed{false};
+  std::size_t acknowledgements{0};
+  std::size_t pending{0};
+};
+[[nodiscard]] auto server_startup_snapshot() -> ServerStartupSnapshot;
+
 // Per-process package data + staging directories. Created on first call;
 // removed at process exit. Stable across calls so the routes registered
 // at server startup keep matching what tests touch on disk. Used by

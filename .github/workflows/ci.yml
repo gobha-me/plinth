@@ -406,6 +406,24 @@ jobs:
           grep -E 'All tests passed \([1-9][0-9]* assertions in 10 test cases\)' \
             registry-tests.log
 
+      - name: WebSocket fixture listener readiness sanitizer regression
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          pg_isready -h "$PLINTH_PG_HOST" -p "$PLINTH_PG_PORT" \
+            -U "$PLINTH_PG_USER" -d "$PLINTH_PG_DATABASE"
+          ctest --test-dir build -N -R '^plinth_tests_ws_listener_readiness$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --output-on-failure --parallel 1 -R \
+            '^plinth_tests_ws_listener_readiness$'
+
       - name: Test
         env:
           PLINTH_PG_HOST: 127.0.0.1

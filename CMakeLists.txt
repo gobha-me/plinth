@@ -641,6 +641,7 @@ add_executable(plinth_tests
   tests/kernel/rbac/ephemeral_user_test.cpp
   tests/kernel/rbac/subscribe_rule_test.cpp
   tests/kernel/ws/ws_test_fixture.cpp
+  tests/kernel/ws/listener_readiness_test.cpp
   tests/kernel/ws/registry_test.cpp
   tests/kernel/ws/auth_test.cpp
   tests/kernel/ws/heartbeat_test.cpp
@@ -857,8 +858,8 @@ add_test(NAME plinth_tests_pure
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
 
-# The ordinary groups exclude [ws] unit cases. Keep map, displacement and
-# bounded owner-release coverage positive alongside the exact close gate.
+# Repeat the WS group's map, displacement and bounded owner-release cases in
+# a focused positive inventory gate alongside the exact close gate.
 add_test(NAME plinth_tests_ws_registry
   COMMAND plinth_tests "[ws][registry]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -1018,12 +1019,26 @@ set_tests_properties(plinth_tests_subprocess
              TIMEOUT 300)
 
 add_test(NAME plinth_tests_ws
-  COMMAND plinth_tests "[ws] ~[browser-proxy]"
+  COMMAND plinth_tests "[ws] ~[browser-proxy] ~[isolated-ws-startup]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_ws
   PROPERTIES RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
              LABELS "needs_pg"
              TIMEOUT 180)
+
+# The Drogon singleton must be untouched before the controlled first-start
+# regression. Exclude only its isolated tag from the shared WS process.
+add_test(NAME plinth_tests_ws_listener_readiness
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "WebSocket fixture waits for both owned listening sockets"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_ws_listener_readiness PROPERTIES
+  RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
+  LABELS "needs_pg"
+  TIMEOUT 40)
 
 # Proxy-origin registration is immutable for a process, like the real kernel.
 add_test(NAME plinth_tests_ws_browser_proxy
