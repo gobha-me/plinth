@@ -121,6 +121,16 @@ task-owned resources even after failure.
 Do not add unexplained or wildcard `NOLINT` suppressions. Follow the exact
 suppression syntax documented in `AGENTS.md`.
 
+## Isolated ingress DAST
+
+The [source-candidate ingress DAST guide](docs/security/ingress-dast.md)
+documents the disposable real-chart/Traefik/browser journey and pinned scanner,
+its narrow GET-query active coverage, private evidence handling, exact finding
+triage, and fail-closed cleanup. Run it only against the task-owned local
+candidate, never an existing service. It does not certify a published release
+or dogfood deployment; raw scan evidence must never be committed or uploaded
+as a CI artifact.
+
 ## Security and privacy
 
 Use fictional data and fake credentials in tests and documentation. Report
