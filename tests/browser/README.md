@@ -14,6 +14,7 @@ bounded clean shutdown before dropping only its database:
 python3 tests/browser/run-production.py --binary build/plinth
 python3 tests/browser/run-production.py --binary build/plinth --realtime
 python3 tests/browser/run-production.py --binary build/plinth --upgrade-cache
+python3 tests/browser/run-client-contracts.py --binary build/plinth
 ```
 
 Set `PLINTH_PG_HOST`, `PLINTH_PG_PORT`, `PLINTH_PG_USER`,
@@ -27,7 +28,7 @@ PLINTH_BASE_URL=http://127.0.0.1:8080 npm test --prefix tests/browser
 
 This mode obtains the document, assets, redirect, CSP and initial session
 response from the running kernel. It does not rewrite production assets.
-The demo panel file, demo snapshot response, WebSocket transport, and boundary
+The demonstration panel file, mock capability responses, WebSocket transport, and boundary
 audit sink are controlled by the browser harness. Authentication, realtime
 protocol integration, and audit persistence require their separate server
 suites; this gate proves startup and module/hook execution.
@@ -86,7 +87,7 @@ It runs separately from `--upgrade-cache`, whose legacy HTTP fixture serves
 the retained-profile cache migration case. Both browser commands run under
 the descendant-owning supervisor described above.
 
-`npm run test:transport --prefix tests/browser` evaluates the packaged SDK
+`npm run test:transport --prefix tests/browser` evaluates the actual SDK
 module with linked test imports and deterministic sockets/timers. It covers
 fresh session-bound CSRF cookie propagation for unsafe same-origin capability
 requests, omission before login and for cross-origin requests, token rotation,
@@ -96,15 +97,38 @@ an outstanding subscribe, duplicate error/close signals, timer cancellation,
 terminal auth failure/displacement, explicit retry, and per-connection-epoch
 subscription readiness.
 
-`npm run test:launcher --prefix tests/browser` covers the pure discovery and
-preference normalization rules. `npm run test:launcher-browser --prefix
+The transport command also runs the pure smart query/controller tests: captured
+JSON, bounded fixed-window debounce/jitter, dirty follow-up, admission and
+stale responses, and conservative/conditional eq/in view optimization. Each
+actual Node file must execute its fixed named count with no fail/cancel/skip/
+TODO. The fail-closed discovery parser has its own 24 regressions. Current
+counts are SDK35 + controller30; Launcher model2 + original-owner51.
+
+`npm run test:launcher --prefix tests/browser` covers pure discovery/preference
+normalization and the whole linked Launcher graph's original-owner boundaries.
+`npm run test:launcher-browser --prefix
 tests/browser` serves the packaged shell and uses deterministic HTTP/WebSocket
 fixtures to exercise Home, application and panel navigation, per-epoch
 subscription readiness, retained panels and LRU eviction, dirty confirmation,
 panel-local failure, stale refresh, responsive layout, and terminal fail-closed
 DOM cleanup. These focused fixtures supplement the real-kernel production gate;
 they do not replace its SessionFilter, RBAC, package lifecycle, or durable
-realtime coverage.
+realtime coverage. It additionally runs four managed-owner cases, six actual
+Preact smart-hook cases, five panel lifecycle/shortcut/stub cases and ten shell
+preference/session cases. They check exact discovery, source identity and
+independent bounded cleanup. On Linux use the descendant-owning supervisor,
+as CI does, to cover hard interruption during a browser launch:
+
+```sh
+python3 tests/browser/process_cleanup.py -- npm run test:launcher-browser --prefix tests/browser
+```
+
+Snapshot-backed `useData` captures one capability query and re-queries after
+events; raw no-snapshot mode still forwards envelopes. Supply a new args/view
+object to change an existing query; internal renders keep the captured object
+immutable. Optional complete eq/in keyed views optimize only certified custom
+ID/full-row events. Native counts-only events conservatively re-query. Neither
+mode adds automatic cursor tracking/replay/resync policy; that remains #42.
 
 `npm run test:realtime --prefix tests/browser` requires `PLINTH_BASE_URL` plus
 `PLINTH_PG_HOST`, `PLINTH_PG_PORT`, `PLINTH_PG_USER`, `PLINTH_PG_PASSWORD`, and
@@ -114,7 +138,7 @@ Set that kernel's `ws_heartbeat_interval_s` to `0.2` and
 The test seeds a synthetic non-admin session/grants, sets its cookie HttpOnly,
 and publishes through PostgreSQL NOTIFY. The real listener, event writer,
 RBAC gates and WebSocket protocol deliver the update to the browser. It checks
-`useData` moving from a controlled HTTP snapshot to an actual published event,
+raw no-snapshot `useData` receiving actual published envelopes with no query,
 multiple heartbeat replies, disconnect/reconnect without duplicate channel
 requests, unsubscribe while another channel stays connected, and terminal
 expired-session authentication. It never mocks the WebSocket transport.
@@ -124,7 +148,11 @@ through the production capability. Each write must produce its own durable
 `plinth:data:ext_shell.user_preferences` event, reach a live browser SDK
 subscriber without a refresh, and replay to a second browser session. The
 synthetic user gets a test-only subscribe grant; normal users do not receive
-this table-wide channel by default.
+this table-wide channel by default. An actual Preact snapshot hook queries the
+real preference capability: each isolated native counts-only event triggers
+one bounded requery and changes the UI to the server's create/update/delete
+snapshot. A raw browser socket separately sends `since_seq` and checks the
+three exact persisted sequence numbers; that is not automatic SDK replay.
 
 The same `--realtime` run also invokes `test:launcher-production`. That test
 uses a separate synthetic admin session to install the built `valid-install`
@@ -133,6 +161,38 @@ disable, enable, upgrade, and uninstall it. The browser must follow each
 durable application-catalog invalidation, remove retained panel DOM when
 authority is withdrawn, and import the upgraded generation from its new
 versioned URL; no HTTP or WebSocket request is mocked.
+
+The final `--realtime` command installs manifest identity `sdkdemo` from its
+test-only `sdk-demo.zip` build ZIP
+through the real multipart API. A separate effective-nonadmin consumer opens
+it in the ordinary Launcher. The installed module must equal current fixture
+bytes, activate once, render the actual capability snapshot, receive a matching
+durable/native counts event and update that same panel via smart requery. Real
+typed 403/404/handler-500 SDK errors are checked. The handler-500 witness is
+one side-effect-free TypeError in the installed test-only `sdkdemo.thrower`
+capability, with only its exact rule granted to the synthetic consumer; it is
+never bundled and declares no default/everyone grant. Native shell preference
+validation precedes JavaScript, so null is not a thrown-handler witness.
+Network failure and missing-
+args cases use explicitly narrow, restored platform-fetch seams; all other
+responses/transports are native. Existing Launcher writes share the channel
+and are accounted for before the isolated preference-event baseline.
+
+`run-client-contracts.py` is the joined persistence/UI gate: real registration
+and login, effective-nonadmin proof plus real admin denial, concurrent SDK
+writes both successful with exactly one stored row, successful theme/scale UI
+mirroring, user-independent token CSS, and actual `/app` mount rejection with
+bundled frontend unchanged. It SIGTERMs the first kernel, requires zero exit,
+starts a distinct process against the **same database/config/root**, poisons
+the local mirror, and reloads the same browser profile. Real hydration and SDK
+reads must recover the exact persisted values/rows. Browser, kernel and exact
+database cleanup are independently attempted and bounded.
+
+Native commands also accept `--image exact-local-reference`, staging test
+archives outside the runtime image and verifying the real kernel is PID1.
+The complete current ICD case/disposition map, including superseded API/error
+wording and #42/#38 boundaries, is
+[`client-runtime-contracts.md`](../../docs/reviews/client-runtime-contracts.md).
 
 C++ transport tests also cover cookie-versus-token authentication races,
 missing/cross-origin/opaque/scheme-mismatched origins, invalid/expired/revoked

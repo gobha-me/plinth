@@ -1890,6 +1890,16 @@ spreads these across 5 phase commits.
 bundled QuickJS handler. I.01-I.03 retain their full-stack/browser or
 concurrency-specific ownership and remain listed in `docs/DEFERRED.md`.
 
+**Development 0.6.6 coverage amendment (#32):** I.01-I.03 are mapped to the
+joined real browser/SDK/database journey in
+[client-runtime-contracts.md](../reviews/client-runtime-contracts.md).
+I.03's historical `ERR_MOUNT_CONFLICT` scenario is implemented by the active-
+mount uniqueness constraint: the current multipart API returns HTTP500,
+`INSTALL_FAILED`, `failed_at_stage: ACTIVATING`, `kind: activation-failed`.
+Tests assert that exact envelope and unchanged bundled frontend, not a
+nonexistent literal or guessed HTTP409. This amendment makes the existing
+wire behavior explicit; it does not introduce a new error taxonomy.
+
 ---
 
 ## §13 — Entry / Exit Criteria

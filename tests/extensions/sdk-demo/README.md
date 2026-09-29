@@ -1,67 +1,85 @@
-# sdk-demo — ICD-0.6.3 manual FE smoke fixture
+# sdk-demo — installed Client SDK fixture
 
-**Posture:** test-only. Not bundled in `shell.zip`; not installed at first-boot.
-The architect-pinned OQ4 resolution at the ICD-0.6.3 paper session is
-"test-only fixture at `tests/extensions/sdk-demo/`" — production users
-see no demo panel.
+This is test-only, not bundled into `shell.zip` or installed at first boot.
+Its manifest identity is now `sdkdemo` version `0.1.0`; the historical test-only
+`sdk-demo` identity is explicitly retired, with no alias. The source directory
+and ZIP basename remain `sdk-demo`. It provides exactly one test-only server
+capability for a controlled genuine exception and does not change the server
+event format.
 
-**Use:** load this extension via the real `POST /api/packages` install
-path during manual FE smoke. The shell's `loadPanel` (in
-`client/shell/client/panels/loader.js`) takes `(extName, extVersion,
-panelId, container, opts)` and the fixture's panel ID is `demo`.
+Build `plinth_test_extension_zips` to produce
+`build/fixtures/extensions/sdk-demo.zip`. The production browser harness
+`tests/browser/sdk-installed-production.mjs` installs those exact bytes through
+`POST /api/packages` with its task-owned synthetic admin operator, then uses a
+different, non-admin session and the ordinary Launcher to open the panel.
+The matching task-owned kernel/database and fixture build directory are
+supplied through `PLINTH_BASE_URL`, `PLINTH_PG_*`, and
+`PLINTH_TEST_BUILD_DIR`; the outer production supervisor owns kernel/database
+shutdown. The script closes its own browser contexts and removes only its
+installed package, users, sessions, and test group.
 
-## Smoke walkthrough (per ICD-0.6.3 §13.5)
+The panel declares the fixture-only visibility rule `plinth.sdkdemo.panel`
+under the validator's supported reserved `plinth` namespace. It grants no
+server capability authority, and `rbac.json` declares no default or `everyone`
+grant. The harness refuses an existing rule, verifies its installed `sdkdemo`
+ownership, and grants it only to its synthetic consumer group. Normal package
+uninstall must remove that exact declared rule. The consumer's effective rules
+include virtual `everyone` membership and exclude orphaned rules; admin and
+configuration authority must remain absent after installation and the grant.
 
-1. Reset PG schema; `plinth serve --dev`. First-boot installs the
-   bundled shell (v0.6.3) automatically.
-2. Build the fixture zip and POST it to `/api/packages` as the admin
-   user.
-3. Browse `http://localhost:8080/app`. Sign in as admin.
-4. Open devtools → Console. Trigger the panel manually:
+The fixture also declares `sdkdemo:1:thrower`, guarded by exactly
+`sdkdemo.thrower`. Its handler throws a fixed `TypeError` without I/O, state
+mutation, or caller-dependent data. There are no default/everyone grants. The
+harness refuses an existing capability/rule, verifies installed `sdkdemo`
+ownership, grants only that rule to its synthetic consumer group, and requires
+normal uninstall to remove both. This is test infrastructure, not a bundled
+application capability or a broad permission grant.
 
-   ```js
-   import('/ext/shell/0.6.3/client/panels/loader.js').then((m) =>
-     m.loadPanel('sdk-demo', '0.1.0', 'demo',
-                 document.querySelector('main'), {}));
-   ```
+The consumer gets an explicit **test-only** `shell.realtime.subscribe` grant
+for `plinth:data:ext_shell.user_preferences`. This is a table-wide channel,
+not an ordinary-user default grant and not a per-user privacy claim. Both the
+panel's raw subscription and snapshot-backed `useData` use that actual native
+channel. The snapshot is the real `shell.preferences.get({key:'shell.theme'})`
+capability. A successful real SDK preference write must produce a durable,
+counts-only native event, reach the same panel's raw counter, and trigger a
+bounded real capability requery that changes its theme UI. IDs or full rows
+are not inferred from native counts. Launcher preference writes use the same
+channel; the harness accounts for their real deliveries before establishing
+the subsequent isolated theme-write baseline.
 
-5. Verify:
-   - `[sdk_demo] onActivate` console log fires.
-   - The panel renders with `theme: <value>` (proves
-     `plinth.call('shell.preferences.get', ...)` round-trip).
-   - From a side terminal:
-     `plinth call pubsub.publish 'sdk_demo:test' '{"hello":"world"}'`
-     → the "envelopes received" counter increments (proves
-     `plinth.subscribe` round-trip).
-   - Press `Ctrl+Shift+D` → console log proves
-     `registerShortcut` dispatch.
-   - Click "Trigger boundary throw" → boundary fallback UI renders;
-     SQL `SELECT ... FROM plinth.audit_log WHERE
-     action='ext.shell.frontend.boundary.caught'` shows a row with
-     non-forgeable identity + sanitised detail keys.
+Stable test-only DOM IDs expose loading/error/theme, raw readiness, delivery
+count/last sequence, and exact activation/deactivation/shortcut counts. They
+do not replace the real module, Preact hooks, transport, or capability dispatch.
+`Ctrl+Shift+D` retains the original demo console action. The "Trigger boundary
+throw" button retains its deliberate panel error; the contained panel boundary
+emits `shell.audit.emit` and displays its fallback. This installed journey does
+not claim that it exercises that button; boundary harnesses cover it separately.
 
-## Why version 0.1.0 (not 0.6.3)
+The native script also checks typed SDK rejections: C02 uses existing
+`kernel.config.get` (HTTP403 / `rbac_denied`); C03 uses a missing shell capability
+(HTTP404 / `not_found`). C04 uses a narrowly scoped, restored platform-fetch
+failure to produce `NetworkError`, not a server-side failure. C05 supplies normal
+`args:null` to the fixture's controlled throwing handler through the real native
+route: actual dispatch must return HTTP500 / `cap.handler_threw`.
+Each native rejection must propagate the exact nonempty HTTP error message;
+the handler-throw witness must retain its actual `TypeError` and fixed fixture
+marker. The former shell-preference null-argument attempt did not exercise a JS
+exception: native preference validation rejects it before handler invocation
+with `invalid_argument`. It is not a null-to-object normalization contract.
+The controlled thrower maps the historical `quickjs_throw` scenario to the
+shipped taxonomy without changing production errors or argument handling.
+C06's narrowly scoped, restored
+platform-fetch seam removes the required `args` member and sends that malformed
+request to the real route (HTTP400 / `bad_request`); subsequent ordinary calls
+still send `args:null` and succeed.
 
-The fixture is independent of plinth's milestone arc. Bumping its
-version is unnecessary for v0.6.3. Future fixture versions are bumped
-when the SDK contract requires it.
-
-## Implementation deviations per §17
-
-1. **Name `sdk-demo` (not `sdk_demo` per ICD §D.1).** The manifest
-   `name` regex `^[a-z][a-z0-9-]{1,63}$` rejects underscores; switched
-   to dash. The shell's loader accepts the dashed name verbatim;
-   panels.json + capabilities.json shapes are unchanged.
-
-2. **`frontend` block omitted entirely.** ICD §D specified
-   `frontend: { mount: null, entry: null }`. v0.6.1's `parse_manifest`
-   only accepts a `frontend` block with non-null mount + entry strings;
-   nullable shape isn't supported. Omitting `frontend` validates
-   cleanly and matches the "primary panel only" use case.
-
-3. **panels.json field is `client_path` (not `component` per ICD §A.5).**
-   The v0.4.4 panels-manifest parser uses `client_path`; ICD-0.6.3 §A.5
-   showed `component`. Both name the same path — the panel module
-   relative to the extension root. The shell's loader was updated to
-   read `panel.client_path` so this stays consistent across the parser
-   and the loader.
+The current test-only manifest name uses lowercase letters only.
+There is no `frontend` block: this is an extension panel, not an `/app` mount.
+`panels.json` uses the current `client_path` and required `rbac_rule` fields.
+On an unexpected package status, the harness reports only bounded envelope
+identifiers and fixture validation rule/location diagnostics, not arbitrary
+server messages or raw report contents. Known fixture identity/setup or
+hyphenated-schema teardown messages are reduced to fixed classification codes;
+a reported migration SQLSTATE is restricted to its five-character code.
+Old demonstration channels
+and hardcoded shell-version/manual-loader instructions are obsolete.

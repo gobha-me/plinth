@@ -198,9 +198,12 @@ class ContainerRuntime:
              fixture_root / "valid-install.zip"),
             (repo / "tests/fixtures/lifecycle_transitions/upgrade-v2",
              fixture_root / "upgrade-v2.zip"),
+            (repo / "tests/extensions/sdk-demo",
+             fixture_root / "extensions/sdk-demo.zip"),
         )
         import zipfile
         for source, archive in fixtures:
+            archive.parent.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
                 for path in sorted(source.rglob("*")):
                     if path.is_file():

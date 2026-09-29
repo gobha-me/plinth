@@ -407,43 +407,62 @@ explicitly when they know it's appropriate (`batch()` or `silent`).
 
 ### 3.4 Frontend SDK — Smart Re-Query Design
 
-**Status: planned/reconciliation required.** The shipped SDK shares one owned
-connection, forwards live envelopes to subscribers, and lets `useData()` take
-an initial snapshot then replace data from its event mapper. It does not yet
-implement the debounce, re-query, ID filtering, sequence tracking, or jitter
-behaviors below. [#32](https://github.com/gobha-me/plinth/issues/32) owns the
-client-runtime reconciliation and executable coverage; source-sequence policy
-remains [#42](https://github.com/gobha-me/plinth/issues/42).
+**Implemented for development 0.6.6.** With `opts.snapshot`, `useData()` owns
+a captured capability query and re-queries that query after relevant events;
+events do not replace snapshot-shaped data. Without a snapshot it remains a
+raw live-envelope hook, with no capability requests. The shared SDK socket and
+per-channel grants remain independently owned.
 
-The design inputs are:
+1. **Bounded coalescing and jitter.** The actual `subscribed` acknowledgement
+   supplies advisory `recommended_debounce_ms` and `recommended_jitter_ms`.
+   Valid integers in 0–60000 and 0–5000 respectively are accepted independently;
+   absent or invalid values use 100ms and 50ms. One uniform inclusive jitter is
+   drawn per fixed window, not per event. A burst does not extend the deadline.
+   There is at most one owned timer, one current logical request, and one dirty
+   follow-up; events are not queued without bound. A response may publish while
+   ordinary invalidations are pending, so continuous traffic cannot starve data.
+2. **Captured query and original owner.** Capability args and supported view
+   metadata are copied before effects or asynchronous dispatch. A continuously
+   supplied args/view object stays captured across internal re-renders; pass a
+   new object when changing the query. Equivalent newly allocated JSON args do
+   not restart it. Channel, capability, args, optional `scope`, view semantics,
+   and managed session changes replace the owner. New-owner state starts with
+   its own `initialData` and loading/error state, never the previous owner's
+   snapshot. Retirement precedes cleanup and is permanent even when an aborted
+   fetch still completes. Logout/expiry cannot rebind old work to a new login.
+3. **Conservative ID filtering.** Optional `opts.view` is a caller-certified,
+   complete, unpaginated, unordered keyed-array view:
+   `{key: 'id', complete: true, where: {eq: id}}` or
+   `{key: 'id', complete: true, where: {in: [ids]}}`; omitting `where` certifies
+   the whole keyed view. IDs must be strings or
+   safe integers, with strict type distinction. Only complete, non-truncated,
+   consistent single-operation ID payloads are eligible. Disjoint IDs can skip
+   a query, including disjoint updates. Relevant updates or mixed relevant operations,
+   ambiguous metadata, invalid descriptors, duplicate IDs, and native
+   counts-only events fall back to re-query.
+4. **Conditional local insert/delete.** A valid complete delete can remove
+   matching rows; an optional `view.insertRows(event)` adapter receives the full
+   outer event envelope and may provide
+   full rows for an insert. The SDK never treats IDs as rows. Invalid, duplicate,
+   or colliding adapter rows fall back to re-query. When a local change crosses
+   an older in-flight result, that result is barred and reconciliation is
+   retained; an idle complete local operation can skip the query. A relevant complete
+   delete also bars an older result when its ID is absent or the view is cold.
+   Native DB events currently contain counts rather than IDs, so these optional
+   optimizations are proved with explicit custom-event fixtures, not attributed
+   to the native producer.
+5. **Error and admission policy.** Query failures keep the last good snapshot
+   from the same owner and expose a typed error. A new grant can clear a live
+   transport error, not an unrelated query failure. Same-session reconnect may
+   resume after a grant; terminal managed-session retirement cancels admission.
+   These rules do not implement cursor tracking, automatic replay, ordering,
+   deduplication, or full-resync policy.
 
-1. **Client-side debounce.** `useData()` has a built-in debounce
-   (default 100ms). Multiple events within the window trigger ONE
-   re-query, not N. _Server-side wire commitment implemented
-   2026-04-26 (v0.5.5):_ `subscribed` ack carries a
-   `recommended_debounce_ms` advisory (default 100; operator-tunable
-   via `realtime.events.debounce.recommend_ms`). Normative contract
-   pinned in [`ICD-0.5.5 §7`](../icd/ICD-0.5.5-sequence-numbers-client-debounce.md).
-2. **Optimistic local updates.** If the event payload includes changed
-   IDs and the operation is `insert` or `delete`, the SDK can update
-   its local state without re-querying.
-3. **Sequence numbers.** Every persisted server event includes a monotonic
-   sequence number (`seq`); the shipped SDK does not track it.
-   _Server implementation 2026-04-26 (v0.5.5):_ writer-first topology in
-   [`ICD-0.5.5 §5`](../icd/ICD-0.5.5-sequence-numbers-client-debounce.md):
-   `envelope["seq"] == plinth.events.seq` BIGSERIAL by construction
-   on both live and replay paths; per-PG-instance strictly monotonic.
-4. **Smart filtering.** If the event includes IDs and the SDK's current
-   `where` clause is simple enough to evaluate locally, the SDK
-   determines whether the change is relevant without hitting the
-   server.
-5. **Thundering herd mitigation.** When the server broadcasts a change
-   event, each client adds random jitter (0–50ms) to its debounce
-   window before re-querying. _Server-side wire commitment implemented
-   2026-04-26 (v0.5.5):_ `subscribed` ack carries a
-   `recommended_jitter_ms` advisory (default 50; operator-tunable via
-   `realtime.events.debounce.jitter_max_ms`). Normative contract
-   pinned in [`ICD-0.5.5 §7`](../icd/ICD-0.5.5-sequence-numbers-client-debounce.md).
+The executable case ledger is
+[client-runtime-contracts.md](../reviews/client-runtime-contracts.md). Server
+sequence numbers remain a distinct contract: `envelope.seq == plinth.events.seq`
+on live/replay paths. Browser cursor/resume/resync decisions belong to
+[#42](https://github.com/gobha-me/plinth/issues/42), not this smart query design.
 
 ### 3.5 Delta Sync on Reconnect
 
@@ -461,8 +480,9 @@ sequence is older than the retention window, the server sends a "full
 resync" signal and the client re-queries all subscribed data.
 
 > Server support implemented 2026-04-25 (v0.5.4). The bundled browser SDK
-> currently subscribes with channels only; #32 owns client integration and
-> coverage, subject to #42's sequence-policy decision. Historical server
+> currently subscribes with channels only; automatic browser cursor tracking,
+> reconnect replay and resync integration are explicitly deferred to #42.
+> Native browser wire replay coverage is retained separately. Historical server
 > contract pinned in
 > [ICD-0.5.4-events-table-delta-sync.md](../icd/ICD-0.5.4-events-table-delta-sync.md).
 > The wire-format extension to the `subscribe` frame is the optional
@@ -535,8 +555,8 @@ Kernel DB Layer (within ext_notes schema)
               ▼
          Each node's WS Broker checks client subscriptions
               │
-              ├── Subscribed client → shipped SDK forwards live envelope
-              │                         (smart handling planned in #32)
+              ├── Subscribed client → raw SDK forwards live envelope
+              │                         snapshot hook invalidates/re-queries (§3.4)
               └── Unsubscribed → skip
 ```
 

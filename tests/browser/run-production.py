@@ -222,6 +222,8 @@ def main():
                         run_browser(["npm", "run", "test:launcher-production", "--prefix",
                                      str(repo / "tests/browser")],
                                     env=child_env, timeout=240)
+                        run_browser(["node", str(repo / "tests/browser/sdk-installed-production.mjs")],
+                                    env=child_env, timeout=180)
                 stop_kernel(child)
             except BaseException:
                 print(output_path.read_text(), flush=True)
