@@ -21,6 +21,21 @@ ACTIVE_SEED = "/app/?issue40_probe=read_only"
 SOURCE_STATUS_COMMAND = ["git", "status", "--porcelain=v1", "--untracked-files=all",
                          "--ignore-submodules=none"]
 SOURCE_CHART_COMMAND = ["git", "ls-files", "--others", "--", "deploy/helm/plinth"]
+EXPECTED_INGRESS_ARGS = (
+    "--accesslog=true",
+    "--accesslog.format=json",
+    "--accesslog.fields.defaultmode=drop",
+    "--accesslog.fields.headers.defaultmode=drop",
+    "--accesslog.fields.names.DownstreamStatus=keep",
+    "--accesslog.fields.names.OriginStatus=keep",
+    "--accesslog.fields.names.RouterName=keep",
+)
+EXPECTED_INGRESS_FIELDS = ("DownstreamStatus", "OriginStatus", "RouterName")
+EXPECTED_INGRESS_ROUTERS = {
+    "WS": "plinth-issue40-fake-owned-issue40-dast-plinth-ws-22bdca97a2858c918051@kubernetescrd",
+    "LOGIN": "plinth-issue40-fake-owned-issue40-dast-plinth-auth-3fa752a55157f8ab2143@kubernetescrd",
+    "PACKAGES": "plinth-issue40-fake-owned-issue40-dast-plinth-packages-1059becbc0d9079a0745@kubernetescrd",
+}
 
 
 def result(stdout="", *, returncode=0, stderr=""):
@@ -588,6 +603,383 @@ class ObservedRouteTest(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(AssertionError):
                     driver.observed_routes([value], ORIGIN)
+
+
+def ingress_container():
+    return {"name": "traefik", "args": ["--entrypoints.web.address=:8000", *EXPECTED_INGRESS_ARGS],
+            "env": [{"name": "TZ", "value": "UTC"}]}
+
+
+def ingress_pod(uid="fake-new-uid"):
+    return {"metadata": {"uid": uid, "name": "fake-traefik-pod", "namespace": "kube-system"},
+            "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+            "spec": {"containers": [ingress_container()]}}
+
+
+class IngressArgumentsTest(unittest.TestCase):
+    def test_literal_reviewed_argument_and_field_oracles_match_source(self):
+        self.assertEqual(driver.INGRESS_LOG_ARGUMENTS, set(EXPECTED_INGRESS_ARGS))
+        self.assertEqual(driver.INGRESS_LOG_FIELDS, EXPECTED_INGRESS_FIELDS)
+        self.assertEqual(driver.INGRESS_LOG_METADATA, {"time", "msg", "level"})
+        self.assertEqual(len(EXPECTED_INGRESS_ARGS), 7)
+
+    def test_exact_arguments_and_unrelated_environment_are_accepted_without_mutation(self):
+        containers = [ingress_container()]
+        before = copy.deepcopy(containers)
+        driver.DastHarness.validate_ingress_arguments(containers)
+        self.assertEqual(containers, before)
+
+    def test_each_missing_or_duplicated_argument_is_rejected(self):
+        for arg in EXPECTED_INGRESS_ARGS:
+            for mode in ("missing", "duplicate"):
+                with self.subTest(arg=arg, mode=mode):
+                    container = ingress_container()
+                    if mode == "missing":
+                        container["args"].remove(arg)
+                    else:
+                        container["args"].append(arg)
+                    with self.assertRaises(AssertionError):
+                        driver.DastHarness.validate_ingress_arguments([container])
+
+    def test_extra_case_variant_format_or_privacy_override_is_rejected(self):
+        for old, new in ((None, "--accesslog.filepath=/fake-fixture/access.log"),
+                         (None, "--accesslog.fields.names.RequestPath=keep"),
+                         ("--accesslog=true", "--accessLog=true"),
+                         ("--accesslog.format=json", "--accesslog.format=common"),
+                         ("--accesslog.fields.defaultmode=drop", "--accesslog.fields.defaultmode=keep"),
+                         ("--accesslog.fields.headers.defaultmode=drop", "--accesslog.fields.headers.defaultmode=keep"),
+                         ("--accesslog.fields.names.DownstreamStatus=keep",
+                          "--accesslog.fields.names.downstreamstatus=keep")):
+            with self.subTest(new=new):
+                container = ingress_container()
+                if old is not None:
+                    container["args"].remove(old)
+                container["args"].append(new)
+                with self.assertRaises(AssertionError):
+                    driver.DastHarness.validate_ingress_arguments([container])
+
+    def test_direct_or_value_from_environment_override_is_rejected(self):
+        for name in ("TRAEFIK_ACCESSLOG", "traefik_accesslog_format", "Traefik_Accesslog_Fields_Names"):
+            for value in ({"value": "fake"}, {"valueFrom": {"secretKeyRef": {
+                    "name": "fake-fixture-secret", "key": "fake-fixture-key"}}}):
+                with self.subTest(name=name, value=value):
+                    container = ingress_container()
+                    container["env"].append({"name": name, **value})
+                    with self.assertRaises(AssertionError):
+                        driver.DastHarness.validate_ingress_arguments([container])
+
+    def test_env_from_is_not_accepted_as_unreviewed_logging_configuration(self):
+        for invalid in ([{"secretRef": {"name": "fake-fixture-secret"}}],
+                        [{"configMapRef": {"name": "fake-fixture-config"}}], None, {}):
+            container = ingress_container()
+            container["envFrom"] = invalid
+            with self.assertRaises(AssertionError):
+                driver.DastHarness.validate_ingress_arguments([container])
+        container = ingress_container()
+        container["envFrom"] = []
+        driver.DastHarness.validate_ingress_arguments([container])
+
+    def test_other_or_missing_container_name_cannot_supply_traefik_argument_proof(self):
+        for name in ("fake-sidecar", "Traefik", None):
+            container = ingress_container()
+            container["name"] = name
+            with self.assertRaises(AssertionError):
+                driver.DastHarness.validate_ingress_arguments([container])
+        container = ingress_container()
+        del container["name"]
+        with self.assertRaises(AssertionError):
+            driver.DastHarness.validate_ingress_arguments([container])
+
+    def test_malformed_container_arguments_or_environment_is_rejected(self):
+        for containers in (None, [], {}, [None], [ingress_container(), ingress_container()]):
+            with self.assertRaises(AssertionError):
+                driver.DastHarness.validate_ingress_arguments(containers)
+        for field, invalid in (("args", None), ("args", "--accesslog=true"), ("args", [True]),
+                               ("env", None), ("env", {}), ("env", [None]), ("env", [{"name": 1}])):
+            container = ingress_container()
+            container[field] = invalid
+            with self.assertRaises(AssertionError):
+                driver.DastHarness.validate_ingress_arguments([container])
+
+
+class IngressMonitorTest(unittest.TestCase):
+    def configured(self, mode="max", *, pods=None, deployment_containers=None):
+        value = harness()
+        value.args = SimpleNamespace(kubernetes=mode)
+        value.private_details = {}
+        value.apply_json = mock.Mock()
+        old = {"items": [ingress_pod("fake-old-uid")]}
+        current = {"items": [ingress_pod()]} if pods is None else {"items": pods}
+        values = {"deployment": {"replicas": 1}, "providers": {"kubernetesCRD": {"enabled": True}}}
+        config = {"spec": {"valuesContent": driver.yaml.safe_dump(values)}}
+        deployment = {"spec": {"template": {"spec": {"containers": (
+            [ingress_container()] if deployment_containers is None else deployment_containers)}}}}
+        pod_reads = 0
+
+        def kubectl(*args):
+            nonlocal pod_reads
+            if args == ("get", "pods", "-n", "kube-system", "-l",
+                        "app.kubernetes.io/name=traefik", "-o", "json"):
+                pod_reads += 1
+                return result(json.dumps(old if pod_reads == 1 else current))
+            if args == ("get", "helmchartconfig/traefik", "-n", "kube-system", "-o", "json"):
+                return result(json.dumps(config))
+            self.assertEqual(args, ("get", "deployment/traefik", "-n", "kube-system", "-o", "json"))
+            return result(json.dumps(deployment))
+
+        value.kubectl = mock.Mock(side_effect=kubectl)
+        return value
+
+    def run_monitor(self, value):
+        def wait(probe, *, timeout, label):
+            self.assertEqual((timeout, label), (180, "monitored ingress rollout"))
+            if not probe():
+                raise TimeoutError("fake rollout never acquired a fresh ready pod")
+        with mock.patch.object(driver, "wait_until", side_effect=wait):
+            value.monitor_ingress()
+
+    def test_both_pinned_chart_schemas_emit_exact_independent_privacy_values(self):
+        expected_names = {"DownstreamStatus": "keep", "OriginStatus": "keep", "RouterName": "keep"}
+        expected = {
+            "min": ("40.1.4+up40.1.0", "logs", {"access": {
+                "enabled": True, "format": "json",
+                "fields": {"general": {"defaultmode": "drop", "names": expected_names},
+                           "headers": {"defaultmode": "drop"}},
+            }}),
+            "max": ("41.4.2+up41.4.0", "accessLog", {
+                "enabled": True, "format": "json",
+                "fields": {"defaultMode": "drop", "names": expected_names,
+                           "headers": {"defaultMode": "drop"}},
+            }),
+        }
+        for mode, (version, key, logging) in expected.items():
+            with self.subTest(mode=mode):
+                value = self.configured(mode)
+                self.run_monitor(value)
+                value.apply_json.assert_called_once()
+                applied = driver.yaml.safe_load(value.apply_json.call_args.args[0]["spec"]["valuesContent"])
+                self.assertEqual(applied[key], logging)
+                self.assertEqual(set(applied), {"deployment", "providers", key})
+                self.assertEqual(applied["deployment"], {"replicas": 1})
+                self.assertEqual(applied["providers"], {"kubernetesCRD": {"enabled": True}})
+                self.assertEqual(value.private_details["ingressConfiguration"], {
+                    "chartVersion": version, "arguments": sorted(EXPECTED_INGRESS_ARGS),
+                })
+
+    def test_unknown_chart_pin_refuses_before_applying_any_config(self):
+        value = self.configured()
+        with mock.patch.object(driver, "K3S_TRAEFIK_CHART_VERSION", {"max": "fake-unreviewed-pin"}):
+            with self.assertRaises(AssertionError):
+                self.run_monitor(value)
+        value.apply_json.assert_not_called()
+        self.assertEqual(value.private_details, {})
+
+    def test_old_uid_nonrunning_or_nonready_pods_do_not_prove_rollout(self):
+        invalid = [ingress_pod("fake-old-uid"), ingress_pod(), ingress_pod(), ingress_pod(), ingress_pod()]
+        invalid[1]["status"]["phase"] = "Pending"
+        invalid[2]["status"]["conditions"][0]["status"] = "False"
+        invalid[3]["status"]["conditions"][0]["status"] = True
+        invalid[4]["status"]["conditions"][0]["type"] = "ContainersReady"
+        for pods in ([], *([pod] for pod in invalid)):
+            with self.subTest(pods=pods):
+                value = self.configured(pods=pods)
+                with self.assertRaises(TimeoutError):
+                    self.run_monitor(value)
+                self.assertNotIn("ingressConfiguration", value.private_details)
+                self.assertFalse(any(call.args[1] == "deployment/traefik"
+                                     for call in value.kubectl.call_args_list))
+
+    def test_wrong_fresh_pod_arguments_are_not_substituted_by_valid_deployment(self):
+        pod = ingress_pod()
+        pod["spec"]["containers"][0]["args"].append("--accesslog.fields.names.RequestPath=keep")
+        value = self.configured(pods=[pod])
+        with self.assertRaises(AssertionError):
+            self.run_monitor(value)
+        self.assertNotIn("ingressConfiguration", value.private_details)
+
+    def test_fresh_valid_pod_does_not_substitute_for_wrong_deployment_arguments(self):
+        container = ingress_container()
+        container["args"].remove("--accesslog.format=json")
+        value = self.configured(deployment_containers=[container])
+        with self.assertRaises(AssertionError):
+            self.run_monitor(value)
+        self.assertNotIn("ingressConfiguration", value.private_details)
+        self.assertTrue(any(call.args[1] == "deployment/traefik"
+                            for call in value.kubectl.call_args_list))
+
+    def test_nontraefik_fresh_pod_does_not_prove_rollout_with_copied_arguments(self):
+        pod = ingress_pod()
+        pod["spec"]["containers"][0]["name"] = "fake-other-workload"
+        value = self.configured(pods=[pod])
+        with self.assertRaises(AssertionError):
+            self.run_monitor(value)
+        self.assertNotIn("ingressConfiguration", value.private_details)
+
+
+def ingress_records():
+    records = [
+        {"DownstreamStatus": 200, "OriginStatus": 200, "RouterName": EXPECTED_INGRESS_ROUTERS["LOGIN"]},
+        {"DownstreamStatus": 101, "OriginStatus": 101, "RouterName": EXPECTED_INGRESS_ROUTERS["WS"]},
+        {"DownstreamStatus": 429, "RouterName": EXPECTED_INGRESS_ROUTERS["LOGIN"]},
+        {"DownstreamStatus": 429, "OriginStatus": 0, "RouterName": EXPECTED_INGRESS_ROUTERS["PACKAGES"]},
+    ]
+    for record in records:
+        record.update(time="2026-09-29T12:34:56Z", msg="", level="info")
+    return records
+
+
+class IngressObservationTest(unittest.TestCase):
+    def configured(self, records=None, *, raw=None):
+        value = harness()
+        value.private_details = {}
+        value.controls = {"INGRESS_MONITOR": False}
+        value.namespace = "plinth-issue40-fake-owned"
+        value.release = "issue40-dast"
+        entries = ingress_records() if records is None else records
+        value.kubectl = mock.Mock(return_value=result(
+            "\n".join(json.dumps(item) for item in entries) if raw is None else raw))
+        return value
+
+    def assert_rejected(self, records=None, *, raw=None):
+        value = self.configured(records, raw=raw)
+        with mock.patch("builtins.print") as emit:
+            with self.assertRaises(AssertionError):
+                value.observe_ingress()
+        self.assertFalse(value.controls["INGRESS_MONITOR"])
+        expected = (ingress_records() if records is None else records) if raw is None else []
+        self.assertEqual(value.private_details, {"ingressAccessLog": expected})
+        emit.assert_not_called()
+
+    def test_exact_router_names_match_literal_independent_wire_oracle(self):
+        value = self.configured()
+        self.assertEqual(value.expected_ingress_routers(), EXPECTED_INGRESS_ROUTERS)
+
+    def test_auth_backend_witness_ws_and_absent_or_zero_origin_edge_records_are_accepted(self):
+        for edge_origin in ("absent", 0):
+            records = ingress_records()
+            for item in records[2:]:
+                item.pop("OriginStatus", None)
+                if edge_origin != "absent":
+                    item["OriginStatus"] = edge_origin
+            before = copy.deepcopy(records)
+            value = self.configured(records)
+            value.observe_ingress()
+            self.assertTrue(value.controls["INGRESS_MONITOR"])
+            self.assertEqual(value.private_details["ingressAccessLog"], before)
+            self.assertEqual(records, before)
+            value.kubectl.assert_called_once_with(
+                "logs", "deployment/traefik", "-n", "kube-system", "--tail=4000")
+
+    def test_backend_429_cannot_supply_either_edge_admission_witness(self):
+        for index in (2, 3):
+            records = ingress_records()
+            records[index]["OriginStatus"] = 429
+            self.assert_rejected(records)
+
+    def test_foreign_namespace_wrong_hash_or_provider_cannot_supply_any_witness(self):
+        for index in range(4):
+            for change in ("namespace", "hash", "provider"):
+                with self.subTest(index=index, change=change):
+                    records = ingress_records()
+                    name = records[index]["RouterName"]
+                    if change == "namespace":
+                        name = name.replace("plinth-issue40-fake-owned-", "plinth-issue40-other-owned-", 1)
+                    elif change == "hash":
+                        name = name.rsplit("-", 1)[0] + "-" + "0" * 20 + "@kubernetescrd"
+                    else:
+                        name = name.replace("@kubernetescrd", "@kubernetes")
+                    records[index]["RouterName"] = name
+                    self.assert_rejected(records)
+
+    def test_bare_or_other_route_101_cannot_prove_owned_websocket_upgrade(self):
+        for router in (None, EXPECTED_INGRESS_ROUTERS["LOGIN"], EXPECTED_INGRESS_ROUTERS["PACKAGES"]):
+            records = ingress_records()
+            if router is None:
+                del records[1]["RouterName"]
+            else:
+                records[1]["RouterName"] = router
+            self.assert_rejected(records)
+
+    def test_registration_auth_router_cannot_supply_login_backend_or_edge_witness(self):
+        registration = "plinth-issue40-fake-owned-issue40-dast-plinth-auth-1d6f71fe9528546e6f41@kubernetescrd"
+        for index in (0, 2):
+            records = ingress_records()
+            records[index]["RouterName"] = registration
+            self.assert_rejected(records)
+
+    def test_absent_or_zero_origin_is_not_edge_proof_without_real_auth_backend_witness(self):
+        variants = [ingress_records()[1:]]
+        for change in ("absent", "zero", "wrong-origin", "wrong-router"):
+            records = ingress_records()
+            if change == "absent":
+                del records[0]["OriginStatus"]
+            elif change == "zero":
+                records[0]["OriginStatus"] = 0
+            elif change == "wrong-origin":
+                records[0]["OriginStatus"] = 201
+            else:
+                records[0]["RouterName"] = "fake-unrelated-router"
+            variants.append(records)
+        for records in variants:
+            self.assert_rejected(records)
+
+    def test_each_required_ws_auth_or_packages_witness_must_be_present(self):
+        for index in (1, 2, 3):
+            records = ingress_records()
+            del records[index]
+            self.assert_rejected(records)
+
+    def test_malformed_status_types_ranges_or_router_names_are_rejected(self):
+        for field, invalid in (("DownstreamStatus", "200"), ("DownstreamStatus", True),
+                               ("DownstreamStatus", 200.0), ("DownstreamStatus", None),
+                               ("DownstreamStatus", 0), ("DownstreamStatus", 600),
+                               ("OriginStatus", "200"), ("OriginStatus", False),
+                               ("OriginStatus", 200.0), ("OriginStatus", None),
+                               ("OriginStatus", -1), ("OriginStatus", 600), ("RouterName", 1)):
+            with self.subTest(field=field, invalid=invalid):
+                records = ingress_records()
+                extra = copy.deepcopy(records[0])
+                extra[field] = invalid
+                records.append(extra)
+                self.assert_rejected(records)
+
+    def test_every_fixed_metadata_field_is_required_and_strict(self):
+        for field in ("time", "msg", "level"):
+            records = ingress_records()
+            del records[0][field]
+            self.assert_rejected(records)
+        for field, invalid in (("level", "debug"), ("level", "INFO"), ("level", None),
+                               ("msg", "fake-private-message"), ("msg", None), ("msg", 0),
+                               ("time", None), ("time", 123), ("time", ""),
+                               ("time", "2026-02-30T12:34:56Z"), ("time", "2026-09-29T25:34:56Z"),
+                               ("time", "2026-09-29T12:34:56+01:60"),
+                               ("time", "2026-09-29T12:34:56+24:00"),
+                               ("time", "2026-09-29T12:34:56Z fake-private-value")):
+            with self.subTest(field=field, invalid=invalid):
+                records = ingress_records()
+                records[0][field] = invalid
+                self.assert_rejected(records)
+
+    def test_valid_fixed_metadata_accepts_reviewed_rfc3339_offsets(self):
+        for stamp in ("2026-09-29T12:34:56Z", "2026-09-29T12:34:56+00:00", "2026-09-29T12:34:56+01:30"):
+            records = ingress_records()
+            for item in records:
+                item["time"] = stamp
+            value = self.configured(records)
+            value.observe_ingress()
+            self.assertTrue(value.controls["INGRESS_MONITOR"])
+            self.assertEqual(value.private_details["ingressAccessLog"], records)
+
+    def test_path_query_header_or_other_extra_fields_fail_and_are_retained_only_privately(self):
+        for field in ("RequestPath", "RequestHost", "request_Authorization", "request_Cookie", "unexpected"):
+            records = ingress_records()
+            records[0][field] = "fake-private-value-never-retained-on-rejection"
+            self.assert_rejected(records)
+
+    def test_empty_malformed_or_saturated_log_cannot_prove_monitor(self):
+        for raw in ("", "not JSON", "[]", "{malformed", '{"RouterName":"fake-auth-router"}'):
+            self.assert_rejected(raw=raw)
+        self.assert_rejected(ingress_records() * 1000)
 
 
 class BrowserReceiptTest(unittest.TestCase):

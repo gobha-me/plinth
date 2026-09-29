@@ -56,7 +56,14 @@ malformed/traversal requests. Separate controls exercise the chart's body-size
 limit, authentication burst limit, and package concurrent-admission limit.
 Traefik JSON access logs must independently show an actual 101 upgrade and
 edge-generated authentication/package 429 responses, not backend substitutes.
-Access-log fields are allowlisted; headers and query values are not logged.
+The two pinned bundled chart versions use separately tested logging schemas.
+The new ready ingress pod and its Deployment must both contain the exact
+reviewed access-log arguments. Only downstream status, origin status and router
+name are retained as request-derived fields, alongside the pinned formatter's
+fixed timestamp, empty message and info level. Paths, headers and query values
+are dropped. A successful backend login must retain its explicit origin status
+before missing origin status may identify a Traefik-generated rejection, as the
+pinned engine omits that field for locally handled responses.
 
 Scanner route coverage is derived from actual retained request messages, with
 matching HTTPS authority and Host, not from planned control names. Required

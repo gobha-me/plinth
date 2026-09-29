@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+from datetime import datetime
+import hashlib
 import http.client
 import json
 import os
@@ -32,7 +34,7 @@ import urllib.request
 import yaml
 
 from dast_report import REQUIRED_CONTROLS, classify_route, public_report
-from k3d_lifecycle_test import Harness, ROOT, free_port, require
+from k3d_lifecycle_test import Harness, K3S_TRAEFIK_CHART_VERSION, ROOT, free_port, require
 
 sys.path.insert(0, str(ROOT / "tests/browser"))
 from process_cleanup import run_browser  # noqa: E402
@@ -48,6 +50,13 @@ ACTIVE_PATHS = ("/app/?issue40_probe=read_only",
                 "/api/frontend/applications?issue40_probe=read_only")
 ADMIN_NAME = "issue36-admin"
 ADMIN_PASSWORD = "fake-password-for-issue36!"
+INGRESS_LOG_FIELDS = ("DownstreamStatus", "OriginStatus", "RouterName")
+INGRESS_LOG_METADATA = {"time", "msg", "level"}
+INGRESS_LOG_ARGUMENTS = {
+    "--accesslog=true", "--accesslog.format=json",
+    "--accesslog.fields.defaultmode=drop", "--accesslog.fields.headers.defaultmode=drop",
+    *(f"--accesslog.fields.names.{name}=keep" for name in INGRESS_LOG_FIELDS),
+}
 
 
 def wait_until(observe, *, timeout, label):
@@ -65,6 +74,17 @@ def private_json(path, value):
     with os.fdopen(descriptor, "w", encoding="utf-8") as output:
         json.dump(value, output, sort_keys=True, indent=2)
         output.write("\n")
+
+
+def ingress_log_time(value):
+    if not isinstance(value, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)", value):
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
 
 
 def observed_routes(messages, origin):
@@ -417,30 +437,69 @@ class DastHarness(Harness):
         config = json.loads(self.kubectl("get", "helmchartconfig/traefik", "-n",
                                         "kube-system", "-o", "json").stdout)
         values = yaml.safe_load(config["spec"]["valuesContent"])
-        # Log fields are an explicit allowlist. Header and query values never
-        # enter access logs; raw paths remain private and are not public output.
-        values["logs"] = {"access": {
-            "enabled": True, "format": "json",
-            "fields": {"general": {"defaultmode": "drop", "names": {
-                "RequestMethod": "keep", "RequestPath": "keep",
-                "DownstreamStatus": "keep", "OriginStatus": "keep",
-                "RouterName": "keep", "StartUTC": "keep",
-            }}, "headers": {"defaultmode": "drop"}},
-        }}
+        chart_version = K3S_TRAEFIK_CHART_VERSION[self.args.kubernetes]
+        names = dict.fromkeys(INGRESS_LOG_FIELDS, "keep")
+        # The two pinned bundled charts have different logging schemas. Keep
+        # only the fields used below: paths, query values and headers are dropped.
+        if chart_version == "40.1.4+up40.1.0":
+            values["logs"] = {"access": {
+                "enabled": True, "format": "json",
+                "fields": {"general": {"defaultmode": "drop", "names": names},
+                           "headers": {"defaultmode": "drop"}},
+            }}
+        elif chart_version == "41.4.2+up41.4.0":
+            values["accessLog"] = {
+                "enabled": True, "format": "json",
+                "fields": {"defaultMode": "drop", "names": names,
+                           "headers": {"defaultMode": "drop"}},
+            }
+        else:
+            raise AssertionError("unreviewed ingress logging chart schema")
         config["spec"]["valuesContent"] = yaml.safe_dump(values)
         self.apply_json(config)
 
         def changed():
             pods = json.loads(self.kubectl("get", "pods", "-n", "kube-system", "-l",
                                           "app.kubernetes.io/name=traefik", "-o", "json").stdout)
-            return any(pod["metadata"]["uid"] not in old_uids
-                       and any(condition.get("status") == "True"
-                               and condition.get("type") == "Ready"
-                               for condition in pod.get("status", {}).get("conditions", []))
-                       and pod.get("status", {}).get("phase") == "Running"
-                       for pod in pods["items"])
+            for pod in pods["items"]:
+                if (pod["metadata"]["uid"] not in old_uids
+                        and any(condition.get("status") == "True"
+                                and condition.get("type") == "Ready"
+                                for condition in pod.get("status", {}).get("conditions", []))
+                        and pod.get("status", {}).get("phase") == "Running"):
+                    self.validate_ingress_arguments(pod["spec"]["containers"])
+                    deployment = json.loads(self.kubectl(
+                        "get", "deployment/traefik", "-n", "kube-system", "-o", "json").stdout)
+                    self.validate_ingress_arguments(
+                        deployment["spec"]["template"]["spec"]["containers"])
+                    return True
+            return False
 
         wait_until(changed, timeout=180, label="monitored ingress rollout")
+        self.private_details["ingressConfiguration"] = {
+            "chartVersion": chart_version, "arguments": sorted(INGRESS_LOG_ARGUMENTS),
+        }
+
+    @staticmethod
+    def validate_ingress_arguments(containers):
+        require(isinstance(containers, list) and len(containers) == 1,
+                "unexpected monitored ingress containers")
+        container = containers[0]
+        require(isinstance(container, dict) and container.get("name") == "traefik",
+                "invalid monitored ingress container")
+        args = container.get("args")
+        require(isinstance(args, list) and all(isinstance(arg, str) for arg in args),
+                "monitored ingress arguments missing")
+        access_args = [arg for arg in args if arg.lower().startswith("--accesslog")]
+        require(len(access_args) == len(INGRESS_LOG_ARGUMENTS)
+                and set(access_args) == INGRESS_LOG_ARGUMENTS,
+                "actual ingress logging arguments do not match the reviewed allowlist")
+        env = container.get("env", [])
+        require(container.get("envFrom", []) == []
+                and isinstance(env, list) and all(
+            isinstance(item, dict) and isinstance(item.get("name"), str)
+            and not item["name"].upper().startswith("TRAEFIK_ACCESSLOG") for item in env),
+            "ingress logging environment override is not reviewed")
 
     def request(self, path, *, method="GET", body=None, headers=None, cookies=False):
         require(path.startswith("/") and not path.startswith("//")
@@ -653,19 +712,55 @@ class DastHarness(Harness):
                 continue
             if isinstance(item, dict) and "DownstreamStatus" in item:
                 entries.append(item)
-        require(entries and len(entries) < 4000, "ingress monitor absent or truncated")
-        require(any(item.get("DownstreamStatus") == 101 for item in entries),
-                "ingress did not observe actual WebSocket upgrade")
-        require(any(item.get("DownstreamStatus") == 429
-                    and "auth" in item.get("RouterName", "")
-                    and item.get("OriginStatus", 0) == 0 for item in entries),
-                "edge authentication rejection was not independently monitored")
-        require(any(item.get("DownstreamStatus") == 429
-                    and "packages" in item.get("RouterName", "")
-                    and item.get("OriginStatus", 0) == 0 for item in entries),
-                "edge package admission rejection was not independently monitored")
+        # Preserve actual private records even when a subsequent witness fails.
         self.private_details["ingressAccessLog"] = entries
+        require(entries and len(entries) < 4000, "ingress monitor absent or truncated")
+        require(all(set(item) <= set(INGRESS_LOG_FIELDS) | INGRESS_LOG_METADATA
+                    and INGRESS_LOG_METADATA <= set(item)
+                    and item["level"] == "info" and item["msg"] == ""
+                    and ingress_log_time(item["time"])
+                    and type(item.get("DownstreamStatus")) is int
+                    and 100 <= item["DownstreamStatus"] <= 599
+                    and ("OriginStatus" not in item
+                         or (type(item["OriginStatus"]) is int
+                             and 0 <= item["OriginStatus"] <= 599))
+                    and ("RouterName" not in item
+                         or isinstance(item["RouterName"], str)) for item in entries),
+                "ingress monitor fields do not match the reviewed allowlist")
+        routers = self.expected_ingress_routers()
+        # Pinned Traefik omits OriginStatus when it handles an edge response.
+        # First prove it retained the explicit status of a real backend login;
+        # only then may absence distinguish edge rejection from backend 429.
+        require(any(item["DownstreamStatus"] == 200
+                    and item.get("OriginStatus") == 200
+                    and item.get("RouterName") == routers["LOGIN"] for item in entries),
+                "ingress monitor did not retain a backend authentication status")
+        require(any(item["DownstreamStatus"] == 101
+                    and item.get("RouterName") == routers["WS"] for item in entries),
+                "ingress did not observe actual WebSocket upgrade")
+        require(any(item["DownstreamStatus"] == 429
+                    and item.get("RouterName") == routers["LOGIN"]
+                    and ("OriginStatus" not in item or item["OriginStatus"] == 0)
+                    for item in entries),
+                "edge authentication rejection was not independently monitored")
+        require(any(item["DownstreamStatus"] == 429
+                    and item.get("RouterName") == routers["PACKAGES"]
+                    and ("OriginStatus" not in item or item["OriginStatus"] == 0)
+                    for item in entries),
+                "edge package admission rejection was not independently monitored")
         self.controls["INGRESS_MONITOR"] = True
+
+    def expected_ingress_routers(self):
+        # Match the unchanged chart's three exact rules and pinned Traefik's
+        # default legacy CRD naming, including namespace and provider identity.
+        rules = {
+            "WS": ("ws", f"Host(`{self.host}`) && Path(`/ws/events`)"),
+            "LOGIN": ("auth", f"Host(`{self.host}`) && Path(`/api/auth/login`) && Method(`POST`)"),
+            "PACKAGES": ("packages", f"Host(`{self.host}`) && Path(`/api/packages`) && Method(`POST`)"),
+        }
+        return {label: f"{self.namespace}-{self.release}-plinth-{kind}-"
+                       f"{hashlib.sha256(rule.encode()).hexdigest()[:20]}@kubernetescrd"
+                for label, (kind, rule) in rules.items()}
 
     def execute_dast(self):
         self.create_infrastructure()
