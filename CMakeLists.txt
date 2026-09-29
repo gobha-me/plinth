@@ -660,6 +660,7 @@ add_executable(plinth_tests
   tests/kernel/js/conversion_corpus_test.cpp
   tests/kernel/js/host_string_boundary_test.cpp
   tests/kernel/js/audit_authority_regression_test.cpp
+  tests/kernel/js/audit_corpus_test.cpp
   tests/kernel/js/log_corpus_test.cpp
   tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -953,6 +954,16 @@ add_test(NAME plinth_tests_audit_authority
   COMMAND plinth_tests "[js][audit][authority-regression]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_audit_authority PROPERTIES TIMEOUT 30)
+
+# Exact, DB-free audit corpus; missing cases, skips and nonzero exits fail closed.
+add_test(NAME plinth_tests_audit_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS audit.log has a bounded deterministic contract corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_audit_corpus PROPERTIES TIMEOUT 75)
 
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
