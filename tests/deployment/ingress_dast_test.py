@@ -9,6 +9,8 @@ published-release certification or an authorization to scan an existing service.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from contextlib import ExitStack
 from datetime import datetime
 import hashlib
@@ -715,19 +717,22 @@ class DastHarness(Harness):
         # Preserve actual private records even when a subsequent witness fails.
         self.private_details["ingressAccessLog"] = entries
         require(entries and len(entries) < 4000, "ingress monitor absent or truncated")
+        routers = self.expected_ingress_routers()
         require(all(set(item) <= set(INGRESS_LOG_FIELDS) | INGRESS_LOG_METADATA
                     and INGRESS_LOG_METADATA <= set(item)
                     and item["level"] == "info" and item["msg"] == ""
                     and ingress_log_time(item["time"])
                     and type(item.get("DownstreamStatus")) is int
-                    and 100 <= item["DownstreamStatus"] <= 599
+                    and (100 <= item["DownstreamStatus"] <= 599
+                         or (item["DownstreamStatus"] == 0
+                             and item.get("RouterName") == routers["WS"]
+                             and item.get("OriginStatus") == 0))
                     and ("OriginStatus" not in item
                          or (type(item["OriginStatus"]) is int
                              and 0 <= item["OriginStatus"] <= 599))
                     and ("RouterName" not in item
                          or isinstance(item["RouterName"], str)) for item in entries),
                 "ingress monitor fields do not match the reviewed allowlist")
-        routers = self.expected_ingress_routers()
         # Pinned Traefik omits OriginStatus when it handles an edge response.
         # First prove it retained the explicit status of a real backend login;
         # only then may absence distinguish edge rejection from backend 429.
@@ -735,9 +740,16 @@ class DastHarness(Harness):
                     and item.get("OriginStatus") == 200
                     and item.get("RouterName") == routers["LOGIN"] for item in entries),
                 "ingress monitor did not retain a backend authentication status")
-        require(any(item["DownstreamStatus"] == 101
-                    and item.get("RouterName") == routers["WS"] for item in entries),
-                "ingress did not observe actual WebSocket upgrade")
+        # The pinned fast proxy writes the 101 directly after Hijack, leaving
+        # both capture statuses unset (zero). Never reinterpret zero as 101:
+        # require the actual proxy handshake AND native authenticated browser
+        # grant/closure, independently of the exact router completion record.
+        websocket_entries = [item for item in entries if item.get("RouterName") == routers["WS"]]
+        require(len(websocket_entries) == 1 and websocket_entries[0]["DownstreamStatus"] == 0
+                and websocket_entries[0].get("OriginStatus") == 0,
+                "ingress did not observe the exact owned WebSocket completion")
+        self.validate_browser_receipt(self.private_details.get("browser"))
+        self.validate_websocket_handshake(self.raw_messages, self.origin)
         require(any(item["DownstreamStatus"] == 429
                     and item.get("RouterName") == routers["LOGIN"]
                     and ("OriginStatus" not in item or item["OriginStatus"] == 0)
@@ -749,6 +761,75 @@ class DastHarness(Harness):
                     for item in entries),
                 "edge package admission rejection was not independently monitored")
         self.controls["INGRESS_MONITOR"] = True
+        self.private_details["websocketProxyProof"] = {
+            "handshakes": 1, "status": 101, "ownedRoute": True, "acceptVerified": True,
+        }
+
+    @staticmethod
+    def validate_websocket_handshake(messages, origin):
+        require(isinstance(messages, list), "WebSocket proxy inventory is unavailable")
+        candidates = [message for message in messages
+                      if observed_routes([message], origin) == {"WS"}]
+        require(len(candidates) == 1, "expected exactly one owned WebSocket proxy handshake")
+        message = candidates[0]
+        first = message["requestHeader"].split("\r\n", 1)[0].split(" ")
+        target = urllib.parse.urlsplit(first[1])
+        require(first[0] == "GET" and first[2] == "HTTP/1.1"
+                and target.path == "/ws/events" and not target.query and not target.fragment
+                and message.get("requestBody") == "",
+                "WebSocket proxy request differs from the native browser route")
+
+        def headers(raw):
+            require(isinstance(raw, str) and raw.endswith("\r\n\r\n"),
+                    "WebSocket proxy headers unavailable or unterminated")
+            lines = raw.split("\r\n")
+            require(len(lines) > 1 and not re.search(r"[\x00-\x1f\x7f]", lines[0]),
+                    "WebSocket proxy headers malformed")
+            fields = {}
+            ended = False
+            for line in lines[1:]:
+                if not line:
+                    ended = True
+                    continue
+                require(not ended, "WebSocket proxy header appeared after the terminator")
+                name, separator, value = line.partition(":")
+                require(separator and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name),
+                        "WebSocket proxy header field malformed")
+                require(not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value),
+                        "WebSocket proxy header value contains a control character")
+                fields.setdefault(name.lower(), []).append(value.strip(" \t"))
+            require(ended, "WebSocket proxy header terminator missing")
+            return lines[0], fields
+
+        _, request = headers(message["requestHeader"])
+        status, response = headers(message.get("responseHeader"))
+        require(re.fullmatch(r"HTTP/1\.1 101(?: [^\r\n]*)?", status),
+                "proxy did not observe an actual WebSocket 101")
+        require(request.get("origin") == [origin]
+                and request.get("sec-websocket-version") == ["13"],
+                "WebSocket browser origin or protocol version differs")
+        for fields in (request, response):
+            upgrade, connection = fields.get("upgrade", []), fields.get("connection", [])
+            require(len(upgrade) == 1 and upgrade[0].lower() == "websocket"
+                    and len(connection) == 1
+                    and "upgrade" in {token.strip().lower() for token in connection[0].split(",")},
+                    "WebSocket proxy upgrade headers are not unambiguous")
+        keys = request.get("sec-websocket-key", [])
+        require(len(keys) == 1 and len(keys[0]) == 24,
+                "WebSocket proxy key is missing or duplicated")
+        try:
+            decoded = base64.b64decode(keys[0], validate=True)
+        except (binascii.Error, ValueError):
+            raise AssertionError("WebSocket proxy key encoding is malformed") from None
+        require(len(decoded) == 16 and base64.b64encode(decoded).decode("ascii") == keys[0],
+                "WebSocket proxy key is not canonical")
+        # RFC 6455 mandates SHA-1 here; this is protocol acceptance, not a
+        # password hash or a claim of cryptographic authorization.
+        accepted = base64.b64encode(hashlib.sha1(
+            (keys[0] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii"),
+            usedforsecurity=False).digest()).decode("ascii")
+        require(response.get("sec-websocket-accept") == [accepted],
+                "WebSocket proxy acceptance does not match the exact request key")
 
     def expected_ingress_routers(self):
         # Match the unchanged chart's three exact rules and pinned Traefik's

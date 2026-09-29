@@ -36,6 +36,9 @@ EXPECTED_INGRESS_ROUTERS = {
     "LOGIN": "plinth-issue40-fake-owned-issue40-dast-plinth-auth-3fa752a55157f8ab2143@kubernetescrd",
     "PACKAGES": "plinth-issue40-fake-owned-issue40-dast-plinth-packages-1059becbc0d9079a0745@kubernetescrd",
 }
+EXPECTED_WEBSOCKET_PROXY_PROOF = {
+    "handshakes": 1, "status": 101, "ownedRoute": True, "acceptVerified": True,
+}
 
 
 def result(stdout="", *, returncode=0, stderr=""):
@@ -819,7 +822,7 @@ class IngressMonitorTest(unittest.TestCase):
 def ingress_records():
     records = [
         {"DownstreamStatus": 200, "OriginStatus": 200, "RouterName": EXPECTED_INGRESS_ROUTERS["LOGIN"]},
-        {"DownstreamStatus": 101, "OriginStatus": 101, "RouterName": EXPECTED_INGRESS_ROUTERS["WS"]},
+        {"DownstreamStatus": 0, "OriginStatus": 0, "RouterName": EXPECTED_INGRESS_ROUTERS["WS"]},
         {"DownstreamStatus": 429, "RouterName": EXPECTED_INGRESS_ROUTERS["LOGIN"]},
         {"DownstreamStatus": 429, "OriginStatus": 0, "RouterName": EXPECTED_INGRESS_ROUTERS["PACKAGES"]},
     ]
@@ -828,13 +831,31 @@ def ingress_records():
     return records
 
 
+def websocket_message():
+    # RFC 6455's published synthetic challenge/accept pair, not credentials.
+    return {
+        "requestHeader": "GET /ws/events HTTP/1.1\r\n"
+                         "Host: plinth.test:8443\r\n"
+                         "Origin: https://plinth.test:8443\r\n"
+                         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                         "Sec-WebSocket-Version: 13\r\n"
+                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+        "requestBody": "",
+        "responseHeader": "HTTP/1.1 101 Switching Protocols\r\n"
+                          "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                          "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+        "responseBody": "",
+    }
+
+
 class IngressObservationTest(unittest.TestCase):
     def configured(self, records=None, *, raw=None):
         value = harness()
-        value.private_details = {}
+        value.private_details = {"browser": browser_receipt()}
         value.controls = {"INGRESS_MONITOR": False}
         value.namespace = "plinth-issue40-fake-owned"
         value.release = "issue40-dast"
+        value.raw_messages = [websocket_message()]
         entries = ingress_records() if records is None else records
         value.kubectl = mock.Mock(return_value=result(
             "\n".join(json.dumps(item) for item in entries) if raw is None else raw))
@@ -847,7 +868,7 @@ class IngressObservationTest(unittest.TestCase):
                 value.observe_ingress()
         self.assertFalse(value.controls["INGRESS_MONITOR"])
         expected = (ingress_records() if records is None else records) if raw is None else []
-        self.assertEqual(value.private_details, {"ingressAccessLog": expected})
+        self.assertEqual(value.private_details, {"browser": browser_receipt(), "ingressAccessLog": expected})
         emit.assert_not_called()
 
     def test_exact_router_names_match_literal_independent_wire_oracle(self):
@@ -866,6 +887,7 @@ class IngressObservationTest(unittest.TestCase):
             value.observe_ingress()
             self.assertTrue(value.controls["INGRESS_MONITOR"])
             self.assertEqual(value.private_details["ingressAccessLog"], before)
+            self.assertEqual(value.private_details["websocketProxyProof"], EXPECTED_WEBSOCKET_PROXY_PROOF)
             self.assertEqual(records, before)
             value.kubectl.assert_called_once_with(
                 "logs", "deployment/traefik", "-n", "kube-system", "--tail=4000")
@@ -894,6 +916,7 @@ class IngressObservationTest(unittest.TestCase):
     def test_bare_or_other_route_101_cannot_prove_owned_websocket_upgrade(self):
         for router in (None, EXPECTED_INGRESS_ROUTERS["LOGIN"], EXPECTED_INGRESS_ROUTERS["PACKAGES"]):
             records = ingress_records()
+            records[1]["DownstreamStatus"] = records[1]["OriginStatus"] = 101
             if router is None:
                 del records[1]["RouterName"]
             else:
@@ -969,6 +992,7 @@ class IngressObservationTest(unittest.TestCase):
             value.observe_ingress()
             self.assertTrue(value.controls["INGRESS_MONITOR"])
             self.assertEqual(value.private_details["ingressAccessLog"], records)
+            self.assertEqual(value.private_details["websocketProxyProof"], EXPECTED_WEBSOCKET_PROXY_PROOF)
 
     def test_path_query_header_or_other_extra_fields_fail_and_are_retained_only_privately(self):
         for field in ("RequestPath", "RequestHost", "request_Authorization", "request_Cookie", "unexpected"):
@@ -980,6 +1004,219 @@ class IngressObservationTest(unittest.TestCase):
         for raw in ("", "not JSON", "[]", "{malformed", '{"RouterName":"fake-auth-router"}'):
             self.assert_rejected(raw=raw)
         self.assert_rejected(ingress_records() * 1000)
+
+    def test_access_log_101_is_not_a_pinned_zero_capture_completion(self):
+        records = ingress_records()
+        records[1]["DownstreamStatus"] = records[1]["OriginStatus"] = 101
+        self.assert_rejected(records)
+
+    def test_exactly_one_owned_zero_completion_is_required(self):
+        records = ingress_records()
+        records.append(copy.deepcopy(records[1]))
+        self.assert_rejected(records)
+
+    def test_additional_same_router_http_completion_cannot_hide_beside_valid_ws_zero(self):
+        for status in (101, 499, 200):
+            with self.subTest(status=status):
+                records = ingress_records()
+                extra = copy.deepcopy(records[1])
+                extra["DownstreamStatus"] = extra["OriginStatus"] = status
+                records.append(extra)
+                self.assert_rejected(records)
+
+    def test_zero_capture_is_rejected_on_other_routers_or_with_invalid_origin(self):
+        for router in (EXPECTED_INGRESS_ROUTERS["LOGIN"], EXPECTED_INGRESS_ROUTERS["PACKAGES"],
+                       None, "fake-foreign-router"):
+            records = ingress_records()
+            extra = copy.deepcopy(records[1])
+            extra["RouterName"] = router
+            records.append(extra)
+            self.assert_rejected(records)
+        for field, invalid in (("DownstreamStatus", False), ("DownstreamStatus", 0.0),
+                               ("DownstreamStatus", "0"), ("OriginStatus", False),
+                               ("OriginStatus", 0.0), ("OriginStatus", "0"),
+                               ("OriginStatus", None), ("OriginStatus", 101)):
+            records = ingress_records()
+            records[1][field] = invalid
+            self.assert_rejected(records)
+        records = ingress_records()
+        del records[1]["OriginStatus"]
+        self.assert_rejected(records)
+
+    def test_proxy_handshake_is_required_in_addition_to_owned_completion_and_native_grant(self):
+        for messages in ([], [message("/ws/events")], [websocket_message(), websocket_message()]):
+            value = self.configured()
+            value.raw_messages = messages
+            with self.assertRaises(AssertionError):
+                value.observe_ingress()
+            self.assertFalse(value.controls["INGRESS_MONITOR"])
+            self.assertNotIn("websocketProxyProof", value.private_details)
+            self.assertEqual(value.private_details["ingressAccessLog"], ingress_records())
+
+    def test_native_grant_and_retired_socket_are_required_with_wire_and_completion_proof(self):
+        invalid = [None, {}]
+        for section, field in (("websocket", "connected"), ("websocket", "applicationGrant"),
+                               ("logout", "originalSocketClosed")):
+            for mutation in ("missing", "false"):
+                receipt = browser_receipt()
+                if mutation == "missing":
+                    del receipt["proof"][section][field]
+                else:
+                    receipt["proof"][section][field] = False
+                invalid.append(receipt)
+        for receipt in invalid:
+            value = self.configured()
+            value.private_details["browser"] = receipt
+            with self.assertRaises(AssertionError):
+                value.observe_ingress()
+            self.assertFalse(value.controls["INGRESS_MONITOR"])
+            self.assertNotIn("websocketProxyProof", value.private_details)
+            self.assertEqual(value.private_details["ingressAccessLog"], ingress_records())
+        value = self.configured()
+        del value.private_details["browser"]
+        with self.assertRaises(AssertionError):
+            value.observe_ingress()
+        self.assertFalse(value.controls["INGRESS_MONITOR"])
+        self.assertNotIn("websocketProxyProof", value.private_details)
+
+
+class WebsocketHandshakeTest(unittest.TestCase):
+    def assert_rejected(self, messages, origin=ORIGIN):
+        before = copy.deepcopy(messages)
+        with mock.patch("builtins.print") as emit:
+            with self.assertRaises(AssertionError):
+                driver.DastHarness.validate_websocket_handshake(messages, origin)
+        self.assertEqual(messages, before)
+        emit.assert_not_called()
+
+    def test_rfc6455_fixture_is_accepted_without_mutation_or_printing(self):
+        messages = [websocket_message()]
+        before = copy.deepcopy(messages)
+        with mock.patch("builtins.print") as emit:
+            self.assertIsNone(driver.DastHarness.validate_websocket_handshake(messages, ORIGIN))
+        self.assertEqual(messages, before)
+        emit.assert_not_called()
+
+    def test_owned_absolute_target_and_case_insensitive_token_lists_are_accepted(self):
+        value = websocket_message()
+        value["requestHeader"] = value["requestHeader"].replace(
+            "GET /ws/events", "GET https://plinth.test:8443/ws/events", 1)
+        for field in ("requestHeader", "responseHeader"):
+            value[field] = value[field].replace("Upgrade: websocket", "uPgRaDe: WebSocket", 1)
+            value[field] = value[field].replace("Connection: Upgrade", "cOnNeCtIoN: keep-alive, upgrade", 1)
+        messages = [message("/app/"), value]
+        before = copy.deepcopy(messages)
+        self.assertIsNone(driver.DastHarness.validate_websocket_handshake(messages, ORIGIN))
+        self.assertEqual(messages, before)
+
+    def test_missing_duplicate_or_unrelated_messages_do_not_supply_exactly_one_handshake(self):
+        for messages in (None, {}, "fake inventory", [], [None], [message()],
+                         [websocket_message(), websocket_message()]):
+            self.assert_rejected(messages)
+
+    def test_wrong_request_authority_path_query_method_protocol_or_origin_is_rejected(self):
+        header = websocket_message()["requestHeader"]
+        for old, new in (("GET /ws/events", "POST /ws/events"),
+                         ("GET /ws/events", "GET /ws/events?fake=1"),
+                         ("GET /ws/events", "GET /ws/events/"),
+                         ("GET /ws/events", "GET /app/"),
+                         ("GET /ws/events", "GET https://foreign.test:8443/ws/events"),
+                         ("HTTP/1.1", "HTTP/1.0"),
+                         ("Host: plinth.test:8443", "Host: foreign.test:8443"),
+                         ("Origin: https://plinth.test:8443", "Origin: https://foreign.test:8443")):
+            with self.subTest(new=new):
+                value = websocket_message()
+                value["requestHeader"] = header.replace(old, new, 1)
+                self.assert_rejected([value])
+
+    def test_missing_or_nonempty_request_body_does_not_count_as_native_upgrade(self):
+        for invalid in ("fake-body", None, 1):
+            value = websocket_message()
+            value["requestBody"] = invalid
+            self.assert_rejected([value])
+        value = websocket_message()
+        del value["requestBody"]
+        self.assert_rejected([value])
+
+    def test_non101_or_malformed_response_status_is_rejected(self):
+        for status in ("HTTP/1.1 200 OK", "HTTP/1.1 302 Found", "HTTP/1.1 401 Unauthorized",
+                       "HTTP/1.1 1010 Fake", "not HTTP"):
+            value = websocket_message()
+            value["responseHeader"] = value["responseHeader"].replace(
+                "HTTP/1.1 101 Switching Protocols", status, 1)
+            self.assert_rejected([value])
+
+    def test_both_header_blocks_require_complete_crlf_crlf_termination(self):
+        for field in ("requestHeader", "responseHeader"):
+            for removed in (2, 4):
+                with self.subTest(field=field, removed=removed):
+                    value = websocket_message()
+                    value[field] = value[field][:-removed]
+                    self.assert_rejected([value])
+
+    def test_bare_controls_in_any_value_or_first_line_are_rejected_before_stripping(self):
+        for field in ("requestHeader", "responseHeader"):
+            for control in ("\r", "\n", "\x00", "\x7f"):
+                with self.subTest(field=field, control=repr(control), location="value"):
+                    value = websocket_message()
+                    value[field] = value[field][:-2] + "X-Fake-Fixture: " + control + "fake" + control + "\r\n\r\n"
+                    self.assert_rejected([value])
+                with self.subTest(field=field, control=repr(control), location="first-line"):
+                    value = websocket_message()
+                    first, rest = value[field].split("\r\n", 1)
+                    value[field] = first + control + "\r\n" + rest
+                    self.assert_rejected([value])
+
+    def test_headers_after_the_first_terminator_are_not_part_of_the_handshake(self):
+        for field in ("requestHeader", "responseHeader"):
+            value = websocket_message()
+            value[field] += "X-Fake-Fixture: fake-post-terminator-header\r\n\r\n"
+            self.assert_rejected([value])
+
+    def test_each_missing_or_duplicated_critical_header_is_rejected(self):
+        for field, names in (("requestHeader", ("Host", "Origin", "Upgrade", "Connection",
+                                               "Sec-WebSocket-Version", "Sec-WebSocket-Key")),
+                             ("responseHeader", ("Upgrade", "Connection", "Sec-WebSocket-Accept"))):
+            for name in names:
+                for mode in ("missing", "duplicate"):
+                    with self.subTest(field=field, name=name, mode=mode):
+                        value = websocket_message()
+                        lines = value[field].split("\r\n")
+                        original = next(line for line in lines if line.startswith(name + ":"))
+                        if mode == "missing":
+                            lines.remove(original)
+                        else:
+                            lines.insert(1, original.swapcase())
+                        value[field] = "\r\n".join(lines)
+                        self.assert_rejected([value])
+
+    def test_wrong_upgrade_connection_version_or_accept_is_rejected(self):
+        for field, old, new in (("requestHeader", "Upgrade: websocket", "Upgrade: h2c"),
+                                ("responseHeader", "Upgrade: websocket", "Upgrade: h2c"),
+                                ("requestHeader", "Connection: Upgrade", "Connection: keep-alive"),
+                                ("responseHeader", "Connection: Upgrade", "Connection: notupgrade"),
+                                ("requestHeader", "Sec-WebSocket-Version: 13", "Sec-WebSocket-Version: 12"),
+                                ("responseHeader", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")):
+            value = websocket_message()
+            value[field] = value[field].replace(old, new, 1)
+            self.assert_rejected([value])
+
+    def test_noncanonical_or_wrong_length_challenge_key_is_rejected(self):
+        for key in ("", "not-base64", "dGhlIHNhbXBsZSBub25jZQ", "dGhlIHNhbXBsZSBub25jZR==",
+                    "c2hvcnQ=", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"):
+            value = websocket_message()
+            value["requestHeader"] = value["requestHeader"].replace("dGhlIHNhbXBsZSBub25jZQ==", key, 1)
+            self.assert_rejected([value])
+
+    def test_missing_or_malformed_headers_are_rejected(self):
+        for field in ("requestHeader", "responseHeader"):
+            for invalid in (None, 1, "", "not a header"):
+                value = websocket_message()
+                value[field] = invalid
+                self.assert_rejected([value])
+            value = websocket_message()
+            del value[field]
+            self.assert_rejected([value])
 
 
 class BrowserReceiptTest(unittest.TestCase):

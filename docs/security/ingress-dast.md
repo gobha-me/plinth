@@ -54,8 +54,14 @@ native fixture certificate validation, cross-origin and missing-CSRF rejection,
 authorized capability access, shipped executable-script CSP, and bounded
 malformed/traversal requests. Separate controls exercise the chart's body-size
 limit, authentication burst limit, and package concurrent-admission limit.
-Traefik JSON access logs must independently show an actual 101 upgrade and
-edge-generated authentication/package 429 responses, not backend substitutes.
+Traefik JSON access logs must independently show the exact owned WebSocket
+router's completion and edge-generated authentication/package 429 responses,
+not unrelated routes or backend substitutes. For the pinned fast HTTP proxy,
+hijacking writes the handshake directly and leaves both logged capture statuses
+unset (zero). Zero is not reclassified as 101 or accepted for another route.
+The gate separately requires exactly one actual proxied 101 with valid native
+origin, upgrade headers and key/acceptance matching, plus the browser's native
+authenticated subscription grant and closure proof.
 The two pinned bundled chart versions use separately tested logging schemas.
 The new ready ingress pod and its Deployment must both contain the exact
 reviewed access-log arguments. Only downstream status, origin status and router
