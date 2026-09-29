@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "rule": "plinth.admin.packages",
+      "namespace": "plinth",
+      "description": "Discover Administration packages panel; package API permissions are independent."
+    }
+  ]
+}

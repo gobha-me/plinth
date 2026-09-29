@@ -400,7 +400,8 @@ not by kernel-privileged code paths. The single exception is the kernel's own
 bootstrap of the bundled shell package on first boot. The install uses the
 package lifecycle, but the canonical name, bundled provenance, and explicit
 kernel-owned upgrade path remain protected from ordinary HTTP/admin callers. A
-bundled admin package is planned design, not current behavior.
+`admin` is an ordinary separately API-installed package, not a second
+trusted bundle or first-boot install.
 See `architecture/06-frontend.md §1` and
 `architecture/05-extensions.md §1.4`.
 

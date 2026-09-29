@@ -168,6 +168,7 @@ jobs:
           image="plinth-runtime:${{ matrix.arch }}-$GITHUB_RUN_ID"
           npm run test:transport --prefix tests/browser
           npm run test:launcher --prefix tests/browser
+          python3 tests/browser/process_cleanup.py -- npm run test:admin --prefix tests/browser
           python3 tests/browser/process_cleanup.py -- npm run test:launcher-browser --prefix tests/browser
           python3 tests/browser/process_cleanup_test.py
           python3 tests/browser/kernel_runtime_test.py
@@ -175,6 +176,7 @@ jobs:
           python3 tests/browser/run-production.py --image "$image" --upgrade-cache
           python3 tests/browser/run-bundled-upgrade.py --image "$image"
           python3 tests/browser/run-client-contracts.py --image "$image"
+          python3 tests/browser/run-admin-package.py --image "$image"
 
       - name: Exercise the Kubernetes and Traefik lifecycle
         if: ${{ matrix.arch == 'amd64' }}
@@ -503,6 +505,7 @@ jobs:
           python3 tests/browser/run-production.py --image "$image" --upgrade-cache
           python3 tests/browser/run-bundled-upgrade.py --image "$image"
           python3 tests/browser/run-client-contracts.py --image "$image"
+          python3 tests/browser/run-admin-package.py --image "$image"
 
       - name: Attest build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2

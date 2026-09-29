@@ -180,12 +180,14 @@ jobs:
           (cd tests/browser && npx playwright install --with-deps chromium)
           npm run test:transport --prefix tests/browser
           npm run test:launcher --prefix tests/browser
+          python3 tests/browser/process_cleanup.py -- npm run test:admin --prefix tests/browser
           python3 tests/browser/process_cleanup.py -- npm run test:launcher-browser --prefix tests/browser
           python3 tests/browser/process_cleanup_test.py
           python3 tests/browser/run-production.py --binary build/plinth --realtime
           python3 tests/browser/run-production.py --binary build/plinth --upgrade-cache
           python3 tests/browser/run-bundled-upgrade.py --binary build/plinth
           python3 tests/browser/run-client-contracts.py --binary build/plinth
+          python3 tests/browser/run-admin-package.py --binary build/plinth
 
   asan-ubsan:
     name: clang-${{ matrix.llvm_version }} / ASan+UBSan

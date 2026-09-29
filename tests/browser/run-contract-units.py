@@ -11,6 +11,7 @@ import sys
 GROUPS = {
     "transport": (("sdk-transport.test.mjs", 35), ("smart-data-controller.test.mjs", 30)),
     "launcher": (("launcher-model.test.mjs", 2), ("launcher-owner.test.mjs", 51)),
+    "admin": (("admin-package.test.mjs", 20),),
 }
 COUNTERS = ("tests", "suites", "pass", "fail", "cancelled", "skipped", "todo")
 

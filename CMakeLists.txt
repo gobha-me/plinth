@@ -371,6 +371,36 @@ add_custom_command(
 )
 add_custom_target(plinth_shell_zip DEPENDS ${PLINTH_SHELL_ZIP})
 
+# The administration package is an ordinary, separately API-installed ZIP.
+# It is an explicit local/test target, never part of Runtime installation or
+# the kernel's first-boot bundled-package directory.
+set(PLINTH_ADMIN_SRC_DIR ${CMAKE_SOURCE_DIR}/client/admin)
+set(PLINTH_ADMIN_PACKER ${CMAKE_SOURCE_DIR}/tools/pack_admin.py)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+             ${PLINTH_ADMIN_SRC_DIR}/manifest.json)
+file(READ ${PLINTH_ADMIN_SRC_DIR}/manifest.json PLINTH_ADMIN_MANIFEST_JSON)
+string(JSON PLINTH_ADMIN_NAME GET ${PLINTH_ADMIN_MANIFEST_JSON} name)
+string(JSON PLINTH_ADMIN_VERSION GET ${PLINTH_ADMIN_MANIFEST_JSON} version)
+if(NOT PLINTH_ADMIN_NAME STREQUAL "admin" OR
+   NOT PLINTH_ADMIN_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+([+-][A-Za-z0-9][A-Za-z0-9.+-]*)?$")
+  message(FATAL_ERROR "Admin package identity or version is not a safe local artifact name")
+endif()
+set(PLINTH_ADMIN_ZIP
+    ${CMAKE_BINARY_DIR}/packages/admin-${PLINTH_ADMIN_VERSION}.zip)
+file(GLOB_RECURSE PLINTH_ADMIN_INPUTS CONFIGURE_DEPENDS
+     ${PLINTH_ADMIN_SRC_DIR}/*)
+add_custom_command(
+  OUTPUT ${PLINTH_ADMIN_ZIP}
+  COMMAND ${Python3_EXECUTABLE} ${PLINTH_ADMIN_PACKER}
+          --source ${PLINTH_ADMIN_SRC_DIR}
+          --output ${PLINTH_ADMIN_ZIP}
+  DEPENDS ${PLINTH_ADMIN_INPUTS} ${PLINTH_ADMIN_PACKER}
+          ${CMAKE_SOURCE_DIR}/tools/pack_shell.py
+  VERBATIM
+  COMMENT "Packing separately API-installed admin package"
+)
+add_custom_target(plinth_admin_zip DEPENDS ${PLINTH_ADMIN_ZIP})
+
 # Stage shell.zip in the build-tree datadir layout so dev runs and tests
 # resolve `share/plinth/bundled/shell.zip` relative to the binary without
 # an explicit `shell.bundle_path` config override (ICD-0.6.1 §9.2 default).
@@ -581,6 +611,18 @@ add_test(NAME plinth_shell_package_determinism
           --source ${PLINTH_SHELL_SRC_DIR}
 )
 set_tests_properties(plinth_shell_package_determinism PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_admin_package_determinism
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tests/tools/pack_admin_test.py
+)
+set_tests_properties(plinth_admin_package_determinism PROPERTIES TIMEOUT 30)
+
+add_test(NAME plinth_admin_browser_supervisor_units
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_SOURCE_DIR}/tests/browser/run_admin_package_test.py
+)
+set_tests_properties(plinth_admin_browser_supervisor_units PROPERTIES TIMEOUT 30)
 
 add_executable(plinth_tests
   tests/kernel/main_test.cpp
@@ -841,7 +883,7 @@ target_link_libraries(plinth_tests PRIVATE
 
 add_dependencies(plinth_tests plinth_shell_bundle_staged plinth_install_fixture_zips
                  plinth_lifecycle_fixture_zips plinth_rbac_test_runner_fixture_zips
-                 plinth_test_extension_zips)
+                 plinth_test_extension_zips plinth_admin_zip)
 
 include(Catch)
 
