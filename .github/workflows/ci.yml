@@ -56,6 +56,9 @@ jobs:
       - name: Verify the focused Catch2 case gate
         run: python3 -m unittest tests.tools.verify_catch_case_test
 
+      - name: Verify deployment PostgreSQL readiness
+        run: python3 tests/deployment/postgres_readiness_test.py
+
       - name: Check licenses, dependency pins, and SBOM
         run: tools/public_readiness.py
 

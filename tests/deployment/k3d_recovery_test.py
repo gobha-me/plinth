@@ -556,8 +556,10 @@ class RecoveryHarness(Harness):
                                     "secretKeyRef": {"name": "plinth-database",
                                                      "key": "password"}}},
                             ],
+                            # Exclude the entrypoint's bootstrap-only Unix socket server.
                             "readinessProbe": {"exec": {"command": [
-                                "pg_isready", "-U", RESTORE_ADMIN,
+                                "pg_isready", "-h", "127.0.0.1", "-p", "5432",
+                                "-U", RESTORE_ADMIN,
                                 "-d", RESTORE_ADMIN]},
                                 "periodSeconds": 2, "timeoutSeconds": 2,
                                 "failureThreshold": 30},
