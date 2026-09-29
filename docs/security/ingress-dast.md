@@ -177,8 +177,13 @@ group privately, and report suspected vulnerabilities through
 
 Only after review, a separate private JSON list may be supplied using
 `--dispositions /absolute/private/reviewed-dispositions.json`. Each record must
-exactly identify `pluginId`, `risk`, `confidence`, `routeLabel`, and `param`,
-with `dispositionId` and `reviewId`. The finite policy in
+exactly identify `pluginId`, `alertRef`, `risk`, `confidence`, `routeLabel`, and
+`param`, with `dispositionId` and `reviewId`. The matching-only `alertRef` must
+be a bounded canonical rule/variant string whose rule prefix matches `pluginId`.
+A bare rule reference matches only that exact reference, never every variant.
+Missing, legacy, malformed, or wildcard references fail closed. Variants are
+qualified separately even when their sanitized public group fields coincide;
+the reference itself is never emitted in the public report. The finite policy in
 `tests/deployment/dast_report.py` permits `FALSE_POSITIVE` only with an applicable
 reviewed evidence ID: `CSRF_READABLE_COOKIE`, `CSRF_HEADER_VERIFIED`,
 `CSP_FRAME_ANCESTORS_ENFORCED`, `CSP_STYLES_ONLY`, or `IMMUTABLE_STATIC_CACHE`.

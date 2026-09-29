@@ -7,7 +7,7 @@ import json
 import unittest
 
 from dast_report import (
-    REQUIRED_CONTROLS, REQUIRED_ROUTES, SCANNER_VERSION, classify_route, public_report,
+    REQUIRED_CONTROLS, REQUIRED_ROUTES, REVIEW_IDS, SCANNER_VERSION, classify_route, public_report,
 )
 
 
@@ -40,7 +40,7 @@ def inputs():
 
 def alert(**changes):
     value = {
-        "pluginId": "10038", "risk": "1", "confidence": "2",
+        "pluginId": "10038", "alertRef": "10038", "risk": "1", "confidence": "2",
         "url": ORIGIN + "/app/?query=" + PRIVATE_MARKER,
         "param": PRIVATE_MARKER, "evidence": PRIVATE_MARKER,
         "name": PRIVATE_MARKER, "description": PRIVATE_MARKER,
@@ -48,16 +48,20 @@ def alert(**changes):
         "attack": PRIVATE_MARKER,
     }
     value.update(changes)
+    if "pluginId" in changes and "alertRef" not in changes:
+        value["alertRef"] = str(changes["pluginId"])
     return value
 
 
 def review(**changes):
     value = {
-        "pluginId": 10038, "risk": 1, "confidence": 2, "routeLabel": "APP",
+        "pluginId": 10038, "alertRef": "10038", "risk": 1, "confidence": 2, "routeLabel": "APP",
         "param": PRIVATE_MARKER, "dispositionId": "FALSE_POSITIVE",
         "reviewId": "CSP_FRAME_ANCESTORS_ENFORCED",
     }
     value.update(changes)
+    if "pluginId" in changes and "alertRef" not in changes:
+        value["alertRef"] = str(changes["pluginId"])
     return value
 
 
@@ -93,7 +97,7 @@ class DastReportTest(unittest.TestCase):
             "dispositionId": "FALSE_POSITIVE", "reviewId": "CSP_FRAME_ANCESTORS_ENFORCED",
         }])
         encoded = json.dumps(report, allow_nan=False)
-        for forbidden in (PRIVATE_MARKER, ORIGIN, "Authorization", "/app/", "description", "param"):
+        for forbidden in (PRIVATE_MARKER, ORIGIN, "Authorization", "/app/", "description", "param", "alertRef"):
             self.assertNotIn(forbidden, encoded)
 
     def test_malformed_identity_does_not_echo_untrusted_fields(self):
@@ -308,6 +312,168 @@ class DastReportTest(unittest.TestCase):
         value["cleanup"]["verified"] = False
         self.assertEqual(report["status"], "COMPLETE")
         self.assertNotIn(PRIVATE_MARKER, json.dumps(report))
+
+    def test_canonical_plugin_bound_refs_and_variant_boundary_are_literal_exact_keys(self):
+        for ref in ("10038", "10038-0", "10038-4", "10038-9999999999"):
+            with self.subTest(ref=ref):
+                value = inputs()
+                value["raw_alerts"] = [alert(alertRef=ref)]
+                value["dispositions"] = [review(alertRef=ref)]
+                before = copy.deepcopy(value)
+                report = public_report(**value)
+                self.assertEqual(report["status"], "COMPLETE")
+                self.assertEqual(report["alertGroups"][0]["count"], 1)
+                self.assertNotIn("alertRef", json.dumps(report))
+                self.assertEqual(value, before)
+        value = inputs()
+        value["raw_alerts"] = [alert(pluginId="10055")]
+        value["dispositions"] = [review(pluginId=10055)]
+        self.assertEqual(value["raw_alerts"][0]["alertRef"], "10055")
+        self.assertEqual(value["dispositions"][0]["alertRef"], "10055")
+        self.assertEqual(public_report(**value)["status"], "COMPLETE")
+
+    def test_missing_malformed_foreign_or_unbounded_alert_ref_cannot_inherit_review(self):
+        invalid = (
+            None, True, 10038, 10038.0, [], {}, "", PRIVATE_MARKER,
+            "0", "010038", "10055", "10055-4", "10038-", "10038--4",
+            "10038-+4", "10038-01", "10038-00", "10038-1-2", "10038-*",
+            "10038-10000000000", "10038-" + "9" * 59,
+            " 10038", "10038 ", "10038-4\n", "10038-4\x00", "10038-４",
+        )
+        for ref in invalid:
+            with self.subTest(ref=ref):
+                value = inputs()
+                value["raw_alerts"] = [alert(alertRef=ref)]
+                value["dispositions"] = [review()]
+                report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+                self.assertEqual(report["alertGroups"], [])
+        value = inputs()
+        raw = alert()
+        del raw["alertRef"]
+        value["raw_alerts"] = [raw]
+        value["dispositions"] = [review()]
+        self.assertEqual(self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")["alertGroups"], [])
+
+    def test_review_schema_requires_exact_canonical_plugin_bound_alert_ref(self):
+        for ref in (None, True, 10038, 10038.0, [], {}, "", PRIVATE_MARKER,
+                    "10055-4", "010038-4", "10038-", "10038--4", "10038-04",
+                    "10038-4-0", "10038-*", "10038-10000000000",
+                    "10038-" + "9" * 59, "10038-4 ", "10038-4\x00"):
+            with self.subTest(ref=ref):
+                value = inputs()
+                value["raw_alerts"] = [alert(alertRef="10038-4")]
+                value["dispositions"] = [review(alertRef=ref)]
+                report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+                self.assertEqual(report["alertGroups"][0]["dispositionId"], "PRIVATE_TRIAGE_REQUIRED")
+                self.assertIsNone(report["alertGroups"][0]["reviewId"])
+        value = inputs()
+        value["raw_alerts"] = [alert()]
+        legacy = review()
+        del legacy["alertRef"]
+        self.assertEqual(len(legacy), 7)
+        value["dispositions"] = [legacy]
+        self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+        value["dispositions"] = [review(alertRef="10038", variant="4")]
+        self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+        self.assertEqual(len(review()), 8)
+
+    def test_same_base_mixed_variants_do_not_share_one_synthetic_review(self):
+        refs = ("10055-4", "10055-6", "10055-13")
+        for reviewed in refs:
+            with self.subTest(reviewed=reviewed):
+                value = inputs()
+                value["raw_alerts"] = [alert(pluginId="10055", alertRef=ref) for ref in refs]
+                value["dispositions"] = [review(pluginId=10055, alertRef=reviewed)]
+                report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+                self.assertEqual(len(report["alertGroups"]), 3)
+                self.assertEqual([group["count"] for group in report["alertGroups"]], [1, 1, 1])
+                self.assertEqual(sum(group["dispositionId"] == "FALSE_POSITIVE"
+                                     for group in report["alertGroups"]), 1)
+                self.assertEqual(sum(group["dispositionId"] == "PRIVATE_TRIAGE_REQUIRED"
+                                     for group in report["alertGroups"]), 2)
+
+    def test_bare_plugin_ref_is_not_a_wildcard_for_any_variant(self):
+        value = inputs()
+        value["raw_alerts"] = [alert(pluginId="10055", alertRef=ref)
+                               for ref in ("10055-4", "10055-6", "10055-13")]
+        value["dispositions"] = [review(pluginId=10055, alertRef="10055")]
+        report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+        self.assertTrue(all(group["dispositionId"] == "PRIVATE_TRIAGE_REQUIRED"
+                            for group in report["alertGroups"]))
+        value["raw_alerts"].append(alert(pluginId="10055", alertRef="10055"))
+        report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+        self.assertEqual(len(report["alertGroups"]), 4)
+        self.assertEqual(sum(group["dispositionId"] == "FALSE_POSITIVE"
+                             for group in report["alertGroups"]), 1)
+
+    def test_duplicate_missing_or_absent_variant_reviews_are_rejected(self):
+        first = review(pluginId=10055, alertRef="10055-4")
+        second = review(pluginId=10055, alertRef="10055-6")
+        for reviews in ([first], [first, first, second],
+                        [first, second, review(pluginId=10055, alertRef="10055-13")]):
+            value = inputs()
+            value["raw_alerts"] = [alert(pluginId="10055", alertRef=ref)
+                                   for ref in ("10055-4", "10055-6")]
+            value["dispositions"] = copy.deepcopy(reviews)
+            self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+
+    def test_identical_variants_aggregate_but_two_exact_synthetic_reviews_remain_separate(self):
+        value = inputs()
+        value["raw_alerts"] = [
+            alert(pluginId="10055", alertRef="10055-4"),
+            alert(pluginId="10055", alertRef="10055-4", url=ORIGIN + "/app/"),
+            alert(pluginId="10055", alertRef="10055-6"),
+        ]
+        value["dispositions"] = [
+            review(pluginId=10055, alertRef="10055-4"),
+            review(pluginId=10055, alertRef="10055-6", reviewId="CSP_STYLES_ONLY"),
+        ]
+        before = copy.deepcopy(value)
+        report = public_report(**value)
+        self.assertEqual(report["status"], "COMPLETE")
+        self.assertEqual(len(report["alertGroups"]), 2)
+        self.assertEqual({group["reviewId"]: group["count"] for group in report["alertGroups"]},
+                         {"CSP_FRAME_ANCESTORS_ENFORCED": 2, "CSP_STYLES_ONLY": 1})
+        self.assertTrue(all(group["ruleId"] == 10055 and group["dispositionId"] == "FALSE_POSITIVE"
+                            for group in report["alertGroups"]))
+        self.assertEqual(value, before)
+        encoded = json.dumps(report, allow_nan=False)
+        for forbidden in (PRIVATE_MARKER, ORIGIN, "alertRef", "10055-4", "10055-6", "param",
+                          "Authorization", "/app/", "description"):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_variant_and_other_key_fields_cannot_recombine_two_synthetic_reviews(self):
+        value = inputs()
+        value["raw_alerts"] = [
+            alert(pluginId="10055", alertRef="10055-4"),
+            alert(pluginId="10055", alertRef="10055-6", risk=2, confidence=3,
+                  url=ORIGIN + "/api/auth/login", param="other-synthetic-param"),
+        ]
+        value["dispositions"] = [
+            review(pluginId=10055, alertRef="10055-6"),
+            review(pluginId=10055, alertRef="10055-4", risk=2, confidence=3,
+                   routeLabel="LOGIN", param="other-synthetic-param"),
+        ]
+        report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+        self.assertEqual(len(report["alertGroups"]), 2)
+        self.assertTrue(all(group["dispositionId"] == "PRIVATE_TRIAGE_REQUIRED"
+                            and group["reviewId"] is None for group in report["alertGroups"]))
+
+    def test_variant_matching_does_not_expand_public_schema_or_finite_review_ids(self):
+        value = inputs()
+        value["raw_alerts"] = [alert(alertRef="10038-4")]
+        value["dispositions"] = [review(alertRef="10038-4")]
+        report = public_report(**value)
+        self.assertEqual(report["status"], "COMPLETE")
+        self.assertEqual(set(report), {"schemaVersion", "status", "reasons", "identity",
+                                      "controls", "scanner", "alertGroups", "cleanup"})
+        self.assertEqual(set(report["alertGroups"][0]), {
+            "ruleId", "risk", "confidence", "count", "dispositionId", "reviewId",
+        })
+        self.assertEqual(REVIEW_IDS, frozenset({
+            "CSRF_READABLE_COOKIE", "CSRF_HEADER_VERIFIED", "CSP_FRAME_ANCESTORS_ENFORCED",
+            "CSP_STYLES_ONLY", "IMMUTABLE_STATIC_CACHE", "PRIVATE_FIX_REQUIRED",
+        }))
 
 
 if __name__ == "__main__":

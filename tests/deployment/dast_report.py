@@ -72,7 +72,7 @@ _CLEANUP_COUNTERS = frozenset({
     "remainingContainers", "remainingNetworks", "remainingVolumes",
 })
 _REVIEW_KEYS = frozenset({
-    "pluginId", "risk", "confidence", "routeLabel", "param", "dispositionId", "reviewId",
+    "pluginId", "alertRef", "risk", "confidence", "routeLabel", "param", "dispositionId", "reviewId",
 })
 _RISK_NAMES = {"Informational": 0, "Low": 1, "Medium": 2, "High": 3}
 _CONFIDENCE_NAMES = {
@@ -151,6 +151,17 @@ def classify_route(url, targetOrigin):
     return _route(url, _url(targetOrigin, origin=True))
 
 
+def _alert_reference(value, plugin):
+    """Validate a matching-only rule/variant identifier, never a wildcard."""
+    if type(value) is not str or not 0 < len(value) <= 64:
+        return None
+    prefix, separator, variant = value.partition("-")
+    if prefix != str(plugin) or (separator and (
+            len(variant) > 10 or not re.fullmatch(r"0|[1-9][0-9]*", variant))):
+        return None
+    return value
+
+
 def _alert_key(record, target):
     if type(record) is not dict:
         return None
@@ -159,17 +170,21 @@ def _alert_key(record, target):
     confidence = _numeric(record.get("confidence"), 4, _CONFIDENCE_NAMES)
     param = record.get("param")
     route = _route(record.get("url"), target)
-    if not plugin or risk is None or confidence is None or type(param) is not str or not route:
+    reference = _alert_reference(record.get("alertRef"), plugin)
+    if (not plugin or risk is None or confidence is None or
+            type(param) is not str or not route or reference is None):
         return None
-    return plugin, risk, confidence, route, param
+    return plugin, risk, confidence, route, param, reference
 
 
 def public_report(identity, controls, scanner, raw_alerts, dispositions, cleanup):
     """Return JSON-safe fixed-schema evidence; malformed inputs never count as green.
 
-    Review keys are ``(pluginId, risk, confidence, routeLabel, param)``. Only an
-    exact explicit FALSE_POSITIVE review with a finite evidence identifier can
-    qualify a group. No default ignore, severity cutoff, or raw rationale exists.
+    Review keys are ``(pluginId, risk, confidence, routeLabel, param, alertRef)``.
+    The rule/variant reference remains private and matching-only. Only an exact
+    explicit FALSE_POSITIVE review with a finite evidence identifier can qualify
+    that variant's group. No legacy or wildcard fallback, default ignore,
+    severity cutoff, or raw rationale exists.
     A review for an absent group is rejected, preventing preemptive suppressions.
     """
     reasons = set()
@@ -256,9 +271,10 @@ def public_report(identity, controls, scanner, raw_alerts, dispositions, cleanup
             plugin = _numeric(review["pluginId"])
             risk = _numeric(review["risk"], 3, _RISK_NAMES)
             confidence = _numeric(review["confidence"], 4, _CONFIDENCE_NAMES)
+            reference = _alert_reference(review["alertRef"], plugin)
             route, param = review["routeLabel"], review["param"]
             disposition, proof = review["dispositionId"], review["reviewId"]
-            if (not plugin or risk is None or confidence is None or
+            if (not plugin or risk is None or confidence is None or reference is None or
                     type(route) is not str or route not in ROUTE_LABELS or type(param) is not str or
                     type(proof) is not str or proof not in REVIEW_IDS or
                     type(disposition) is not str or disposition not in {
@@ -266,7 +282,7 @@ def public_report(identity, controls, scanner, raw_alerts, dispositions, cleanup
                     (disposition == "PRIVATE_REMEDIATION_REQUIRED") != (proof == "PRIVATE_FIX_REQUIRED")):
                 reasons.add("PRIVATE_TRIAGE_REQUIRED")
                 continue
-            key = plugin, risk, confidence, route, param
+            key = plugin, risk, confidence, route, param, reference
             if key in reviews or key not in groups:
                 reasons.add("PRIVATE_TRIAGE_REQUIRED")
                 continue
