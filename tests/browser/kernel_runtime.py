@@ -23,6 +23,7 @@ SERVER_ENV_KEYS = (
     "PLINTH_PG_DATABASE",
     "PLINTH_PG_POOL_SIZE",
     "PLINTH_DEV_MODE",
+    "PLINTH_BOOTSTRAP_TOKEN",
 )
 SERVER_ROOT_ENTRIES = ("config.json", "bundled", "data", "logs")
 
@@ -198,6 +199,12 @@ class ContainerRuntime:
              fixture_root / "valid-install.zip"),
             (repo / "tests/fixtures/lifecycle_transitions/upgrade-v2",
              fixture_root / "upgrade-v2.zip"),
+            (repo / "tests/fixtures/lifecycle_transitions/upgrade-v2-broken-migration",
+             fixture_root / "upgrade-v2-broken-migration.zip"),
+            (repo / "tests/fixtures/lifecycle_transitions/upgrade-v1-slow",
+             fixture_root / "upgrade-v1-slow.zip"),
+            (repo / "tests/fixtures/lifecycle_transitions/upgrade-v2-slow",
+             fixture_root / "upgrade-v2-slow.zip"),
             (repo / "tests/extensions/sdk-demo",
              fixture_root / "extensions/sdk-demo.zip"),
         )
@@ -208,6 +215,11 @@ class ContainerRuntime:
                 for path in sorted(source.rglob("*")):
                     if path.is_file():
                         package.write(path, path.relative_to(source))
+        admin_archive = fixture_root.parent / "packages/admin-0.1.0.zip"
+        subprocess.run(
+            [sys.executable, str(repo / "tools/pack_admin.py"),
+             "--source", str(repo / "client/admin"), "--output", str(admin_archive)],
+            check=True, timeout=30, capture_output=True)
         return fixture_root.parent
 
     @staticmethod

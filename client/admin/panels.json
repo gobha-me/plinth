@@ -1,0 +1,11 @@
+{
+  "panels": [
+    {
+      "id": "packages",
+      "title": "Administration",
+      "rbac_rule": "plinth.admin.packages",
+      "client_path": "packages.js",
+      "order": 0
+    }
+  ]
+}

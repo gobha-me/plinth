@@ -23,6 +23,9 @@ class KernelRuntimeTest(unittest.TestCase):
             expected = {
                 "valid-install.zip": "notes",
                 "upgrade-v2.zip": "notes",
+                "upgrade-v2-broken-migration.zip": "notes",
+                "upgrade-v1-slow.zip": "slow",
+                "upgrade-v2-slow.zip": "slow",
                 "extensions/sdk-demo.zip": "sdkdemo",
             }
             import json
@@ -36,6 +39,10 @@ class KernelRuntimeTest(unittest.TestCase):
                         self.assertIn("client/panels/demo.js", archive.namelist())
                         self.assertEqual(archive.read("client/panels/demo.js"),
                                          (repo / "tests/extensions/sdk-demo/client/panels/demo.js").read_bytes())
+            with zipfile.ZipFile(build / "packages/admin-0.1.0.zip") as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+                self.assertEqual((manifest["name"], manifest["version"]), ("admin", "0.1.0"))
+                self.assertIn("client/panels/packages.js", archive.namelist())
             self.assertFalse((root / "bundled").exists())
 
     def test_runtime_selection_preserves_native_binary(self):

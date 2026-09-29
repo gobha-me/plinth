@@ -703,11 +703,12 @@ extension design docs:
 
 Admin UI (groups management, package management, RBAC panels) is
 extracted to a separate design doc: `DESIGN-admin-v06x.md`. The
-admin panel is a second built-in extension, bundled and installed
-at first boot alongside the shell. It has its own manifest, own
-`panels.json`, own `rbac.json`, own migrations. This separation
-is deliberate dogfooding: if the admin extension can't be built
-from shell-SDK-only contracts, the shell SDK is wrong.
+`admin` package-management is a separate ordinary extension, locally packed
+and installed through the authenticated package API, not a trusted bundle or
+first-boot companion. It has its own manifest, `panels.json` and `rbac.json`,
+no `ext_admin` migrations for this scope, and no default grants. This
+separation exercises the existing shell panel SDK without adding shell
+authority; see `DESIGN-admin-v06x.md` for its current contract.
 
 ### 0.6.0 — Bootstrap and Frame
 

@@ -7,6 +7,7 @@
     "test:transport": "python3 -m unittest -q run_contract_units_test && python3 run-contract-units.py transport",
     "test:launcher": "python3 -m unittest -q run_contract_units_test && python3 run-contract-units.py launcher",
     "test:launcher-browser": "node launcher-browser.mjs && node launcher-owner-browser.mjs && node smart-data-browser.mjs && node panel-contract-browser.mjs && node shell-preferences-browser.mjs",
+    "test:admin": "python3 run-contract-units.py admin && node admin-package-browser.mjs",
     "test:launcher-production": "node launcher-production.mjs",
     "test:realtime": "node realtime-smoke.mjs && node preferences-realtime.mjs"
   },
