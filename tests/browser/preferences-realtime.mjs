@@ -64,10 +64,16 @@ try {
     ]);
     const page = await context.newPage();
     const errors = [];
+    const snapshotRequests = [];
     page.on('pageerror', error => errors.push(error.message));
+    page.on('request', request => {
+        if (new URL(request.url()).pathname !== '/api/cap/shell.preferences.get') return;
+        if (request.postDataJSON()?.args?.key === key) snapshotRequests.push(request);
+    });
     await page.goto(baseURL + '/app/');
-    await page.evaluate(async channel => {
+    await page.evaluate(async ({ channel, key }) => {
         const sdk = await import('@plinth/frontend/sdk');
+        const { h, render } = await import('preact');
         window.__preferenceSdk = sdk;
         window.__preferenceEvents = [];
         window.__preferenceErrors = [];
@@ -77,13 +83,30 @@ try {
                 onReady: () => { window.__preferenceReady = true; },
                 onError: error => window.__preferenceErrors.push(error.code),
             });
-    }, channel);
+        const host = document.createElement('section');
+        host.id = 'preference-smart-hook'; document.body.append(host);
+        function PreferenceHook() {
+            const state = sdk.useData(channel, {
+                snapshot: { capability: 'shell.preferences.get', args: { key } },
+            });
+            return h('div', null,
+                h('output', { id: 'preference-smart-data' }, state.data?.value ?? 'absent'),
+                h('output', { id: 'preference-smart-error' }, state.error?.code ?? 'none'),
+                h('output', { id: 'preference-smart-loading' }, String(state.loading)));
+        }
+        render(h(PreferenceHook), host);
+        window.__unmountPreferenceHook = () => render(null, host);
+    }, { channel, key });
     await page.waitForFunction(() => window.__preferenceReady || window.__preferenceErrors.length);
     assert.deepEqual(await page.evaluate(() => window.__preferenceErrors), []);
+    await page.waitForFunction(() => document.getElementById('preference-smart-loading').textContent === 'false');
+    assert.equal(await page.locator('#preference-smart-data').textContent(), 'absent');
+    assert.equal(snapshotRequests.length, 1, 'one real initial snapshot');
     const baseline = Number(sql(`SELECT coalesce(max(seq),0) FROM plinth.events
         WHERE channel='${channel}'`));
 
     async function writeAndObserve(value, op, expectedValue) {
+        const beforeSnapshots = snapshotRequests.length;
         const prior = Number(sql(`SELECT coalesce(max(seq),0) FROM plinth.events
             WHERE channel='${channel}'`));
         const outcome = await page.evaluate(({ key, value, remove }) =>
@@ -114,6 +137,14 @@ try {
             frame => frame.payload?.seq === seq), event.seq);
         assert.equal(live.channel, channel);
         assert.deepEqual(live.payload.ops, event.payload.ops);
+        assert(live.payload.ops.every(operation => !Object.hasOwn(operation, 'ids')),
+            'this production proof must exercise counts-only fallback, not custom ID fixtures');
+        await page.waitForFunction(expected =>
+            document.getElementById('preference-smart-data').textContent === expected,
+        value === undefined ? 'absent' : expectedValue);
+        assert.equal(snapshotRequests.length, beforeSnapshots + 1,
+            'each isolated native event admits exactly one capability re-query');
+        assert.equal(await page.locator('#preference-smart-error').textContent(), 'none');
         const current = await page.evaluate(key =>
             window.__preferenceSdk.call('shell.preferences.get', { key }), key);
         if (value === undefined) assert.equal(Object.hasOwn(current, 'value'), false);
@@ -169,10 +200,10 @@ try {
         [{ op: 'insert', count: 0 }, { op: 'update', count: 0 }, { op: 'delete', count: 1 }],
     ]);
     await replayContext.close();
-    await page.evaluate(() => window.__removePreference());
+    await page.evaluate(() => { window.__removePreference(); window.__unmountPreferenceHook(); });
     assert.deepEqual(errors, []);
     await context.close();
-    console.log('PASS preference create, update, delete durable events, live browser SDK, and replay');
+    console.log('PASS preference create/update/delete durable events, native counts-only smart re-query and changed server snapshot UI, raw browser SDK, and raw replay');
 } finally {
     await browser.close();
 }

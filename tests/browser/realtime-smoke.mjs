@@ -73,11 +73,8 @@ try {
             constructor(...args) { super(...args); window.__realSockets.push(this); }
         };
     });
-    // The snapshot is deterministic; the live transport and PostgreSQL writer,
-    // RBAC delivery and heartbeat are entirely the production implementation.
-    await page.route('**/api/cap/browser.snapshot', route => route.fulfill({
-        json: { ok: true, value: { value: 'snapshot' } },
-    }));
+    // This remains the raw-stream contract. Snapshot-backed hooks are tested
+    // separately against actual preference capability reads/native data events.
     await page.goto(baseURL + '/app/');
     assert.match(await page.evaluate(() => new URL(document.baseURI).pathname),
         /^\/ext\/shell\/[^/]+\/$/, 'production document selects versioned module assets');
@@ -97,7 +94,7 @@ try {
         document.body.append(container);
         function Hook() {
             const { data, error } = sdk.useData(channel, {
-                snapshot: { capability: 'browser.snapshot' },
+                initialData: { value: 'raw-ready' },
             });
             return h('div', null,
                 h('output', { id: 'live-data' }, data?.payload?.value ?? data?.value ?? 'loading'),
@@ -106,7 +103,7 @@ try {
         render(h(Hook), container);
         window.__unmountHook = () => render(null, container);
     }, { channel, keepChannel });
-    await page.getByText('snapshot', { exact: true }).waitFor();
+    await page.getByText('raw-ready', { exact: true }).waitFor();
     await page.waitForFunction(() => window.__sdk.getRealtimeState().status === 'connected');
     // Wait for the server acknowledgement before publishing, not a fixed delay.
     async function waitFor(check, message, timeout = 10000) {
@@ -161,6 +158,8 @@ try {
 
     // Expiry is detected on the next real authentication attempt, reported to
     // handlers/state, and never converted to an infinite reconnect loop.
+    const expiredProbe = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/auth/session' && response.status() === 401);
     sql(`UPDATE plinth.sessions SET expires_at=NOW()-INTERVAL '1 second' WHERE id='${session}'`);
     await page.evaluate(() => {
         window.__expired = window.__sdk.subscribe('plinth:ext:browser:update', () => {}, {
@@ -169,14 +168,25 @@ try {
         window.__sdk.reconnectRealtime();
     });
     await page.waitForFunction(() => window.__sdk.getRealtimeState().status === 'failed');
-    assert.equal(await page.evaluate(() => window.__sdk.getRealtimeState().error.code), 'auth_failed');
-    assert((await page.evaluate(() => window.__subscriptionErrors)).includes('auth_failed'));
+    const expiry = await expiredProbe;
+    assert.equal((await expiry.json()).error, 'session_expired',
+        'managed Launcher revalidation must confirm expiry on the real HTTP route');
+    await page.waitForFunction(() => window.__sdk.getRealtimeState().error?.code === 'session_expired');
+    await page.getByRole('heading', { name: 'Sign in to Plinth', exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.__sdk.getRealtimeState().error.code), 'session_expired');
+    const terminalErrors = await page.evaluate(() => window.__subscriptionErrors);
+    assert(terminalErrors.includes('auth_failed'), JSON.stringify({ terminalErrors,
+        terminalFrames: connections.flatMap(connection => connection.received)
+            .filter(frame => frame.type === 'error') }));
+    assert(connections.at(-1).received.some(frame =>
+        frame.type === 'error' && frame.error === 'auth_failed'),
+    'raw SDK must report the actual generic WebSocket authentication failure');
     const count = connections.length;
     await page.waitForTimeout(1200); // Exceeds first reconnect interval: assert no retry.
     assert.equal(connections.length, count);
     assert.deepEqual(errors, []);
     await context.close();
-    console.log('PASS production non-admin cookie auth, PG event/useData, three heartbeats, reconnect, unsubscribe, expiry');
+    console.log('PASS production non-admin cookie auth, PG raw useData stream, three heartbeats, reconnect, unsubscribe, expiry');
 } finally {
     await browser.close();
 }

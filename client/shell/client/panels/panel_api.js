@@ -58,11 +58,12 @@ export function normaliseCombo(combo) {
     return [...mods, key].join('+');
 }
 
-export function makePanelApi({ shell, panel, context, packageRow }) {
+export function makePanelApi({ shell, panel, context = {}, packageRow }) {
     const activateCallbacks   = [];
     const deactivateCallbacks = [];
     const navIntentCallbacks  = [];
     const shortcutRegistry    = new Map();
+    const shortcutOwners      = new Map();
     let   dirty   = false;
     let   unbound = false;
 
@@ -112,8 +113,12 @@ export function makePanelApi({ shell, panel, context, packageRow }) {
             if (shortcutRegistry.has(normalised)) {
                 throw new ShortcutConflictError(normalised, panel.id);
             }
+            const owner = Symbol();
             shortcutRegistry.set(normalised, callback);
+            shortcutOwners.set(normalised, owner);
             return function unregister() {
+                if (shortcutOwners.get(normalised) !== owner) return;
+                shortcutOwners.delete(normalised);
                 shortcutRegistry.delete(normalised);
             };
         },
@@ -159,6 +164,7 @@ export function makePanelApi({ shell, panel, context, packageRow }) {
                 deactivateCallbacks.length = 0;
                 navIntentCallbacks.length  = 0;
                 shortcutRegistry.clear();
+                shortcutOwners.clear();
             },
         },
     };

@@ -47,9 +47,10 @@ function ApplicationMark({ application, iconToken = application.icon, small = fa
     }, ICON_PATHS[resolvedIcon].map(path => h('path', { d: path }))) : monogram(application.title));
 }
 
-function DirtyDialog({ onCancel, onDiscard }) {
+function DirtyDialog({ onCancel, onDiscard, isCurrent }) {
     let dialog;
     const keydown = event => {
+        if (!isCurrent() || !dialog?.isConnected) return;
         if (event.key === 'Escape') {
             event.preventDefault();
             onCancel();
@@ -70,7 +71,11 @@ function DirtyDialog({ onCancel, onDiscard }) {
             'aria-labelledby': 'dirty-dialog-title', onKeyDown: keydown,
             ref: element => {
                 dialog = element;
-                queueMicrotask(() => element?.querySelector('.dirty-cancel')?.focus());
+                queueMicrotask(() => {
+                    if (isCurrent() && element?.isConnected) {
+                        element.querySelector('.dirty-cancel')?.focus();
+                    }
+                });
             },
         },
         h('h2', { id: 'dirty-dialog-title' }, 'Discard changes and continue?'),
@@ -83,6 +88,9 @@ function DirtyDialog({ onCancel, onDiscard }) {
 export class Launcher extends Component {
     constructor(props) {
         super(props);
+        this.owner = Symbol();
+        this.retired = false;
+        this.recoveryToken = 0;
         this.state = {
             catalogStatus: 'unrequested', applications: [], navigation: { kind: 'home' },
             menuOpen: false, menuIndex: 0, focusedPanel: null, dirtyIntent: null,
@@ -102,31 +110,65 @@ export class Launcher extends Component {
         this.menuItems = [];
     }
 
+    owns(owner = this.owner) {
+        return !this.retired && owner === this.owner;
+    }
+
+    setOwnedState(update, callback, current) {
+        const owner = this.owner;
+        const isCurrent = () => this.owns(owner) && (!current || current());
+        if (!isCurrent()) return;
+        this.setState((state, props) => {
+            if (!isCurrent()) return null;
+            return typeof update === 'function' ? update(state, props) : update;
+        }, () => {
+            if (isCurrent()) callback?.();
+        });
+    }
+
+    forceOwnedUpdate() {
+        if (this.owns()) this.forceUpdate();
+    }
+
     componentDidMount() {
+        const owner = this.owner;
+        const isCurrent = () => this.owns(owner);
+        if (!isCurrent()) return;
         this.panelManager = new PanelManager(this.panelHost, {
-            onFailure: (target, error, info) => this.auditPanelFailure(target, error, info),
-            onRetry: target => this.navigateTarget(target, { source: 'retry', forceNew: true }),
-            onHome: () => this.requestHome(),
-            onDirtyChange: () => this.forceUpdate(),
+            onFailure: (target, error, info) => {
+                if (isCurrent()) this.auditPanelFailure(target, error, info);
+            },
+            onRetry: target => {
+                if (isCurrent()) this.navigateTarget(target, { source: 'retry', forceNew: true });
+            },
+            onHome: () => { if (isCurrent()) this.requestHome(); },
+            onDirtyChange: () => { if (isCurrent()) this.forceOwnedUpdate(); },
         });
         this.preferencePromise = this.loadPreference();
         this.unsubscribeApplications = subscribe(APPLICATIONS_CHANNEL,
-            () => this.refreshWhenPreferencesReady(), {
-                onReady: () => this.realtimeReady(),
-                onError: error => this.realtimeError(error),
+            () => { if (isCurrent()) this.refreshWhenPreferencesReady(); }, {
+                onReady: () => { if (isCurrent()) this.realtimeReady(); },
+                onError: error => { if (isCurrent()) this.realtimeError(error); },
             });
         this.visibility = () => {
-            if (document.visibilityState === 'visible' && this.subscriptionReady) {
+            if (isCurrent() && document.visibilityState === 'visible' && this.subscriptionReady) {
                 this.refreshWhenPreferencesReady();
             }
         };
         document.addEventListener('visibilitychange', this.visibility);
         this.narrowQuery = window.matchMedia('(max-width: 42rem)');
-        this.narrowChanged = event => this.setState({ narrow: event.matches });
+        this.narrowChanged = event => {
+            if (isCurrent()) this.setOwnedState({ narrow: event.matches }, null, isCurrent);
+        };
         this.narrowQuery.addEventListener('change', this.narrowChanged);
     }
 
     componentWillUnmount() {
+        // Retire admission before cleanup invokes any panel or transport callbacks.
+        this.retired = true;
+        this.recoveryToken++;
+        this.subscriptionReady = false;
+        this.recovering = false;
         this.catalogToken++;
         this.navigationToken++;
         this.catalogAbort?.abort();
@@ -137,35 +179,45 @@ export class Launcher extends Component {
     }
 
     async loadPreference() {
+        const owner = this.owner;
+        const isCurrent = () => this.owns(owner);
+        if (!isCurrent()) return;
         try {
             const result = await call('shell.preferences.get', { key: 'shell.launcher' });
+            if (!isCurrent()) return;
             this.preference = normalizeLauncherPreference(result?.value);
-            this.setState(({ applications }) => ({
+            this.setOwnedState(({ applications }) => ({
                 applications: orderApplications(applications, this.preference),
-            }));
+            }), null, isCurrent);
         } catch {
+            if (!isCurrent()) return;
             this.preference = normalizeLauncherPreference(null);
-            this.setState({ statusMessage: 'Launcher preferences could not be loaded.' });
+            this.setOwnedState({ statusMessage: 'Launcher preferences could not be loaded.' }, null, isCurrent);
         }
     }
 
     realtimeReady() {
+        if (!this.owns()) return;
+        this.recoveryToken++;
         this.subscriptionReady = true;
         this.recovering = false;
-        this.setState({ authorityCode: null });
+        this.setOwnedState({ authorityCode: null });
         this.refreshWhenPreferencesReady();
     }
 
     refreshWhenPreferencesReady() {
+        const owner = this.owner;
+        if (!this.owns(owner)) return;
         this.preferencePromise.then(() => {
-            if (this.subscriptionReady) this.refreshCatalog();
+            if (this.owns(owner) && this.subscriptionReady) this.refreshCatalog();
         });
     }
 
     realtimeError(error) {
+        if (!this.owns()) return;
         const reportedCode = error?.code || 'auth_failed';
         if (reportedCode === 'disconnected') {
-            this.setState(({ applications }) => ({
+            this.setOwnedState(({ applications }) => ({
                 catalogStatus: applications.length ? 'stale' : 'failed',
                 statusMessage: 'Realtime updates are reconnecting.',
             }));
@@ -181,6 +233,8 @@ export class Launcher extends Component {
     }
 
     failClosedAuthority(code) {
+        if (!this.owns()) return;
+        this.recoveryToken++;
         this.subscriptionReady = false;
         this.recovering = false;
         this.catalogToken++;
@@ -188,7 +242,7 @@ export class Launcher extends Component {
         this.catalogAbort?.abort();
         this.pendingTarget = null;
         this.panelManager?.destroyAll();
-        this.setState({
+        this.setOwnedState({
             applications: [], navigation: { kind: 'home' }, catalogStatus: 'failed',
             authorityCode: code, menuOpen: false, dirtyIntent: null, panelFailure: null,
             liveMessage: '', statusMessage: 'Application access must be revalidated.',
@@ -202,26 +256,38 @@ export class Launcher extends Component {
     }
 
     async recoverAuthority() {
-        if (this.recovering) return;
+        const owner = this.owner;
+        if (!this.owns(owner) || this.recovering) return;
+        const token = ++this.recoveryToken;
+        const isCurrent = () => this.owns(owner) && token === this.recoveryToken;
         this.recovering = true;
         try {
             const response = await fetch('/api/auth/session', { credentials: 'include' });
+            if (!isCurrent()) return;
             if (response.status === 401) {
                 let code = 'not_authenticated';
-                try { code = (await response.json()).error || code; } catch { /* generic */ }
+                try {
+                    const body = await response.json();
+                    if (!isCurrent()) return;
+                    code = body.error || code;
+                } catch { /* generic */ }
+                if (!isCurrent()) return;
                 this.props.onSessionEnd(code);
                 return;
             }
             if (!response.ok) throw new Error('session validation failed');
             reconnectRealtime();
-            this.setState({ statusMessage: 'Reconnecting application updates…' });
+            this.setOwnedState({ statusMessage: 'Reconnecting application updates…' }, null, isCurrent);
         } catch {
+            if (!isCurrent()) return;
             this.recovering = false;
-            this.setState({ catalogStatus: 'failed', statusMessage: 'Application access could not be revalidated.' });
+            this.setOwnedState({ catalogStatus: 'failed', statusMessage: 'Application access could not be revalidated.' },
+                null, isCurrent);
         }
     }
 
     retry() {
+        if (!this.owns()) return;
         if (this.state.authorityCode) {
             this.recoverAuthority();
         } else if (this.subscriptionReady) {
@@ -232,36 +298,48 @@ export class Launcher extends Component {
     }
 
     useThisTab() {
+        if (!this.owns()) return;
         this.automaticRecoverySpent = true;
         this.recoverAuthority();
     }
 
     async refreshCatalog() {
+        const owner = this.owner;
+        if (!this.owns(owner)) return;
         const token = ++this.catalogToken;
+        const isCurrent = () => this.owns(owner) && token === this.catalogToken;
         this.catalogAbort?.abort();
         const controller = new AbortController();
         this.catalogAbort = controller;
-        this.setState(({ applications }) => ({
+        this.setOwnedState(({ applications }) => ({
             catalogStatus: applications.length ? 'refreshing' : 'loading',
             liveMessage: '', statusMessage: '',
-        }));
+        }), null, isCurrent);
         try {
             const response = await fetch('/api/frontend/applications', {
                 credentials: 'include', signal: controller.signal,
                 cache: 'no-store',
                 headers: { Accept: 'application/json' },
             });
+            if (!isCurrent()) return;
             if (response.status === 401) {
                 let code = 'not_authenticated';
-                try { code = (await response.json()).error || code; } catch { /* generic */ }
+                try {
+                    const body = await response.json();
+                    if (!isCurrent()) return;
+                    code = body.error || code;
+                } catch { /* generic */ }
+                if (!isCurrent()) return;
                 this.failClosedAuthority(code);
                 return;
             }
             if (!response.ok) throw new Error(`application discovery failed: ${response.status}`);
-            const applications = orderApplications(normalizeCatalog(await response.json()), this.preference);
-            if (token !== this.catalogToken) return;
+            const body = await response.json();
+            if (!isCurrent()) return;
+            const applications = orderApplications(normalizeCatalog(body), this.preference);
 
             const activeRemoved = this.panelManager.reconcile(catalogTargetKeys(applications));
+            if (!isCurrent()) return;
             const pendingTargetRemoved = this.pendingTarget &&
                 !this.findTarget(applications, this.pendingTarget);
             if (pendingTargetRemoved) {
@@ -289,20 +367,20 @@ export class Launcher extends Component {
                 panelFailure: null,
             };
             if (dismissDirtyIntent) nextState.dirtyIntent = null;
-            this.setState(nextState, () => {
+            this.setOwnedState(nextState, () => {
                 this.automaticRecoverySpent = false;
                 if (replacement) this.navigateTarget(replacement, { source: 'forced' });
                 else if (activeRemoved) this.homeHeading?.focus();
                 else if (dirtyTargetRemoved) this.panelManager.active?.container.focus();
-            });
+            }, isCurrent);
         } catch (error) {
-            if (error.name === 'AbortError' || token !== this.catalogToken) return;
-            this.setState(({ applications }) => ({
+            if (!isCurrent() || error.name === 'AbortError') return;
+            this.setOwnedState(({ applications }) => ({
                 catalogStatus: applications.length ? 'stale' : 'failed',
                 statusMessage: applications.length
                     ? 'Application list may be out of date.'
                     : 'Applications could not be loaded.',
-            }));
+            }), null, isCurrent);
         }
     }
 
@@ -314,76 +392,90 @@ export class Launcher extends Component {
     }
 
     applicationSelected(application, source = 'switcher') {
+        if (!this.owns()) return;
         const panel = choosePanel(application, this.preference);
         this.requestNavigation(makeTarget(application, panel), source);
     }
 
     panelSelected(application, panel, source = 'tab') {
+        if (!this.owns()) return;
         this.requestNavigation(makeTarget(application, panel), source);
     }
 
     requestNavigation(target, source) {
+        if (!this.owns()) return;
         if (this.state.dirtyIntent) return;
         const active = this.panelManager.activeTarget;
         if (active && active.generation === target.generation && active.panel.id === target.panel.id) {
-            this.setState({ menuOpen: false });
+            this.setOwnedState({ menuOpen: false });
             return;
         }
         if (this.panelManager.activeDirty) {
             this.focusBeforeDialog = document.activeElement;
-            this.setState({ dirtyIntent: { kind: 'target', target, source }, menuOpen: false });
+            this.setOwnedState({ dirtyIntent: { kind: 'target', target, source }, menuOpen: false });
             return;
         }
         this.navigateTarget(target, { source });
     }
 
     requestHome() {
+        if (!this.owns()) return;
         if (this.state.dirtyIntent) return;
         if (this.state.navigation.kind === 'home') return;
         if (this.panelManager.activeDirty) {
             this.focusBeforeDialog = document.activeElement;
-            this.setState({ dirtyIntent: { kind: 'home' }, menuOpen: false });
+            this.setOwnedState({ dirtyIntent: { kind: 'home' }, menuOpen: false });
             return;
         }
         this.commitHome(false);
     }
 
     cancelDirty() {
-        this.setState({ dirtyIntent: null }, () => this.focusBeforeDialog?.focus());
+        if (!this.owns()) return;
+        const token = this.navigationToken;
+        this.setOwnedState({ dirtyIntent: null }, () => this.focusBeforeDialog?.focus(),
+            () => token === this.navigationToken);
     }
 
     confirmDirty() {
+        if (!this.owns()) return;
         const intent = this.state.dirtyIntent;
-        this.setState({ dirtyIntent: null }, () => {
+        if (!intent) return;
+        const token = this.navigationToken;
+        this.setOwnedState({ dirtyIntent: null }, () => {
             if (intent.kind === 'home') this.commitHome(true);
             else this.navigateTarget(intent.target, {
                 source: intent.source,
                 discardActive: true,
                 restoreTabFocus: intent.source === 'tab',
             });
-        });
+        }, () => token === this.navigationToken);
     }
 
     commitHome(discardActive) {
-        ++this.navigationToken;
+        if (!this.owns()) return;
+        const token = ++this.navigationToken;
         this.pendingTarget = null;
         this.panelManager.deactivateToHome({ discardActive });
-        this.setState({ navigation: { kind: 'home' }, menuOpen: false, panelFailure: null },
-            () => this.homeHeading?.focus());
+        this.setOwnedState({ navigation: { kind: 'home' }, menuOpen: false, panelFailure: null },
+            () => this.homeHeading?.focus(), () => token === this.navigationToken);
     }
 
     async navigateTarget(requested, {
         source, discardActive = false, forceNew = false, restoreTabFocus = false,
     } = {}) {
+        const owner = this.owner;
+        if (!this.owns(owner)) return;
         const target = this.findTarget(this.state.applications, requested);
         if (!target) {
-            this.setState({ liveMessage: 'Application unavailable' });
+            this.setOwnedState({ liveMessage: 'Application unavailable' });
             this.commitHome(discardActive);
             return;
         }
         const token = ++this.navigationToken;
+        const isCurrent = () => this.owns(owner) && token === this.navigationToken;
         this.pendingTarget = target;
-        this.setState({ panelFailure: null, statusMessage: 'Loading panel…', menuOpen: false });
+        this.setOwnedState({ panelFailure: null, statusMessage: 'Loading panel…', menuOpen: false }, null, isCurrent);
         if (forceNew) {
             const existing = [...this.panelManager.instances.values()].find(instance =>
                 instance.target.generation === target.generation && instance.target.panel.id === target.panel.id);
@@ -393,28 +485,29 @@ export class Launcher extends Component {
         try {
             instance = await this.panelManager.prepare(target);
             const current = this.findTarget(this.state.applications, target);
-            if (token !== this.navigationToken || !current) {
+            if (!isCurrent() || !current) {
                 if (!this.pendingTarget || this.pendingTarget.generation !== target.generation ||
                     this.pendingTarget.panel.id !== target.panel.id) this.panelManager.destroyPrepared(instance);
                 return;
             }
             this.panelManager.commit(instance, { discardActive });
         } catch (error) {
+            if (!isCurrent()) return;
             if (error?.name === 'PanelImportError') await this.refreshCatalog();
-            if (token !== this.navigationToken) return;
+            if (!isCurrent()) return;
             this.pendingTarget = null;
             if (!this.panelManager.activeTarget) {
-                this.setState({ panelFailure: target, statusMessage: '' });
+                this.setOwnedState({ panelFailure: target, statusMessage: '' }, null, isCurrent);
             } else {
-                this.setState({ statusMessage: 'The requested panel could not be displayed.' });
+                this.setOwnedState({ statusMessage: 'The requested panel could not be displayed.' }, null, isCurrent);
             }
             return;
         }
-        if (token !== this.navigationToken) return;
+        if (!isCurrent()) return;
         this.pendingTarget = null;
         this.preference = updatePreference(this.preference, target.applicationId, target.panel.id);
         this.writePreference();
-        this.setState({
+        this.setOwnedState({
             navigation: { kind: 'application', applicationId: target.applicationId,
                 panelId: target.panel.id, generation: target.generation },
             focusedPanel: target.panel.id, statusMessage: '', panelFailure: null,
@@ -426,17 +519,21 @@ export class Launcher extends Component {
             } else if (source !== 'tab') {
                 instance.container.focus();
             }
-        });
+        }, isCurrent);
     }
 
     writePreference() {
+        const owner = this.owner;
+        if (!this.owns(owner)) return;
         const value = JSON.parse(JSON.stringify(this.preference));
-        this.preferenceWrite = this.preferenceWrite.catch(() => {}).then(() =>
-            call('shell.preferences.set', { key: 'shell.launcher', value }))
-            .catch(() => this.setState({ statusMessage: 'Launcher preference could not be saved.' }));
+        this.preferenceWrite = this.preferenceWrite.catch(() => {}).then(() => {
+            if (this.owns(owner)) return call('shell.preferences.set', { key: 'shell.launcher', value });
+        }).catch(() => this.setOwnedState({ statusMessage: 'Launcher preference could not be saved.' },
+            null, () => this.owns(owner)));
     }
 
     auditPanelFailure(target, error, info) {
+        if (!this.owns()) return;
         const detail = {
             application_id: target.applicationId,
             panel_id: target.panel.id,
@@ -452,17 +549,26 @@ export class Launcher extends Component {
     }
 
     openMenu() {
+        if (!this.owns()) return;
         if (!this.state.applications.length) return;
+        const token = this.navigationToken;
         const current = this.state.navigation.applicationId;
         const index = Math.max(0, this.state.applications.findIndex(item => item.id === current));
-        this.setState({ menuOpen: true, menuIndex: index }, () => this.menuItems[index]?.focus());
+        this.setOwnedState({ menuOpen: true, menuIndex: index }, () => {
+            if (this.state.menuOpen) this.menuItems[index]?.focus();
+        }, () => token === this.navigationToken);
     }
 
     closeMenu() {
-        this.setState({ menuOpen: false }, () => this.appTrigger?.focus());
+        if (!this.owns()) return;
+        const token = this.navigationToken;
+        this.setOwnedState({ menuOpen: false }, () => {
+            if (!this.state.menuOpen) this.appTrigger?.focus();
+        }, () => token === this.navigationToken);
     }
 
     menuKey(event) {
+        if (!this.owns()) return;
         const count = this.state.applications.length;
         if (!count) return;
         let index = this.state.menuIndex;
@@ -479,10 +585,13 @@ export class Launcher extends Component {
             return;
         } else return;
         event.preventDefault();
-        this.setState({ menuIndex: index }, () => this.menuItems[index]?.focus());
+        const token = this.navigationToken;
+        this.setOwnedState({ menuIndex: index }, () => this.menuItems[index]?.focus(),
+            () => token === this.navigationToken && this.state.menuOpen);
     }
 
     tabKey(event, application, index) {
+        if (!this.owns()) return;
         const panels = application.panels;
         let next = index;
         if (event.key === 'ArrowRight' || event.key === 'ArrowDown') next = (index + 1) % panels.length;
@@ -495,11 +604,12 @@ export class Launcher extends Component {
             return;
         } else return;
         event.preventDefault();
-        this.setState({ focusedPanel: panels[next].id }, () => {
+        const token = this.navigationToken;
+        this.setOwnedState({ focusedPanel: panels[next].id }, () => {
             const tab = document.getElementById(makeTarget(application, panels[next]).tabId);
             tab?.focus();
             tab?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-        });
+        }, () => token === this.navigationToken);
     }
 
     renderHome(applications, status) {
@@ -537,7 +647,7 @@ export class Launcher extends Component {
                 key: panel.id, id: target.tabId, type: 'button', role: 'tab',
                 'aria-selected': selected === panel.id ? 'true' : 'false',
                 'aria-controls': target.paneId, tabIndex: focused === panel.id ? 0 : -1,
-                onFocus: () => this.setState({ focusedPanel: panel.id }),
+                onFocus: () => this.setOwnedState({ focusedPanel: panel.id }),
                 onKeyDown: event => this.tabKey(event, application, index),
                 onClick: () => this.panelSelected(application, panel, 'tab'),
                 disabled: Boolean(this.state.dirtyIntent),
@@ -546,6 +656,7 @@ export class Launcher extends Component {
     }
 
     render() {
+        const owner = this.owner;
         const applications = this.state.applications;
         const currentApplication = this.state.navigation.kind === 'application'
             ? applications.find(item => item.id === this.state.navigation.applicationId) : null;
@@ -593,7 +704,7 @@ export class Launcher extends Component {
                             key: application.id, type: 'button', role: 'menuitem',
                             ref: element => { this.menuItems[index] = element; },
                             tabIndex: this.state.menuIndex === index ? 0 : -1,
-                            onMouseEnter: () => this.setState({ menuIndex: index }),
+                            onMouseEnter: () => this.setOwnedState({ menuIndex: index }),
                             onClick: () => this.applicationSelected(application),
                         }, h(ApplicationMark, { application, small: true }), application.title)))) : null),
                     this.renderTabs(currentApplication)),
@@ -601,7 +712,7 @@ export class Launcher extends Component {
                 this.props.userControls,
                 DEVELOPMENT_MODE ? h('button', {
                     type: 'button', class: 'ipoint-toggle',
-                    onClick: () => this.setState({ overlay: !this.state.overlay }),
+                    onClick: () => this.setOwnedState({ overlay: !this.state.overlay }),
                 }, this.state.overlay ? 'Hide ownership' : 'Show ownership') : null),
             h('main', {
                 class: `launcher-main${this.state.overlay ? ' show-ipoints' : ''}`,
@@ -624,6 +735,7 @@ export class Launcher extends Component {
                 'Ownership: blue = shell, amber = extension') : null,
             this.state.dirtyIntent ? h(DirtyDialog, {
                 onCancel: () => this.cancelDirty(), onDiscard: () => this.confirmDirty(),
+                isCurrent: () => this.owns(owner),
             }) : null);
     }
 }

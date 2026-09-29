@@ -217,7 +217,7 @@ TEST_CASE("B.01: GET /api/frontend/tokens.css returns 302 to "
   auto r = capture(s.db);
   REQUIRE(r.received);
   REQUIRE(r.status == drogon::k302Found);
-  REQUIRE(r.location == "/ext/shell/0.6.5/css/tokens.css");
+  REQUIRE(r.location == "/ext/shell/0.6.6/css/tokens.css");
   REQUIRE(r.cache_control == "no-cache");
   REQUIRE(r.body.empty());
 }

@@ -840,7 +840,8 @@ target_link_libraries(plinth_tests PRIVATE
 )
 
 add_dependencies(plinth_tests plinth_shell_bundle_staged plinth_install_fixture_zips
-                 plinth_lifecycle_fixture_zips plinth_rbac_test_runner_fixture_zips)
+                 plinth_lifecycle_fixture_zips plinth_rbac_test_runner_fixture_zips
+                 plinth_test_extension_zips)
 
 include(Catch)
 

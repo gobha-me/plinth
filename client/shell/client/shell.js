@@ -7,7 +7,8 @@ import { h, render, Component } from 'preact';
 import htm from 'htm';
 import {
   call as plinthCall,
-  reconnectRealtime,
+  activateRealtimeSession,
+  retireRealtimeSession,
   withCsrf,
 } from '@plinth/frontend/sdk';
 import { Launcher } from './launcher/launcher.js';
@@ -50,23 +51,29 @@ function sanitizeBoundaryPayload(error, info, panelId) {
 // stored values synchronously before first paint; this module re-applies
 // on user action (popover select).
 //
-// Implementation deviation from ICD-0.6.2 §4.4 + §7.2 + §7.3:
-// kernel-side persistence via `cap.call("shell.preferences.set", …)`
-// is deferred to the 0.6.1.N JS-dispatch follow-up that closes
-// ICD-0.6.1's P.\* / I.\* deferral (the same path
-// `project_test_fixture_inflight.md` session 9 noted needs the
-// `init_registry` teardown bug resolved first). v0.6.2 ships
-// localStorage-only persistence — per-browser, per-device. The
-// SCHEMA validator in `server/handlers/preferences.set.js` ships
-// in this PR so the wiring is ready when the 0.6.1.N follow-up
-// connects browser → kernel. Recorded in §17 amendment block.
+// The local mirror is only the synchronous first-paint bridge. Authenticated
+// get_all hydration is authoritative; user actions apply and mirror only after
+// a successful server write. Each mounted frame owns its async work.
 const PREF_KEYS = Object.freeze({ THEME: 'shell.theme',
                                   SCALE: 'shell.scale_pct' });
 const SCALE_PRESETS = Object.freeze([80, 90, 100, 110, 125, 150, 175]);
 
 function readPrefs() {
-  try { return JSON.parse(localStorage.getItem('shellPrefs') || '{}'); }
+  try {
+    const prefs = JSON.parse(localStorage.getItem('shellPrefs') || '{}');
+    return prefs && typeof prefs === 'object' && !Array.isArray(prefs) ? prefs : {};
+  }
   catch (_) { return {}; }
+}
+let currentTheme = readPrefs()[PREF_KEYS.THEME];
+function preferenceValues(prefs) {
+  return {
+    [PREF_KEYS.THEME]: ['light', 'dark', 'system'].includes(prefs[PREF_KEYS.THEME])
+      ? prefs[PREF_KEYS.THEME] : 'system',
+    [PREF_KEYS.SCALE]: Number.isInteger(prefs[PREF_KEYS.SCALE]) &&
+      prefs[PREF_KEYS.SCALE] >= 80 && prefs[PREF_KEYS.SCALE] <= 175
+      ? prefs[PREF_KEYS.SCALE] : 100,
+  };
 }
 function writePrefs(prefs) {
   try { localStorage.setItem('shellPrefs', JSON.stringify(prefs)); }
@@ -79,6 +86,7 @@ function setPref(key, value) {
 }
 function applyTheme(stored) {
   const want = (stored === 'light' || stored === 'dark') ? stored : 'system';
+  currentTheme = want;
   const resolved = want === 'system'
     ? (window.matchMedia('(prefers-color-scheme: dark)').matches
         ? 'dark' : 'light')
@@ -98,7 +106,7 @@ function applyScale(pct) {
   if (typeof window === 'undefined' || !window.matchMedia) { return; }
   const mql = window.matchMedia('(prefers-color-scheme: dark)');
   const handler = () => {
-    const stored = readPrefs()[PREF_KEYS.THEME];
+    const stored = currentTheme;
     if (stored !== 'light' && stored !== 'dark') {
       applyTheme(stored);
     }
@@ -136,6 +144,17 @@ function errString(code, retryAfter) {
 // ── App state singleton (avoids a full state-management framework) ──
 const listeners = new Set();
 const state = { route: 'loading', user: null, errorCode: null, retryAfter: 0 };
+let sessionGeneration = 0;
+function endSession(code) {
+  sessionGeneration++;
+  retireRealtimeSession(code || 'session_ended');
+  setState({ route: 'login', user: null, errorCode: code || null, retryAfter: 0 });
+}
+function beginSession(user) {
+  sessionGeneration++;
+  activateRealtimeSession();
+  setState({ route: 'authenticated', user, errorCode: null });
+}
 function setState(patch) {
   Object.assign(state, patch);
   listeners.forEach((fn) => fn());
@@ -147,17 +166,20 @@ function subscribe(fn) {
 
 // ── Fetch wrapper (ICD-0.6.0 §5.3 + §5.6 redirect-on-401) ───────────
 async function plinthFetch(url, opts) {
+  const generation = sessionGeneration;
   const r = await fetch(url, withCsrf(url, {
     ...(opts ?? {}),
     credentials: 'include',
   }));
   if (r.status === 401 && url !== '/api/auth/login') {
+    if (generation !== sessionGeneration) throw new Error('superseded session response');
     let code = 'session_expired';
     try {
       const body = await r.clone().json();
       if (body && typeof body.error === 'string') code = body.error;
     } catch (_) { /* ignore body parse errors */ }
-    setState({ route: 'login', user: null, errorCode: code, retryAfter: 0 });
+    if (generation !== sessionGeneration) throw new Error('superseded session response');
+    endSession(code);
     throw new Error('redirect-on-401');
   }
   return r;
@@ -222,12 +244,17 @@ class LoginForm extends Component {
       registrationProcessed: false,
     };
     this.lockoutTimer = null;
+    this.retired = false;
+    this.generation = sessionGeneration;
   }
+  isCurrent() { return !this.retired && this.generation === sessionGeneration; }
   componentDidMount() {
     plinthFetch('/api/auth/registration')
       .then(async (r) => {
+        if (!this.isCurrent()) return;
         if (r.status !== 200) return;
         const body = await r.json();
+        if (!this.isCurrent()) return;
         if (body.mode === 'invite' || body.mode === 'open') {
           this.setState({ registrationMode: body.mode });
         }
@@ -235,12 +262,15 @@ class LoginForm extends Component {
       .catch(() => {});
   }
   componentWillUnmount() {
+    this.retired = true;
     if (this.lockoutTimer) clearInterval(this.lockoutTimer);
   }
   startLockout(seconds) {
+    if (!this.isCurrent()) return;
     this.setState({ lockoutSeconds: seconds });
     if (this.lockoutTimer) clearInterval(this.lockoutTimer);
     this.lockoutTimer = setInterval(() => {
+      if (!this.isCurrent()) return;
       const next = this.state.lockoutSeconds - 1;
       if (next <= 0) {
         clearInterval(this.lockoutTimer);
@@ -253,7 +283,7 @@ class LoginForm extends Component {
   }
   async submit(ev) {
     ev.preventDefault();
-    if (this.state.submitting || this.state.lockoutSeconds > 0) return;
+    if (!this.isCurrent() || this.state.submitting || this.state.lockoutSeconds > 0) return;
     this.setState({ submitting: true, error: null });
     try {
       const r = await plinthFetch('/api/auth/login', {
@@ -264,20 +294,21 @@ class LoginForm extends Component {
           password: this.state.password,
         }),
       });
+      if (!this.isCurrent()) return;
       if (r.status === 200) {
         const session = await plinthFetch('/api/auth/session');
+        if (!this.isCurrent()) return;
         if (session.status === 200) {
           const sessionBody = await session.json();
-          reconnectRealtime();
-          setState({ route: 'authenticated',
-                     user: sessionBody.user ?? sessionBody,
-                     errorCode: null });
+          if (!this.isCurrent()) return;
+          beginSession(sessionBody.user ?? sessionBody);
           return;
         }
         this.setState({ submitting: false, error: 'not_authenticated' });
         return;
       }
       const body = await r.json().catch(() => ({}));
+      if (!this.isCurrent()) return;
       const code = body.error ?? `http_${r.status}`;
       // OQ3: rate-limit lockout disables submit + shows countdown.
       if (r.status === 429) {
@@ -291,13 +322,14 @@ class LoginForm extends Component {
         retryAfter: Number(body.retry_after) || 0,
       });
     } catch (err) {
+      if (!this.isCurrent()) return;
       // Server unreachable / non-JSON / network — generic state.
       this.setState({ submitting: false, error: 'server_unreachable', password: '' });
     }
   }
   async submitRegistration(ev) {
     ev.preventDefault();
-    if (this.state.submitting || this.state.lockoutSeconds > 0) return;
+    if (!this.isCurrent() || this.state.submitting || this.state.lockoutSeconds > 0) return;
     this.setState({ submitting: true, error: null, registrationProcessed: false });
     const body = {
       username: this.state.username,
@@ -312,8 +344,10 @@ class LoginForm extends Component {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+      if (!this.isCurrent()) return;
       if (r.status === 202) {
         await r.text();
+        if (!this.isCurrent()) return;
         this.setState({
           submitting: false,
           registering: false,
@@ -324,6 +358,7 @@ class LoginForm extends Component {
         return;
       }
       const responseBody = await r.json().catch(() => ({}));
+      if (!this.isCurrent()) return;
       const code = responseBody.error ?? `http_${r.status}`;
       if (r.status === 429) {
         const retryAfter = Number(r.headers.get('Retry-After')) || 60;
@@ -336,6 +371,7 @@ class LoginForm extends Component {
         retryAfter: Number(r.headers.get('Retry-After')) || 0,
       });
     } catch (_) {
+      if (!this.isCurrent()) return;
       this.setState({ submitting: false, error: 'server_unreachable', password: '' });
     }
   }
@@ -410,20 +446,75 @@ class LoginForm extends Component {
 class AuthFrame extends Component {
   constructor(props) {
     super(props);
-    this.state = { popoverOpen: false };
+    this.state = { popoverOpen: false, prefs: preferenceValues(readPrefs()), preferenceError: null };
+    this.retired = false;
+    this.generation = sessionGeneration;
+    this.preferenceVersions = new Map(Object.values(PREF_KEYS).map(key => [key, 0]));
+    this.appliedVersions = new Map(Object.values(PREF_KEYS).map(key => [key, 0]));
+    this.preferenceWrites = new Map();
     this.onDocClick = (ev) => {
-      if (!this.avatarRef) return;
+      if (!this.isCurrent() || !this.avatarRef) return;
       if (this.avatarRef.contains(ev.target)) return;
       if (this.state.popoverOpen) this.setState({ popoverOpen: false });
     };
   }
-  componentDidMount() { document.addEventListener('click', this.onDocClick); }
-  componentWillUnmount() { document.removeEventListener('click', this.onDocClick); }
+  isCurrent() { return !this.retired && this.generation === sessionGeneration; }
+  componentDidMount() {
+    document.addEventListener('click', this.onDocClick);
+    this.hydratePreferences();
+  }
+  componentWillUnmount() {
+    this.retired = true;
+    document.removeEventListener('click', this.onDocClick);
+  }
+  preferenceFailed() {
+    if (!this.isCurrent()) return;
+    this.setState(() => this.isCurrent()
+      ? { preferenceError: 'Preferences could not be saved or loaded.' } : null);
+  }
+  applyPreference(key, value, version) {
+    if (!this.isCurrent()) return;
+    this.appliedVersions.set(key, version);
+    setPref(key, value);
+    if (key === PREF_KEYS.THEME) applyTheme(value);
+    else applyScale(value);
+    this.setState(previous => this.isCurrent() && this.appliedVersions.get(key) === version
+      ? { prefs: { ...previous.prefs, [key]: value }, preferenceError: null } : null);
+  }
+  async hydratePreferences() {
+    const versions = new Map(this.appliedVersions);
+    try {
+      const result = await plinthCall('shell.preferences.get_all');
+      if (!this.isCurrent()) return;
+      if (!Array.isArray(result?.entries)) throw new Error('invalid preference response');
+      const prefs = preferenceValues(Object.fromEntries(result.entries
+        .filter(entry => entry && typeof entry.key === 'string')
+        .map(entry => [entry.key, entry.value])));
+      for (const key of Object.values(PREF_KEYS)) {
+        if (this.appliedVersions.get(key) === versions.get(key)) {
+          this.applyPreference(key, prefs[key], versions.get(key));
+        }
+      }
+    } catch { this.preferenceFailed(); }
+  }
+  persistPreference(key, value) {
+    if (!this.isCurrent()) return;
+    const version = this.preferenceVersions.get(key) + 1;
+    this.preferenceVersions.set(key, version);
+    const prior = this.preferenceWrites.get(key) || Promise.resolve();
+    const write = prior.catch(() => {}).then(async () => {
+      if (!this.isCurrent()) return;
+      await plinthCall('shell.preferences.set', { key, value });
+      if (this.isCurrent()) this.applyPreference(key, value, version);
+    }).catch(() => this.preferenceFailed());
+    this.preferenceWrites.set(key, write);
+  }
   async signOut() {
+    if (!this.isCurrent()) return;
     try {
       const response = await plinthFetch('/api/auth/logout', { method: 'POST' });
-      if (response.ok) {
-        setState({ route: 'login', user: null, errorCode: null });
+      if (response.ok && this.isCurrent()) {
+        endSession(null);
       }
     } catch (_) {
       // A terminal 401 already moved the shell to login in plinthFetch. Keep
@@ -433,25 +524,21 @@ class AuthFrame extends Component {
     }
   }
   sessionEnded(code) {
-    setState({ route: 'login', user: null, errorCode: code, retryAfter: 0 });
+    if (this.isCurrent()) endSession(code);
   }
   setTheme(value) {
     if (value !== 'light' && value !== 'dark' && value !== 'system') return;
-    setPref(PREF_KEYS.THEME, value);
-    applyTheme(value);
-    this.forceUpdate();  // re-render popover with new selected value
+    this.persistPreference(PREF_KEYS.THEME, value);
   }
   setScale(value) {
-    const pct = parseInt(value, 10);
+    const pct = Number(value);
     if (!Number.isInteger(pct) || pct < 80 || pct > 175) return;
-    setPref(PREF_KEYS.SCALE, pct);
-    applyScale(pct);
-    this.forceUpdate();
+    this.persistPreference(PREF_KEYS.SCALE, pct);
   }
   render(props) {
     const username = props.user?.username ?? '';
     const initial = username ? username[0].toUpperCase() : '?';
-    const prefs = readPrefs();
+    const prefs = this.state.prefs;
     const theme = (prefs[PREF_KEYS.THEME] === 'light'
                    || prefs[PREF_KEYS.THEME] === 'dark'
                    || prefs[PREF_KEYS.THEME] === 'system')
@@ -464,7 +551,9 @@ class AuthFrame extends Component {
       <div class="zone zone-avatar"
            ref=${(el) => { this.avatarRef = el; }}
            style="position: relative;">
-          <button onClick=${() => this.setState({ popoverOpen: !this.state.popoverOpen })}>
+          <button onClick=${() => {
+            if (this.isCurrent()) this.setState({ popoverOpen: !this.state.popoverOpen });
+          }}>
             <span class="avatar-circle">${initial}</span>
             <svg class="chev" viewBox="0 0 16 16" aria-hidden="true">
               <path d="M4 6 L8 10 L12 6" fill="none"
@@ -493,6 +582,7 @@ class AuthFrame extends Component {
                 </select>
               </div>
               <hr class="popover-sep" />
+              ${this.state.preferenceError ? html`<p role="status">${this.state.preferenceError}</p>` : null}
               <button role="menuitem" onClick=${() => this.signOut()}>Sign Out</button>
             </div>` : null}
       </div>`;
@@ -506,6 +596,9 @@ class AuthFrame extends Component {
 // ── Root component (ICD-0.6.0 §4.4 boot sequence) ───────────────────
 class App extends Component {
   componentDidMount() {
+    this.retired = false;
+    const generation = sessionGeneration;
+    const isCurrent = () => !this.retired && generation === sessionGeneration && state.route === 'loading';
     this.unsub = subscribe(() => this.forceUpdate());
     // E.01 test-only seam — query string toggles a deliberate-throw component
     // so the boundary fallback can be exercised in browser smoke tests.
@@ -519,35 +612,40 @@ class App extends Component {
     // "session expired" condition.
     fetch('/api/auth/session', { credentials: 'include' })
       .then(async (r) => {
+        if (!isCurrent()) return;
         if (r.status === 200) {
           const sessionBody = await r.json();
-          setState({ route: 'authenticated',
-                     user: sessionBody.user ?? sessionBody,
-                     errorCode: null });
+          if (!isCurrent()) return;
+          beginSession(sessionBody.user ?? sessionBody);
         } else if (r.status === 401) {
           await r.text();
-          setState({ route: 'login', user: null, errorCode: null });
+          if (!isCurrent()) return;
+          endSession(null);
         } else {
           await r.text();
+          if (!isCurrent()) return;
           setState({ route: 'login', user: null, errorCode: 'server_unreachable' });
         }
       })
       .catch(() => {
-        if (state.route === 'loading') {
+        if (isCurrent()) {
           setState({ route: 'login', user: null, errorCode: 'server_unreachable' });
         }
       });
   }
-  componentWillUnmount() { if (this.unsub) this.unsub(); }
+  componentWillUnmount() {
+    this.retired = true;
+    if (this.unsub) this.unsub();
+  }
   render() {
     if (state.route === 'force-throw') return html`<${ForceThrow} />`;
     if (state.route === 'loading') {
       return html`<main>Loading…</main>`;
     }
     if (state.route === 'authenticated' && state.user) {
-      return html`<${AuthFrame} user=${state.user} />`;
+      return html`<${AuthFrame} key=${sessionGeneration} user=${state.user} />`;
     }
-    return html`<${LoginForm} initialErrorCode=${state.errorCode} />`;
+    return html`<${LoginForm} key=${sessionGeneration} initialErrorCode=${state.errorCode} />`;
   }
 }
 

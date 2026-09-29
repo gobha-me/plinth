@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "rule": "plinth.sdkdemo.panel",
+      "namespace": "plinth",
+      "description": "Test-only SDK demo panel visibility; no server capability authority."
+    },
+    {
+      "rule": "sdkdemo.thrower",
+      "namespace": "sdkdemo",
+      "description": "Invoke only the test fixture's controlled throwing handler."
+    }
+  ]
+}

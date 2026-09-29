@@ -11,6 +11,27 @@ tag list (`git tag -l`).
 
 ---
 
+## 2026-09-29 — development 0.6.6 client runtime contracts (not released)
+
+- Added query-owned smart snapshot hooks with bounded debounce/jitter,
+  conservative certified-view insert/delete filtering, last-good typed errors,
+  and permanent original-session retirement. Raw event hooks remain raw;
+  automatic cursor/replay/resync policy stays with #42.
+- Bound Launcher queued work, panel imports and retained callbacks to their
+  original owners; preserve supplied panel context and shortcut default choice.
+- Made preference hydration and writes owner-safe and success-only, with
+  explicit theme behavior when browser storage is unavailable.
+- Added an exact 45-case historical ICD disposition ledger, shipped-module
+  units and real-Preact browser controls, plus native installed-panel and
+  same-database persistence/restart journeys. Controlled test-only capabilities
+  and network seams are explicitly identified and never bundled.
+- Coordinated the development VERSION, asset manifest, Docker defaults and
+  generated SBOM. This entry grants no release, tag or publication authority.
+
+Tracks [GitHub issue #32](https://github.com/gobha-me/plinth/issues/32).
+
+---
+
 ## 2026-09-21 — safe local registration policy
 
 - Separated first-administrator creation into a one-time,

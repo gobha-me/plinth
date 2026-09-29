@@ -4,6 +4,7 @@
       "id":          "demo",
       "title":       "SDK Demo",
       "icon":        "edit-3",
+      "rbac_rule":   "plinth.sdkdemo.panel",
       "client_path": "demo.js"
     }
   ]

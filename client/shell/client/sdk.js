@@ -9,7 +9,9 @@
 // declared in shell/client/index.html.
 //
 import { h } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
+import { prepareCapabilityRequest, captureView, sameQuery } from './data-query.js';
+import { createDataController } from './data-controller.js';
 
 // ── Error classes ───────────────────────────────────────────────────
 
@@ -107,15 +109,25 @@ export async function call(capability, args) {
     // for parameterless caps. ICD-0.6.3 §A.2's rest-spread shape is
     // incompatible with the kernel binding and was redesigned here —
     // see ICD §17 deviation #N.
+    let prepared;
+    try {
+        prepared = prepareCapabilityRequest(capability, args);
+    } catch (error) {
+        throw new NetworkError(`fetch failed for ${capability}`, error);
+    }
+    return requestPrepared(prepared);
+}
+
+async function requestPrepared(prepared, { signal } = {}) {
+    const capability = prepared.capability;
     let resp;
     try {
-        const body = (args === undefined) ? { args: null } : { args };
-        const url = `/api/cap/${encodeURIComponent(capability)}`;
-        resp = await fetch(url, withCsrf(url, {
+        resp = await fetch(prepared.url, withCsrf(prepared.url, {
             method:      'POST',
             credentials: 'include',
             headers:     { 'Content-Type': 'application/json' },
-            body:        JSON.stringify(body),
+            body:        prepared.body,
+            ...(signal ? { signal } : {}),
         }));
     } catch (e) {
         throw new NetworkError(`fetch failed for ${capability}`, e);
@@ -165,6 +177,51 @@ let reconnectTimer = null;
 let backoffMs = 1000;
 let terminalError = null;
 let realtimeState = Object.freeze({ status: 'idle', error: null });
+let sessionOwner = { active: true, error: null, listeners: new Set() };
+const hookSessionListeners = new Set();
+const DEFAULT_ADVICE = Object.freeze({ debounceMs: 100, jitterMs: 50 });
+
+function grantAdvice(frame) {
+    const valid = (value, maximum, fallback) =>
+        Number.isInteger(value) && value >= 0 && value <= maximum ? value : fallback;
+    return Object.freeze({
+        debounceMs: valid(frame.recommended_debounce_ms, 60000, DEFAULT_ADVICE.debounceMs),
+        jitterMs: valid(frame.recommended_jitter_ms, 5000, DEFAULT_ADVICE.jitterMs),
+    });
+}
+
+// These are managed-shell admission seams, not implicit reauthentication on
+// scope changes. Old owners can never become live again after retirement.
+export function retireRealtimeSession(code = 'session_ended') {
+    retireSession(new RealtimeError(code, 'Realtime session has ended'), false);
+}
+
+function retireSession(error, report) {
+    if (!sessionOwner.active) return;
+    const retired = sessionOwner;
+    retired.active = false;
+    retired.error = error;
+    const entries = [...subscriptions.values()].flatMap(set => [...set]);
+    for (const set of subscriptions.values()) set.clear();
+    subscriptions.clear();
+    if (socket) socket.restart = false;
+    terminalError = retired.error;
+    closeSocket();
+    for (const listener of [...retired.listeners]) notify(listener, false);
+    retired.listeners.clear();
+    setRealtimeState('failed', retired.error);
+    for (const entry of report ? entries : []) {
+        if (sessionOwner === retired && entry.onError) notify(entry.onError, error);
+    }
+    for (const listener of [...hookSessionListeners]) notify(listener);
+}
+
+export function activateRealtimeSession() {
+    if (sessionOwner.active) retireRealtimeSession('session_rotated');
+    sessionOwner = { active: true, error: null, listeners: new Set() };
+    for (const listener of [...hookSessionListeners]) notify(listener);
+    reconnectRealtime();
+}
 
 function notify(handler, value) {
     try { handler(value); }
@@ -197,14 +254,18 @@ function reportError(error, channel) {
 }
 
 function reportReady(owner, channel) {
+    const grant = owner.advice.get(channel);
+    if (!grant) return;
     const set = subscriptions.get(channel);
     for (const entry of [...(set || [])]) {
-        if (!set.has(entry) || entry.readyOwner === owner || !entry.onReady) continue;
-        entry.readyOwner = owner;
+        if (!set.has(entry) || entry.readyOwner === grant || !entry.onReady) continue;
+        entry.readyOwner = grant;
         queueMicrotask(() => {
-            if (socket === owner && !owner.closing && terminalError === null &&
+            if (sessionOwner === owner.session && sessionOwner.active &&
+                socket === owner && !owner.closing && terminalError === null &&
+                subscriptions.get(channel) === set && owner.advice.get(channel) === grant &&
                 set.has(entry) && owner.granted.has(channel) &&
-                entry.readyOwner === owner) notify(entry.onReady);
+                entry.readyOwner === grant) notify(entry.onReady, grant.value);
         });
     }
 }
@@ -219,12 +280,17 @@ function closeSocket(restart = false) {
         // Retain ownership until the close event. Starting a replacement before
         // that event would briefly create two live sockets for one session.
         previous.closing = true;
+        previous.advice.clear();
         previous.restart ||= restart;
         previous.ws.close();
     }
 }
 
 function failRealtime(error) {
+    if (['not_authenticated', 'session_expired', 'session_revoked'].includes(error.code)) {
+        retireSession(error, true);
+        return;
+    }
     terminalError = error;
     closeSocket();
     setRealtimeState('failed', error);
@@ -234,6 +300,7 @@ function failRealtime(error) {
 // Call explicitly after successful sign-in or to reclaim a displaced session.
 // Auth failures never cause an unbounded background authentication loop.
 export function reconnectRealtime() {
+    if (!sessionOwner.active) return;
     terminalError = null;
     backoffMs = 1000;
     setRealtimeState('idle');
@@ -267,8 +334,10 @@ function acceptAcknowledgement(owner, frame) {
         if (pending.type === 'unsubscribe') {
             owner.granted.delete(channel);
             owner.denied.delete(channel);
+            owner.advice.delete(channel);
         } else if (acknowledged.has(channel)) {
             owner.granted.add(channel);
+            owner.advice.set(channel, { value: grantAdvice(frame) });
             reportReady(owner, channel);
         } else {
             owner.denied.add(channel);
@@ -280,7 +349,7 @@ function acceptAcknowledgement(owner, frame) {
 }
 
 function receiveFrame(owner, event) {
-    if (socket !== owner || owner.closing) return;
+    if (socket !== owner || owner.closing || sessionOwner !== owner.session || !sessionOwner.active) return;
     let frame;
     try { frame = JSON.parse(event.data); } catch { return; }
     if (!frame || typeof frame !== 'object') return;
@@ -313,7 +382,7 @@ function receiveFrame(owner, event) {
 }
 
 function ensureWs() {
-    if (terminalError || !subscriptions.size) return;
+    if (!sessionOwner.active || terminalError || !subscriptions.size) return;
     if (socket) {
         if (socket.closing) socket.restart = true;
         return;
@@ -322,7 +391,8 @@ function ensureWs() {
     const proto = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${proto}://${window.location.host}/ws/events`);
     const owner = { ws, authenticated: false, granted: new Set(),
-        denied: new Set(), pending: null, closing: false, restart: false };
+        denied: new Set(), advice: new Map(), session: sessionOwner,
+        pending: null, closing: false, restart: false };
     socket = owner;
     ws.addEventListener('message', event => receiveFrame(owner, event));
     // A browser WebSocket error is always followed by close. Only close owns
@@ -330,6 +400,7 @@ function ensureWs() {
     ws.addEventListener('close', event => {
         if (socket !== owner) return;
         socket = null;
+        owner.advice.clear();
         if (owner.closing) {
             if (owner.restart) ensureWs();
             return;
@@ -359,6 +430,13 @@ export function subscribe(channel, handler, options = {}) {
     }
     if (options.onReady !== undefined && typeof options.onReady !== 'function') {
         throw new TypeError('subscribe onReady must be a function');
+    }
+    const admitted = sessionOwner;
+    if (!admitted.active) {
+        queueMicrotask(() => {
+            if (sessionOwner === admitted && options.onError) notify(options.onError, admitted.error);
+        });
+        return () => {};
     }
     let set = subscriptions.get(channel);
     if (!set) {
@@ -390,6 +468,7 @@ export function subscribe(channel, handler, options = {}) {
     }
     return function unsubscribe() {
         if (!set.delete(entry)) return;
+        if (sessionOwner !== admitted || subscriptions.get(channel) !== set) return;
         if (!set.size) {
             subscriptions.delete(channel);
             socket?.denied.delete(channel);
@@ -405,39 +484,101 @@ export function subscribe(channel, handler, options = {}) {
 
 // ── plinth.useData: Preact hook ─────────────────────────────────────
 //
-// Composes `call` (snapshot fetch) + `subscribe` (live updates) into
-// `{ data, error, loading }`. Stale-on-error semantics per OQ5: the
-// `initialData` (or last-good `data`) persists when an update fails.
+// Snapshot-backed hooks own conservative smart requeries. Without a snapshot,
+// data remains the original outer event frame. Stored state is tagged with its
+// render owner so a changed query/session cannot show the previous owner's data
+// even before effect cleanup; body identity stays private and in memory.
 
 export function useData(channel, opts) {
     opts = opts || {};
-    const [data, setData]       = useState(opts.initialData);
-    const [error, setError]     = useState(null);
-    const [loading, setLoading] = useState(opts.snapshot != null);
-
-    useEffect(() => {
-        let cancelled = false;
-        if (opts.snapshot) {
-            const { capability, args } = opts.snapshot;
-            call(capability, args).then(
-                (v) => { if (!cancelled) { setData(v); setLoading(false); } },
-                (e) => { if (!cancelled) { setError(e); setLoading(false); } });
+    const renderOwner = useRef(null);
+    const requestCapture = useRef(null);
+    const viewCapture = useRef(null);
+    const [stored, setStored] = useState(null);
+    const [, setSessionRevision] = useState(0);
+    const session = sessionOwner;
+    const query = { channel, scope: opts.scope, initialData: opts.initialData,
+        view: null, snapshot: null, preparationError: null };
+    const sameAdmission = (capture, capability) => capture &&
+        capture.channel === channel && Object.is(capture.capability, capability) &&
+        Object.is(capture.scope, opts.scope) && capture.session === session;
+    if (opts.snapshot != null) {
+        let capability;
+        try {
+            capability = opts.snapshot.capability;
+            const args = opts.snapshot.args;
+            let capture = requestCapture.current;
+            // A continuously supplied object is one immutable query input.
+            // Automatic renders must not serialize later caller mutations;
+            // supply a new object to request a changed query. Explicit owner
+            // discriminators recapture even when input references are reused.
+            if (!sameAdmission(capture, capability) || !Object.is(capture.args, args)) {
+                capture = { channel, capability, scope: opts.scope, session, args,
+                    snapshot: null, error: null };
+                try { capture.snapshot = prepareCapabilityRequest(capability, args); }
+                catch (error) { capture.error = new NetworkError(`fetch failed for ${capability}`, error); }
+                requestCapture.current = capture;
+            }
+            query.snapshot = capture.snapshot;
+            query.preparationError = capture.error;
+            let descriptor = viewCapture.current;
+            if (!sameAdmission(descriptor, capability) || descriptor.source !== opts.view ||
+                descriptor.identity !== query.snapshot?.identity) {
+                descriptor = { channel, capability, scope: opts.scope, session,
+                    source: opts.view, identity: query.snapshot?.identity, value: captureView(opts.view) };
+                viewCapture.current = descriptor;
+            }
+            query.view = descriptor.value;
+        } catch (error) {
+            query.preparationError = new NetworkError(`fetch failed for ${capability}`, error);
         }
-        const unsub = subscribe(channel, (env) => {
-            if (cancelled) { return; }
-            setData(env);
-            setError(null);
-            setLoading(false);
-        }, { onError: (error) => {
-            if (!cancelled) { setError(error); setLoading(false); }
-        } });
-        return () => { cancelled = true; unsub(); };
-    // Channel + opts identity drive resubscription; consumers pass
-    // stable opts or accept the conservative re-fetch.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [channel]);
-
-    return { data, error, loading };
+    } else {
+        // Re-entering snapshot mode is a fresh logical query admission.
+        requestCapture.current = null;
+        viewCapture.current = null;
+    }
+    let owner = renderOwner.current;
+    if (!owner || owner.session !== session || owner.allowed !== session.active ||
+        !sameQuery(owner.query, query)) {
+        owner = { query, session, allowed: session.active };
+        renderOwner.current = owner;
+    }
+    const isCurrent = () => renderOwner.current === owner &&
+        sessionOwner === owner.session && owner.session.active;
+    useEffect(() => {
+        const refresh = () => setSessionRevision(value => value + 1);
+        hookSessionListeners.add(refresh);
+        // Rotation can occur between render and this effect's admission.
+        if (renderOwner.current?.session !== sessionOwner ||
+            renderOwner.current?.allowed !== sessionOwner.active) refresh();
+        return () => hookSessionListeners.delete(refresh);
+    }, []);
+    useEffect(() => {
+        if (!isCurrent()) return;
+        const controller = createDataController({
+            query: owner.query, isCurrent,
+            publish: state => {
+                if (isCurrent()) setStored(previous => isCurrent() ? { owner, state } : previous);
+            },
+            request: requestPrepared, subscribe,
+            admission: {
+                isAllowed: () => owner.session === sessionOwner && owner.session.active,
+                subscribe: listener => {
+                    owner.session.listeners.add(listener);
+                    return () => owner.session.listeners.delete(listener);
+                },
+            },
+            clock: () => Date.now(), random: () => Math.random(),
+            timer: { set: (fn, milliseconds) => setTimeout(fn, milliseconds), clear: clearTimeout },
+            AbortController,
+        });
+        controller.start();
+        return () => controller.dispose();
+    }, [owner]);
+    if (stored?.owner === owner && isCurrent()) return stored.state;
+    return { data: owner.query.initialData,
+        error: owner.query.preparationError || (!owner.session.active ? owner.session.error : null),
+        loading: owner.session.active && !!owner.query.snapshot && !owner.query.preparationError };
 }
 
 // ── Convenience namespace ───────────────────────────────────────────

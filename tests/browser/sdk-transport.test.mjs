@@ -1,9 +1,13 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const source = await readFile(new URL('../../client/shell/client/sdk.js', import.meta.url), 'utf8');
+const client = resolve(dirname(fileURLToPath(import.meta.url)), '../../client/shell/client');
+const sources = new Map(await Promise.all(['sdk.js', 'data-query.js', 'data-controller.js'].map(async path =>
+    [resolve(client, path), await readFile(resolve(client, path), 'utf8')])));
 async function fixture(options = {}) {
     const sockets = [];
     const timers = new Map();
@@ -40,7 +44,7 @@ async function fixture(options = {}) {
             origin: 'https://plinth.test',
             href: 'https://plinth.test/app/',
         } },
-        document, URL, Headers,
+        document, URL, Headers, AbortController,
         fetch: options.fetch || (() => { throw new Error('unexpected fetch'); }),
         WebSocket: Socket, console: { error() {} }, queueMicrotask,
         setTimeout(fn, delay) { const id = ++nextTimer; timers.set(id, { fn, delay }); return id; },
@@ -48,14 +52,30 @@ async function fixture(options = {}) {
     });
     // Evaluate unchanged SDK source with real ES-module import linkage. These
     // tests isolate transport ownership; actual Preact hooks run in Chromium.
-    const module = new vm.SourceTextModule(source, { context });
-    await module.link(specifier => {
-        const exports = specifier === 'preact' ? ['h'] : ['useEffect', 'useState'];
-        return new vm.SyntheticModule(exports, function () {
-            for (const name of exports) this.setExport(name, () => {});
-        }, { context });
+    const preact = new vm.SyntheticModule(['h'], function () {
+        this.setExport('h', () => { throw new Error('unexpected Preact rendering in transport fixture'); });
+    }, { context, identifier: 'platform:preact' });
+    const hooks = new vm.SyntheticModule(['useEffect', 'useState', 'useRef'], function () {
+        for (const name of ['useEffect', 'useState', 'useRef']) {
+            this.setExport(name, () => { throw new Error(`unexpected ${name} in transport fixture`); });
+        }
+    }, { context, identifier: 'platform:preact/hooks' });
+    const modules = new Map();
+    function load(path) {
+        assert(sources.has(path), `unexpected private module ${path}`);
+        if (!modules.has(path)) modules.set(path, new vm.SourceTextModule(sources.get(path),
+            { context, identifier: path }));
+        return modules.get(path);
+    }
+    const module = load(resolve(client, 'sdk.js'));
+    await module.link((specifier, importer) => {
+        if (specifier === 'preact') return preact;
+        if (specifier === 'preact/hooks') return hooks;
+        assert(specifier.startsWith('.'), `unexpected external module ${specifier}`);
+        return load(resolve(dirname(importer.identifier), specifier));
     });
     await module.evaluate();
+    assert.equal(modules.size, 3, 'must link the actual SDK/query/controller modules');
     return { sdk: module.namespace, sockets, timers, document,
         runTimer() {
             assert.equal(timers.size, 1);
@@ -158,6 +178,43 @@ test('wait for authentication, multiplex once, acknowledge grants, unsubscribe a
     keep();
     assert.equal(socket.readyState, 3);
     assert.equal(sdk.getRealtimeState().status, 'idle');
+});
+
+test('same-channel handler A failure is isolated while B and C receive one exact envelope', async () => {
+    const { sdk, sockets, timers } = await fixture();
+    let attemptsA = 0;
+    const receivedB = [], receivedC = [];
+    const removeA = sdk.subscribe('isolated', () => {
+        attemptsA++;
+        throw new Error('fake subscriber A failure');
+    });
+    const removeB = sdk.subscribe('isolated', envelope => receivedB.push(envelope));
+    const removeC = sdk.subscribe('isolated', envelope => receivedC.push(envelope));
+    try {
+        assert.equal(sockets.length, 1, 'three listeners must share one physical socket');
+        const socket = sockets[0];
+        socket.open(); socket.receive({ type: 'connected' });
+        assert.deepEqual(socket.frames, [{ type: 'subscribe', channels: ['isolated'] }]);
+        socket.receive({ type: 'subscribed', channels: ['isolated'] });
+        const envelope = { type: 'event', channel: 'isolated', payload: {
+            seq: 32, marker: 'fake event', nested: ['unchanged', { value: true }],
+        } };
+        assert.doesNotThrow(() => socket.receive(envelope), 'A failure must not escape dispatch');
+        assert.equal(attemptsA, 1);
+        assert.equal(receivedB.length, 1); assert.equal(receivedC.length, 1);
+        assert.deepEqual(JSON.parse(JSON.stringify(receivedB)), [envelope]);
+        assert.deepEqual(JSON.parse(JSON.stringify(receivedC)), [envelope]);
+        assert.equal(receivedB[0], receivedC[0], 'both listeners receive the same outer envelope');
+        assert.equal(socket.frames.length, 1, 'handler failure must not resubscribe or open another socket');
+        assert.equal(sockets.length, 1);
+        removeA(); removeB();
+        assert.equal(socket.readyState, 1, 'remaining C still owns its grant');
+        assert.equal(socket.frames.length, 1);
+        removeC();
+        assert.equal(socket.readyState, 3);
+        assert.equal(timers.size, 0);
+        assert.equal(sdk.getRealtimeState().status, 'idle');
+    } finally { removeA(); removeB(); removeC(); }
 });
 
 test('onReady fires once per acknowledged connection epoch and unsubscribe cancels pending delivery', async () => {
@@ -341,4 +398,208 @@ test('explicit reconnect and resubscribe wait for previous socket to close', asy
     sockets[2].receive({ type: 'connected' });
     assert.deepEqual(sockets[2].frames, [{ type: 'subscribe', channels: ['new'] }]);
     keep();
+});
+
+for (const [name, frame, expected] of [
+    ['missing defaults', {}, { debounceMs: 100, jitterMs: 50 }],
+    ['explicit zeros', { recommended_debounce_ms: 0, recommended_jitter_ms: 0 },
+        { debounceMs: 0, jitterMs: 0 }],
+    ['inclusive upper bounds', { recommended_debounce_ms: 60000, recommended_jitter_ms: 5000 },
+        { debounceMs: 60000, jitterMs: 5000 }],
+    ['invalid debounce alone', { recommended_debounce_ms: -1, recommended_jitter_ms: 0 },
+        { debounceMs: 100, jitterMs: 0 }],
+    ['invalid jitter alone', { recommended_debounce_ms: 0, recommended_jitter_ms: 5001 },
+        { debounceMs: 0, jitterMs: 50 }],
+    ['fractional advice', { recommended_debounce_ms: 0.5, recommended_jitter_ms: 1.5 },
+        { debounceMs: 100, jitterMs: 50 }],
+    ['string and boolean advice', { recommended_debounce_ms: '0', recommended_jitter_ms: false },
+        { debounceMs: 100, jitterMs: 50 }],
+    ['above debounce bound alone', { recommended_debounce_ms: 60001, recommended_jitter_ms: 5000 },
+        { debounceMs: 100, jitterMs: 5000 }],
+]) {
+    test(`actual subscribed advice validates ${name} independently`, async () => {
+        const { sdk, sockets } = await fixture();
+        const ready = [];
+        const remove = sdk.subscribe('a', () => {}, { onReady: advice => ready.push(advice) });
+        sockets[0].open(); sockets[0].receive({ type: 'connected' });
+        assert.deepEqual(ready, []);
+        sockets[0].receive({ type: 'subscribed', channels: ['a'], ...frame });
+        await new Promise(resolve => queueMicrotask(resolve));
+        assert.equal(ready.length, 1);
+        assert.deepEqual(JSON.parse(JSON.stringify(ready[0])), expected);
+        assert.equal(Object.isFrozen(ready[0]), true);
+        remove();
+    });
+}
+
+test('one consumer removal retains actual channel advice for a later consumer', async () => {
+    const { sdk, sockets } = await fixture();
+    const ready = [];
+    const a = sdk.subscribe('a', () => {});
+    const b = sdk.subscribe('a', () => {});
+    sockets[0].open(); sockets[0].receive({ type: 'connected' });
+    sockets[0].receive({ type: 'subscribed', channels: ['a'],
+        recommended_debounce_ms: 17, recommended_jitter_ms: 3 });
+    a();
+    const c = sdk.subscribe('a', () => {}, { onReady: advice => ready.push(advice) });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(JSON.parse(JSON.stringify(ready)), [{ debounceMs: 17, jitterMs: 3 }]);
+    assert.equal(sockets[0].frames.length, 1);
+    b(); c();
+});
+
+test('actual channel unsubscribe retires advice before same-socket regrant', async () => {
+    const { sdk, sockets } = await fixture();
+    const a = sdk.subscribe('a', () => {});
+    const keep = sdk.subscribe('keep', () => {});
+    const socket = sockets[0]; socket.open(); socket.receive({ type: 'connected' });
+    socket.receive({ type: 'subscribed', channels: ['a', 'keep'],
+        recommended_debounce_ms: 17, recommended_jitter_ms: 3 });
+    a(); socket.receive({ type: 'unsubscribed', channels: ['a'] });
+    const ready = [];
+    const fresh = sdk.subscribe('a', () => {}, { onReady: advice => ready.push(advice) });
+    await new Promise(resolve => queueMicrotask(resolve)); assert.deepEqual(ready, []);
+    socket.receive({ type: 'subscribed', channels: ['a'] });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(JSON.parse(JSON.stringify(ready)), [{ debounceMs: 100, jitterMs: 50 }]);
+    fresh(); keep();
+});
+
+test('stale ACK cannot seed replacement physical owner advice', async () => {
+    const { sdk, sockets } = await fixture();
+    const ready = [];
+    const remove = sdk.subscribe('a', () => {}, { onReady: advice => ready.push(advice) });
+    const first = sockets[0]; first.open(); first.receive({ type: 'connected' });
+    sdk.reconnectRealtime();
+    first.receive({ type: 'subscribed', channels: ['a'],
+        recommended_debounce_ms: 60000, recommended_jitter_ms: 5000 });
+    const next = sockets[1]; next.open(); next.receive({ type: 'connected' });
+    next.receive({ type: 'subscribed', channels: ['a'],
+        recommended_debounce_ms: 0, recommended_jitter_ms: 0 });
+    await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(JSON.parse(JSON.stringify(ready)), [{ debounceMs: 0, jitterMs: 0 }]);
+    remove();
+});
+
+test('managed retirement drops pending A ready and stale unsubscribe cannot erase B', async () => {
+    const { sdk, sockets, timers } = await fixture();
+    const ready = [];
+    const events = [];
+    const errors = [];
+    const removeA = sdk.subscribe('same', event => events.push(['A', event.payload]), {
+        onReady: advice => ready.push(['A', advice]), onError: error => errors.push(error.code),
+    });
+    const first = sockets[0]; first.open(); first.receive({ type: 'connected' });
+    first.receive({ type: 'subscribed', channels: ['same'],
+        recommended_debounce_ms: 17, recommended_jitter_ms: 3 });
+    first.deferClose = true;
+    sdk.retireRealtimeSession();
+    sdk.reconnectRealtime();
+    assert.equal(sockets.length, 1); assert.equal(timers.size, 0);
+    sdk.activateRealtimeSession();
+    const removeB = sdk.subscribe('same', event => events.push(['B', event.payload]), {
+        onReady: advice => ready.push(['B', advice]),
+    });
+    removeA();
+    first.receive({ type: 'subscribed', channels: ['same'],
+        recommended_debounce_ms: 60000, recommended_jitter_ms: 5000 });
+    first.receive({ type: 'event', channel: 'same', payload: 'old' });
+    first.finishClose();
+    const second = sockets[1]; second.open(); second.receive({ type: 'connected' });
+    assert.deepEqual(second.frames, [{ type: 'subscribe', channels: ['same'] }]);
+    second.receive({ type: 'subscribed', channels: ['same'],
+        recommended_debounce_ms: 0, recommended_jitter_ms: 0 });
+    await new Promise(resolve => queueMicrotask(resolve));
+    second.receive({ type: 'event', channel: 'same', payload: 'new' });
+    assert.deepEqual(events, [['B', 'new']]); assert.deepEqual(errors, []);
+    assert.deepEqual(JSON.parse(JSON.stringify(ready)), [['B', { debounceMs: 0, jitterMs: 0 }]]);
+    removeB();
+});
+
+test('retired session denies new subscriptions and explicit reconnect until activation', async () => {
+    const { sdk, sockets, timers } = await fixture();
+    sdk.retireRealtimeSession('session_ended');
+    const errors = [];
+    const remove = sdk.subscribe('a', () => assert.fail('retired event'), {
+        onReady: () => assert.fail('retired readiness'), onError: error => errors.push(error.code),
+    });
+    sdk.reconnectRealtime(); await new Promise(resolve => queueMicrotask(resolve));
+    assert.deepEqual(errors, ['session_ended']); assert.equal(sockets.length, 0); assert.equal(timers.size, 0);
+    sdk.activateRealtimeSession();
+    const fresh = sdk.subscribe('a', () => {}); remove();
+    assert.equal(sockets.length, 1); fresh();
+});
+
+for (const code of ['auth_failed', 'auth_timeout', 'already_connected']) {
+    test(`${code} keeps same-session subscribers for explicit current-grant recovery`, async () => {
+        const { sdk, sockets, timers } = await fixture();
+        const ready = [];
+        const errors = [];
+        const remove = sdk.subscribe('a', () => {}, {
+            onReady: advice => ready.push(advice), onError: error => errors.push(error.code),
+        });
+        sockets[0].open(); sockets[0].receive({ type: 'error', error: code });
+        assert.deepEqual(errors, [code]); assert.equal(timers.size, 0);
+        sdk.reconnectRealtime();
+        sockets[1].open(); sockets[1].receive({ type: 'connected' });
+        sockets[1].receive({ type: 'subscribed', channels: ['a'],
+            recommended_debounce_ms: 0, recommended_jitter_ms: 0 });
+        await new Promise(resolve => queueMicrotask(resolve));
+        assert.deepEqual(JSON.parse(JSON.stringify(ready)), [{ debounceMs: 0, jitterMs: 0 }]);
+        remove();
+    });
+}
+
+for (const code of ['not_authenticated', 'session_expired', 'session_revoked']) {
+    test(`${code} permanently retires raw subscribers until a fresh session`, async () => {
+        const { sdk, sockets, timers } = await fixture();
+        const errors = [];
+        const events = [];
+        const remove = sdk.subscribe('a', value => events.push(value), { onError: error => errors.push(error.code) });
+        sockets[0].open(); sockets[0].receive({ type: 'error', error: code });
+        sdk.reconnectRealtime(); assert.equal(sockets.length, 1); assert.equal(timers.size, 0);
+        assert.deepEqual(errors, [code]);
+        sdk.activateRealtimeSession();
+        const next = sdk.subscribe('a', value => events.push(value)); remove();
+        sockets[1].open(); sockets[1].receive({ type: 'connected' });
+        sockets[1].receive({ type: 'subscribed', channels: ['a'] });
+        sockets[1].receive({ type: 'event', channel: 'a', payload: 'new' });
+        assert.equal(events.length, 1); next();
+    });
+}
+
+test('call serialization remains one immutable JSON value with undefined becoming null', async () => {
+    const bodies = [];
+    const { sdk } = await fixture({ fetch: async (_url, options) => {
+        bodies.push(options.body); return { ok: true, json: async () => ({ ok: true, value: 1 }) };
+    } });
+    let serialized = 0;
+    const args = { toJSON() { serialized++; return { key: 'captured' }; } };
+    await sdk.call('test.capture', args); await sdk.call('test.empty');
+    assert.equal(serialized, 1);
+    assert.deepEqual(bodies.map(body => JSON.parse(body)), [{ args: { key: 'captured' } }, { args: null }]);
+});
+
+test('serialization and URI preparation failures keep typed NetworkError with zero dispatch', async () => {
+    let requests = 0;
+    const { sdk } = await fixture({ fetch: () => { requests++; throw new Error('unexpected dispatch'); } });
+    const cycle = {}; cycle.self = cycle;
+    for (const args of [cycle, 1n]) {
+        await assert.rejects(sdk.call('test.serialize', args), error =>
+            error.name === 'NetworkError' && error.message === 'fetch failed for test.serialize' &&
+            error.cause?.name === 'TypeError');
+    }
+    await assert.rejects(sdk.call('\uD800', {}), error => error.name === 'NetworkError' && error.cause?.name === 'URIError');
+    assert.equal(requests, 0);
+});
+
+test('fetch and response JSON failures retain independent typed NetworkError boundaries', async () => {
+    const { sdk } = await fixture({ fetch: async url => {
+        if (url.endsWith('/test.fetch')) throw new Error('fake network down');
+        return { json: async () => { throw new Error('fake malformed JSON'); } };
+    } });
+    await assert.rejects(sdk.call('test.fetch', {}), error =>
+        error.name === 'NetworkError' && error.message === 'fetch failed for test.fetch');
+    await assert.rejects(sdk.call('test.json', {}), error =>
+        error.name === 'NetworkError' && error.message === 'response is not JSON for test.json');
 });

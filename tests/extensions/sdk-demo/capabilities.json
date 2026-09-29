@@ -1,4 +1,15 @@
 {
-  "provides": [],
+  "provides": [
+    {
+      "namespace": "sdkdemo",
+      "version": 1,
+      "function": "thrower",
+      "params": [],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Test-only controlled handler exception; no I/O or state mutation.",
+      "rbac_rule": "sdkdemo.thrower"
+    }
+  ],
   "requires": []
 }

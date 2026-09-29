@@ -153,6 +153,11 @@ try {
             json: { ok: true, value: { value: 'browser-hook-ok' } },
         }));
         await page.evaluate(async () => {
+            // This module/hook smoke uses mock capability and WS responses,
+            // not authenticated backend proof. Admit its explicit mock session
+            // after the real startup correctly retired an unauthenticated boot.
+            const sdk = await import('@plinth/frontend/sdk');
+            sdk.activateRealtimeSession();
             const container = document.createElement('div');
             container.id = 'sdk-smoke';
             document.body.append(container);
