@@ -11,12 +11,16 @@ import unittest
 from unittest import mock
 
 import ingress_dast_test as driver
+from dast_report import REQUIRED_ROUTES
 
 
 ORIGIN = "https://plinth.test:8443"
 HOST = "plinth.test:8443"
 OWNER = "fake-exact-task-owner"
 ACTIVE_SEED = "/app/?issue40_probe=read_only"
+SOURCE_STATUS_COMMAND = ["git", "status", "--porcelain=v1", "--untracked-files=all",
+                         "--ignore-submodules=none"]
+SOURCE_CHART_COMMAND = ["git", "ls-files", "--others", "--", "deploy/helm/plinth"]
 
 
 def result(stdout="", *, returncode=0, stderr=""):
@@ -1003,6 +1007,8 @@ class RunCleanupTest(unittest.TestCase):
                     target.side_effect = RuntimeError("fake partial failure")
 
                 def check_output(argv, **_kwargs):
+                    if argv in (SOURCE_STATUS_COMMAND, SOURCE_CHART_COMMAND):
+                        return ""
                     if argv == ["git", "rev-parse", "HEAD"]:
                         return "a" * 40
                     if argv == ["git", "rev-parse", "HEAD^{tree}"]:
@@ -1042,6 +1048,8 @@ class RunCleanupTest(unittest.TestCase):
                                report=report, private_report=private_report, dispositions=None)
 
         def check_output(argv, **_kwargs):
+            if argv in (SOURCE_STATUS_COMMAND, SOURCE_CHART_COMMAND):
+                return ""
             if argv == ["git", "rev-parse", "HEAD"]:
                 return "a" * 40
             if argv == ["git", "rev-parse", "HEAD^{tree}"]:
@@ -1086,6 +1094,177 @@ class RunCleanupTest(unittest.TestCase):
                     self.assert_destination_rejected(
                         outside if field == "report" else report,
                         outside if field == "private_report" else private_report)
+
+    def assert_source_rejected(self, status, *, chart_additions=""):
+        args = SimpleNamespace(image="fake-exact-image", helm="helm", kubectl="kubectl", k3d="k3d",
+                               report=Path("/tmp/plinth-issue40-public-unit/report.json"),
+                               private_report=Path("/tmp/plinth-issue40-private-unit/private.json"),
+                               dispositions=None)
+        commands = []
+
+        def check_output(argv, **kwargs):
+            commands.append(argv)
+            if argv in (SOURCE_STATUS_COMMAND, SOURCE_CHART_COMMAND):
+                self.assertEqual(kwargs, {"cwd": driver.ROOT, "text": True})
+                response = status if argv == SOURCE_STATUS_COMMAND else chart_additions
+                if isinstance(response, Exception):
+                    raise response
+                return response
+            if argv == ["git", "rev-parse", "HEAD"]:
+                return "a" * 40
+            if argv == ["git", "rev-parse", "HEAD^{tree}"]:
+                return "b" * 40
+            self.assertEqual(argv, ["docker", "image", "inspect", args.image])
+            return json.dumps([{"Config": {"Labels": {
+                "org.opencontainers.image.revision": "a" * 40,
+                "org.opencontainers.image.version": "0.6.5",
+            }}}])
+
+        with mock.patch.object(driver, "platform_is_amd64", return_value=True), \
+                mock.patch.object(driver.os, "umask"), \
+                mock.patch.object(driver.shutil, "which", return_value="/fake/tool"), \
+                mock.patch.object(driver.subprocess, "check_output", side_effect=check_output), \
+                mock.patch.object(Path, "read_text", return_value="0.6.5"), \
+                mock.patch.object(Path, "exists", return_value=False), \
+                mock.patch.object(Path, "is_dir", return_value=True), \
+                mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path: path), \
+                mock.patch.object(driver, "DastHarness",
+                                  side_effect=RuntimeError("fake forbidden construction")) as construct, \
+                mock.patch.object(driver, "private_json") as write:
+            failure = status if isinstance(status, Exception) else chart_additions
+            expected = type(failure) if isinstance(failure, Exception) else AssertionError
+            with self.assertRaises(expected):
+                driver.run(args)
+        construct.assert_not_called()
+        write.assert_not_called()
+        self.assertFalse(any(command[:3] == ["docker", "image", "inspect"] for command in commands))
+
+    def test_unstaged_chart_input_refuses_before_image_inspection_and_harness(self):
+        self.assert_source_rejected(" M deploy/helm/plinth/values.yaml\n")
+
+    def test_staged_browser_input_refuses_before_image_inspection_and_harness(self):
+        self.assert_source_rejected("M  tests/browser/ingress-dast.mjs\n")
+
+    def test_untracked_chart_input_refuses_before_image_inspection_and_harness(self):
+        self.assert_source_rejected("?? deploy/helm/plinth/templates/fake-extra.yaml\n")
+
+    def test_dirty_submodule_input_refuses_before_image_inspection_and_harness(self):
+        self.assert_source_rejected(" m third_party/fake-submodule\n")
+
+    def test_failed_source_status_is_not_recast_as_clean(self):
+        self.assert_source_rejected(driver.subprocess.CalledProcessError(
+            1, SOURCE_STATUS_COMMAND, output="fake unavailable status"))
+
+    def test_ignored_chart_extra_refuses_even_when_standard_status_is_empty(self):
+        self.assert_source_rejected(
+            "", chart_additions="deploy/helm/plinth/templates/build/fake-extra.yaml\n")
+
+    def test_failed_ignored_chart_inventory_is_not_recast_as_clean(self):
+        self.assert_source_rejected("", chart_additions=driver.subprocess.CalledProcessError(
+            1, SOURCE_CHART_COMMAND, output="fake unavailable chart inventory"))
+
+    def run_with_source_change(self, change):
+        args = SimpleNamespace(image="fake-exact-image", helm="helm", kubectl="kubectl", k3d="k3d",
+                               report=Path("/tmp/plinth-issue40-public-unit/report.json"),
+                               private_report=Path("/tmp/plinth-issue40-private-unit/private.json"),
+                               dispositions=None)
+        events, reports, counts = [], {}, {}
+
+        def step(name):
+            def invoke():
+                events.append(name)
+                return 0 if name == "VOLUMES" else None
+            return mock.Mock(side_effect=invoke)
+
+        value = SimpleNamespace(
+            execute_dast=step("EXECUTE"), inventory_owned_volumes=step("INVENTORY"),
+            retain_private_failure_evidence=step("RETAIN"), cleanup_complete=True,
+            cleanup=step("CLEANUP"), remove_owned_volumes=step("VOLUMES"),
+            scanner=SimpleNamespace(name="fake-owned-scanner", cleanup=step("SCANNER"),
+                                    completed=True, passive_remaining=0),
+            registry="fake-owned-registry", cluster="fake-owned-cluster", namespace_created=False,
+            root=mock.Mock(spec=Path), private_details={}, raw_alerts=[], raw_messages=[message()],
+            route_labels=set(REQUIRED_ROUTES), controls={code: True for code in driver.REQUIRED_CONTROLS},
+            candidate_digest="sha256:" + "c" * 64, origin=ORIGIN,
+        )
+        value.root.exists.return_value = False
+
+        def check_output(argv, **kwargs):
+            if argv[0] == "git":
+                self.assertEqual(kwargs, {"cwd": driver.ROOT, "text": True})
+                key = tuple(argv)
+                counts[key] = counts.get(key, 0) + 1
+                late = counts[key] == 2
+                if argv == SOURCE_STATUS_COMMAND:
+                    events.append("SOURCE_FINAL" if late else "SOURCE_INITIAL")
+                    if late and change == "status_error":
+                        raise driver.subprocess.CalledProcessError(1, argv, output="fake raw Git detail")
+                    return " M tests/browser/ingress-dast.mjs\n" if late and change == "status" else ""
+                if argv == SOURCE_CHART_COMMAND:
+                    if late and change == "chart_error":
+                        raise driver.subprocess.CalledProcessError(1, argv, output="fake raw chart detail")
+                    return ("deploy/helm/plinth/templates/build/fake-extra.yaml\n"
+                            if late and change == "chart" else "")
+                if argv == ["git", "rev-parse", "HEAD"]:
+                    return "d" * 40 if late and change == "HEAD" else "a" * 40
+                self.assertEqual(argv, ["git", "rev-parse", "HEAD^{tree}"])
+                return "e" * 40 if late and change == "tree" else "b" * 40
+            if argv == ["docker", "image", "inspect", args.image]:
+                return json.dumps([{"Config": {"Labels": {
+                    "org.opencontainers.image.revision": "a" * 40,
+                    "org.opencontainers.image.version": "0.6.5",
+                }}}])
+            self.assertIn(argv, (
+                ["docker", "ps", "-a", "--format", "{{.Names}}"],
+                ["docker", "network", "ls", "--format", "{{.Name}}"],
+            ))
+            return ""
+
+        def write(path, report):
+            events.append("PRIVATE_WRITE" if path == args.private_report else "PUBLIC_WRITE")
+            reports[path] = copy.deepcopy(report)
+
+        with mock.patch.object(driver, "platform_is_amd64", return_value=True), \
+                mock.patch.object(driver.os, "umask"), \
+                mock.patch.object(driver.shutil, "which", return_value="/fake/tool"), \
+                mock.patch.object(driver.subprocess, "check_output", side_effect=check_output), \
+                mock.patch.object(Path, "read_text", return_value="0.6.5"), \
+                mock.patch.object(Path, "exists", return_value=False), \
+                mock.patch.object(Path, "is_dir", return_value=True), \
+                mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path: path), \
+                mock.patch.object(driver, "DastHarness", return_value=value) as construct, \
+                mock.patch.object(driver, "private_json", side_effect=write), \
+                mock.patch("builtins.print"):
+            code = driver.run(args)
+        construct.assert_called_once_with(args)
+        for method in (value.execute_dast, value.inventory_owned_volumes,
+                       value.retain_private_failure_evidence, value.scanner.cleanup,
+                       value.cleanup, value.remove_owned_volumes):
+            method.assert_called_once_with()
+        self.assertLess(events.index("VOLUMES"), events.index("SOURCE_FINAL"))
+        self.assertLess(events.index("SOURCE_FINAL"), events.index("PRIVATE_WRITE"))
+        self.assertLess(events.index("PRIVATE_WRITE"), events.index("PUBLIC_WRITE"))
+        return code, reports[args.report], reports[args.private_report], counts
+
+    def test_clean_stable_source_completes_without_inventorying_ignored_browser_caches(self):
+        code, public, private, counts = self.run_with_source_change(None)
+        self.assertEqual(code, 0)
+        self.assertEqual(public["status"], "COMPLETE")
+        self.assertIsNone(private["error"])
+        self.assertEqual(set(counts), {tuple(SOURCE_STATUS_COMMAND), tuple(SOURCE_CHART_COMMAND),
+                                      ("git", "rev-parse", "HEAD"), ("git", "rev-parse", "HEAD^{tree}")})
+        self.assertTrue(all(count == 2 for count in counts.values()))
+
+    def test_late_source_mutation_or_query_error_keeps_cleanup_and_private_evidence_but_not_complete(self):
+        for change in ("status", "chart", "HEAD", "tree", "status_error", "chart_error"):
+            with self.subTest(change=change):
+                code, public, private, _counts = self.run_with_source_change(change)
+                self.assertEqual(code, 1)
+                self.assertNotEqual(public["status"], "COMPLETE")
+                self.assertEqual(private["error"], "source-candidate checkout changed during the scan")
+                self.assertEqual(private["sourceRevision"], "a" * 40)
+                self.assertEqual(private["sourceTree"], "b" * 40)
+                self.assertNotIn("fake raw", json.dumps(public))
 
 
 class WorkflowPrivacyTest(unittest.TestCase):

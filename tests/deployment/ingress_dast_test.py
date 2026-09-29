@@ -801,13 +801,28 @@ class DastHarness(Harness):
         self.cleanup_complete = True
 
 
+def source_identity():
+    """Reject changed checkout inputs, including ignored chart additions."""
+    status = subprocess.check_output([
+        "git", "status", "--porcelain=v1", "--untracked-files=all",
+        "--ignore-submodules=none",
+    ], cwd=ROOT, text=True)
+    require(not status.strip(), "source-candidate checkout must be clean")
+    chart_additions = subprocess.check_output([
+        "git", "ls-files", "--others", "--", "deploy/helm/plinth",
+    ], cwd=ROOT, text=True)
+    require(not chart_additions.strip(), "source-candidate chart contains untracked inputs")
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
+    return revision, tree
+
+
 def run(args):
     os.umask(0o077)
     require(platform_is_amd64(), "DAST uses reviewed linux/amd64 scanner identity")
     for executable in ("docker", "curl", "openssl", "node", args.helm, args.kubectl, args.k3d):
         require(shutil.which(executable), "required DAST executable is unavailable")
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
+    revision, tree = source_identity()
     version = (ROOT / "VERSION").read_text().strip()
     inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", args.image], text=True))[0]
     labels = inspected["Config"]["Labels"]
@@ -851,6 +866,11 @@ def run(args):
         except BaseException:
             error = error or "owned volume cleanup failed"
             remaining_volumes = None
+        try:
+            require(source_identity() == (revision, tree),
+                    "source-candidate identity changed during the scan")
+        except BaseException:
+            error = error or "source-candidate checkout changed during the scan"
         # Cleanup diagnostics must survive, including a failure of an earlier
         # independent stage. All raw traffic remains outside the repository.
         raw = {"details": harness.private_details, "alerts": harness.raw_alerts,

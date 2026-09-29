@@ -3,9 +3,14 @@
 This is source-candidate validation, not certification of a published release,
 a dogfood deployment, or an existing service. The harness accepts an exact
 locally built candidate image whose revision and version labels match the
-current checkout. It does not publish that image or authorize scanning any
-external target. This document describes the gate; it records no live scan or
-green result.
+current clean checkout. Before provisioning and after cleanup, it rejects
+tracked/staged changes, untracked checkout inputs, changed Git identity, and
+untracked chart files even when Git ignores them. This check does not reject
+ignored dependency/build caches outside the chart. These boundary checks do not
+lock the shared checkout against a concurrent writer: run from an isolated
+worktree and never change it during a scan. It does not publish that image or
+authorize scanning any external target. This document describes the gate; it
+records no live scan or green result.
 
 ## Owned deployment and scanner
 
