@@ -77,6 +77,9 @@ jobs:
       - name: Verify container exit event matching
         run: python3 tests/deployment/containerd_exit_event_test.py
 
+      - name: Verify deployment PostgreSQL readiness
+        run: python3 tests/deployment/postgres_readiness_test.py
+
       - name: Verify the effective Docker context policy
         run: python3 tests/tools/docker_context_test.py
 

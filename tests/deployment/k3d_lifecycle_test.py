@@ -509,8 +509,10 @@ service:
                                     ],
                                     "ports": [{"containerPort": 5432, "name": "postgres"}],
                                     "readinessProbe": {
+                                        # Exclude the entrypoint's bootstrap-only Unix socket server.
                                         "exec": {"command": [
-                                            "pg_isready", "-U", "plinth", "-d", "plinth"
+                                            "pg_isready", "-h", "127.0.0.1", "-p", "5432",
+                                            "-U", "plinth", "-d", "plinth"
                                         ]},
                                         "periodSeconds": 2,
                                         "timeoutSeconds": 2,
