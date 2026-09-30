@@ -162,6 +162,25 @@ class DastReviewTest(unittest.TestCase):
             bad[0]["evidence"] = "export const example = 1;"
             self.assertEqual(run([bad], ctx), [])
 
+    def test_unknown_comment_in_other_exact_asset_rejects_entire_static_group(self):
+        known = "// fake reviewed preference comment"
+        unknown = "// fake unreviewed query comment"
+        first_path = "/ext/shell/0.6.6/prepaint.js"
+        second_path = "/ext/shell/0.6.6/sdk.js"
+        ctx = context()
+        ctx.assets.update({first_path: known, second_path: unknown})
+        records = [pair(10027, first_path, evidence=known, body=known),
+                   pair(10027, second_path, evidence=unknown, body=unknown, mid="2")]
+        allow = {"prepaint.js": {hashlib.sha256(known.encode()).hexdigest()}}
+        with patch("dast_review.COMMENT_DIGESTS", allow):
+            self.assertEqual(run(records, ctx), [])
+        allow["sdk.js"] = {hashlib.sha256(unknown.encode()).hexdigest()}
+        with patch("dast_review.COMMENT_DIGESTS", allow):
+            self.assertEqual(len(run(records, ctx)), 1)
+            changed = copy.deepcopy(records)
+            changed[1][0]["evidence"] = "// fake unreviewed query"
+            self.assertEqual(run(changed, ctx), [])
+
     def test_discovery_markers_require_actual_expected_request_or_response(self):
         app = pair(10109, "/app/", body=APP, evidence='id="root"')
         login = pair(10111, "/api/auth/login", method="POST", confidence=3, param="password",

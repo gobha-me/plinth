@@ -41,6 +41,8 @@ COMMENT_DIGESTS = {
     "shell.js": frozenset({
         "dfcb5da8cf92e743b40efc0e6187b5ba2a2786696dc678d9b19238875ea0c168",
         "2f311734e5ba5b0e03cf915b707bd8ed82a0b07d577b7fca852409dd608f0ead",
+        # Public ICD/capability-name compatibility explanation.
+        "e27fc039f222f9deeaddccfeb57f882d039c788495f405278e9029bbdb018cc2",
     }),
     "runtime-config.js": frozenset({
         "99844512c709ee6b4b0876da0061f42faaa0ca1f729b3c78ca885d9cdfb5babc",
@@ -48,6 +50,9 @@ COMMENT_DIGESTS = {
     }),
     "sdk.js": frozenset({
         "eb64d4a52df7400ec5f7c9ef731d1c7391dd889fc84f094ff828d442192b30d9",
+        # Public snapshot/session ownership and immutable-query contracts.
+        "5c5e225167c0bb0b34c497137412efa92909e1067fd2d0596eb7ab443b994883",
+        "1f9c10f9ac25d4952c77d2d68b7ccc8591c2a09d2948dbfeae498a37cf500b1c",
     }),
 }
 

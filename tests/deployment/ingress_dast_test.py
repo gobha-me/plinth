@@ -165,6 +165,99 @@ def observed_routes(messages, origin):
     return labels
 
 
+def scanner_request(message, origin):
+    """Parse a complete owned request without exposing any request values."""
+    first, rest = message["requestHeader"].split("\r\n", 1)
+    parts = first.split(" ")
+    require(len(parts) == 3, "scanner request line is malformed")
+    method, target, protocol = parts
+    require(all(33 <= ord(character) <= 126 for character in target) and "\\" not in target,
+            "scanner request target has a noncanonical character")
+    observed_routes([message], origin)
+    fields = []
+    ended = False
+    for line in rest.split("\r\n"):
+        if not line:
+            ended = True
+            continue
+        name, separator, value = line.partition(":")
+        require(not ended and separator
+                and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name)
+                and not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value),
+                "scanner request header is malformed")
+        fields.append(name.lower())
+    require(ended, "scanner request header is unterminated")
+    parsed = urllib.parse.urlsplit(target if target.startswith("https://") else origin + target)
+    require(not parsed.fragment, "scanner request contains an unowned fragment")
+    return method, target, protocol, rest, parsed, fields
+
+
+def completed_scanner_messages(messages, alerts, origin):
+    """Distinguish sent traffic from source-proven ZAP site-tree ancestors.
+
+    ZAP 2.17.0 SiteMap.createReference clones only a descendant request, replaces
+    its URI with a tree ancestor, makes it GET, clears its body and Content-Type/
+    Length, and stores TYPE_TEMPORARY (0). HttpMessage.cloneRequest leaves send
+    time/RTT zero and response empty. Such records never prove an HTTP response.
+
+    Pinned source: https://github.com/zaproxy/zaproxy/blob/v2.17.0/zap/src/main/java/org/parosproxy/paros/model/SiteMap.java#L638-L649
+    https://github.com/zaproxy/zaproxy/blob/v2.17.0/zap/src/main/java/org/parosproxy/paros/network/HttpMessage.java#L941-L978
+    """
+    require(isinstance(messages, list) and 0 < len(messages) < 5000,
+            "scanner HTTP traffic is absent or truncated")
+    seen, completed, structural, requests = set(), [], [], {}
+    for message in messages:
+        require(isinstance(message, dict) and isinstance(message.get("id"), str)
+                and re.fullmatch(r"[1-9][0-9]{0,9}", message["id"])
+                and message["id"] not in seen,
+                "scanner traffic identity is missing, duplicated or noncanonical")
+        seen.add(message["id"])
+        require(isinstance(message.get("requestHeader"), str)
+                and message["requestHeader"].endswith("\r\n\r\n")
+                and isinstance(message.get("requestBody"), str)
+                and isinstance(message.get("responseHeader"), str)
+                and message["responseHeader"].endswith("\r\n\r\n")
+                and isinstance(message.get("responseBody"), str),
+                "scanner traffic has no complete request and response representation")
+        requests[message["id"]] = scanner_request(message, origin)
+        if re.match(r"^HTTP/\d(?:\.\d)? [1-5][0-9]{2}(?: [^\r\n]*)?\r\n",
+                    message["responseHeader"]):
+            completed.append(message)
+        else:
+            structural.append(message)
+    require(completed, "scanner inventory has no completed HTTP traffic")
+    proofs = []
+    for message in structural:
+        method, target, protocol, rest, parent, fields = requests[message["id"]]
+        require(message.get("type") == "0" and message.get("timestamp") == "0"
+                and message.get("rtt") == "0" and message.get("note") == ""
+                and message.get("tags") == []
+                and message["responseHeader"] == "HTTP/1.0 0\r\n\r\n"
+                and message["requestBody"] == "" and message["responseBody"] == ""
+                and method == "GET" and target.startswith(origin)
+                and not parent.query and not parent.fragment
+                and not {"content-type", "content-length", "x-zap-scan-id"}.intersection(fields)
+                and not any(isinstance(alert, dict) and
+                            str(alert.get("messageId")) == message["id"] for alert in alerts),
+                "zero-status traffic is not an unreferenced structural history record")
+        matches = []
+        for sent in completed:
+            _, _, child_protocol, child_rest, child, _ = requests[sent["id"]]
+            if (child_protocol != protocol or child.netloc != parent.netloc
+                    or not child.path.startswith(parent.path.rstrip("/") + "/")):
+                continue
+            if any(segment in (".", "..") for segment in parent.path.split("/")):
+                if classify_route(child.geturl(), origin) != "ERROR_PROBE":
+                    continue
+            projected = "\r\n".join(line for line in child_rest.split("\r\n")
+                                      if not line.lower().startswith(("content-type:", "content-length:")))
+            if projected == rest:
+                matches.append(sent["id"])
+        require(matches, "structural history record has no exact completed descendant proof")
+        proofs.append({"structuralId": message["id"], "completedDescendantIds": matches})
+    return completed, proofs
+
+
 class Scanner:
     def __init__(self, harness):
         self.harness = harness
@@ -404,26 +497,9 @@ class Scanner:
         messages = self.api("core", "view", "messages", baseurl=self.harness.origin,
                             start="0", count="5000")["messages"]
         retained.setdefault("messages", messages)
-        require(isinstance(messages, list) and 0 < len(messages) < 5000,
-                "scanner HTTP traffic is absent or truncated")
-        seen = set()
-        for message in messages:
-            require(isinstance(message, dict) and isinstance(message.get("id"), str)
-                    and re.fullmatch(r"[1-9][0-9]{0,9}", message["id"])
-                    and message["id"] not in seen,
-                    "scanner traffic identity is missing, duplicated or noncanonical")
-            seen.add(message["id"])
-            require(isinstance(message.get("requestHeader"), str)
-                    and message["requestHeader"].endswith("\r\n\r\n")
-                    and isinstance(message.get("requestBody"), str)
-                    and isinstance(message.get("responseHeader"), str)
-                    and message["responseHeader"].endswith("\r\n\r\n")
-                    and re.match(r"^HTTP/\d(?:\.\d)? [1-5][0-9]{2}(?: [^\r\n]*)?\r\n",
-                                 message["responseHeader"])
-                    and isinstance(message.get("responseBody"), str),
-                    "scanner traffic has no complete actual request and response")
-        observed_routes(messages, self.harness.origin)
-        return alerts, messages
+        completed, structural_proof = completed_scanner_messages(messages, alerts, self.harness.origin)
+        retained.setdefault("structuralHistoryProof", structural_proof)
+        return alerts, completed
 
     def cleanup(self):
         if self.creation_attempted:
@@ -890,14 +966,11 @@ class DastHarness(Harness):
         status, response = headers(message.get("responseHeader"))
         require(re.fullmatch(r"HTTP/1\.1 101(?: [^\r\n]*)?", status),
                 "proxy did not observe an actual WebSocket 101")
-        fields = response_headers([(name, value) for name, values in response.items()
-                                   for value in values])
-        # The pinned fast proxy hijacks the successful 101 before its response
-        # modifiers run. The kernel still applies nosniff and removes Server;
-        # HSTS is independently proven on the same-origin HTTPS document and
-        # all normal HTTP denials, rather than fabricated on this empty upgrade.
-        require(fields.get("x-content-type-options") == "nosniff" and "server" not in fields,
-                "WebSocket upgrade did not retain the kernel response policy")
+        # The pinned proxy bypasses its response modifiers when it hijacks the
+        # 101. The kernel's configured-HTTPS authority fallback must still
+        # supply the exact response policy on this actual empty upgrade.
+        verify_response_policy([(name, value) for name, values in response.items()
+                                for value in values])
         require(request.get("origin") == [origin]
                 and request.get("sec-websocket-version") == ["13"],
                 "WebSocket browser origin or protocol version differs")

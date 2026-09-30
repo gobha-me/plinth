@@ -797,7 +797,7 @@ auto main(int argc, char* argv[]) -> int {
         plinth::shell::register_routes_for_active_frontend(
             cfg.shell, cfg.db, cfg.packages_data_dir);
 
-        plinth::security::register_response_headers();
+        plinth::security::register_response_headers(cfg.browser_origin);
         shutdown.install_ingress_gate();
         drogon::app()
             .setLogPath("") // Drogon logging disabled — spdlog handles it

@@ -59,11 +59,16 @@ Normal responses and HTTPS edge denials must retain the intended MIME types,
 `nosniff`, bounded HSTS, and no Server banner. The bundled shell explicitly
 restricts resource, framing, base and form origins while preserving its
 documented inline-style support. Custom frontend policies are unchanged.
-The actual bodyless WebSocket 101 must retain kernel `nosniff` and omit its
-Server banner, alongside the native protocol/authentication witnesses below.
-Pinned Traefik's raw hijack bypasses its ordinary response-header modifiers:
-the gate does not claim HSTS on that 101 or impose a document CSP/MIME policy
-on it. Normal HTTP upgrade denials still receive the chart's full TLS policy.
+The actual bodyless WebSocket 101 must retain `nosniff`, the same one-year HSTS
+policy and no Server banner, alongside the native protocol/authentication
+witnesses below. Pinned Traefik's raw hijack bypasses its ordinary response
+modifiers. The kernel supplies HSTS for successful `GET /ws/events` upgrades
+using the operator's explicit valid HTTPS `browser_origin`: its authority must
+match `Host`, and any supplied `Origin` must match the full configured origin.
+Native clients may omit `Origin`. Forwarded headers never establish this policy,
+and authentication and origin admission are unchanged. The gate does not impose
+a document CSP or MIME type on an empty protocol upgrade. Normal HTTP upgrade
+denials still receive the chart's full TLS response policy.
 Traefik JSON access logs must independently show the exact owned WebSocket
 router's completion and edge-generated authentication/package 429 responses,
 not unrelated routes or backend substitutes. For the pinned fast HTTP proxy,
@@ -88,6 +93,15 @@ WS, PACKAGES, and HEALTH. The browser's own receipt also requires both controls
 complete, positive observed route counts, zero error/CSP/unscoped-traffic
 counters, and confirmed browser/context cleanup. The harness establishes a
 fresh HTTP session after browser logout before authenticated scanning.
+
+The pinned scanner also exports synthetic site-tree ancestor records, which
+are not sent HTTP requests. All original records remain private. A zero-status
+record is excluded from traffic and coverage only when its temporary-history
+type, zero timing, empty bodies, owned queryless GET and exact header
+transformation prove it is an ancestor of a completed request. It cannot carry
+an alert reference or active-rule marker. Named malformed-path ancestors must
+come from the existing negative fixtures. Any other missing response remains
+red; structural records never prove route coverage or scan completion.
 
 The active scan is deliberately narrow: non-recursive GET query probes on
 `/app/`, `/api/auth/session`, and `/api/frontend/applications`, each with the

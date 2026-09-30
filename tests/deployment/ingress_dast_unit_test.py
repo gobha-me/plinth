@@ -304,7 +304,7 @@ class ScannerResultsInventoryTest(unittest.TestCase):
         value = self.capture(messages)
         self.assertEqual(value.results(), ([], messages))
         self.assertEqual(value.harness.private_details["scannerResults"],
-                         {"alerts": [], "messages": messages})
+                         {"alerts": [], "messages": messages, "structuralHistoryProof": []})
 
     def test_zero_alerts_never_hide_missing_noncanonical_or_duplicate_message_ids(self):
         cases = [[], None, {}, [None], active_messages() + active_messages()[:1]]
@@ -336,6 +336,116 @@ class ScannerResultsInventoryTest(unittest.TestCase):
         messages[0]["requestHeader"] = messages[0]["requestHeader"].replace(HOST, "foreign.test:8443")
         with self.assertRaises(AssertionError):
             self.capture(messages).results()
+
+    def structural_fixture(self, parent="/ext/shell", child="/ext/shell/0.6.6/sdk.js"):
+        # Independent wire oracle for SiteMap.createReference's documented
+        # request clone. The unsent ancestor has no response and is not traffic.
+        sent = {"id": "1", "type": "1", "timestamp": "123456", "rtt": "3",
+                "requestHeader": (f"GET {ORIGIN}{child} HTTP/1.1\r\nHost: {HOST}\r\n"
+                                  "Accept: */*\r\nContent-Type: application/octet-stream\r\n"
+                                  "Content-Length: 4\r\nCookie: fake-owned=fixture\r\n\r\n"),
+                "requestBody": "fake", "responseHeader": "HTTP/1.1 200 OK\r\n\r\n",
+                "responseBody": "fake-public-source", "note": "", "tags": []}
+        ancestor = {"id": "2", "type": "0", "timestamp": "0", "rtt": "0",
+                    "requestHeader": (f"GET {ORIGIN}{parent} HTTP/1.1\r\nHost: {HOST}\r\n"
+                                      "Accept: */*\r\nCookie: fake-owned=fixture\r\n\r\n"),
+                    "requestBody": "", "responseHeader": "HTTP/1.0 0\r\n\r\n",
+                    "responseBody": "", "note": "", "tags": []}
+        return [sent, ancestor]
+
+    def assert_structural_rejected(self, messages, alerts=None):
+        value = self.capture(messages, alerts)
+        before = copy.deepcopy(messages)
+        with self.assertRaises(AssertionError):
+            value.results()
+        self.assertEqual(messages, before)
+        self.assertEqual(value.harness.private_details["scannerResults"]["messages"], before)
+
+    def test_structural_ancestors_never_count_as_responses_routes_or_review_messages(self):
+        messages = self.structural_fixture()
+        before = copy.deepcopy(messages)
+        value = self.capture(messages)
+        alerts, completed = value.results()
+        self.assertEqual(alerts, [])
+        self.assertEqual(completed, [messages[0]])
+        self.assertEqual(driver.observed_routes(completed, ORIGIN), {"STATIC"})
+        retained = value.harness.private_details["scannerResults"]
+        self.assertEqual(retained["messages"], before)
+        self.assertEqual(retained["structuralHistoryProof"],
+                         [{"structuralId": "2", "completedDescendantIds": ["1"]}])
+        self.assertEqual(messages, before)
+
+    def test_structural_status_type_timing_body_and_metadata_drift_is_rejected(self):
+        for field, invalid in (("type", "1"), ("type", 0), ("timestamp", "1"),
+                               ("timestamp", 0), ("rtt", "1"), ("note", "unreviewed"),
+                               ("tags", ["active"]), ("requestBody", "failed-request"),
+                               ("responseBody", "partial response"),
+                               ("responseHeader", "HTTP/1.1 0\r\n\r\n"),
+                               ("responseHeader", "HTTP/1.0 000\r\n\r\n"),
+                               ("responseHeader", "HTTP/1.0 0\r\nX-Failed: yes\r\n\r\n")):
+            with self.subTest(field=field, invalid=invalid):
+                messages = self.structural_fixture()
+                messages[1][field] = invalid
+                self.assert_structural_rejected(messages)
+        for field in ("type", "timestamp", "rtt", "note", "tags"):
+            messages = self.structural_fixture()
+            del messages[1][field]
+            self.assert_structural_rejected(messages)
+
+    def test_structural_request_header_path_protocol_and_owner_need_exact_clone_proof(self):
+        for old, new in (("GET ", "POST "), ("HTTP/1.1", "HTTP/1.0"),
+                         (HOST, "foreign.test:8443"), ("/ext/shell ", "/unmatched "),
+                         ("/ext/shell ", "/ext/shell?query=present "),
+                         ("/ext/shell ", "/ext/shell#fragment "),
+                         ("Accept: */*", "Accept: text/html"),
+                         ("Cookie: fake-owned=fixture", "Cookie: fake-other=fixture")):
+            messages = self.structural_fixture()
+            messages[1]["requestHeader"] = messages[1]["requestHeader"].replace(old, new, 1)
+            self.assert_structural_rejected(messages)
+        for line in ("Content-Type: text/plain\r\n", "Content-Length: 0\r\n",
+                     "X-Zap-Scan-Id: 40012\r\n", "X-Zap-Scan-Id: 99999\r\n",
+                     "Host: " + HOST + "\r\n"):
+            messages = self.structural_fixture()
+            messages[1]["requestHeader"] = messages[1]["requestHeader"][:-2] + line + "\r\n"
+            self.assert_structural_rejected(messages)
+
+    def test_any_alert_reference_or_duplicate_identity_blocks_structural_exclusion(self):
+        for reference in ("2", 2):
+            self.assert_structural_rejected(self.structural_fixture(), [{"messageId": reference}])
+        messages = self.structural_fixture()
+        messages[1]["id"] = "1"
+        self.assert_structural_rejected(messages)
+        for invalid in ("0", "02", "1" * 11, 2, None):
+            messages = self.structural_fixture()
+            messages[1]["id"] = invalid
+            self.assert_structural_rejected(messages)
+
+    def test_raw_parent_target_controls_unicode_or_backslash_cannot_normalize_into_proof(self):
+        for character in ("\t", "\n", "\r", "\x00", "\x1f", "\x7f", "é", "\\"):
+            messages = self.structural_fixture()
+            messages[1]["requestHeader"] = messages[1]["requestHeader"].replace(
+                "/ext/shell ", "/ext/" + character + "shell ", 1)
+            self.assert_structural_rejected(messages)
+
+    def test_ancestor_requires_completed_strict_descendant_not_equal_or_prefix_sibling(self):
+        for parent, child in (("/ext/shell", "/ext/shell"),
+                              ("/ext/shell", "/ext/shellfish/sdk.js")):
+            self.assert_structural_rejected(self.structural_fixture(parent, child))
+        messages = self.structural_fixture()
+        self.assert_structural_rejected(messages[1:])
+        messages[0]["responseHeader"] = "HTTP/1.0 0\r\n\r\n"
+        self.assert_structural_rejected(messages)
+
+    def test_dot_ancestors_require_the_exact_named_negative_fixture_descendant(self):
+        for parent, child in (("/app/..", "/app/../../config.json"),
+                              ("/ext/shell/0.6.6/..", "/ext/shell/0.6.6/../../config.json")):
+            messages = self.structural_fixture(parent, child)
+            _alerts, completed = self.capture(messages).results()
+            self.assertEqual(completed, [messages[0]])
+            self.assertEqual(driver.observed_routes(completed, ORIGIN), {"ERROR_PROBE"})
+        for parent, child in (("/app/..", "/app/../unplanned.json"),
+                              ("/other/..", "/other/../../config.json")):
+            self.assert_structural_rejected(self.structural_fixture(parent, child))
 
 
 def message_query(value, query):
@@ -1062,6 +1172,7 @@ def websocket_message():
                          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         "requestBody": "",
         "responseHeader": "HTTP/1.1 101 Switching Protocols\r\n"
+                          "Strict-Transport-Security: max-age=31536000\r\n"
                           "X-Content-Type-Options: nosniff\r\n"
                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                           "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
@@ -1367,20 +1478,21 @@ class WebsocketHandshakeTest(unittest.TestCase):
                 "HTTP/1.1 101 Switching Protocols", status, 1)
             self.assert_rejected([value])
 
-    def test_hijacked_upgrade_requires_kernel_policy_without_document_mime_or_hsts_headers(self):
+    def test_hijacked_upgrade_requires_exact_policy_without_document_or_mime_headers(self):
         value = websocket_message()
         self.assertNotIn("Content-Type:", value["responseHeader"])
         self.assertNotIn("Content-Security-Policy:", value["responseHeader"])
-        self.assertNotIn("Strict-Transport-Security:", value["responseHeader"])
         driver.DastHarness.validate_websocket_handshake([value], ORIGIN)
-        for line in ("X-Content-Type-Options: nosniff\r\n",):
+        for line in ("Strict-Transport-Security: max-age=31536000\r\n",
+                     "X-Content-Type-Options: nosniff\r\n"):
             value = websocket_message()
             value["responseHeader"] = value["responseHeader"].replace(line, "", 1)
             self.assert_rejected([value])
             value = websocket_message()
             value["responseHeader"] = value["responseHeader"].replace(line, line + line, 1)
             self.assert_rejected([value])
-        for header in ("Server: fake-backend\r\n", "X-Content-Type-Options: unsafe\r\n"):
+        for header in ("Server: fake-backend\r\n", "X-Content-Type-Options: unsafe\r\n",
+                       "Strict-Transport-Security: max-age=0\r\n"):
             value = websocket_message()
             value["responseHeader"] = value["responseHeader"][:-2] + header + "\r\n"
             self.assert_rejected([value])

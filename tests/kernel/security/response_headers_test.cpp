@@ -3,6 +3,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <drogon/HttpTypes.h>
 
+#include <string>
+
 TEST_CASE("response headers preserve handler semantics across response classes",
           "[security][response-headers]") {
   for (const auto status :
@@ -51,4 +53,85 @@ TEST_CASE("framework fallback is an inert constant plain-text 404",
   REQUIRE(response->body() == "not found");
   REQUIRE(response->getHeader("X-Content-Type-Options") == "nosniff");
   REQUIRE(response->getHeader("Server").empty());
+}
+
+TEST_CASE("TLS proxy upgrade policy matches only its declared HTTPS authority",
+          "[security][response-headers]") {
+  struct UpgradeCase {
+    std::string configured_origin;
+    std::string host;
+    std::string origin;
+    std::string path;
+    drogon::HttpStatusCode status;
+    bool expected;
+    bool has_origin = false;
+    drogon::HttpMethod method = drogon::Get;
+  };
+  for (const auto& example : {
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443",
+                       "https://plinth.example:8443", "/ws/events",
+                       drogon::k101SwitchingProtocols, true},
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443", "",
+                       "/ws/events", drogon::k101SwitchingProtocols, true},
+           UpgradeCase{"", "plinth.example:8443", "https://plinth.example:8443",
+                       "/ws/events", drogon::k101SwitchingProtocols, false},
+           UpgradeCase{"http://plinth.example:8443", "plinth.example:8443",
+                       "http://plinth.example:8443", "/ws/events",
+                       drogon::k101SwitchingProtocols, false},
+           UpgradeCase{"https://plinth.example:8443", "other.example:8443",
+                       "https://plinth.example:8443", "/ws/events",
+                       drogon::k101SwitchingProtocols, false},
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443",
+                       "https://other.example:8443", "/ws/events",
+                       drogon::k101SwitchingProtocols, false},
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443",
+                       "https://plinth.example:8443", "/other",
+                       drogon::k101SwitchingProtocols, false},
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443",
+                       "https://plinth.example:8443", "/ws/events",
+                       drogon::k200OK, false},
+           UpgradeCase{"https://plinth.example:8443/", "plinth.example:8443",
+                       "https://plinth.example:8443/", "/ws/events",
+                       drogon::k101SwitchingProtocols, false},
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443", "",
+                       "/ws/events", drogon::k101SwitchingProtocols, false,
+                       true},
+           UpgradeCase{"https://plinth.example:8443", "plinth.example:8443",
+                       "https://plinth.example:8443", "/ws/events",
+                       drogon::k101SwitchingProtocols, false, false,
+                       drogon::Post},
+       }) {
+    auto request = drogon::HttpRequest::newHttpRequest();
+    request->setMethod(example.method);
+    request->setPath(example.path);
+    request->addHeader("Host", example.host);
+    if (!example.origin.empty() || example.has_origin) {
+      request->addHeader("Origin", example.origin);
+    }
+    request->addHeader("Forwarded", "proto=https;host=plinth.example:8443");
+    request->addHeader("X-Forwarded-Proto", "https");
+    request->addHeader("X-Forwarded-Host", "plinth.example:8443");
+    auto response = drogon::HttpResponse::newHttpResponse();
+    response->setStatusCode(example.status);
+    response->setContentTypeCode(drogon::CT_NONE);
+    response->addHeader("Upgrade", "websocket");
+    response->addHeader("Sec-WebSocket-Accept", "preserved-handshake");
+    if (example.expected) {
+      response->addHeader("Strict-Transport-Security",
+                          "max-age=7; includeSubDomains; preload");
+    }
+    plinth::security::apply_websocket_transport_headers(
+        request, response, example.configured_origin);
+    plinth::security::apply_websocket_transport_headers(
+        request, response, example.configured_origin);
+    REQUIRE(response->getHeader("Strict-Transport-Security") ==
+            (example.expected ? "max-age=31536000" : ""));
+    REQUIRE(response->statusCode() == example.status);
+    REQUIRE(response->getContentType() == drogon::CT_NONE);
+    REQUIRE(response->body().empty());
+    REQUIRE(response->getHeader("Upgrade") == "websocket");
+    REQUIRE(response->getHeader("Sec-WebSocket-Accept") ==
+            "preserved-handshake");
+    REQUIRE(response->getHeader("Content-Security-Policy").empty());
+  }
 }
