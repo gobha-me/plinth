@@ -86,7 +86,7 @@ def _review_class(disposition, proof, plugin, risk, confidence, route, param, re
         expected_confidence = {10015: {1}, 10111: {3}, 10112: {2, 3}, 10038: {3}}.get(plugin, {2})
         param_valid = (param in {"plinth_session", "plinth_csrf"} if plugin in {10010, 10011, 10054, 10112}
                        else param.lower() == "cache-control" if plugin == 10015
-                       else param == "password" if plugin == 10111 else param == "")
+                       else param == "username" if plugin == 10111 else param == "")
         return (disposition == kind and plugin in plugins and route in routes and risk == severity and
                 confidence in expected_confidence and reference == allowed_ref and param_valid)
     if disposition == "DOCUMENTED_POLICY":

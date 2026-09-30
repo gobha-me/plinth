@@ -54,7 +54,7 @@ def run(records, ctx=None):
 
 class DastReviewTest(unittest.TestCase):
     def session(self, **changes):
-        return pair(10010, "/api/auth/session", risk=1, param="plinth_csrf", evidence=LIVE_CSRF,
+        return pair(10010, "/api/auth/session", risk=1, param="plinth_csrf", evidence="Set-Cookie: plinth_csrf",
                     response=[*PRIVATE_HEADERS, ("Set-Cookie", LIVE_CSRF)],
                     request=[("Cookie", COOKIE)], **changes)
 
@@ -68,7 +68,7 @@ class DastReviewTest(unittest.TestCase):
         self.assertEqual(len(run([with_prefix])), 1)
 
     def test_live_login_cookie_requires_safe_flags_and_positive_lifetime(self):
-        good = pair(10010, "/api/auth/login", risk=1, param="plinth_csrf", evidence=LIVE_CSRF,
+        good = pair(10010, "/api/auth/login", risk=1, param="plinth_csrf", evidence="Set-Cookie: " + LIVE_CSRF,
                     method="POST", response=[*PRIVATE_HEADERS, ("Set-Cookie", LIVE_CSRF),
                                               ("Set-Cookie", LIVE_SESSION)])
         self.assertEqual(len(run([good])), 1)
@@ -81,7 +81,7 @@ class DastReviewTest(unittest.TestCase):
         for replacement in (LIVE_CSRF.replace("; Secure", ""), LIVE_CSRF.replace("Path=/", "Path=/other"),
                             LIVE_CSRF + "; Domain=plinth.test", LIVE_CSRF + "; HttpOnly"):
             bad = self.session()
-            bad[0]["evidence"] = replacement
+            bad[0]["evidence"] = "Set-Cookie: " + replacement
             bad[1]["responseHeader"] = bad[1]["responseHeader"].replace(LIVE_CSRF, replacement)
             self.assertEqual(run([bad]), [])
         bad = self.session()
@@ -100,7 +100,7 @@ class DastReviewTest(unittest.TestCase):
 
     def test_expired_cookie_not_applicable_requires_owned_csrf_logout(self):
         deleted = "plinth_csrf=; Path=/; SameSite=Strict; Max-Age=0"
-        good = pair(10011, "/api/auth/logout", risk=1, param="plinth_csrf", evidence=deleted,
+        good = pair(10011, "/api/auth/logout", risk=1, param="plinth_csrf", evidence="Set-Cookie: " + deleted,
                     method="POST", body='{"status":"logged_out"}',
                     response=[*PRIVATE_HEADERS, ("Set-Cookie", deleted)],
                     request=[("Cookie", COOKIE), ("Origin", ORIGIN), ("X-Plinth-CSRF", CSRF)])
@@ -183,8 +183,8 @@ class DastReviewTest(unittest.TestCase):
 
     def test_discovery_markers_require_actual_expected_request_or_response(self):
         app = pair(10109, "/app/", body=APP, evidence='id="root"')
-        login = pair(10111, "/api/auth/login", method="POST", confidence=3, param="password",
-                     evidence="password", request_body=json.dumps({"username": "fake-admin", "password": "fake-password"}),
+        login = pair(10111, "/api/auth/login", method="POST", confidence=3, param="username",
+                     evidence="username", request_body=json.dumps({"username": "fake-admin", "password": "fake-password"}),
                      response=[("Set-Cookie", LIVE_SESSION)], mid="2")
         session = pair(10112, "/api/auth/session", param="plinth_csrf", evidence=LIVE_CSRF,
                        response=[("Set-Cookie", LIVE_CSRF)], request=[("Cookie", COOKIE)], mid="3")
@@ -193,6 +193,33 @@ class DastReviewTest(unittest.TestCase):
         session[0]["evidence"] = "not in cookie"
         app[1]["responseBody"] += "unreviewed"
         self.assertEqual(run([app, login, session]), [])
+
+    def test_known_cookie_marker_requires_exact_name_format_and_unique_target_cookie(self):
+        good = self.session()
+        self.assertEqual(len(run([good])), 1)
+        for evidence in ("Set-Cookie:", "Set-Cookie: ", "set-cookie: plinth_csrf", "Set-Cookie: plinth_csr",
+                         "Set-Cookie: plinth_csrf-other", "Set-Cookie: plinth_session",
+                         "Set-Cookie: plinth_csrf ", "plinth_csrf", LIVE_CSRF):
+            bad = copy.deepcopy(good)
+            bad[0]["evidence"] = evidence
+            self.assertEqual(run([bad]), [])
+        bad = copy.deepcopy(good)
+        bad[1]["responseHeader"] = bad[1]["responseHeader"].replace(
+            "\r\n\r\n", "\r\nSet-Cookie: " + LIVE_CSRF + "\r\n\r\n")
+        self.assertEqual(run([bad]), [])
+        bad = copy.deepcopy(good)
+        bad[1]["responseHeader"] = bad[1]["responseHeader"].replace("plinth_csrf=", "other_cookie=")
+        self.assertEqual(run([bad]), [])
+
+    def test_authentication_discovery_is_only_the_identified_username_parameter(self):
+        good = pair(10111, "/api/auth/login", method="POST", confidence=3, param="username",
+                    evidence="username", request_body=json.dumps({"username": "fake-admin", "password": "fake-password"}),
+                    response=[("Set-Cookie", LIVE_SESSION)])
+        self.assertEqual(len(run([good])), 1)
+        for parameter in ("password", "username,password", "username, password", "", "other"):
+            bad = copy.deepcopy(good)
+            bad[0]["param"] = parameter
+            self.assertEqual(run([bad]), [])
 
     def test_styles_policy_keeps_scanner_medium_risk_and_never_qualifies_other_variants(self):
         good = pair(10055, "/app/", ref="10055-6", risk=2, confidence=3, param="Content-Security-Policy",

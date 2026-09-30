@@ -140,14 +140,18 @@ def _cookies(headers, response=False):
     return result
 
 
-def _cookie_evidence(headers, name, evidence):
-    if not evidence:
+def _cookie_evidence(headers, name, evidence, *, discovery=False):
+    if not evidence or name not in {"plinth_session", "plinth_csrf"} or name not in _cookies(headers, True):
         return False
+    # The pinned passive cookie rules use CookieUtils.getSetCookiePlusName:
+    # https://github.com/zaproxy/zap-extensions/blob/pscanrules-v76/addOns/commonlib/src/main/java/org/zaproxy/addon/commonlib/CookieUtils.java#L128-L154
+    # This is an exact known-cookie marker, not an arbitrary header prefix.
+    marker = evidence == "Set-Cookie: " + name
     prefix, separator, value = evidence.partition(":")
     full_header = bool(separator and prefix.lower() == "set-cookie")
     for line in headers.get("set-cookie", []):
         cookie = _cookies({"set-cookie": [line]}, True)
-        if name in cookie and (value.strip() == line if full_header else evidence in line):
+        if name in cookie and (marker or (value.strip() == line if full_header else discovery and evidence in line)):
             return True
     return False
 
@@ -320,7 +324,8 @@ def _predicate(key, alert, message, context, origin):
             body == context.app_document and evidence and evidence in body):
         return "INFORMATIONAL", "SCANNER_APPLICATION_DISCOVERY"
     if (plugin == 10111 and reference == "10111" and risk == 0 and confidence == 3 and
-            route == "LOGIN" and method == "POST" and status == 200 and _identity(body, context, token)):
+            route == "LOGIN" and method == "POST" and status == 200 and param == "username" and
+            _identity(body, context, token)):
         payload = message.get("requestBody")
         if (_json(payload) == {"username": context.username, "password": context.password} and
                 evidence and evidence in payload and "plinth_session" in response_cookies):
@@ -330,7 +335,7 @@ def _predicate(key, alert, message, context, origin):
             ((route == "LOGIN" and method == "POST") or (route == "SESSION" and method == "GET")) and
             param in {"plinth_session", "plinth_csrf"} and _identity(body, context, token) and
             param in response_cookies and response_cookies[param].value and
-            _cookie_evidence(response, param, evidence)):
+            _cookie_evidence(response, param, evidence, discovery=True)):
         return "INFORMATIONAL", "SCANNER_SESSION_DISCOVERY"
     if (plugin == 10038 and reference == "10038-1" and risk == 2 and confidence == 3 and
             route == "WS" and method == "GET" and status == 101 and body == "" and

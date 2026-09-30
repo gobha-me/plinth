@@ -511,6 +511,18 @@ class DastReportTest(unittest.TestCase):
                 record.update(changes)
             self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
 
+    def test_authentication_discovery_binding_is_only_the_username_parameter(self):
+        value = inputs()
+        value["raw_alerts"] = [alert(pluginId="10111", risk=0, confidence=3, url=ORIGIN + "/api/auth/login",
+                                     param="username")]
+        value["dispositions"] = [review(pluginId=10111, risk=0, confidence=3, routeLabel="LOGIN", param="username",
+                                         dispositionId="INFORMATIONAL", reviewId="SCANNER_AUTHENTICATION_DISCOVERY")]
+        self.assertEqual(public_report(**value)["status"], "COMPLETE")
+        for parameter in ("password", "username,password", "", PRIVATE_MARKER):
+            value["raw_alerts"][0]["param"] = parameter
+            value["dispositions"][0]["param"] = parameter
+            self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+
 
 if __name__ == "__main__":
     unittest.main()
