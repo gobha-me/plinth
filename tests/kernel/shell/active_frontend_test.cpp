@@ -347,3 +347,56 @@ TEST_CASE("`/` handler honours shell.root_redirect override",
   REQUIRE(r.status == drogon::k302Found);
   REQUIRE(r.location == "/console/");
 }
+
+TEST_CASE("shell policy bounds resources and preserves authorized styles",
+          "[shell][active-frontend][security]") {
+  auto root = scratch_client_root({
+      {"index.html", "<!doctype html><!-- PLINTH_VERSIONED_ASSET_BASE -->"},
+      {"shell.js", "export const example = true;"},
+  });
+  auto active = make_active(root);
+  const auto document = capture_app(active, "");
+  REQUIRE(document.body.find("<base href=\"/ext/shell/0.6.1/\">") !=
+          std::string::npos);
+  for (const auto* directive :
+       {"default-src 'self'", "style-src 'self' 'unsafe-inline'",
+        "connect-src 'self'", "img-src 'self'", "font-src 'self'",
+        "media-src 'self'", "frame-src 'self'", "frame-ancestors 'self'",
+        "base-uri 'self'", "form-action 'self'", "object-src 'none'"}) {
+    REQUIRE(document.csp.find(directive) != std::string::npos);
+  }
+  REQUIRE(document.csp.find(
+              "script-src 'self' "
+              "'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='") == 0);
+  REQUIRE(capture_app(active, "shell.js").csp == document.csp);
+  REQUIRE(capture_app(active, "nested/route").csp == document.csp);
+}
+
+TEST_CASE("replacement frontend preserves its existing policy with either base "
+          "contract",
+          "[shell][active-frontend][security]") {
+  const std::string legacy_policy =
+      "script-src 'self' "
+      "'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='; "
+      "style-src 'self' 'unsafe-inline'; connect-src 'self'";
+  for (const auto& body :
+       {std::string{"<!doctype html><base href=\"https://example.invalid/\">"},
+        std::string{"<!doctype html><!-- PLINTH_VERSIONED_ASSET_BASE -->"}}) {
+    auto root = scratch_client_root({
+        {"index.html", body},
+        {"app.js", "export const custom = true;"},
+    });
+    auto active = make_active(root, "/console");
+    active.name = "replacement";
+    const auto document = capture_app(active, "");
+    REQUIRE(document.csp == legacy_policy);
+    REQUIRE(capture_app(active, "app.js").csp == legacy_policy);
+    REQUIRE(capture_app(active, "nested/route").csp == legacy_policy);
+    if (body.find("PLINTH_VERSIONED_ASSET_BASE") == std::string::npos) {
+      REQUIRE(document.body == body);
+    } else {
+      REQUIRE(document.body.find("<base href=\"/ext/replacement/0.6.1/\">") !=
+              std::string::npos);
+    }
+  }
+}

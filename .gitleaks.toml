@@ -14,6 +14,13 @@ paths = ['''^tests/kernel/(lifecycle/process_shutdown_test|ws/auth_test)\.cpp$''
 regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']
 
 [[allowlists]]
+description = "RFC 6455 example WebSocket nonce in the ingress protocol fixture"
+condition = "AND"
+paths = ['''^tests/deployment/ingress_dast_unit_test\.py$''']
+regexTarget = "secret"
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+
+[[allowlists]]
 description = "Nonfunctional PAT shown in the protocol documentation"
 condition = "AND"
 paths = ['''^docs/icd/ICD-0\.1\.3-pats\.md$''']

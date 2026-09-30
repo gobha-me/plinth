@@ -146,6 +146,15 @@ empty is correct only when the scheme seen by Plinth plus the exact `Host`
 header is also the browser-visible origin. In particular, an HTTPS browser in
 front of an HTTP upstream must configure the public HTTPS origin.
 
+For a successful `GET /ws/events` upgrade, the kernel emits
+`Strict-Transport-Security: max-age=31536000` when this explicit public origin
+uses HTTPS and its exact authority matches `Host`. A supplied `Origin` must
+also match; native clients may omit it. This preserves the TLS proxy's transport
+policy when its normal response modifiers are bypassed during WebSocket handoff.
+It uses the operator's declared TLS deployment contract, with no forwarded-header
+inference, subdomain coverage or preload. Other responses retain the reverse
+proxy's HSTS policy. Authentication and origin admission remain independent.
+
 ## Supported runtime image
 
 The supported OCI image begins with v0.6.6 and is published as

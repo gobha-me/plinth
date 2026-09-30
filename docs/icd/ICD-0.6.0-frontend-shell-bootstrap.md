@@ -250,7 +250,10 @@ prefix. The handler:
   immutable mount responses migrate without clearing their cache.
 - Sets the strict CSP `script-src 'self'; style-src 'self'
   'unsafe-inline'; connect-src 'self'` on every response, per
-  `architecture/06-frontend.md §3`. No external sources.
+  `architecture/06-frontend.md §3`. The bundled shell additionally restricts
+  default/resource, framing, base and form origins and disables objects; its
+  exact import map is hash-authorized. Replacement frontends retain the prior
+  policy. No external script or connection sources.
 
 ### 4.2 Bundle layout
 

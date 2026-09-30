@@ -34,6 +34,7 @@
 #include "kernel/realtime/coalescer.hpp"
 #include "kernel/realtime/events_writer.hpp"
 #include "kernel/realtime/listener.hpp"
+#include "kernel/security/response_headers.hpp"
 #include "kernel/shell/active_frontend.hpp"
 #include "kernel/shell/firstboot.hpp"
 #include "kernel/ws/connection_registry.hpp"
@@ -796,6 +797,7 @@ auto main(int argc, char* argv[]) -> int {
         plinth::shell::register_routes_for_active_frontend(
             cfg.shell, cfg.db, cfg.packages_data_dir);
 
+        plinth::security::register_response_headers(cfg.browser_origin);
         shutdown.install_ingress_gate();
         drogon::app()
             .setLogPath("") // Drogon logging disabled — spdlog handles it

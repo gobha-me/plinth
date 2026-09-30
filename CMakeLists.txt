@@ -569,6 +569,7 @@ add_executable(plinth
   src/kernel/packages/rbac_test_runner.cpp
   src/kernel/packages/handlers.cpp
   src/kernel/security/unicode_scanner.cpp
+  src/kernel/security/response_headers.cpp
   src/kernel/shell/active_frontend.cpp
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
@@ -740,6 +741,7 @@ add_executable(plinth_tests
   tests/kernel/packages/rbac_test_runner_test.cpp
   tests/kernel/main/cli_test_rbac_test.cpp
   tests/kernel/security/unicode_scanner_test.cpp
+  tests/kernel/security/response_headers_test.cpp
   tests/kernel/shell/active_frontend_test.cpp
   tests/kernel/shell/firstboot_test.cpp
   tests/kernel/shell/preferences_test.cpp
@@ -830,6 +832,7 @@ add_executable(plinth_tests
   src/kernel/packages/rbac_test_runner.cpp
   src/kernel/packages/handlers.cpp
   src/kernel/security/unicode_scanner.cpp
+  src/kernel/security/response_headers.cpp
   src/kernel/shell/active_frontend.cpp
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp

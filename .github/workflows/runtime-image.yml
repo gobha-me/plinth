@@ -77,6 +77,14 @@ jobs:
       - name: Verify container exit event matching
         run: python3 tests/deployment/containerd_exit_event_test.py
 
+      - name: Verify fail-closed ingress scan and public report gates
+        run: |
+          python3 tests/deployment/dast_report_test.py
+          python3 tests/deployment/dast_review_test.py
+          python3 tests/deployment/ingress_dast_unit_test.py
+          node --test tests/browser/ingress-browser-sandbox.test.mjs
+          python3 tests/browser/run_ingress_browser_sandbox_test.py
+
       - name: Verify deployment PostgreSQL readiness
         run: python3 tests/deployment/postgres_readiness_test.py
 
@@ -154,6 +162,10 @@ jobs:
         run: |
           npm ci --prefix tests/browser
           (cd tests/browser && npx playwright install --with-deps chromium)
+
+      - name: Prepare the owned sandboxed ingress browser
+        if: ${{ matrix.arch == 'amd64' }}
+        run: python3 tests/browser/run_ingress_browser_sandbox.py
 
       - name: Exercise the browser and retained upgrade journeys against the image
         if: ${{ matrix.browser }}
@@ -248,6 +260,44 @@ jobs:
             --previous-image "plinth-runtime:previous-$GITHUB_RUN_ID" \
             --previous-chart "$RUNNER_TEMP/plinth-previous-$GITHUB_RUN_ID/deploy/helm/plinth" \
             --kubernetes max
+
+      - name: Scan only the disposable monitored ingress candidate
+        if: ${{ matrix.arch == 'amd64' }}
+        env:
+          PLINTH_DEPLOYMENT_TOOLS_DIR: /tmp/plinth-deployment-tools/bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$PLINTH_DEPLOYMENT_TOOLS_DIR:$PATH"
+          docker pull ghcr.io/zaproxy/zaproxy:2.17.0@sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef
+          dast_dir=$(mktemp -d /tmp/plinth-issue40-ci.XXXXXX)
+          echo "PLINTH_DAST_REPORT_DIR=$dast_dir" >> "$GITHUB_ENV"
+          python3 tests/deployment/ingress_dast_test.py \
+            --image "plinth-runtime:amd64-$GITHUB_RUN_ID" --kubernetes max \
+            --report "$dast_dir/report.json" --private-report "$dast_dir/private.json"
+
+      - name: Remove the owned ingress browser sandbox profile
+        if: ${{ always() && matrix.arch == 'amd64' }}
+        run: python3 tests/browser/run_ingress_browser_sandbox.py --cleanup
+
+      - name: Retain only a complete sanitized ingress report
+        if: ${{ success() && matrix.arch == 'amd64' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ingress-dast-${{ github.sha }}
+          path: ${{ env.PLINTH_DAST_REPORT_DIR }}/report.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove ephemeral scan reports without publishing findings
+        if: ${{ always() && matrix.arch == 'amd64' && env.PLINTH_DAST_REPORT_DIR != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$PLINTH_DAST_REPORT_DIR" =~ ^/tmp/plinth-issue40-ci\.[[:alnum:]]{6}$ ]]
+          test ! -L "$PLINTH_DAST_REPORT_DIR"
+          rm -f -- "$PLINTH_DAST_REPORT_DIR/private.json" "$PLINTH_DAST_REPORT_DIR/report.json"
+          rmdir -- "$PLINTH_DAST_REPORT_DIR"
 
   release_preflight:
     name: Validate immutable release identity

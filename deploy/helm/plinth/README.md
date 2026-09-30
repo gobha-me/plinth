@@ -78,6 +78,23 @@ with `passHostHeader: true`; upstream or controller-wide middleware must not
 rewrite `Host`. Plinth does not trust `Forwarded` or `X-Forwarded-*` headers for
 browser authority.
 
+Normal HTTP responses on every configured TLS host route, including rejected
+WebSocket handshakes and responses rejected by the edge limits, send
+`X-Content-Type-Options: nosniff`, remove the `Server` response header, and
+apply a one-year HSTS policy for that host.
+The policy does not include subdomains or preload registration and does not
+force HSTS on plaintext requests. Outermost content-type detection supplies a
+type when a response has none while preserving explicit backend media types.
+The pinned Traefik fast proxy writes successful WebSocket `101` upgrades after
+hijacking the connection, bypassing its response-header modifiers. These empty
+protocol upgrades retain the kernel's `nosniff` and absent Server banner. The
+kernel supplies the same HSTS policy for successful `GET /ws/events` upgrades
+when the explicitly configured HTTPS `browser_origin` authority matches `Host`.
+Any supplied `Origin` must also match; native clients may omit it. This uses the
+chart's declared TLS public authority without trusting forwarded headers or
+changing authentication and origin admission. The WebSocket route keeps the
+edge response policy for ordinary HTTP rejection responses.
+
 Four route groups keep their limits independent:
 
 - `/ws/events` has no buffering or in-flight middleware, so an upgraded socket

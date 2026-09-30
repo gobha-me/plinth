@@ -11,6 +11,31 @@
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
+  name: {{ include "plinth.fullname" . }}-content-type
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  contentType: {}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ include "plinth.fullname" . }}-response-headers
+  labels:
+    {{- include "plinth.labels" . | nindent 4 }}
+spec:
+  headers:
+    stsSeconds: 31536000
+    stsIncludeSubdomains: false
+    stsPreload: false
+    forceSTSHeader: false
+    contentTypeNosniff: true
+    customResponseHeaders:
+      Server: ""
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
   name: {{ include "plinth.fullname" . }}-default-body
   labels:
     {{- include "plinth.labels" . | nindent 4 }}
