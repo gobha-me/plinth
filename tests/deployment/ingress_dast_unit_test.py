@@ -337,6 +337,53 @@ class ScannerResultsInventoryTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.capture(messages).results()
 
+    def test_zero_alerts_cannot_hide_malformed_completed_response_framing(self):
+        invalid_headers = (
+            "HTTP/1.1 200 OK\r\n\r\nmalformed: after terminator\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Test: value\r\n\r\nHTTP/1.1 200 OK\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Test: value\nOther: injected\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Test: value\rOther: injected\r\n\r\n",
+            "HTTP/1.1 200 OK\nX-Test: value\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nHeader without colon\r\n\r\n",
+            "HTTP/1.1 200 OK\r\n: empty name\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nBad Name: value\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Test : value\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Test: value\r\n folded\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nÜnicode: value\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nX-Test: value\r\n",
+        )
+        invalid_headers += tuple(
+            f"HTTP/1.1 200 OK\r\nX-Test: fake{control}value\r\n\r\n"
+            for control in ("\x00", "\x08", "\x0b", "\x1f", "\x7f"))
+        invalid_headers += tuple(
+            f"{line}\r\n\r\n" for line in (
+                "HTTP/0.9 200 OK", "HTTP/1.2 200 OK", "HTTP/3 200 OK",
+                "HTTP/1.1 099 status", "HTTP/1.1 600 status", "HTTP/1.1 0200 OK",
+                "HTTP/1.1 200OK", "HTTP/1.1 200 OK\x00", "HTTP/1.1 200 OK\x7f",
+                "HTTP/1.1  200 OK", "HTTP/1.1\t200 OK"))
+        for header in invalid_headers:
+            with self.subTest(header=repr(header)):
+                messages = active_messages()
+                messages[0]["responseHeader"] = header
+                before = copy.deepcopy(messages)
+                value = self.capture(messages)
+                with self.assertRaises(AssertionError):
+                    value.results()
+                self.assertEqual(messages, before)
+                self.assertEqual(value.harness.private_details["scannerResults"]["messages"], before)
+
+    def test_completed_response_parser_preserves_protocols_upgrade_and_repeated_fields(self):
+        for status in ("HTTP/1.0 200 OK", "HTTP/1.1 101 Switching Protocols",
+                       "HTTP/1.1 599", "HTTP/2 200", "HTTP/2 404 Not Found"):
+            messages = active_messages()
+            messages[0]["responseHeader"] = (
+                status + "\r\nX-Test: \tfake\xff\r\n"
+                "Set-Cookie: fake-one=fixture\r\nSet-Cookie: fake-two=fixture\r\n\r\n")
+            before = copy.deepcopy(messages)
+            self.assertEqual(self.capture(messages).results(), ([], messages))
+            self.assertEqual(messages, before)
+
     def structural_fixture(self, parent="/ext/shell", child="/ext/shell/0.6.6/sdk.js"):
         # Independent wire oracle for SiteMap.createReference's documented
         # request clone. The unsent ancestor has no response and is not traffic.

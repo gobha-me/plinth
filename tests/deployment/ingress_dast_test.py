@@ -192,6 +192,20 @@ def scanner_request(message, origin):
     return method, target, protocol, rest, parsed, fields
 
 
+def completed_scanner_response(header):
+    """Require one complete response-header block, never trailing wire data."""
+    require(isinstance(header, str) and header.endswith("\r\n\r\n"),
+            "scanner response header is unterminated")
+    lines = header[:-4].split("\r\n")
+    require(re.fullmatch(r"HTTP/(?:1\.0|1\.1|2) [1-5][0-9]{2}(?: [\t\x20-\x7e\x80-\xff]*)?",
+                         lines[0]), "scanner response status line is malformed")
+    for line in lines[1:]:
+        name, separator, value = line.partition(":")
+        require(separator and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name)
+                and not re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value),
+                "scanner response header is malformed")
+
+
 def completed_scanner_messages(messages, alerts, origin):
     """Distinguish sent traffic from source-proven ZAP site-tree ancestors.
 
@@ -220,11 +234,11 @@ def completed_scanner_messages(messages, alerts, origin):
                 and isinstance(message.get("responseBody"), str),
                 "scanner traffic has no complete request and response representation")
         requests[message["id"]] = scanner_request(message, origin)
-        if re.match(r"^HTTP/\d(?:\.\d)? [1-5][0-9]{2}(?: [^\r\n]*)?\r\n",
-                    message["responseHeader"]):
-            completed.append(message)
-        else:
+        if message["responseHeader"] == "HTTP/1.0 0\r\n\r\n":
             structural.append(message)
+        else:
+            completed_scanner_response(message["responseHeader"])
+            completed.append(message)
     require(completed, "scanner inventory has no completed HTTP traffic")
     proofs = []
     for message in structural:
