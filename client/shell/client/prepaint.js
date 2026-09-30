@@ -9,8 +9,7 @@
 // Per ICD-0.6.2 §11 SC5, localStorage is the synchronous-startup
 // bridge only; the post-init hydrate from cap.call("shell.preferences.
 // get_all") will overwrite with DB-authoritative values once the
-// JS-dispatch path lands (deferred to 0.6.1.N follow-up — see §17
-// amendment block).
+// authenticated shell mounts. The mirror is never server authority.
 //
 // Implementation deviation from ICD-0.6.2 §11 SC4 path (a):
 // the SC4 prescription was an inline `<script>` block protected by
@@ -28,7 +27,10 @@
   let prefs = {};
   try {
     const raw = localStorage.getItem('shellPrefs');
-    if (raw) { prefs = JSON.parse(raw); }
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) prefs = parsed;
+    }
   } catch (_) { /* malformed JSON → fall through to defaults */ }
 
   // Theme: stored value is one of 'light' / 'dark' / 'system'. Absent

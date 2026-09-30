@@ -148,11 +148,12 @@ primitive — see §Deferred below.
 
 The **shell** is the only extension currently shipped as a trusted bundled
 companion asset and installed on first boot through the package lifecycle.
-It is not embedded in the kernel binary. There is no
-bundled admin package today. `DESIGN-admin-v06x.md` remains design input for
-the issue-owned administration panels #50-#55, which must use ordinary package
-and capability contracts if they land. See `DESIGN-packages-v04x.md §0.4.4`
-for the shipped shell install mechanism and `architecture/06-frontend.md §1`
+It is not embedded in the kernel binary. The `admin` package-management panel
+is instead built as an ordinary, separately API-installed package, with no
+first-boot install or default grants. `DESIGN-admin-v06x.md` describes its
+current scope and defers other administration panels. See
+`DESIGN-packages-v04x.md §0.4.4` for the shipped shell install mechanism and
+`architecture/06-frontend.md §1`
 for why this packaging model matters.
 
 ---

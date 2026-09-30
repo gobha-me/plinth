@@ -1466,6 +1466,18 @@ acceptance gate (§13 exit criterion #4). Deferred to the browser
 harness if not available at ship; manual smoke stand-in per
 U.05.
 
+**Development 0.6.6 coverage amendment (#32):** I.01-I.03 now have the joined
+real browser/SDK/same-database restart gate; U.01-U.05/R.01 have actual shipped
+shell/Preact mechanical browser assertions. The exact
+[case ledger](../reviews/client-runtime-contracts.md) distinguishes native
+persistence from controlled browser race fixtures. R.01 follows §17's
+authoritative 0.30rem right-edge offset at 80/100/175%, not the superseded
+left-edge equality above; U.05's theme/anchor scenario is absorbed into
+computed rendered palette colors and measured geometry, not claimed as a
+human aesthetic review. Theme/scale writes apply and mirror only on success;
+`get_all` supplies authoritative per-key hydration over the cosmetic local
+mirror without overwriting a newer successful selection.
+
 ### 12.7 Test counts
 
 Total enumerated: **24 cases** (4 B + 8 T + 8 S + 3 I + 1 R, plus 5 U

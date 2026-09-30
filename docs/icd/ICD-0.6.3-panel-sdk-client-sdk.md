@@ -3112,6 +3112,48 @@ paper time.
     bump the version segment in `/ext/shell/{version}/sdk.js`,
     invalidating the cache. No remedial action.
 
+### Development 0.6.6 client coverage amendment (#32)
+
+The historical §12 client families are re-enumerated against executable gates
+in [client-runtime-contracts.md](../reviews/client-runtime-contracts.md).
+L.02/L.03 now exercise actual Launcher panel switching. C.05's historical
+`quickjs_throw` literal maps to the current HTTP500 `cap.handler_threw` from
+the installed test-only `sdkdemo.thrower` handler, which deliberately throws a
+side-effect-free TypeError under one explicit fake-consumer rule. It is never
+bundled and adds no production capability or default grant. Native shell
+preference argument validation precedes JS execution, so a null argument is
+not this throw witness. No server taxonomy is changed. S.05's Promise/
+`CapabilityError` wording is retired: `subscribe` returns a removal function
+and uses `onError` with `RealtimeError/subscription_denied` for an ACK-denied
+channel, with grant/owner-aware
+`onReady`. Restoring a Promise return would break the shipped API.
+
+§5.4/U.03's envelope replacement is retained only for raw no-snapshot mode.
+With a snapshot, `useData` now owns a captured single-JSON-value capability
+query: first-render state belongs to that query/session, invalidations use
+bounded fixed-window debounce/jitter and requery, errors keep same-owner last
+good data, and stale/unmounted/retired results cannot publish. Args/view
+objects stay captured across automatic renders; supply a new object to change
+them. Optional `scope` partitions owner identity. Optional caller-certified
+complete unpaginated/unordered keyed-array `view` supports strict eq/in IDs
+and conditional insert/delete adapters; unknown or native counts-only events
+requery conservatively. See [data architecture §3.4](../architecture/03-data.md)
+for descriptor/advice bounds and fallback details. Ordinary `call` remains a
+single JSON argument (undefined becomes null); its public signature does not
+gain AbortSignal. Cancellation is internal to owned snapshot requests.
+
+The test-only installed fixture now uses manifest identity `sdkdemo` 0.1.0;
+its `sdk-demo` directory/ZIP basename is unchanged. The historical hyphenated
+manifest identity is retired without an alias. This is an explicit test-fixture
+compatibility correction, not a repair of the separate backend manifest/database
+naming and cleanup mismatch.
+
+Managed session retirement is permanent for old work; explicit new-session
+activation does not rebind old subscriptions, callbacks or snapshots. This is
+separate from same-session transport recovery. Automatic browser cursor,
+source-sequence, replay/resync policy remains explicitly with #42. Installed
+fixture/native counts and raw browser replay checks do not imply that policy.
+
 ### Design-bundle / architecture amendments (per Constraint #4)
 
 Per METHODOLOGY §Phase 2 Constraint #4, the v0.6.3 code PR

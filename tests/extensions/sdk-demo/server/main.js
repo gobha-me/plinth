@@ -1,3 +1,3 @@
 // sdk_demo/server/main.js — required entry-point per manifest.entry_point.
-// The fixture has no kernel-side capabilities; the entry is a no-op.
+// The entry is a no-op; server/handlers/thrower.js is the one test-only cap.
 export default function main() {}

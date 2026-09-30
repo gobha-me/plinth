@@ -62,6 +62,18 @@ harness exist. The older "33 deferred cases" phrase was arithmetically and
 topologically ambiguous; future work must enumerate the chosen categories
 from their ICD tables rather than reuse that number.
 
+**Development 0.6.6 update (#32):** the Launcher runtime exists and these
+browser/client families now have named executable gates. The exact
+[case ledger](reviews/client-runtime-contracts.md) maps the 3 preference
+integration, 9 token/UI/regression and 33 SDK/client cases to assertions,
+including absorbed server/browser evidence and retired historical API/error
+literals. Smart snapshot mode implements captured-query debounce, bounded
+jitter, conservative native-counts requery and conditional certified ID/view
+optimization. Raw stream and raw browser `since_seq` replay proofs remain
+separate. Automatic SDK sequence/cursor/resume/resync policy stays with #42;
+it is not claimed by #32. This entry is retained as historical design evidence;
+the implementation ledger is not itself a candidate/exact-merge CI receipt.
+
 ---
 
 

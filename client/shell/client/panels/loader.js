@@ -66,22 +66,26 @@ export class PanelManager {
         try { combo = normaliseCombo([...mods, key].join('+')); } catch { return; }
         const callback = this.active.api.__shell_internal.getShortcuts().get(combo);
         if (typeof callback !== 'function') return;
-        event.preventDefault();
         try { callback(event); } catch (error) { this.reportFailure(this.active, error); }
     }
 
+    owns(instance) {
+        return !!instance && this.instances.get(instance.key) === instance;
+    }
+
     reportFailure(instance, error, info = null) {
+        if (!this.owns(instance)) return;
         this.options.onFailure?.(instance.target, error, info);
     }
 
     failureView(instance) {
         return h(FailureView, {
-            onRetry: () => this.options.onRetry?.(instance.target),
-            onHome: () => this.options.onHome?.(),
+            onRetry: () => { if (this.owns(instance)) this.options.onRetry?.(instance.target); },
+            onHome: () => { if (this.owns(instance)) this.options.onHome?.(); },
         });
     }
 
-    async prepare(target) {
+    async prepare(target, { context } = {}) {
         const key = instanceKey(target);
         const retained = this.instances.get(key);
         if (retained) {
@@ -114,7 +118,7 @@ export class PanelManager {
                 } catch (cause) {
                     throw new PanelImportError(target, cause);
                 }
-                if (!this.instances.has(instance.key)) {
+                if (!this.owns(instance)) {
                     throw new DOMException('panel load superseded', 'AbortError');
                 }
                 if (typeof module.default !== 'function') {
@@ -125,7 +129,7 @@ export class PanelManager {
                         notifyDirtyChange: (_panelId, dirty) => this.dirtyChanged(instance, dirty),
                     },
                     panel: target.panel,
-                    context: {},
+                    context,
                     packageRow: {
                         name: target.applicationId,
                         version: target.version,
@@ -133,9 +137,13 @@ export class PanelManager {
                     },
                 });
                 const PanelComponent = module.default(instance.api);
+                if (!this.owns(instance)) {
+                    throw new DOMException('panel load superseded', 'AbortError');
+                }
                 let renderError = null;
                 render(h(PanelBoundary, {
                     onError: (error, info) => {
+                        if (!this.owns(instance)) return;
                         renderError = error;
                         instance.status = 'failed';
                         this.reportFailure(instance, error, info);
@@ -145,7 +153,7 @@ export class PanelManager {
                 if (renderError) throw renderError;
                 instance.status = 'prepared';
             } catch (error) {
-                if (error.name !== 'AbortError' && instance.status !== 'failed') {
+                if (this.owns(instance) && error.name !== 'AbortError' && instance.status !== 'failed') {
                     this.reportFailure(instance, error);
                 }
                 this.destroy(instance, { deactivate: false });
@@ -159,7 +167,7 @@ export class PanelManager {
     }
 
     commit(instance, { discardActive = false } = {}) {
-        if (!this.instances.has(instance.key)) throw new Error('panel instance is no longer available');
+        if (!this.owns(instance)) throw new Error('panel instance is no longer available');
         if (this.active === instance) return instance;
         const previous = this.active;
         if (previous) {
@@ -182,7 +190,7 @@ export class PanelManager {
         try {
             instance.api.__shell_internal.fireActivate();
         } catch (error) {
-            if (previous && this.instances.has(previous.key) && !discardActive && !previous.dirty) {
+            if (this.owns(previous) && !discardActive && !previous.dirty) {
                 this.reportFailure(instance, error);
                 // The candidate became active before its activation callbacks
                 // ran. Destruction must therefore run its deactivation chain
@@ -205,6 +213,7 @@ export class PanelManager {
     }
 
     showFailure(instance, error) {
+        if (!this.owns(instance)) return;
         instance.status = 'failed';
         render(this.failureView(instance), instance.container);
         instance.container.hidden = false;
@@ -230,7 +239,7 @@ export class PanelManager {
     }
 
     dirtyChanged(instance, dirty) {
-        if (!this.instances.has(instance.key)) return;
+        if (!this.owns(instance)) return;
         instance.dirty = dirty;
         if (instance !== this.active && dirty) {
             this.destroy(instance, { deactivate: false });
@@ -269,7 +278,7 @@ export class PanelManager {
     }
 
     destroy(instance, { deactivate = instance === this.active } = {}) {
-        if (!instance || !this.instances.has(instance.key)) return;
+        if (!this.owns(instance)) return;
         if (deactivate && instance.api) {
             try { instance.api.__shell_internal.fireDeactivate(); }
             catch (error) { this.reportFailure(instance, error); }
@@ -279,12 +288,12 @@ export class PanelManager {
         instance.api?.__shell_internal.unbind();
         instance.container.remove();
         instance.status = 'destroyed';
-        this.instances.delete(instance.key);
+        if (this.owns(instance)) this.instances.delete(instance.key);
         this.syncUnloadGuard();
     }
 
     destroyPrepared(instance) {
-        if (instance !== this.active && instance?.status === 'prepared') {
+        if (this.owns(instance) && instance !== this.active && instance.status === 'prepared') {
             this.destroy(instance, { deactivate: false });
         }
     }
@@ -337,7 +346,7 @@ export async function loadPanel(extName, extVersion, panelId, container, opts = 
         tabId: `compat-tab-${panelId}`,
         paneId: `compat-pane-${panelId}`,
     };
-    const instance = await compatibilityManager.prepare(target);
+    const instance = await compatibilityManager.prepare(target, { context: opts.context });
     compatibilityManager.commit(instance);
     return { panelApi: instance.api, panel, instance };
 }

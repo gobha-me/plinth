@@ -7,11 +7,44 @@ import subprocess
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 from kernel_runtime import ContainerProcess, ContainerRuntime, NativeRuntime, runtime_from_args
 
 
 class KernelRuntimeTest(unittest.TestCase):
+    def test_image_test_build_stages_sdk_fixture_without_shipping_it(self):
+        runtime = object.__new__(ContainerRuntime)
+        repo = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = runtime.test_build_dir(repo, root)
+            self.assertEqual(build, root / "image-browser-build")
+            expected = {
+                "valid-install.zip": "notes",
+                "upgrade-v2.zip": "notes",
+                "upgrade-v2-broken-migration.zip": "notes",
+                "upgrade-v1-slow.zip": "slow",
+                "upgrade-v2-slow.zip": "slow",
+                "extensions/sdk-demo.zip": "sdkdemo",
+            }
+            import json
+            for relative, name in expected.items():
+                with zipfile.ZipFile(build / "fixtures" / relative) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                    self.assertEqual(manifest["name"], name)
+                    self.assertFalse(any(path.startswith("/") or ".." in Path(path).parts
+                                         for path in archive.namelist()))
+                    if name == "sdkdemo":
+                        self.assertIn("client/panels/demo.js", archive.namelist())
+                        self.assertEqual(archive.read("client/panels/demo.js"),
+                                         (repo / "tests/extensions/sdk-demo/client/panels/demo.js").read_bytes())
+            with zipfile.ZipFile(build / "packages/admin-0.1.0.zip") as archive:
+                manifest = json.loads(archive.read("manifest.json"))
+                self.assertEqual((manifest["name"], manifest["version"]), ("admin", "0.1.0"))
+                self.assertIn("client/panels/packages.js", archive.namelist())
+            self.assertFalse((root / "bundled").exists())
+
     def test_runtime_selection_preserves_native_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
             binary = Path(temporary) / "plinth"
