@@ -36,6 +36,7 @@ import urllib.request
 import yaml
 
 from dast_report import REQUIRED_CONTROLS, classify_route, public_report
+from dast_review import ReviewContext, reviewed_dispositions
 from k3d_lifecycle_test import Harness, K3S_TRAEFIK_CHART_VERSION, ROOT, free_port, require
 
 sys.path.insert(0, str(ROOT / "tests/browser"))
@@ -59,6 +60,52 @@ INGRESS_LOG_ARGUMENTS = {
     "--accesslog.fields.defaultmode=drop", "--accesslog.fields.headers.defaultmode=drop",
     *(f"--accesslog.fields.names.{name}=keep" for name in INGRESS_LOG_FIELDS),
 }
+RESPONSE_POLICY_HEADERS = {
+    "content-type", "strict-transport-security", "x-content-type-options", "server",
+    "content-security-policy", "location",
+}
+
+
+def response_headers(headers):
+    """Keep the inspected response policy unambiguous across header casing."""
+    pairs = headers.items() if isinstance(headers, dict) else headers
+    result = {}
+    for name, value in pairs:
+        require(isinstance(name, str) and isinstance(value, str), "malformed response header")
+        key = name.lower()
+        require(key not in RESPONSE_POLICY_HEADERS or key not in result,
+                "ambiguous response policy header")
+        result[key] = value
+    return result
+
+
+def verify_response_policy(headers, *, mime=None):
+    fields = response_headers(headers)
+    require(fields.get("strict-transport-security") == "max-age=31536000"
+            and fields.get("x-content-type-options") == "nosniff"
+            and "server" not in fields, "TLS response policy did not reach the actual response")
+    if mime is not None:
+        require(fields.get("content-type", "").split(";", 1)[0].strip() == mime,
+                "actual response media type differs from its surface contract")
+    return fields
+
+
+def verify_shell_policy(policy):
+    require(isinstance(policy, str), "missing bundled shell CSP")
+    directives = {}
+    for directive in policy.split(";"):
+        tokens = directive.split()
+        require(tokens and tokens[0] not in directives, "ambiguous bundled shell CSP")
+        directives[tokens[0]] = tokens[1:]
+    expected = {name: ["'self'"] for name in (
+        "default-src", "connect-src", "img-src", "font-src", "media-src",
+        "frame-src", "frame-ancestors", "base-uri", "form-action",
+    )}
+    expected.update({
+        "script-src": ["'self'", "'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='"],
+        "style-src": ["'self'", "'unsafe-inline'"], "object-src": ["'none'"],
+    })
+    require(directives == expected, "bundled shell CSP differs from the bounded document policy")
 
 
 def wait_until(observe, *, timeout, label):
@@ -348,14 +395,34 @@ class Scanner:
     def results(self):
         alerts = self.api("core", "view", "alerts", baseurl=self.harness.origin,
                           start="0", count="5000")["alerts"]
+        retained = self.harness.private_details.setdefault("scannerResults", {})
+        retained.setdefault("alerts", alerts)
         number = int(self.api("core", "view", "numberOfAlerts",
                               baseurl=self.harness.origin)["numberOfAlerts"])
         require(isinstance(alerts, list) and len(alerts) == number and number <= 5000,
                 "scanner alert inventory is truncated or inconsistent")
         messages = self.api("core", "view", "messages", baseurl=self.harness.origin,
                             start="0", count="5000")["messages"]
+        retained.setdefault("messages", messages)
         require(isinstance(messages, list) and 0 < len(messages) < 5000,
                 "scanner HTTP traffic is absent or truncated")
+        seen = set()
+        for message in messages:
+            require(isinstance(message, dict) and isinstance(message.get("id"), str)
+                    and re.fullmatch(r"[1-9][0-9]{0,9}", message["id"])
+                    and message["id"] not in seen,
+                    "scanner traffic identity is missing, duplicated or noncanonical")
+            seen.add(message["id"])
+            require(isinstance(message.get("requestHeader"), str)
+                    and message["requestHeader"].endswith("\r\n\r\n")
+                    and isinstance(message.get("requestBody"), str)
+                    and isinstance(message.get("responseHeader"), str)
+                    and message["responseHeader"].endswith("\r\n\r\n")
+                    and re.match(r"^HTTP/\d(?:\.\d)? [1-5][0-9]{2}(?: [^\r\n]*)?\r\n",
+                                 message["responseHeader"])
+                    and isinstance(message.get("responseBody"), str),
+                    "scanner traffic has no complete actual request and response")
+        observed_routes(messages, self.harness.origin)
         return alerts, messages
 
     def cleanup(self):
@@ -400,6 +467,7 @@ class DastHarness(Harness):
         self.raw_alerts = []
         self.raw_messages = []
         self.private_details = {}
+        self.review_context = None
         self.cleanup_proof = {}
         self.initial_volumes = set(self.run([
             "docker", "volume", "ls", "--format", "{{.Name}}"], timeout=15).stdout.splitlines())
@@ -527,7 +595,8 @@ class DastHarness(Harness):
             response = connection.getresponse()
             data = response.read(2 * 1024 * 1024 + 1)
             require(len(data) <= 2 * 1024 * 1024, "unbounded HTTP response")
-            return response.status, dict(response.getheaders()), data
+            fields = verify_response_policy(response.getheaders())
+            return response.status, fields, data
         finally:
             connection.close()
 
@@ -596,6 +665,9 @@ class DastHarness(Harness):
                 and logout["sessionStatus"] == 401
                 and logout.get("originalSocketClosed") is True,
                 "browser logout did not retire its session and WebSocket")
+        require(proof.get("styles") == {"themeApplied": True, "scaleApplied": True}
+                and all(value is True for value in proof["styles"].values()),
+                "browser theme and scale behavior was not proven under the document policy")
 
     def verify_http(self):
         session = self.request("/api/auth/session")[0]
@@ -629,15 +701,25 @@ class DastHarness(Harness):
                                        body=args, headers=headers, cookies=True)
         require(status == 200 and json.loads(body)["ok"] is True,
                 "valid capability control did not reach the real handler")
-        for path in ("/app/", "/api/frontend/sdk.js", "/healthz"):
-            status, headers, _ = self.request(path)
-            require(status in (200, 302), "expected surface unavailable")
+        for path, mime in (("/app/", "text/html"),
+                           ("/api/frontend/sdk.js", "application/javascript"),
+                           ("/healthz", "application/json"),
+                           ("/api/issue40-missing-route", "text/plain")):
+            status, headers, body = self.request(path)
+            fields = verify_response_policy(headers)
+            if path == "/api/frontend/sdk.js":
+                require(status == 302 and fields.get("location")
+                        == f"/ext/shell/{shell_version}/sdk.js",
+                        "SDK redirect escaped the exact bundled source asset")
+                status, headers, body = self.request(fields["location"])
+            verify_response_policy(headers, mime=mime)
+            require(status == (404 if path == "/api/issue40-missing-route" else 200),
+                    "expected surface unavailable")
+            if path == "/api/issue40-missing-route":
+                require(body == b"not found", "missing API response must remain inert text")
             if path == "/app/":
-                policy = headers.get("Content-Security-Policy", "")
-                require("script-src 'self'" in policy and "connect-src 'self'" in policy
-                        and "'unsafe-eval'" not in policy
-                        and "'unsafe-inline'" not in policy.split(";")[0],
-                        "shipped executable-script CSP differs from the browser contract")
+                policy = response_headers(headers).get("content-security-policy", "")
+                verify_shell_policy(policy)
                 self.private_details["shippedCsp"] = policy
         self.controls["HTTP_SURFACE"] = self.controls["SECURITY_HEADERS"] = True
         self.controls["TLS_AUTHORITY"] = True
@@ -653,9 +735,10 @@ class DastHarness(Harness):
     def verify_request_limits(self):
         defaults = yaml.safe_load((ROOT / "deploy/helm/plinth/values.yaml").read_text())
         limit = defaults["traefik"]["limits"]["defaultRequestBodyBytes"]
-        status, _, _ = self.request("/api/cap/shell.preferences.get", method="POST",
+        status, headers, _ = self.request("/api/cap/shell.preferences.get", method="POST",
                                     body=b"x" * (limit + 1))
         require(status == 413, "default ingress request boundary was not enforced")
+        verify_response_policy(headers, mime="text/plain")
         self.controls["REQUEST_LIMITS"] = True
 
     def verify_concurrency_limits(self):
@@ -682,8 +765,9 @@ class DastHarness(Harness):
                 except TimeoutError:
                     continue
                 raise AssertionError("held package request ended before the limit probe")
-            status, _, _ = self.request("/api/packages", method="POST", body=b"x")
+            status, headers, _ = self.request("/api/packages", method="POST", body=b"x")
             require(status == 429, "package concurrent admission bound was not enforced")
+            verify_response_policy(headers, mime="text/plain")
         self.route_labels.add("PACKAGES")
         self.controls["CONCURRENCY_LIMITS"] = True
 
@@ -691,11 +775,12 @@ class DastHarness(Harness):
         payload = json.dumps({"username": ADMIN_NAME, "password": ADMIN_PASSWORD})
         statuses = []
         for _ in range(6):
-            status, _, body = self.request("/api/auth/login", method="POST", body=payload,
+            status, headers, body = self.request("/api/auth/login", method="POST", body=payload,
                                            headers={"Origin": self.origin,
                                                     "Content-Type": "application/json"})
             statuses.append(status)
             require(status in (200, 429), "rate probe failed outside the edge token bucket")
+            verify_response_policy(headers, mime="text/plain" if status == 429 else "application/json")
             if status == 429:
                 require(b"rate_limited" not in body, "kernel throttling substituted for edge admission")
         require(429 in statuses, "six immediate logins exceeded the five-token edge burst")
@@ -805,6 +890,14 @@ class DastHarness(Harness):
         status, response = headers(message.get("responseHeader"))
         require(re.fullmatch(r"HTTP/1\.1 101(?: [^\r\n]*)?", status),
                 "proxy did not observe an actual WebSocket 101")
+        fields = response_headers([(name, value) for name, values in response.items()
+                                   for value in values])
+        # The pinned fast proxy hijacks the successful 101 before its response
+        # modifiers run. The kernel still applies nosniff and removes Server;
+        # HSTS is independently proven on the same-origin HTTPS document and
+        # all normal HTTP denials, rather than fabricated on this empty upgrade.
+        require(fields.get("x-content-type-options") == "nosniff" and "server" not in fields,
+                "WebSocket upgrade did not retain the kernel response policy")
         require(request.get("origin") == [origin]
                 and request.get("sec-websocket-version") == ["13"],
                 "WebSocket browser origin or protocol version differs")
@@ -870,11 +963,53 @@ class DastHarness(Harness):
                    label="final passive scanner drain")
         self.scanner.passive_remaining = self.scanner.remaining()
         self.raw_alerts, self.raw_messages = self.scanner.results()
+        self.capture_review_context()
         # Route coverage comes from observed engine messages, not a planned
         # control list or a direct-backend mock. Query values stay private.
         self.route_labels = observed_routes(self.raw_messages, self.origin)
         self.observe_ingress()
         self.verify_clean_removal()
+
+    def capture_review_context(self):
+        """Bind bounded reviews to independent source bytes and fixture DB owners."""
+        version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+        require(re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version), "invalid shell source version")
+        client = ROOT / "client/shell/client"
+        document = (client / "index.html").read_text(encoding="utf-8")
+        marker = "<!-- PLINTH_VERSIONED_ASSET_BASE -->"
+        require(document.count(marker) == 1, "bundled shell entry marker is ambiguous")
+        document = document.replace(marker, f'<base href="/ext/shell/{version}/">')
+        assets = {f"/ext/shell/{version}/{path.relative_to(client).as_posix()}":
+                  path.read_text(encoding="utf-8") for path in client.rglob("*.js")}
+        policy = self.private_details.get("shippedCsp")
+        verify_shell_policy(policy)
+        snapshot = self.kubectl(
+            "exec", "-n", self.namespace, "deployment/postgres", "--",
+            "psql", "-U", "plinth", "-d", "plinth", "-At", "-c",
+            "SELECT COALESCE(json_agg(json_build_object('token_hash', s.token_hash, "
+            "'user_id', s.user_id, 'session_id', s.id)), '[]'::json) "
+            "FROM plinth.sessions s JOIN plinth.users u ON u.id=s.user_id "
+            "WHERE u.username='issue36-admin';", timeout=30,
+        ).stdout
+        rows = json.loads(snapshot)
+        require(isinstance(rows, list) and 0 < len(rows) <= 16, "fixture session snapshot is unbounded")
+        owners = {}
+        uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+        for row in rows:
+            require(isinstance(row, dict) and set(row) == {"token_hash", "user_id", "session_id"}
+                    and isinstance(row["token_hash"], str)
+                    and re.fullmatch(r"[0-9a-f]{64}", row["token_hash"])
+                    and row["token_hash"] not in owners
+                    and all(isinstance(row[key], str) and re.fullmatch(uuid, row[key])
+                            for key in ("user_id", "session_id")),
+                    "fixture session ownership snapshot is malformed")
+            owners[row["token_hash"]] = (row["user_id"], row["session_id"])
+        require(hashlib.sha256(self.cookie("plinth_session").encode()).hexdigest() in owners,
+                "current fixture session is absent from the independent ownership snapshot")
+        self.review_context = ReviewContext(username=ADMIN_NAME, password=ADMIN_PASSWORD,
+                                            app_document=document, assets=assets, csp=policy,
+                                            session_owners=owners)
+        self.private_details["reviewSessionOwners"] = owners
 
     def verify_scanner_session(self):
         status, _, body = self.request("/api/auth/session")
@@ -1014,6 +1149,7 @@ def run(args):
                 "report destination must be an owned non-repository path")
     harness = DastHarness(args)
     error = None
+    dispositions = []
     cleaned = False
     try:
         harness.execute_dast()
@@ -1047,10 +1183,24 @@ def run(args):
                     "source-candidate identity changed during the scan")
         except BaseException:
             error = error or "source-candidate checkout changed during the scan"
+        if error is None:
+            try:
+                require(isinstance(harness.review_context, ReviewContext),
+                        "independent fixture review context is missing")
+                dispositions = reviewed_dispositions(harness.raw_alerts, harness.raw_messages,
+                                                      harness.origin, harness.review_context)
+                if args.dispositions:
+                    submitted = json.loads(args.dispositions.read_text())
+                    require(submitted == dispositions,
+                            "manual review differs from the independently proven present observations")
+            except BaseException:
+                error = "exact observation review did not complete"
+                dispositions = []
         # Cleanup diagnostics must survive, including a failure of an earlier
         # independent stage. All raw traffic remains outside the repository.
         raw = {"details": harness.private_details, "alerts": harness.raw_alerts,
                "messages": harness.raw_messages, "error": error,
+               "reviews": dispositions,
                "sourceRevision": revision, "sourceTree": tree}
         try:
             private_json(args.private_report, raw)
@@ -1069,7 +1219,6 @@ def run(args):
                "temporaryFilesAbsent": not harness.root.exists(),
                "remainingContainers": remaining, "remainingNetworks": remaining_networks,
                "remainingVolumes": remaining_volumes}
-    dispositions = json.loads(args.dispositions.read_text()) if args.dispositions else []
     scanner = {"completed": harness.scanner.completed and error is None,
                "version": SCANNER_VERSION,
                "passiveRecordsRemaining": harness.scanner.passive_remaining,
@@ -1084,6 +1233,8 @@ def run(args):
     private_json(args.report, report)
     print("ingress DAST: " + ("complete" if report.get("status") == "COMPLETE"
                               else "incomplete; private triage/evidence required"))
+    if report.get("status") == "COMPLETE":
+        print("ingress DAST identity: " + json.dumps(identity, sort_keys=True))
     return 0 if report.get("status") == "COMPLETE" else 1
 
 

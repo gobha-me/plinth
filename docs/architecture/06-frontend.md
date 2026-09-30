@@ -178,9 +178,14 @@ dependencies (Preact, htm, the kernel SDK, design tokens) live in the
 active frontend's bundle and are imported by specifier through import
 maps — extensions never ship their own copy of Preact.
 
-**CSP.** The kernel serves a strict content-security policy:
-`script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src
-'self'`. Extensions run within this CSP. Any extension requiring
+**CSP.** The bundled shell serves a strict content-security policy: same-origin
+scripts (plus the exact bundled import-map hash), connections, images, fonts,
+media and frames; `default-src 'self'`, `frame-ancestors 'self'`,
+`base-uri 'self'`, `form-action 'self'` and `object-src 'none'`.
+`style-src 'self' 'unsafe-inline'` preserves the documented inline-style
+contract. Configured replacement frontends retain their prior script/style/
+connect policy; the versioned asset-base marker does not select the stronger
+shell policy. Extensions run within their frontend's CSP. Any extension requiring
 external script or connect sources is an architecture-session
 conversation, not a code-session workaround.
 
@@ -402,6 +407,16 @@ stacks from audit payloads. A development package may explicitly set it to
 `false` before packaging. Missing or malformed configuration does not enable
 stack emission; URL parameters and local storage cannot select development
 mode. The browser smoke exercises both explicit configurations.
+
+Kernel responses use `X-Content-Type-Options: nosniff`, omit Drogon's Server
+banner and use an inert plain-text framework 404. Chart TLS routes apply the
+same nosniff/banner policy, infer a MIME type only when absent, and set HSTS
+`max-age=31536000` without subdomain, preload or cleartext forcing. These
+outer middlewares also cover ingress-generated 413/429 responses; they do not
+change backend MIME types or add a document CSP to bodyless WebSocket upgrades.
+Pinned Traefik's raw WebSocket hijack bypasses response-header modifiers, so
+HSTS is proved on ordinary HTTPS responses and upgrade denials, not the 101.
+The kernel's pre-send advice and disabled banner still apply to the real 101.
 
 ### Browser realtime sessions
 

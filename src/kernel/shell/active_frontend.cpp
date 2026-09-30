@@ -31,8 +31,29 @@ namespace {
 // scripts remain blocked. Update together with client/shell/client/index.html.
 constexpr std::string_view STRICT_CSP =
     "script-src 'self' 'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='; "
+    "default-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "connect-src 'self'; "
+    "img-src 'self'; "
+    "font-src 'self'; "
+    "media-src 'self'; "
+    "frame-src 'self'; "
+    "frame-ancestors 'self'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "object-src 'none'";
+
+// Replacement frontends retain the previous policy, including their resource
+// and base behavior. The bundled shell owns the stronger document contract;
+// the asset-base opt-in marker alone never selects a security policy.
+constexpr std::string_view CUSTOM_FRONTEND_CSP =
+    "script-src 'self' 'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='; "
     "style-src 'self' 'unsafe-inline'; "
     "connect-src 'self'";
+
+auto policy_for(const ActiveFrontend& active) -> std::string_view {
+  return active.name == "shell" ? STRICT_CSP : CUSTOM_FRONTEND_CSP;
+}
 
 // Every mount URL is a mutable alias, including modules, CSS and fonts.
 // Replacement frontends keep these paths; revisit must revalidate the graph.
@@ -175,12 +196,12 @@ auto resolve_under_root(const std::filesystem::path& client_root,
 }
 
 auto serve_file(const std::filesystem::path& full_path,
-                std::string_view content_type, std::string_view cache_control)
-    -> drogon::HttpResponsePtr {
+                std::string_view content_type, std::string_view cache_control,
+                std::string_view policy) -> drogon::HttpResponsePtr {
   auto resp = drogon::HttpResponse::newFileResponse(
       full_path.string(), "", drogon::CT_CUSTOM, std::string{content_type});
   resp->addHeader("Cache-Control", std::string{cache_control});
-  resp->addHeader("Content-Security-Policy", std::string{STRICT_CSP});
+  resp->addHeader("Content-Security-Policy", std::string{policy});
   return resp;
 }
 
@@ -216,7 +237,7 @@ auto serve_entry(const std::filesystem::path& full_path,
   const auto marker = body.find(ASSET_BASE_MARKER);
   if (marker == std::string::npos) {
     // Custom documents retain their own base and byte-for-byte behavior.
-    return serve_file(full_path, mime, CACHE_MOUNT);
+    return serve_file(full_path, mime, CACHE_MOUNT, policy_for(active));
   }
   const auto base = "<base href=\"/ext/" + encode_path_segment(active.name) +
                     "/" + encode_path_segment(active.version) + "/\">";
@@ -226,7 +247,8 @@ auto serve_entry(const std::filesystem::path& full_path,
   response->setBody(std::move(body));
   response->addHeader("Cache-Control", std::string{CACHE_MOUNT});
   // The base changes URL resolution, never the authorized import-map bytes.
-  response->addHeader("Content-Security-Policy", std::string{STRICT_CSP});
+  response->addHeader("Content-Security-Policy",
+                      std::string{policy_for(active)});
   return response;
 }
 
@@ -262,7 +284,7 @@ auto handle_app_request(
     std::move(cb)(serve_entry(*resolved, *active, mime));
     return;
   }
-  std::move(cb)(serve_file(*resolved, mime, CACHE_MOUNT));
+  std::move(cb)(serve_file(*resolved, mime, CACHE_MOUNT, policy_for(*active)));
 }
 
 // `<mount>` may or may not have a trailing slash in the manifest. The

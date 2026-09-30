@@ -45,7 +45,8 @@ responses, WebSockets, modules, or hooks with mocks. It records the actual root
 navigation status, then exercises sign-in, Home, native session/registration/
 catalog requests, missing-CSRF rejection, and an authorized SDK capability
 request. Cookie checks require a Secure, HttpOnly, Strict session cookie and a
-Secure, readable, Strict CSRF cookie. Real connected and subscription-grant
+Secure, readable, Strict CSRF cookie. Native theme and scale preference writes
+must succeed and visibly apply without CSP violations. Real connected and subscription-grant
 frames are required; ordinary keyboard sign-out must close the original socket
 and make the session endpoint return 401.
 
@@ -54,6 +55,15 @@ native fixture certificate validation, cross-origin and missing-CSRF rejection,
 authorized capability access, shipped executable-script CSP, and bounded
 malformed/traversal requests. Separate controls exercise the chart's body-size
 limit, authentication burst limit, and package concurrent-admission limit.
+Normal responses and HTTPS edge denials must retain the intended MIME types,
+`nosniff`, bounded HSTS, and no Server banner. The bundled shell explicitly
+restricts resource, framing, base and form origins while preserving its
+documented inline-style support. Custom frontend policies are unchanged.
+The actual bodyless WebSocket 101 must retain kernel `nosniff` and omit its
+Server banner, alongside the native protocol/authentication witnesses below.
+Pinned Traefik's raw hijack bypasses its ordinary response-header modifiers:
+the gate does not claim HSTS on that 101 or impose a document CSP/MIME policy
+on it. Normal HTTP upgrade denials still receive the chart's full TLS policy.
 Traefik JSON access logs must independently show the exact owned WebSocket
 router's completion and edge-generated authentication/package 429 responses,
 not unrelated routes or backend substitutes. For the pinned fast HTTP proxy,
@@ -170,13 +180,30 @@ private evidence is authoritative for that investigation. This lane grants no
 new registry-write, identity-token, or repository-secret permissions.
 
 Every observed alert starts unresolved, regardless of severity. There is no
-blanket rule ignore, severity cutoff, automatic false-positive classification,
-or suppression for findings that were not observed. Investigate the exact
+blanket rule ignore, severity cutoff, or suppression for findings that were not
+observed. The version-controlled review producer joins each alert to its unique
+actual scanner message and checks every member of each present group against a
+finite, source-reviewed predicate. It verifies actual method, authority, route,
+status, headers and body against independently captured fixture ownership and
+the current candidate's reviewed public bytes. Missing, ambiguous, changed or
+unknown evidence remains unresolved. Investigate the exact
 group privately, and report suspected vulnerabilities through
 [SECURITY.md](../../SECURITY.md), not public issues.
 
-Only after review, a separate private JSON list may be supplied using
-`--dispositions /absolute/private/reviewed-dispositions.json`. Each record must
+The default run produces matching-only dispositions with these predicates;
+it never changes the scanner's original severity or confidence. Accepted
+categories distinguish `FALSE_POSITIVE`, `INFORMATIONAL`, `NOT_APPLICABLE` and
+`DOCUMENTED_POLICY`: discovery observations are not mislabeled false positives,
+and the narrowly verified inline-style policy is not a claim that inline styles
+are forbidden. Code-reviewed cookie-deletion, cache, own-session, harmless
+public-comment and bodyless-upgrade predicates are not blanket rule exemptions.
+New or drifting observations require private investigation and a reviewed
+policy change before they can pass unattended CI.
+
+An independently checked private JSON list may be supplied using
+`--dispositions /absolute/private/reviewed-dispositions.json`. It must exactly
+agree with the records proven by the current run; it cannot override unknown
+evidence or authorize a new exception. Each record must
 exactly identify `pluginId`, `alertRef`, `risk`, `confidence`, `routeLabel`, and
 `param`, with `dispositionId` and `reviewId`. The matching-only `alertRef` must
 be a bounded canonical rule/variant string whose rule prefix matches `pluginId`.
@@ -184,10 +211,9 @@ A bare rule reference matches only that exact reference, never every variant.
 Missing, legacy, malformed, or wildcard references fail closed. Variants are
 qualified separately even when their sanitized public group fields coincide;
 the reference itself is never emitted in the public report. The finite policy in
-`tests/deployment/dast_report.py` permits `FALSE_POSITIVE` only with an applicable
-reviewed evidence ID: `CSRF_READABLE_COOKIE`, `CSRF_HEADER_VERIFIED`,
-`CSP_FRAME_ANCESTORS_ENFORCED`, `CSP_STYLES_ONLY`, or `IMMUTABLE_STATIC_CACHE`.
-Those identifiers are not conclusions on their own. A real finding uses
+`tests/deployment/dast_report.py` binds each accepted review ID to its applicable
+disposition, rule, variant, severity and route. Identifiers are not conclusions
+on their own and a review cannot match a broader scanner variant. A real finding uses
 `PRIVATE_REMEDIATION_REQUIRED` with `PRIVATE_FIX_REQUIRED` and remains red.
 Unknown, duplicate, absent-group, malformed, or unresolved dispositions remain
 red. Changing this finite policy requires code review, not a broader ignore file.

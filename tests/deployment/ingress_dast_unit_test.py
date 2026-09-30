@@ -91,6 +91,7 @@ def browser_receipt():
         "proof": {
             "websocket": {"connections": 1, "connected": True, "applicationGrant": True},
             "logout": {"sessionStatus": 401, "originalSocketClosed": True},
+            "styles": {"themeApplied": True, "scaleApplied": True},
         },
         "cleanup": {"contextClosed": True, "browserClosed": True}, "elapsedMs": 100,
     }
@@ -116,6 +117,225 @@ def active_messages(path=ACTIVE_SEED):
         "requestBody": "", "responseHeader": "HTTP/1.1 200 OK\r\n\r\n",
         "responseBody": "fake owned HTTP response",
     } for index, rule in enumerate(driver.ACTIVE_RULES, 1)]
+
+
+def tls_headers(mime="text/plain; charset=utf-8"):
+    return {"Content-Type": mime, "Strict-Transport-Security": "max-age=31536000",
+            "X-Content-Type-Options": "nosniff"}
+
+
+def shell_policy():
+    return ("script-src 'self' 'sha256-cCDc4AaNiyEAbj29NffEKnWAezVHyPJNEKKLUd8ZTkw='; "
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "img-src 'self'; font-src 'self'; media-src 'self'; frame-src 'self'; "
+            "frame-ancestors 'self'; base-uri 'self'; form-action 'self'; object-src 'none'")
+
+
+class ActualResponsePolicyTest(unittest.TestCase):
+    def test_backend_and_edge_media_types_keep_actual_response_policy(self):
+        for mime in ("text/plain", "text/html", "application/javascript", "application/json"):
+            headers = tls_headers(mime)
+            before = copy.deepcopy(headers)
+            driver.verify_response_policy(headers, mime=mime)
+            self.assertEqual(headers, before)
+
+    def test_missing_weakened_duplicate_or_banner_headers_cannot_pass(self):
+        for field, invalid in (("Strict-Transport-Security", "max-age=31536000; includeSubDomains"),
+                               ("Strict-Transport-Security", "max-age=0"),
+                               ("X-Content-Type-Options", ""), ("Server", "backend"),
+                               ("Content-Type", "text/html"), ("content-type", "text/plain")):
+            with self.subTest(field=field, value=invalid):
+                headers = tls_headers()
+                headers[field] = invalid
+                with self.assertRaises(AssertionError):
+                    driver.verify_response_policy(headers, mime="text/plain")
+        for name in ("Strict-Transport-Security", "X-Content-Type-Options", "Content-Type"):
+            headers = tls_headers()
+            del headers[name]
+            with self.assertRaises(AssertionError):
+                driver.verify_response_policy(headers, mime="text/plain")
+        with self.assertRaises(AssertionError):
+            driver.response_headers([("Content-Type", "text/plain"), ("Content-Type", "text/html")])
+
+    def test_strict_document_policy_accepts_styles_only_relaxation(self):
+        driver.verify_shell_policy(shell_policy())
+        for old, new in (("default-src 'self'; ", ""),
+                         ("script-src 'self'", "script-src 'self' 'unsafe-inline'"),
+                         ("connect-src 'self'", "connect-src *"),
+                         ("object-src 'none'", "object-src 'self'"),
+                         ("form-action 'self'", "form-action *"),
+                         ("frame-ancestors 'self'", "frame-ancestors *"),
+                         ("style-src 'self' 'unsafe-inline'", "style-src * 'unsafe-inline'"),
+                         ("base-uri 'self'", "base-uri 'self'; base-uri *")):
+            with self.assertRaises(AssertionError):
+                driver.verify_shell_policy(shell_policy().replace(old, new))
+
+    def test_edge_body_and_rate_gates_require_headers_before_passing_control(self):
+        value = harness()
+        value.controls = {code: False for code in driver.REQUIRED_CONTROLS}
+        value.route_labels = set()
+        value.request = mock.Mock(return_value=(413, {}, b"denied"))
+        with self.assertRaises(AssertionError):
+            value.verify_request_limits()
+        self.assertFalse(value.controls["REQUEST_LIMITS"])
+        value.request.return_value = (413, tls_headers(), b"denied")
+        value.verify_request_limits()
+        self.assertTrue(value.controls["REQUEST_LIMITS"])
+        value.request.return_value = (429, {}, b"denied")
+        with self.assertRaises(AssertionError):
+            value.verify_rate_limits()
+        self.assertFalse(value.controls["RATE_LIMITS"])
+
+    def http_fixture(self, altered_path=None, altered_response=None):
+        value = harness()
+        value.controls = {code: False for code in driver.REQUIRED_CONTROLS}
+        value.route_labels = set()
+        value.private_details = {}
+        value.cookie = mock.Mock(return_value="fake-csrf")
+        version = (driver.ROOT / "VERSION").read_text().strip()
+        sdk = f"/ext/shell/{version}/sdk.js"
+        surfaces = {
+            "/app/": (200, {**tls_headers("text/html; charset=utf-8"),
+                             "Content-Security-Policy": shell_policy()}, b"fake shell"),
+            "/api/frontend/sdk.js": (302, {**tls_headers(), "Location": sdk}, b""),
+            sdk: (200, tls_headers("application/javascript"), b"export const sdk = {};"),
+            "/healthz": (200, tls_headers("application/json"), b'{"status":"ok"}'),
+            "/api/issue40-missing-route": (404, tls_headers(), b"not found"),
+        }
+        if altered_path is not None:
+            surfaces[altered_path] = altered_response
+
+        def request(path, **kwargs):
+            if path in surfaces:
+                return surfaces[path]
+            if path == "/api/auth/session":
+                return 401, tls_headers("application/json"), b"{}"
+            if path == "/api/auth/registration":
+                return 200, tls_headers("application/json"), b'{"mode":"disabled"}'
+            if path == "/api/auth/register":
+                return 403, tls_headers("application/json"), b'{"error":"registration_unavailable"}'
+            if path == "/api/auth/logout":
+                return 403, tls_headers("application/json"), b'{"error":"csrf_failed"}'
+            if path == "/api/cap/shell.preferences.get":
+                if "X-Plinth-CSRF" in kwargs.get("headers", {}):
+                    return 200, tls_headers("application/json"), b'{"ok":true}'
+                return 403, tls_headers("application/json"), b'{"error":"csrf_failed"}'
+            return 404, tls_headers(), b"not found"
+
+        value.request = mock.Mock(side_effect=request)
+        value.curl = mock.Mock(side_effect=lambda _path, **kwargs:
+                               (0, "404" if kwargs else "200", ""))
+        return value
+
+    def test_actual_http_surface_verifies_sdk_redirect_target_and_normal_contracts(self):
+        value = self.http_fixture()
+        value.verify_http()
+        self.assertTrue(value.controls["SECURITY_HEADERS"])
+        self.assertTrue(value.controls["HTTP_SURFACE"])
+
+    def test_missing_api_html_or_wrong_mime_and_unbounded_shell_policy_fail_before_control(self):
+        cases = [
+            ("/api/issue40-missing-route", (404, tls_headers("text/html"), b"not found")),
+            ("/api/issue40-missing-route", (404, tls_headers(), b"<html>not found</html>")),
+            ("/healthz", (200, tls_headers("text/plain"), b'{"status":"ok"}')),
+            ("/app/", (200, {**tls_headers("text/html"),
+                             "Content-Security-Policy": "script-src 'self'"}, b"fake shell")),
+            ("/api/frontend/sdk.js", (302, {**tls_headers(),
+                                            "Location": "https://other.test/sdk.js"}, b"")),
+        ]
+        for path, response in cases:
+            with self.subTest(path=path):
+                value = self.http_fixture(path, response)
+                with self.assertRaises(AssertionError):
+                    value.verify_http()
+                self.assertFalse(value.controls["SECURITY_HEADERS"])
+
+
+class TrustedReviewContextTest(unittest.TestCase):
+    def fixture(self):
+        value = harness()
+        value.namespace = "fake-owned-namespace"
+        value.private_details = {"shippedCsp": shell_policy()}
+        value.cookie = mock.Mock(return_value="fake-fixture-token")
+        row = {"token_hash": driver.hashlib.sha256(b"fake-fixture-token").hexdigest(),
+               "user_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+               "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}
+        value.kubectl = mock.Mock(return_value=result(json.dumps([row])))
+        return value, row
+
+    def test_context_uses_current_source_and_independent_fixture_snapshot(self):
+        value, row = self.fixture()
+        value.capture_review_context()
+        context = value.review_context
+        self.assertEqual(context.username, driver.ADMIN_NAME)
+        self.assertEqual(context.session_owners[row["token_hash"]], (row["user_id"], row["session_id"]))
+        self.assertIn('<base href="/ext/shell/', context.app_document)
+        self.assertNotIn("<!-- PLINTH_VERSIONED_ASSET_BASE -->", context.app_document)
+        self.assertTrue(any(path.endswith("/sdk.js") for path in context.assets))
+        self.assertIn("WHERE u.username='issue36-admin'", value.kubectl.call_args.args[-1])
+        self.assertNotIn("revoked_at IS NULL", value.kubectl.call_args.args[-1])
+
+    def test_missing_duplicate_foreign_or_malformed_fixture_sessions_fail_closed(self):
+        for change in ("missing", "duplicate", "foreign", "invalid_uuid", "extra"):
+            value, row = self.fixture()
+            if change == "foreign":
+                row["token_hash"] = "a" * 64
+            elif change == "invalid_uuid":
+                row["user_id"] = "fake-unbound-owner"
+            elif change == "extra":
+                row["extra"] = "unreviewed-field"
+            rows = [] if change == "missing" else [row, row] if change == "duplicate" else [row]
+            value.kubectl.return_value = result(json.dumps(rows))
+            with self.assertRaises(AssertionError):
+                value.capture_review_context()
+
+
+class ScannerResultsInventoryTest(unittest.TestCase):
+    def capture(self, messages, alerts=None):
+        value = scanner()
+        value.harness.private_details = {}
+        alerts = [] if alerts is None else alerts
+        value.api = mock.Mock(side_effect=[{"alerts": alerts}, {"numberOfAlerts": str(len(alerts))},
+                                           {"messages": messages}])
+        return value
+
+    def test_actual_zero_alert_traffic_inventory_remains_independently_valid(self):
+        messages = active_messages()
+        value = self.capture(messages)
+        self.assertEqual(value.results(), ([], messages))
+        self.assertEqual(value.harness.private_details["scannerResults"],
+                         {"alerts": [], "messages": messages})
+
+    def test_zero_alerts_never_hide_missing_noncanonical_or_duplicate_message_ids(self):
+        cases = [[], None, {}, [None], active_messages() + active_messages()[:1]]
+        for mid in (None, 1, True, "", "0", "01", "-1", "1.0", "1" * 11):
+            messages = active_messages()
+            messages[0]["id"] = mid
+            cases.append(messages)
+        missing = active_messages()
+        del missing[0]["id"]
+        cases.append(missing)
+        for messages in cases:
+            value = self.capture(messages)
+            with self.assertRaises(AssertionError):
+                value.results()
+            self.assertEqual(value.harness.private_details["scannerResults"]["messages"], messages)
+
+    def test_incomplete_untyped_or_foreign_actual_messages_remain_private_and_red(self):
+        for field, bad in (("requestHeader", None), ("requestHeader", "not HTTP\r\n\r\n"),
+                           ("requestBody", None), ("responseHeader", "HTTP/1.1 000\r\n\r\n"),
+                           ("responseHeader", "HTTP/1.1 200 OK\r\n"),
+                           ("responseBody", None), ("responseBody", {})):
+            messages = active_messages()
+            messages[0][field] = bad
+            value = self.capture(messages)
+            with self.assertRaises(AssertionError):
+                value.results()
+            self.assertEqual(value.harness.private_details["scannerResults"]["messages"], messages)
+        messages = active_messages()
+        messages[0]["requestHeader"] = messages[0]["requestHeader"].replace(HOST, "foreign.test:8443")
+        with self.assertRaises(AssertionError):
+            self.capture(messages).results()
 
 
 def message_query(value, query):
@@ -842,6 +1062,7 @@ def websocket_message():
                          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
         "requestBody": "",
         "responseHeader": "HTTP/1.1 101 Switching Protocols\r\n"
+                          "X-Content-Type-Options: nosniff\r\n"
                           "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                           "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
         "responseBody": "",
@@ -1146,6 +1367,24 @@ class WebsocketHandshakeTest(unittest.TestCase):
                 "HTTP/1.1 101 Switching Protocols", status, 1)
             self.assert_rejected([value])
 
+    def test_hijacked_upgrade_requires_kernel_policy_without_document_mime_or_hsts_headers(self):
+        value = websocket_message()
+        self.assertNotIn("Content-Type:", value["responseHeader"])
+        self.assertNotIn("Content-Security-Policy:", value["responseHeader"])
+        self.assertNotIn("Strict-Transport-Security:", value["responseHeader"])
+        driver.DastHarness.validate_websocket_handshake([value], ORIGIN)
+        for line in ("X-Content-Type-Options: nosniff\r\n",):
+            value = websocket_message()
+            value["responseHeader"] = value["responseHeader"].replace(line, "", 1)
+            self.assert_rejected([value])
+            value = websocket_message()
+            value["responseHeader"] = value["responseHeader"].replace(line, line + line, 1)
+            self.assert_rejected([value])
+        for header in ("Server: fake-backend\r\n", "X-Content-Type-Options: unsafe\r\n"):
+            value = websocket_message()
+            value["responseHeader"] = value["responseHeader"][:-2] + header + "\r\n"
+            self.assert_rejected([value])
+
     def test_both_header_blocks_require_complete_crlf_crlf_termination(self):
         for field in ("requestHeader", "responseHeader"):
             for removed in (2, 4):
@@ -1291,6 +1530,16 @@ class BrowserReceiptTest(unittest.TestCase):
                         {"sessionStatus": 401, "originalSocketClosed": 1}):
             value = browser_receipt()
             value["proof"]["logout"] = invalid
+            with self.assertRaises(AssertionError):
+                driver.DastHarness.validate_browser_receipt(value)
+
+    def test_styles_require_applied_theme_and_scale_boolean_proofs(self):
+        for invalid in (None, {}, {"themeApplied": True},
+                        {"themeApplied": False, "scaleApplied": True},
+                        {"themeApplied": True, "scaleApplied": 1},
+                        {"themeApplied": True, "scaleApplied": True, "extra": True}):
+            value = browser_receipt()
+            value["proof"]["styles"] = invalid
             with self.assertRaises(AssertionError):
                 driver.DastHarness.validate_browser_receipt(value)
 
@@ -1792,11 +2041,11 @@ class RunCleanupTest(unittest.TestCase):
         self.assert_source_rejected("", chart_additions=driver.subprocess.CalledProcessError(
             1, SOURCE_CHART_COMMAND, output="fake unavailable chart inventory"))
 
-    def run_with_source_change(self, change):
+    def run_with_source_change(self, change, manual=None):
         args = SimpleNamespace(image="fake-exact-image", helm="helm", kubectl="kubectl", k3d="k3d",
                                report=Path("/tmp/plinth-issue40-public-unit/report.json"),
                                private_report=Path("/tmp/plinth-issue40-private-unit/private.json"),
-                               dispositions=None)
+                               dispositions=Path("/fake-manual-review.json") if manual is not None else None)
         events, reports, counts = [], {}, {}
 
         def step(name):
@@ -1815,8 +2064,14 @@ class RunCleanupTest(unittest.TestCase):
             root=mock.Mock(spec=Path), private_details={}, raw_alerts=[], raw_messages=[message()],
             route_labels=set(REQUIRED_ROUTES), controls={code: True for code in driver.REQUIRED_CONTROLS},
             candidate_digest="sha256:" + "c" * 64, origin=ORIGIN,
+            review_context=driver.ReviewContext(username=driver.ADMIN_NAME,
+                                                password=driver.ADMIN_PASSWORD,
+                                                app_document="fake owned shell", assets={},
+                                                csp=shell_policy(), session_owners={}),
         )
         value.root.exists.return_value = False
+        if change == "review_context":
+            value.review_context = None
 
         def check_output(argv, **kwargs):
             if argv[0] == "git":
@@ -1857,14 +2112,25 @@ class RunCleanupTest(unittest.TestCase):
                 mock.patch.object(driver.os, "umask"), \
                 mock.patch.object(driver.shutil, "which", return_value="/fake/tool"), \
                 mock.patch.object(driver.subprocess, "check_output", side_effect=check_output), \
-                mock.patch.object(Path, "read_text", return_value="0.6.5"), \
+                mock.patch.object(Path, "read_text", autospec=True,
+                                  side_effect=lambda path, **_kwargs: json.dumps(manual)
+                                  if path == args.dispositions else "0.6.5"), \
                 mock.patch.object(Path, "exists", return_value=False), \
                 mock.patch.object(Path, "is_dir", return_value=True), \
                 mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path: path), \
                 mock.patch.object(driver, "DastHarness", return_value=value) as construct, \
                 mock.patch.object(driver, "private_json", side_effect=write), \
-                mock.patch("builtins.print"):
+                mock.patch("builtins.print") as printed:
             code = driver.run(args)
+        markers = [call.args[0] for call in printed.call_args_list
+                   if call.args and call.args[0].startswith("ingress DAST identity: ")]
+        self.assertEqual(len(markers), 1 if code == 0 else 0)
+        if markers:
+            identity = json.loads(markers[0].removeprefix("ingress DAST identity: "))
+            self.assertEqual(identity, {"sourceRevision": "a" * 40, "sourceTree": "b" * 40,
+                                       "imageDigest": "sha256:" + "c" * 64,
+                                       "scannerDigest": driver.SCANNER_DIGEST,
+                                       "scannerVersion": driver.SCANNER_VERSION})
         construct.assert_called_once_with(args)
         for method in (value.execute_dast, value.inventory_owned_volumes,
                        value.retain_private_failure_evidence, value.scanner.cleanup,
@@ -1894,6 +2160,23 @@ class RunCleanupTest(unittest.TestCase):
                 self.assertEqual(private["sourceRevision"], "a" * 40)
                 self.assertEqual(private["sourceTree"], "b" * 40)
                 self.assertNotIn("fake raw", json.dumps(public))
+
+    def test_manual_review_cannot_bypass_independent_producer_predicates(self):
+        code, public, private, _ = self.run_with_source_change(None, manual=[])
+        self.assertEqual(code, 0)
+        self.assertEqual(private["reviews"], [])
+        for manual in ({}, [{"reviewId": "caller-forged-claim"}]):
+            code, public, private, _ = self.run_with_source_change(None, manual=manual)
+            self.assertEqual(code, 1)
+            self.assertNotEqual(public["status"], "COMPLETE")
+            self.assertEqual(private["error"], "exact observation review did not complete")
+            self.assertEqual(private["reviews"], [])
+
+    def test_absent_independent_context_never_completes_even_with_zero_alerts(self):
+        code, public, private, _ = self.run_with_source_change("review_context")
+        self.assertEqual(code, 1)
+        self.assertNotEqual(public["status"], "COMPLETE")
+        self.assertEqual(private["error"], "exact observation review did not complete")
 
 
 class WorkflowPrivacyTest(unittest.TestCase):

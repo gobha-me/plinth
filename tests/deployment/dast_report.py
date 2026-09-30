@@ -56,7 +56,55 @@ REVIEW_IDS = frozenset({
     "CSRF_READABLE_COOKIE", "CSRF_HEADER_VERIFIED",
     "CSP_FRAME_ANCESTORS_ENFORCED", "CSP_STYLES_ONLY",
     "IMMUTABLE_STATIC_CACHE", "PRIVATE_FIX_REQUIRED",
+    "EXPIRED_COOKIE_DELETION", "PUBLIC_SHELL_REVALIDATION", "PUBLIC_CONSTANT_HEALTH",
+    "PRIVATE_RESPONSE_NO_STORE", "AUTHORIZED_OWN_SESSION_METADATA",
+    "REVIEWED_PUBLIC_SOURCE_COMMENT", "SCANNER_APPLICATION_DISCOVERY",
+    "SCANNER_AUTHENTICATION_DISCOVERY", "SCANNER_SESSION_DISCOVERY",
+    "WEBSOCKET_UPGRADE_NO_DOCUMENT",
 })
+# Honest non-vulnerability classifications retain the scanner's severity.
+# Each new accepted identifier is restricted to its specific rule and routes;
+# it is not a generic severity cutoff or permission to ignore a different rule.
+_REVIEW_CLASSES = {
+    "EXPIRED_COOKIE_DELETION": ("NOT_APPLICABLE", {10010, 10011, 10054}, {"LOGOUT"}, 1),
+    "PUBLIC_SHELL_REVALIDATION": ("INFORMATIONAL", {10015}, {"APP"}, 0),
+    "PUBLIC_CONSTANT_HEALTH": ("INFORMATIONAL", {10015}, {"HEALTH"}, 0),
+    "PRIVATE_RESPONSE_NO_STORE": ("INFORMATIONAL", {10015}, {"REGISTRATION", "SESSION", "APPLICATIONS"}, 0),
+    "AUTHORIZED_OWN_SESSION_METADATA": ("FALSE_POSITIVE", {2}, {"SESSION"}, 1),
+    "REVIEWED_PUBLIC_SOURCE_COMMENT": ("INFORMATIONAL", {10027}, {"STATIC"}, 0),
+    "SCANNER_APPLICATION_DISCOVERY": ("INFORMATIONAL", {10109}, {"APP"}, 0),
+    "SCANNER_AUTHENTICATION_DISCOVERY": ("INFORMATIONAL", {10111}, {"LOGIN"}, 0),
+    "SCANNER_SESSION_DISCOVERY": ("INFORMATIONAL", {10112}, {"LOGIN", "SESSION"}, 0),
+    "WEBSOCKET_UPGRADE_NO_DOCUMENT": ("NOT_APPLICABLE", {10038}, {"WS"}, 2),
+}
+
+
+def _review_class(disposition, proof, plugin, risk, confidence, route, param, reference):
+    if proof in _REVIEW_CLASSES:
+        kind, plugins, routes, severity = _REVIEW_CLASSES[proof]
+        allowed_ref = {10054: "10054-1", 10038: "10038-1"}.get(plugin, str(plugin))
+        expected_confidence = {10015: {1}, 10111: {3}, 10112: {2, 3}, 10038: {3}}.get(plugin, {2})
+        param_valid = (param in {"plinth_session", "plinth_csrf"} if plugin in {10010, 10011, 10054, 10112}
+                       else param.lower() == "cache-control" if plugin == 10015
+                       else param == "password" if plugin == 10111 else param == "")
+        return (disposition == kind and plugin in plugins and route in routes and risk == severity and
+                confidence in expected_confidence and reference == allowed_ref and param_valid)
+    if disposition == "DOCUMENTED_POLICY":
+        return ((proof == "CSRF_READABLE_COOKIE" and plugin == 10010 and risk == 1 and confidence == 2 and
+                 route in {"LOGIN", "SESSION"} and reference == "10010" and param == "plinth_csrf") or
+                (proof == "CSP_STYLES_ONLY" and plugin == 10055 and risk == 2 and
+                 confidence == 3 and route == "APP" and reference == "10055-6" and
+                 param.lower() == "content-security-policy"))
+    # Retained legacy proof names are deliberately restricted; none authorizes
+    # accepting another plugin, another variant or an actual omission.
+    return (disposition == "FALSE_POSITIVE" and
+            ((proof == "CSP_FRAME_ANCESTORS_ENFORCED" and plugin == 10020 and
+              reference == "10020-1" and risk == 2 and confidence == 2 and route == "APP" and
+              param.lower() == "x-frame-options") or
+             (proof == "IMMUTABLE_STATIC_CACHE" and plugin == 10015 and reference == "10015" and
+              risk == 0 and confidence == 1 and route == "STATIC" and param.lower() == "cache-control")))
+
+
 _IDENTITY_KEYS = frozenset({
     "sourceRevision", "sourceTree", "imageDigest", "scannerDigest", "scannerVersion",
 })
@@ -182,8 +230,10 @@ def public_report(identity, controls, scanner, raw_alerts, dispositions, cleanup
 
     Review keys are ``(pluginId, risk, confidence, routeLabel, param, alertRef)``.
     The rule/variant reference remains private and matching-only. Only an exact
-    explicit FALSE_POSITIVE review with a finite evidence identifier can qualify
-    that variant's group. No legacy or wildcard fallback, default ignore,
+    explicit review with a finite, appropriate evidence identifier can qualify
+    that variant's group. Non-vulnerability reviews preserve severity and name
+    their informational, protocol or documented-policy basis honestly.
+    No legacy or wildcard fallback, default ignore,
     severity cutoff, or raw rationale exists.
     A review for an absent group is rejected, preventing preemptive suppressions.
     """
@@ -278,8 +328,13 @@ def public_report(identity, controls, scanner, raw_alerts, dispositions, cleanup
                     type(route) is not str or route not in ROUTE_LABELS or type(param) is not str or
                     type(proof) is not str or proof not in REVIEW_IDS or
                     type(disposition) is not str or disposition not in {
-                        "FALSE_POSITIVE", "PRIVATE_REMEDIATION_REQUIRED"} or
+                        "FALSE_POSITIVE", "PRIVATE_REMEDIATION_REQUIRED", "INFORMATIONAL",
+                        "NOT_APPLICABLE", "DOCUMENTED_POLICY"} or
                     (disposition == "PRIVATE_REMEDIATION_REQUIRED") != (proof == "PRIVATE_FIX_REQUIRED")):
+                reasons.add("PRIVATE_TRIAGE_REQUIRED")
+                continue
+            if disposition != "PRIVATE_REMEDIATION_REQUIRED" and not _review_class(
+                    disposition, proof, plugin, risk, confidence, route, param, reference):
                 reasons.add("PRIVATE_TRIAGE_REQUIRED")
                 continue
             key = plugin, risk, confidence, route, param, reference
@@ -294,7 +349,7 @@ def public_report(identity, controls, scanner, raw_alerts, dispositions, cleanup
             "ruleId": key[0], "risk": key[1], "confidence": key[2], "count": count,
             "dispositionId": disposition, "reviewId": proof,
         })
-        if disposition != "FALSE_POSITIVE":
+        if disposition not in {"FALSE_POSITIVE", "INFORMATIONAL", "NOT_APPLICABLE", "DOCUMENTED_POLICY"}:
             reasons.add("PRIVATE_TRIAGE_REQUIRED")
 
     valid_cleanup = _record(cleanup, _CLEANUP_BOOLEANS | _CLEANUP_COUNTERS)

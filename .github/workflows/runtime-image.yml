@@ -80,6 +80,7 @@ jobs:
       - name: Verify fail-closed ingress scan and public report gates
         run: |
           python3 tests/deployment/dast_report_test.py
+          python3 tests/deployment/dast_review_test.py
           python3 tests/deployment/ingress_dast_unit_test.py
 
       - name: Verify deployment PostgreSQL readiness

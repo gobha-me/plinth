@@ -40,9 +40,9 @@ def inputs():
 
 def alert(**changes):
     value = {
-        "pluginId": "10038", "alertRef": "10038", "risk": "1", "confidence": "2",
-        "url": ORIGIN + "/app/?query=" + PRIVATE_MARKER,
-        "param": PRIVATE_MARKER, "evidence": PRIVATE_MARKER,
+        "pluginId": "10038", "alertRef": "10038-1", "risk": "2", "confidence": "3",
+        "url": ORIGIN + "/ws/events?query=" + PRIVATE_MARKER,
+        "param": "", "evidence": PRIVATE_MARKER,
         "name": PRIVATE_MARKER, "description": PRIVATE_MARKER,
         "solution": PRIVATE_MARKER, "headers": {"Authorization": PRIVATE_MARKER},
         "attack": PRIVATE_MARKER,
@@ -55,9 +55,9 @@ def alert(**changes):
 
 def review(**changes):
     value = {
-        "pluginId": 10038, "alertRef": "10038", "risk": 1, "confidence": 2, "routeLabel": "APP",
-        "param": PRIVATE_MARKER, "dispositionId": "FALSE_POSITIVE",
-        "reviewId": "CSP_FRAME_ANCESTORS_ENFORCED",
+        "pluginId": 10038, "alertRef": "10038-1", "risk": 2, "confidence": 3, "routeLabel": "WS",
+        "param": "", "dispositionId": "NOT_APPLICABLE",
+        "reviewId": "WEBSOCKET_UPGRADE_NO_DOCUMENT",
     }
     value.update(changes)
     if "pluginId" in changes and "alertRef" not in changes:
@@ -88,13 +88,13 @@ class DastReportTest(unittest.TestCase):
 
     def test_reviewed_group_aggregates_only_safe_fields(self):
         value = inputs()
-        value["raw_alerts"] = [alert(), alert(url=ORIGIN + "/app/")]
+        value["raw_alerts"] = [alert(), alert(url=ORIGIN + "/ws/events")]
         value["dispositions"] = [review()]
         report = public_report(**value)
         self.assertEqual(report["status"], "COMPLETE")
         self.assertEqual(report["alertGroups"], [{
-            "ruleId": 10038, "risk": 1, "confidence": 2, "count": 2,
-            "dispositionId": "FALSE_POSITIVE", "reviewId": "CSP_FRAME_ANCESTORS_ENFORCED",
+            "ruleId": 10038, "risk": 2, "confidence": 3, "count": 2,
+            "dispositionId": "NOT_APPLICABLE", "reviewId": "WEBSOCKET_UPGRADE_NO_DOCUMENT",
         }])
         encoded = json.dumps(report, allow_nan=False)
         for forbidden in (PRIVATE_MARKER, ORIGIN, "Authorization", "/app/", "description", "param", "alertRef"):
@@ -149,7 +149,7 @@ class DastReportTest(unittest.TestCase):
         value["raw_alerts"] = [alert(url=ORIGIN + "/app/../../config.json")]
         self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
         value["dispositions"] = [review(routeLabel="ERROR_PROBE")]
-        self.assertEqual(public_report(**value)["status"], "COMPLETE")
+        self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
 
     def test_controls_require_exact_distinct_boolean_named_set(self):
         for change in ("missing", "duplicate", "unknown", "extra", "not_bool", "failed", "not_list"):
@@ -266,7 +266,7 @@ class DastReportTest(unittest.TestCase):
     def test_exact_review_key_includes_param_route_risk_and_confidence(self):
         for changes in (
             {"pluginId": 10039}, {"param": "other"}, {"routeLabel": "LOGIN"},
-            {"risk": 2}, {"confidence": 3},
+            {"risk": 1}, {"confidence": 2},
         ):
             value = inputs()
             value["raw_alerts"] = [alert()]
@@ -297,9 +297,10 @@ class DastReportTest(unittest.TestCase):
     def test_exact_zap_enum_names_and_confirmed_confidence_are_normalized(self):
         value = inputs()
         value["raw_alerts"] = [alert(risk="Low", confidence="Confirmed")]
-        value["dispositions"] = [review(risk="Low", confidence="4")]
+        value["dispositions"] = [review(risk="Low", confidence="4",
+                                       dispositionId="PRIVATE_REMEDIATION_REQUIRED", reviewId="PRIVATE_FIX_REQUIRED")]
         report = public_report(**value)
-        self.assertEqual(report["status"], "COMPLETE")
+        self.assertEqual(report["status"], "INCOMPLETE")
         self.assertEqual(report["alertGroups"][0]["confidence"], 4)
         value["raw_alerts"][0]["risk"] = "low"
         self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
@@ -318,10 +319,11 @@ class DastReportTest(unittest.TestCase):
             with self.subTest(ref=ref):
                 value = inputs()
                 value["raw_alerts"] = [alert(alertRef=ref)]
-                value["dispositions"] = [review(alertRef=ref)]
+                value["dispositions"] = [review(alertRef=ref, dispositionId="PRIVATE_REMEDIATION_REQUIRED",
+                                                reviewId="PRIVATE_FIX_REQUIRED")]
                 before = copy.deepcopy(value)
                 report = public_report(**value)
-                self.assertEqual(report["status"], "COMPLETE")
+                self.assertEqual(report["status"], "INCOMPLETE")
                 self.assertEqual(report["alertGroups"][0]["count"], 1)
                 self.assertNotIn("alertRef", json.dumps(report))
                 self.assertEqual(value, before)
@@ -330,7 +332,7 @@ class DastReportTest(unittest.TestCase):
         value["dispositions"] = [review(pluginId=10055)]
         self.assertEqual(value["raw_alerts"][0]["alertRef"], "10055")
         self.assertEqual(value["dispositions"][0]["alertRef"], "10055")
-        self.assertEqual(public_report(**value)["status"], "COMPLETE")
+        self.assertEqual(public_report(**value)["status"], "INCOMPLETE")
 
     def test_missing_malformed_foreign_or_unbounded_alert_ref_cannot_inherit_review(self):
         invalid = (
@@ -387,10 +389,10 @@ class DastReportTest(unittest.TestCase):
                 report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
                 self.assertEqual(len(report["alertGroups"]), 3)
                 self.assertEqual([group["count"] for group in report["alertGroups"]], [1, 1, 1])
-                self.assertEqual(sum(group["dispositionId"] == "FALSE_POSITIVE"
-                                     for group in report["alertGroups"]), 1)
+                self.assertEqual(sum(group["dispositionId"] != "PRIVATE_TRIAGE_REQUIRED"
+                                     for group in report["alertGroups"]), 0)
                 self.assertEqual(sum(group["dispositionId"] == "PRIVATE_TRIAGE_REQUIRED"
-                                     for group in report["alertGroups"]), 2)
+                                     for group in report["alertGroups"]), 3)
 
     def test_bare_plugin_ref_is_not_a_wildcard_for_any_variant(self):
         value = inputs()
@@ -404,7 +406,7 @@ class DastReportTest(unittest.TestCase):
         report = self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
         self.assertEqual(len(report["alertGroups"]), 4)
         self.assertEqual(sum(group["dispositionId"] == "FALSE_POSITIVE"
-                             for group in report["alertGroups"]), 1)
+                             for group in report["alertGroups"]), 0)
 
     def test_duplicate_missing_or_absent_variant_reviews_are_rejected(self):
         first = review(pluginId=10055, alertRef="10055-4")
@@ -420,22 +422,25 @@ class DastReportTest(unittest.TestCase):
     def test_identical_variants_aggregate_but_two_exact_synthetic_reviews_remain_separate(self):
         value = inputs()
         value["raw_alerts"] = [
-            alert(pluginId="10055", alertRef="10055-4"),
-            alert(pluginId="10055", alertRef="10055-4", url=ORIGIN + "/app/"),
-            alert(pluginId="10055", alertRef="10055-6"),
+            alert(pluginId="10055", alertRef="10055-4", url=ORIGIN + "/app/", param="Content-Security-Policy"),
+            alert(pluginId="10055", alertRef="10055-4", url=ORIGIN + "/app/?query=" + PRIVATE_MARKER,
+                  param="Content-Security-Policy"),
+            alert(pluginId="10055", alertRef="10055-6", url=ORIGIN + "/app/", param="Content-Security-Policy"),
         ]
         value["dispositions"] = [
-            review(pluginId=10055, alertRef="10055-4"),
-            review(pluginId=10055, alertRef="10055-6", reviewId="CSP_STYLES_ONLY"),
+            review(pluginId=10055, alertRef="10055-4", routeLabel="APP", param="Content-Security-Policy",
+                   dispositionId="PRIVATE_REMEDIATION_REQUIRED",
+                   reviewId="PRIVATE_FIX_REQUIRED"),
+            review(pluginId=10055, alertRef="10055-6", routeLabel="APP", param="Content-Security-Policy",
+                   dispositionId="DOCUMENTED_POLICY", reviewId="CSP_STYLES_ONLY"),
         ]
         before = copy.deepcopy(value)
         report = public_report(**value)
-        self.assertEqual(report["status"], "COMPLETE")
+        self.assertEqual(report["status"], "INCOMPLETE")
         self.assertEqual(len(report["alertGroups"]), 2)
         self.assertEqual({group["reviewId"]: group["count"] for group in report["alertGroups"]},
-                         {"CSP_FRAME_ANCESTORS_ENFORCED": 2, "CSP_STYLES_ONLY": 1})
-        self.assertTrue(all(group["ruleId"] == 10055 and group["dispositionId"] == "FALSE_POSITIVE"
-                            for group in report["alertGroups"]))
+                         {"PRIVATE_FIX_REQUIRED": 2, "CSP_STYLES_ONLY": 1})
+        self.assertTrue(all(group["ruleId"] == 10055 for group in report["alertGroups"]))
         self.assertEqual(value, before)
         encoded = json.dumps(report, allow_nan=False)
         for forbidden in (PRIVATE_MARKER, ORIGIN, "alertRef", "10055-4", "10055-6", "param",
@@ -461,8 +466,8 @@ class DastReportTest(unittest.TestCase):
 
     def test_variant_matching_does_not_expand_public_schema_or_finite_review_ids(self):
         value = inputs()
-        value["raw_alerts"] = [alert(alertRef="10038-4")]
-        value["dispositions"] = [review(alertRef="10038-4")]
+        value["raw_alerts"] = [alert()]
+        value["dispositions"] = [review()]
         report = public_report(**value)
         self.assertEqual(report["status"], "COMPLETE")
         self.assertEqual(set(report), {"schemaVersion", "status", "reasons", "identity",
@@ -473,7 +478,38 @@ class DastReportTest(unittest.TestCase):
         self.assertEqual(REVIEW_IDS, frozenset({
             "CSRF_READABLE_COOKIE", "CSRF_HEADER_VERIFIED", "CSP_FRAME_ANCESTORS_ENFORCED",
             "CSP_STYLES_ONLY", "IMMUTABLE_STATIC_CACHE", "PRIVATE_FIX_REQUIRED",
+            "EXPIRED_COOKIE_DELETION", "PUBLIC_SHELL_REVALIDATION", "PUBLIC_CONSTANT_HEALTH",
+            "PRIVATE_RESPONSE_NO_STORE", "AUTHORIZED_OWN_SESSION_METADATA",
+            "REVIEWED_PUBLIC_SOURCE_COMMENT", "SCANNER_APPLICATION_DISCOVERY",
+            "SCANNER_AUTHENTICATION_DISCOVERY", "SCANNER_SESSION_DISCOVERY",
+            "WEBSOCKET_UPGRADE_NO_DOCUMENT",
         }))
+
+    def test_documented_style_policy_cannot_qualify_other_variants_or_false_positive_claims(self):
+        for ref, kind in (("10055-4", "DOCUMENTED_POLICY"), ("10055-13", "DOCUMENTED_POLICY"),
+                          ("10055-6", "FALSE_POSITIVE")):
+            value = inputs()
+            value["raw_alerts"] = [alert(pluginId="10055", alertRef=ref, url=ORIGIN + "/app/",
+                                         param="Content-Security-Policy")]
+            value["dispositions"] = [review(pluginId=10055, alertRef=ref, routeLabel="APP",
+                                              param="Content-Security-Policy", dispositionId=kind,
+                                              reviewId="CSP_STYLES_ONLY")]
+            self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
+
+    def test_information_class_does_not_ignore_unknown_rules_or_lower_scanner_risk(self):
+        value = inputs()
+        value["raw_alerts"] = [alert(pluginId="10015", risk=0, confidence=1, url=ORIGIN + "/healthz",
+                                     param="Cache-Control")]
+        value["dispositions"] = [review(pluginId=10015, risk=0, confidence=1, routeLabel="HEALTH",
+                                          param="Cache-Control", dispositionId="INFORMATIONAL",
+                                          reviewId="PUBLIC_CONSTANT_HEALTH")]
+        self.assertEqual(public_report(**value)["status"], "COMPLETE")
+        original = copy.deepcopy(value)
+        for changes in ({"pluginId": 98765, "alertRef": "98765"}, {"risk": 1}, {"confidence": 2}):
+            value = copy.deepcopy(original)
+            for record in (value["raw_alerts"][0], value["dispositions"][0]):
+                record.update(changes)
+            self.assert_incomplete(value, "PRIVATE_TRIAGE_REQUIRED")
 
 
 if __name__ == "__main__":

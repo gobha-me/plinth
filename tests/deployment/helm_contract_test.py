@@ -454,8 +454,11 @@ def verify_traefik_contract(items):
     routes = all_kind(items, "IngressRoute")
     require(len(routes) == 4,
             "expected separate WebSocket, package, auth, and default routes")
-    require(len(all_kind(items, "Middleware")) == 5,
-            "expected body-limit, in-flight, and auth-rate middlewares")
+    require(len(all_kind(items, "Middleware")) == 7,
+            "expected response-policy, body-limit, in-flight, and auth-rate middlewares")
+    response_policy = [
+        expected_name + "-content-type", expected_name + "-response-headers",
+    ]
     transports = {
         item["metadata"]["name"]: item for item in all_kind(items, "ServersTransport")
     }
@@ -494,6 +497,11 @@ def verify_traefik_contract(items):
         require(route["spec"].get("tls", {}).get("secretName") == "plinth-tls",
                 "routes must require the configured TLS secret")
         for rule in route["spec"].get("routes", []):
+            require(
+                [item.get("name") for item in rule.get("middlewares", [])][:2]
+                == response_policy,
+                "every TLS rule must apply content-type and response headers before edge limits",
+            )
             for service in rule.get("services", []):
                 require(service.get("passHostHeader") is True,
                         "Traefik must preserve the browser-visible Host authority")
@@ -508,11 +516,12 @@ def verify_traefik_contract(items):
     ws_rule = route_by_name[expected_name + "-ws"]["spec"]["routes"][0]
     require("/ws/events" in ws_rule.get("match", ""),
             "WebSocket route must be exact and highest priority")
-    require(not ws_rule.get("middlewares"),
-            "WebSocket upgrades must not pass through buffering middleware")
+    require([item.get("name") for item in ws_rule.get("middlewares", [])]
+            == response_policy,
+            "WebSocket upgrades must apply response policy without buffering or concurrency limits")
     default_rule = route_by_name[expected_name + "-http"]["spec"]["routes"][0]
     require(
-        [item.get("name") for item in default_rule.get("middlewares", [])] == [
+        [item.get("name") for item in default_rule.get("middlewares", [])] == response_policy + [
             expected_name + "-inflight",
             expected_name + "-default-body",
         ],
@@ -521,10 +530,10 @@ def verify_traefik_contract(items):
     package_rule = route_by_name[expected_name + "-packages"]["spec"]["routes"][0]
     require("/api/packages" in package_rule.get("match", ""),
             "package route must carry the larger upload budget")
-    require(len(package_rule.get("middlewares", [])) == 2,
+    require(len(package_rule.get("middlewares", [])) == 4,
             "package route must enforce body and in-flight limits")
     require(
-        [item.get("name") for item in package_rule["middlewares"]] == [
+        [item.get("name") for item in package_rule["middlewares"]] == response_policy + [
             expected_name + "-package-inflight",
             expected_name + "-package-body",
         ],
@@ -543,7 +552,7 @@ def verify_traefik_contract(items):
         require(rule.get("priority") == 250,
                 "auth rules must outrank package and default routes")
         require(
-            [item.get("name") for item in rule.get("middlewares", [])] == [
+            [item.get("name") for item in rule.get("middlewares", [])] == response_policy + [
                 expected_name + "-auth-rate",
                 expected_name + "-inflight",
                 expected_name + "-default-body",
@@ -554,6 +563,19 @@ def verify_traefik_contract(items):
     middleware_by_name = {
         item["metadata"]["name"]: item for item in all_kind(items, "Middleware")
     }
+    require(middleware_by_name[expected_name + "-content-type"]["spec"] == {
+        "contentType": {},
+    }, "content-type detection must preserve explicit backend media types")
+    require(middleware_by_name[expected_name + "-response-headers"]["spec"] == {
+        "headers": {
+            "stsSeconds": 31536000,
+            "stsIncludeSubdomains": False,
+            "stsPreload": False,
+            "forceSTSHeader": False,
+            "contentTypeNosniff": True,
+            "customResponseHeaders": {"Server": ""},
+        },
+    }, "TLS response policy must remain host-scoped without a global content-type override")
     default_buffer = middleware_by_name[expected_name + "-default-body"]["spec"]["buffering"]
     package_buffer = middleware_by_name[expected_name + "-package-body"]["spec"]["buffering"]
     inflight = middleware_by_name[expected_name + "-inflight"]["spec"]["inFlightReq"]

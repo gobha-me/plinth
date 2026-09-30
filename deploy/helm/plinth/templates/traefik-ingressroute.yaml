@@ -14,6 +14,9 @@ spec:
     - kind: Rule
       match: {{ printf "Host(`%s`) && Path(`/ws/events`)" .Values.public.host | quote }}
       priority: 300
+      middlewares:
+        - name: {{ include "plinth.fullname" . }}-content-type
+        - name: {{ include "plinth.fullname" . }}-response-headers
       services:
         - {{- include "plinth.traefikService" . | nindent 10 }}
   tls:
@@ -35,6 +38,8 @@ spec:
       match: {{ printf "Host(`%s`) && Path(`/api/packages`) && Method(`POST`)" .Values.public.host | quote }}
       priority: 200
       middlewares:
+        - name: {{ include "plinth.fullname" . }}-content-type
+        - name: {{ include "plinth.fullname" . }}-response-headers
         - name: {{ include "plinth.fullname" . }}-package-inflight
         - name: {{ include "plinth.fullname" . }}-package-body
       services:
@@ -58,6 +63,8 @@ spec:
       match: {{ printf "Host(`%s`) && Path(`/api/auth/login`) && Method(`POST`)" .Values.public.host | quote }}
       priority: 250
       middlewares:
+        - name: {{ include "plinth.fullname" . }}-content-type
+        - name: {{ include "plinth.fullname" . }}-response-headers
         - name: {{ include "plinth.fullname" . }}-auth-rate
         - name: {{ include "plinth.fullname" . }}-inflight
         - name: {{ include "plinth.fullname" . }}-default-body
@@ -67,6 +74,8 @@ spec:
       match: {{ printf "Host(`%s`) && Path(`/api/auth/register`) && Method(`POST`)" .Values.public.host | quote }}
       priority: 250
       middlewares:
+        - name: {{ include "plinth.fullname" . }}-content-type
+        - name: {{ include "plinth.fullname" . }}-response-headers
         - name: {{ include "plinth.fullname" . }}-auth-rate
         - name: {{ include "plinth.fullname" . }}-inflight
         - name: {{ include "plinth.fullname" . }}-default-body
@@ -91,6 +100,8 @@ spec:
       match: {{ printf "Host(`%s`)" .Values.public.host | quote }}
       priority: 100
       middlewares:
+        - name: {{ include "plinth.fullname" . }}-content-type
+        - name: {{ include "plinth.fullname" . }}-response-headers
         - name: {{ include "plinth.fullname" . }}-inflight
         - name: {{ include "plinth.fullname" . }}-default-body
       services:

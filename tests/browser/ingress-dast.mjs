@@ -281,7 +281,32 @@ async function run() {
         receipt.proof.sdkCapability.resolvedObject);
     console.log('CASE BROWSER_AUTH native-controls completed');
 
+    receipt.stage = 'STYLE_POLICY';
+    await page.locator('.zone-avatar > button').click();
+    for (const [selector, preference, selection, expected] of [
+        ['#shell-theme-select', 'shell.theme', 'light', 'light'],
+        ['#shell-scale-select', 'shell.scale_pct', '125', 125],
+    ]) {
+        const saved = responseWait(page, response =>
+            new URL(response.url()).pathname === '/api/cap/shell.preferences.set' &&
+            response.request().method() === 'POST' &&
+            response.request().postDataJSON()?.args?.key === preference);
+        await page.locator(selector).selectOption(selection);
+        const response = await bounded(saved, runDeadline);
+        check(response.status() === 200 && (await response.json()).ok === true);
+        await bounded(page.waitForFunction(({ preference, expected }) =>
+            JSON.parse(localStorage.getItem('shellPrefs') || '{}')[preference] === expected,
+        { preference, expected }), runDeadline);
+    }
+    await bounded(page.waitForFunction(() =>
+        document.documentElement.dataset.theme === 'light' &&
+        document.documentElement.style.fontSize === '16.875px'), runDeadline);
+    receipt.proof.styles = { themeApplied: true, scaleApplied: true };
+    check(receipt.counts.cspViolations === 0);
+
     receipt.stage = 'LOGOUT';
+    // Restore keyboard navigation to the menu's first item after selectOption.
+    await page.locator('.zone-avatar > button').click();
     await page.locator('.zone-avatar > button').click();
     await page.keyboard.press('Tab');
     check(await page.evaluate(() => document.activeElement?.id === 'shell-theme-select'));
