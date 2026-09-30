@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
 import re
+import runpy
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -2142,7 +2145,7 @@ class RunCleanupTest(unittest.TestCase):
         def check_output(argv, **kwargs):
             commands.append(argv)
             if argv in (SOURCE_STATUS_COMMAND, SOURCE_CHART_COMMAND):
-                self.assertEqual(kwargs, {"cwd": driver.ROOT, "text": True})
+                self.assertEqual(kwargs, {"cwd": driver.ROOT, "text": True, "stderr": driver.subprocess.PIPE})
                 response = status if argv == SOURCE_STATUS_COMMAND else chart_additions
                 if isinstance(response, Exception):
                     raise response
@@ -2234,7 +2237,7 @@ class RunCleanupTest(unittest.TestCase):
 
         def check_output(argv, **kwargs):
             if argv[0] == "git":
-                self.assertEqual(kwargs, {"cwd": driver.ROOT, "text": True})
+                self.assertEqual(kwargs, {"cwd": driver.ROOT, "text": True, "stderr": driver.subprocess.PIPE})
                 key = tuple(argv)
                 counts[key] = counts.get(key, 0) + 1
                 late = counts[key] == 2
@@ -2338,6 +2341,278 @@ class RunCleanupTest(unittest.TestCase):
         self.assertEqual(private["error"], "exact observation review did not complete")
 
 
+class DiagnosticsPrivacyTest(unittest.TestCase):
+    private_marker = "fake-private-marker https://fake-private.test/credential /fake/private/path"
+
+    def receipt(self, stdout, stderr):
+        self.assertNotIn(self.private_marker, stdout + stderr)
+        lines = [line.removeprefix("ingress DAST diagnostic: ") for line in stderr.splitlines()
+                 if line.startswith("ingress DAST diagnostic: ")]
+        self.assertEqual(len(lines), 1)
+        receipt = json.loads(lines[0])
+        self.assertEqual(set(receipt), {"stage", "errorClass", "reasons"})
+        self.assertIn(receipt["stage"], driver.DIAGNOSTIC_STAGES)
+        self.assertIn(receipt["errorClass"], driver.DIAGNOSTIC_ERROR_CLASSES)
+        self.assertTrue(set(receipt["reasons"]).issubset(driver.DIAGNOSTIC_REASONS))
+        self.assertNotIn("ingress DAST: complete", stdout + stderr)
+        self.assertNotIn("ingress DAST identity:", stdout + stderr)
+        return receipt
+
+    def invoke(self, failure=None, *, cleanup_failure=False):
+        report = Path("/tmp/plinth-issue40-unit/report.json")
+        private_report = Path("/tmp/plinth-issue40-unit/private.json")
+        argv = ["/fake/private/program", "--image", "fake-exact-image", "--report", str(report),
+                "--private-report", str(private_report)]
+        value = SimpleNamespace(
+            execute_dast=mock.Mock(), inventory_owned_volumes=mock.Mock(),
+            retain_private_failure_evidence=mock.Mock(), cleanup_complete=True,
+            cleanup=mock.Mock(), remove_owned_volumes=mock.Mock(return_value=0),
+            scanner=SimpleNamespace(name="fake-owned-scanner", cleanup=mock.Mock(),
+                                    completed=True, passive_remaining=0),
+            registry="fake-owned-registry", cluster="fake-owned-cluster", namespace_created=False,
+            root=mock.Mock(spec=Path), private_details={}, raw_alerts=[], raw_messages=[message()],
+            route_labels=set(REQUIRED_ROUTES), controls={name: True for name in driver.REQUIRED_CONTROLS},
+            candidate_digest="sha256:" + "c" * 64, origin=ORIGIN,
+            review_context=driver.ReviewContext(driver.ADMIN_NAME, driver.ADMIN_PASSWORD,
+                                                "fake-public-shell", {}, shell_policy()),
+        )
+        value.root.exists.return_value = False
+        if failure == "REVIEW":
+            value.review_context = None
+        if failure == "REPORT_INCOMPLETE":
+            value.controls["HTTP_SURFACE"] = False
+        if failure == "DEPLOYMENT_CLEANUP" or cleanup_failure:
+            value.cleanup.side_effect = OSError(self.private_marker)
+        if failure == "ACTIVE_SCAN":
+            def failed_scan():
+                value.diagnostics_state.enter("ACTIVE_SCAN")
+                raise driver.subprocess.TimeoutExpired([self.private_marker], 1,
+                                                       output=self.private_marker, stderr=self.private_marker)
+            value.execute_dast.side_effect = failed_scan
+        queries = []
+        source_calls = 0
+
+        def source():
+            nonlocal source_calls
+            source_calls += 1
+            if failure == "SOURCE_INITIAL":
+                raise driver.subprocess.CalledProcessError(1, [self.private_marker], stderr=self.private_marker)
+            return ("d" * 40 if failure == "SOURCE_FINAL" and source_calls == 2 else "a" * 40, "b" * 40)
+
+        def check_output(command, **kwargs):
+            queries.append((command, kwargs))
+            self.assertEqual(kwargs, {"text": True, "stderr": driver.subprocess.PIPE})
+            if command[:3] == ["docker", "image", "inspect"]:
+                return json.dumps([{"Config": {"Labels": {
+                    "org.opencontainers.image.revision": "d" * 40 if failure == "IMAGE_IDENTITY" else "a" * 40,
+                    "org.opencontainers.image.version": "0.6.6",
+                }}}])
+            if failure == "FINAL_INVENTORY":
+                raise driver.subprocess.CalledProcessError(1, command, stderr=self.private_marker)
+            self.assertIn(command[:2], (["docker", "ps"], ["docker", "network"]))
+            return ""
+
+        writes = {}
+
+        def write(path, body):
+            if ((failure == "PRIVATE_REPORT" and path == private_report)
+                    or (failure == "PUBLIC_RETENTION" and path == report)):
+                raise OSError(self.private_marker)
+            writes[path] = copy.deepcopy(body)
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with ExitStack() as stack:
+            stack.enter_context(redirect_stdout(stdout))
+            stack.enter_context(redirect_stderr(stderr))
+            stack.enter_context(mock.patch.object(driver.sys, "argv", argv))
+            stack.enter_context(mock.patch.object(driver.signal, "signal"))
+            stack.enter_context(mock.patch.object(driver.os, "umask"))
+            stack.enter_context(mock.patch.object(driver, "platform_is_amd64", return_value=True))
+            stack.enter_context(mock.patch.object(driver.shutil, "which",
+                                                  return_value=None if failure == "PREFLIGHT" else "/fake/tool"))
+            stack.enter_context(mock.patch.object(driver, "source_identity", side_effect=source))
+            stack.enter_context(mock.patch.object(driver.subprocess, "check_output", side_effect=check_output))
+            stack.enter_context(mock.patch.object(Path, "read_text", return_value="0.6.6"))
+            stack.enter_context(mock.patch.object(Path, "exists", return_value=failure == "DESTINATIONS"))
+            stack.enter_context(mock.patch.object(Path, "is_dir", return_value=True))
+            stack.enter_context(mock.patch.object(Path, "resolve", autospec=True, side_effect=lambda path: path))
+            construct = stack.enter_context(mock.patch.object(
+                driver, "DastHarness", return_value=value,
+                side_effect=RuntimeError(self.private_marker) if failure == "HARNESS_INIT" else None))
+            stack.enter_context(mock.patch.object(driver, "private_json", side_effect=write))
+            if failure == "PUBLIC_REPORT":
+                stack.enter_context(mock.patch.object(driver, "public_report", side_effect=ValueError(self.private_marker)))
+            code = driver.main()
+        return code, stdout.getvalue(), stderr.getvalue(), value, construct, writes
+
+    def test_preflight_failures_emit_finite_receipt_before_constructing_or_writing(self):
+        for stage, error_class in (("PREFLIGHT", "CHECK_FAILED"), ("SOURCE_INITIAL", "PROCESS_FAILED"),
+                                   ("IMAGE_IDENTITY", "CHECK_FAILED"), ("DESTINATIONS", "CHECK_FAILED"),
+                                   ("HARNESS_INIT", "INTERNAL_ERROR")):
+            with self.subTest(stage=stage):
+                code, stdout, stderr, value, construct, writes = self.invoke(stage)
+                self.assertEqual(code, 1)
+                self.assertEqual(self.receipt(stdout, stderr), {"stage": stage, "errorClass": error_class, "reasons": []})
+                self.assertEqual(writes, {})
+                value.execute_dast.assert_not_called()
+                if stage != "HARNESS_INIT":
+                    construct.assert_not_called()
+
+    def test_execution_cleanup_source_and_retention_failures_remain_red_and_private(self):
+        for stage, error_class in (("ACTIVE_SCAN", "TIMEOUT"), ("DEPLOYMENT_CLEANUP", "IO_FAILED"),
+                                   ("SOURCE_FINAL", "CHECK_FAILED"), ("REVIEW", "CHECK_FAILED"),
+                                   ("PRIVATE_REPORT", "IO_FAILED"), ("FINAL_INVENTORY", "PROCESS_FAILED"),
+                                   ("PUBLIC_REPORT", "INVALID_DATA"), ("PUBLIC_RETENTION", "IO_FAILED")):
+            with self.subTest(stage=stage):
+                code, stdout, stderr, value, _construct, _writes = self.invoke(stage)
+                self.assertEqual(code, 1)
+                receipt = self.receipt(stdout, stderr)
+                self.assertEqual((receipt["stage"], receipt["errorClass"]), (stage, error_class))
+                for operation in (value.retain_private_failure_evidence, value.inventory_owned_volumes,
+                                  value.scanner.cleanup, value.cleanup, value.remove_owned_volumes):
+                    operation.assert_called_once_with()
+
+    def test_first_execution_failure_survives_later_cleanup_failure(self):
+        code, stdout, stderr, value, _construct, _writes = self.invoke("ACTIVE_SCAN", cleanup_failure=True)
+        self.assertEqual(code, 1)
+        receipt = self.receipt(stdout, stderr)
+        self.assertEqual((receipt["stage"], receipt["errorClass"]), ("ACTIVE_SCAN", "TIMEOUT"))
+        value.cleanup.assert_called_once_with()
+        value.remove_owned_volumes.assert_called_once_with()
+
+    def test_incomplete_report_emits_fixed_reasons_not_groups_or_identity(self):
+        code, stdout, stderr, _value, _construct, _writes = self.invoke("REPORT_INCOMPLETE")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.receipt(stdout, stderr),
+                         {"stage": "PUBLIC_REPORT", "errorClass": "REPORT_INCOMPLETE", "reasons": ["CONTROL_FAILED"]})
+
+    def test_complete_output_and_identity_marker_remain_unchanged(self):
+        code, stdout, stderr, _value, _construct, writes = self.invoke()
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(stdout.splitlines()[0], "ingress DAST: complete")
+        lines = stdout.splitlines()
+        self.assertEqual(len(lines), 2)
+        identity = json.loads(lines[1].removeprefix("ingress DAST identity: "))
+        self.assertEqual(set(identity), {"sourceRevision", "sourceTree", "imageDigest", "scannerDigest", "scannerVersion"})
+        self.assertEqual(writes[Path("/tmp/plinth-issue40-unit/report.json")]["status"], "COMPLETE")
+
+    def test_error_classification_never_reads_exception_text_command_or_type_name(self):
+        class PrivateError(Exception):
+            def __str__(self):
+                raise AssertionError("exception text must never be read")
+        errors = ((AssertionError(self.private_marker), "CHECK_FAILED"),
+                  (driver.subprocess.TimeoutExpired([self.private_marker], 1), "TIMEOUT"),
+                  (driver.subprocess.CalledProcessError(1, [self.private_marker]), "PROCESS_FAILED"),
+                  (OSError(self.private_marker), "IO_FAILED"), (KeyboardInterrupt(self.private_marker), "INTERRUPTED"),
+                  (ValueError(self.private_marker), "INVALID_DATA"), (PrivateError(self.private_marker), "INTERNAL_ERROR"))
+        for error, expected in errors:
+            diagnostic = driver.Diagnostics()
+            diagnostic.enter("PREFLIGHT")
+            diagnostic.failed(error)
+            self.assertEqual(diagnostic.first_failure, {"stage": "PREFLIGHT", "errorClass": expected})
+
+    def test_unknown_stage_class_and_report_reasons_never_cross_public_boundary(self):
+        diagnostic = driver.Diagnostics()
+        diagnostic.stage = self.private_marker
+        diagnostic.failed(error_class=self.private_marker)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            diagnostic.emit([self.private_marker, "PRIVATE_TRIAGE_REQUIRED", "PRIVATE_TRIAGE_REQUIRED", {}, 123])
+        self.assertEqual(self.receipt("", stderr.getvalue()),
+                         {"stage": "UNKNOWN_STAGE", "errorClass": "INTERNAL_ERROR", "reasons": ["PRIVATE_TRIAGE_REQUIRED"]})
+        diagnostic.enter({"private": self.private_marker})
+        self.assertEqual(diagnostic.stage, "UNKNOWN_STAGE")
+        diagnostic.first_failure = {"stage": self.private_marker, "errorClass": self.private_marker,
+                                    "exception": self.private_marker}
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            diagnostic.emit({"private": self.private_marker})
+        self.assertEqual(self.receipt("", stderr.getvalue()),
+                         {"stage": "UNKNOWN_STAGE", "errorClass": "INTERNAL_ERROR", "reasons": []})
+
+    def test_argparse_never_prints_unknown_values_paths_or_program(self):
+        for tail in (["--unknown", self.private_marker], ["--kubernetes", self.private_marker],
+                     ["--image", self.private_marker]):
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr), \
+                    mock.patch.object(driver.sys, "argv", [self.private_marker, *tail]), \
+                    mock.patch.object(driver.signal, "signal"), mock.patch.object(driver, "run") as run:
+                self.assertEqual(driver.main(), 1)
+            receipt = self.receipt(stdout.getvalue(), stderr.getvalue())
+            self.assertEqual((receipt["stage"], receipt["errorClass"]), ("ARGUMENTS", "INVALID_DATA"))
+            run.assert_not_called()
+
+    def test_dependency_and_source_import_failures_emit_only_fixed_preflight_receipt(self):
+        original_import = __import__
+        for module in ("yaml", "dast_report", "dast_review", "k3d_lifecycle_test", "process_cleanup"):
+            for exception, error_class in ((ImportError(self.private_marker), "DEPENDENCY_UNAVAILABLE"),
+                                           (RuntimeError(self.private_marker), "INTERNAL_ERROR"),
+                                           (KeyboardInterrupt(self.private_marker), "INTERRUPTED")):
+                with self.subTest(module=module, error_class=error_class):
+                    def import_module(name, *args, **kwargs):
+                        if name == module:
+                            raise exception
+                        return original_import(name, *args, **kwargs)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr), \
+                            mock.patch("builtins.__import__", side_effect=import_module), \
+                            self.assertRaises(SystemExit) as stopped:
+                        runpy.run_path(driver.__file__, run_name="__main__")
+                    self.assertEqual(stopped.exception.code, 1)
+                    self.assertEqual(self.receipt(stdout.getvalue(), stderr.getvalue()),
+                                     {"stage": "PREFLIGHT", "errorClass": error_class, "reasons": []})
+
+    def test_fixed_help_does_not_claim_a_scan_or_reveal_program_path(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr), \
+                mock.patch.object(driver.sys, "argv", [self.private_marker, "--help"]), \
+                mock.patch.object(driver.signal, "signal"):
+            self.assertEqual(driver.main(), 0)
+        self.assertNotIn(self.private_marker, stdout.getvalue() + stderr.getvalue())
+        self.assertNotIn("ingress DAST identity:", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def browser_failure(self, stage, log, *, oversize=False):
+        value = harness()
+        value.root = Path("/tmp/plinth-issue40-unit")
+        value.env = {}
+        value.diagnostics_state = driver.Diagnostics()
+        value.diagnostics_state.enter("BROWSER_EXECUTION")
+
+        def read(path, **_kwargs):
+            return json.dumps({"stage": stage, "error": self.private_marker}) if path.suffix == ".json" else log
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), mock.patch.object(Path, "open", mock.mock_open()), \
+                mock.patch.object(Path, "is_file", return_value=True), \
+                mock.patch.object(Path, "stat", return_value=SimpleNamespace(st_size=5 * 1024 * 1024 if oversize else 1)), \
+                mock.patch.object(Path, "read_text", autospec=True, side_effect=read), \
+                mock.patch.object(driver, "run_browser", side_effect=driver.subprocess.CalledProcessError(
+                    1, [self.private_marker], stderr=self.private_marker)) as run:
+            try:
+                value.browser()
+            except BaseException as error:
+                value.diagnostics_state.failed(error)
+                value.diagnostics_state.emit()
+            else:
+                self.fail("failed browser execution must remain an error")
+        self.assertNotIn("PLINTH_BROWSER_NO_SANDBOX", run.call_args.kwargs["env"])
+        return self.receipt("", stderr.getvalue())
+
+    def test_browser_launch_classification_requires_known_private_signature_and_stage(self):
+        for signature in ("No usable sandbox!", "Running as root without --no-sandbox is not supported"):
+            receipt = self.browser_failure("BROWSER_START", self.private_marker + signature)
+            self.assertEqual((receipt["stage"], receipt["errorClass"]), ("BROWSER_START", "SANDBOX_UNAVAILABLE"))
+        for stage, log, oversize, expected_stage in (
+                ("BROWSER_START", "sandbox " + self.private_marker, False, "BROWSER_START"),
+                ("LOGIN", "No usable sandbox!" + self.private_marker, False, "BROWSER_LOGIN"),
+                (self.private_marker, "No usable sandbox!", False, "BROWSER_EXECUTION"),
+                ("BROWSER_START", "No usable sandbox!", True, "BROWSER_EXECUTION")):
+            receipt = self.browser_failure(stage, log, oversize=oversize)
+            self.assertEqual((receipt["stage"], receipt["errorClass"]), (expected_stage, "PROCESS_FAILED"))
+
+
 class WorkflowPrivacyTest(unittest.TestCase):
     def workflow(self):
         return driver.yaml.safe_load((driver.ROOT / ".github/workflows/runtime-image.yml").read_text())
@@ -2374,6 +2649,42 @@ class WorkflowPrivacyTest(unittest.TestCase):
         self.assertIn('rm -f -- "$PLINTH_DAST_REPORT_DIR/private.json" "$PLINTH_DAST_REPORT_DIR/report.json"',
                       script)
         self.assertIn('rmdir -- "$PLINTH_DAST_REPORT_DIR"', script)
+        self.assert_sandbox_boundary(workflow)
+
+    def assert_sandbox_boundary(self, workflow):
+        candidate = workflow["jobs"]["candidate"]
+        steps = candidate["steps"]
+        prepare = [step for step in steps if step.get("name") == "Prepare the owned sandboxed ingress browser"]
+        cleanup = [step for step in steps if step.get("name") == "Remove the owned ingress browser sandbox profile"]
+        self.assertEqual(len(prepare), 1)
+        self.assertEqual(len(cleanup), 1)
+        prepare, cleanup = prepare[0], cleanup[0]
+        self.assertEqual(prepare["if"], "${{ matrix.arch == 'amd64' }}")
+        self.assertEqual(prepare["run"], "python3 tests/browser/run_ingress_browser_sandbox.py")
+        self.assertEqual(cleanup["if"], "${{ always() && matrix.arch == 'amd64' }}")
+        self.assertEqual(cleanup["run"], "python3 tests/browser/run_ingress_browser_sandbox.py --cleanup")
+        install = next(step for step in steps if step.get("name") == "Install the production browser")
+        scan = next(step for step in steps if "python3 tests/deployment/ingress_dast_test.py" in step.get("run", ""))
+        upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
+        self.assertLess(steps.index(install), steps.index(prepare))
+        self.assertLess(steps.index(prepare), steps.index(scan))
+        self.assertEqual(steps.index(cleanup), steps.index(scan) + 1)
+        self.assertLess(steps.index(cleanup), steps.index(upload))
+        gates = [step for step in steps if "node --test tests/browser/ingress-browser-sandbox.test.mjs"
+                 in step.get("run", "")]
+        self.assertEqual(len(gates), 1)
+        self.assertNotIn("if", gates[0])  # Pure gate runs in both architecture lanes.
+        self.assertLess(steps.index(gates[0]), steps.index(prepare))
+        for command in ("python3 tests/deployment/ingress_dast_unit_test.py",
+                        "node --test tests/browser/ingress-browser-sandbox.test.mjs",
+                        "python3 tests/browser/run_ingress_browser_sandbox_test.py"):
+            self.assertIn(command + "\n", gates[0]["run"])
+        for env in (workflow.get("env", {}), candidate.get("env", {}), *(step.get("env", {}) for step in steps)):
+            self.assertNotIn("PLINTH_BROWSER_NO_SANDBOX", env)
+        for step in steps:
+            script = step.get("run", "")
+            self.assertNotRegex(script, r"\bsysctl\b|apparmor_restrict_unprivileged_userns|--no-sandbox|"
+                                r"PLINTH_BROWSER_NO_SANDBOX|chromiumSandbox\s*:\s*false")
 
     def test_current_candidate_has_readonly_exact_complete_report_only_publication(self):
         self.assert_private_artifact_boundary(self.workflow())
@@ -2408,6 +2719,47 @@ class WorkflowPrivacyTest(unittest.TestCase):
                     cleanup["if"] = "${{ success() && matrix.arch == 'amd64' }}"
                 else:
                     cleanup["run"] = cleanup["run"].replace('"$PLINTH_DAST_REPORT_DIR/private.json"', "")
+                with self.assertRaises(AssertionError):
+                    self.assert_private_artifact_boundary(workflow)
+
+    def test_sandbox_prerequisite_cleanup_and_publication_regressions_are_rejected(self):
+        original = self.workflow()
+        for failure in ("prepare_arm", "prepare_missing", "cleanup_success_only", "cleanup_arm",
+                        "cleanup_missing", "cleanup_after_upload", "pure_gate_amd_only", "wrapper_gate_missing", "global_optout",
+                        "job_optout", "step_optout", "sysctl_disable", "chromium_optout"):
+            with self.subTest(failure=failure):
+                workflow = copy.deepcopy(original)
+                candidate = workflow["jobs"]["candidate"]
+                steps = candidate["steps"]
+                prepare = next(step for step in steps if step.get("name") == "Prepare the owned sandboxed ingress browser")
+                cleanup = next(step for step in steps if step.get("name") == "Remove the owned ingress browser sandbox profile")
+                if failure == "prepare_arm":
+                    prepare["if"] = "${{ matrix.arch == 'arm64' }}"
+                elif failure == "prepare_missing":
+                    steps.remove(prepare)
+                elif failure == "cleanup_success_only":
+                    cleanup["if"] = "${{ success() && matrix.arch == 'amd64' }}"
+                elif failure == "cleanup_arm":
+                    cleanup["if"] = "${{ always() && matrix.arch == 'arm64' }}"
+                elif failure == "cleanup_missing":
+                    steps.remove(cleanup)
+                elif failure == "cleanup_after_upload":
+                    upload = next(step for step in steps if step.get("uses", "").startswith("actions/upload-artifact@"))
+                    steps.remove(cleanup)
+                    steps.insert(steps.index(upload) + 1, cleanup)
+                elif failure == "pure_gate_amd_only":
+                    gate = next(step for step in steps if "ingress-browser-sandbox.test.mjs" in step.get("run", ""))
+                    gate["if"] = "${{ matrix.arch == 'amd64' }}"
+                elif failure == "wrapper_gate_missing":
+                    gate = next(step for step in steps if "ingress-browser-sandbox.test.mjs" in step.get("run", ""))
+                    gate["run"] = gate["run"].replace("python3 tests/browser/run_ingress_browser_sandbox_test.py\n", "")
+                elif failure in ("global_optout", "job_optout", "step_optout"):
+                    scope = workflow if failure == "global_optout" else candidate if failure == "job_optout" else prepare
+                    scope["env"] = {"PLINTH_BROWSER_NO_SANDBOX": "1"}
+                elif failure == "sysctl_disable":
+                    prepare["run"] += "\nsudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+                else:
+                    prepare["run"] += "\nnode browser.mjs --no-sandbox"
                 with self.assertRaises(AssertionError):
                     self.assert_private_artifact_boundary(workflow)
 

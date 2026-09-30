@@ -159,6 +159,16 @@ python3 tests/deployment/ingress_dast_test.py \
 does not prove the other ran. Sandboxing remains enabled by default. Only for
 an owned local container that cannot run it, explicitly set
 `PLINTH_BROWSER_NO_SANDBOX=1`; this is not a production recommendation.
+The worker launches the exact Chromium executable supplied by pinned
+Playwright, rather than implicitly selecting its separate headless shell.
+Hosted CI first proves that executable can launch with sandboxing enabled.
+On the owned Ubuntu runner only, a known user-namespace restriction may require
+an exact-executable AppArmor `userns` profile, as described by
+[Chromium's sandbox documentation](https://chromium.googlesource.com/chromium/src/+/main/docs/security/apparmor-userns-restrictions.md).
+The helper refuses foreign runners, paths, profiles and identities; it does
+not disable sandboxing, change a global sysctl or reload unrelated profiles.
+Its always-run cleanup must remove its owned profile and receipt before any
+complete scan report can be uploaded. A failed prerequisite or cleanup is red.
 
 Both report destinations must be new files in an existing, non-symlink parent
 outside the checkout, under `/tmp/plinth-issue40*/`. The harness refuses
@@ -187,9 +197,12 @@ architectures. It uses the same pinned scanner and an owned
 sanitized summary may be uploaded. Failed/incomplete summaries and all raw
 reports are never uploaded; an always-run cleanup step removes its exact
 raw/report files, including after failure, and a cleanup failure remains red.
-CI raw evidence is therefore not durably retained. An unexpected CI finding
-requires reproduction on the exact
-candidate locally and private triage before merge; the outside-Git local
+CI raw evidence is therefore not durably retained. Failed runs emit only
+fixed high-level failure-stage/error-class and existing reason IDs,
+never raw errors, paths, request values or finding details. These diagnostics
+do not change review predicates, report schema or the success-only artifact
+boundary. An unexpected CI finding requires reproduction on the exact candidate
+locally and private triage before merge; the outside-Git local
 private evidence is authoritative for that investigation. This lane grants no
 new registry-write, identity-token, or repository-secret permissions.
 

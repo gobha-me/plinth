@@ -33,14 +33,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-import yaml
+try:
+    import yaml
 
-from dast_report import REQUIRED_CONTROLS, classify_route, public_report
-from dast_review import ReviewContext, reviewed_dispositions
-from k3d_lifecycle_test import Harness, K3S_TRAEFIK_CHART_VERSION, ROOT, free_port, require
+    from dast_report import REQUIRED_CONTROLS, classify_route, public_report
+    from dast_review import ReviewContext, reviewed_dispositions
+    from k3d_lifecycle_test import Harness, K3S_TRAEFIK_CHART_VERSION, ROOT, free_port, require
 
-sys.path.insert(0, str(ROOT / "tests/browser"))
-from process_cleanup import run_browser  # noqa: E402
+    sys.path.insert(0, str(ROOT / "tests/browser"))
+    from process_cleanup import run_browser  # noqa: E402
+except BaseException as import_error:
+    # No fixture resources exist yet. Interpreter/standard-library bootstrap
+    # precedes this guard; source/dependency import errors expose no raw text.
+    import_class = ("DEPENDENCY_UNAVAILABLE" if isinstance(import_error, ImportError) else
+                    "INTERRUPTED" if isinstance(import_error, KeyboardInterrupt) else "INTERNAL_ERROR")
+    print("ingress DAST diagnostic: " + json.dumps(
+        {"stage": "PREFLIGHT", "errorClass": import_class, "reasons": []}, sort_keys=True), file=sys.stderr)
+    print("ingress DAST: incomplete; private triage/evidence required", file=sys.stderr)
+    raise SystemExit(1) from None
 
 
 SCANNER_VERSION = "2.17.0"
@@ -64,6 +74,91 @@ RESPONSE_POLICY_HEADERS = {
     "content-type", "strict-transport-security", "x-content-type-options", "server",
     "content-security-policy", "location",
 }
+DIAGNOSTIC_STAGES = frozenset({
+    "ARGUMENTS", "PREFLIGHT", "SOURCE_INITIAL", "IMAGE_IDENTITY", "DESTINATIONS", "HARNESS_INIT",
+    "EXECUTION", "DEPLOYMENT", "INGRESS_SETUP", "NAMESPACE_SETUP", "CHART_INSTALL", "BOOTSTRAP",
+    "BOOTSTRAP_REMOVAL", "ROUTE_ENABLE", "SCANNER_START", "BROWSER_EXECUTION", "BROWSER_RECEIPT",
+    "BROWSER_START", "BROWSER_ROOT", "BROWSER_LOGIN", "BROWSER_COOKIE_POLICY", "BROWSER_NATIVE_HTTP",
+    "BROWSER_STYLE_POLICY", "BROWSER_LOGOUT", "BROWSER_COMPLETE_CHECK", "LOGIN", "HTTP_CHECKS",
+    "SCANNER_AUTH", "ACTIVE_SCAN", "INGRESS_LIMITS", "SCANNER_DRAIN", "SCANNER_RESULTS",
+    "REVIEW_CONTEXT", "COVERAGE", "INGRESS_OBSERVATION", "REMOVAL_CHECK", "EVIDENCE_CAPTURE",
+    "VOLUME_INVENTORY", "SCANNER_CLEANUP", "DEPLOYMENT_CLEANUP", "VOLUME_CLEANUP", "SOURCE_FINAL",
+    "REVIEW", "PRIVATE_REPORT", "FINAL_INVENTORY", "PUBLIC_REPORT", "PUBLIC_RETENTION", "UNKNOWN_STAGE",
+})
+DIAGNOSTIC_ERROR_CLASSES = frozenset({
+    "CHECK_FAILED", "TIMEOUT", "PROCESS_FAILED", "IO_FAILED", "INTERRUPTED", "INVALID_DATA",
+    "INTERNAL_ERROR", "REPORT_INCOMPLETE", "SANDBOX_UNAVAILABLE", "DEPENDENCY_UNAVAILABLE",
+})
+DIAGNOSTIC_REASONS = frozenset({
+    "INVALID_IDENTITY", "INVALID_CONTROLS", "CONTROL_FAILED", "INVALID_SCANNER", "SCAN_INCOMPLETE",
+    "MISSING_ROUTE", "PRIVATE_TRIAGE_REQUIRED", "INVALID_CLEANUP", "CLEANUP_UNVERIFIED",
+})
+BROWSER_DIAGNOSTIC_STAGES = {
+    "BROWSER_START": "BROWSER_START", "ROOT": "BROWSER_ROOT", "LOGIN": "BROWSER_LOGIN",
+    "COOKIE_POLICY": "BROWSER_COOKIE_POLICY", "NATIVE_HTTP": "BROWSER_NATIVE_HTTP",
+    "STYLE_POLICY": "BROWSER_STYLE_POLICY", "LOGOUT": "BROWSER_LOGOUT", "COMPLETE": "BROWSER_COMPLETE_CHECK",
+}
+
+
+class BrowserSandboxUnavailable(RuntimeError):
+    """Classification from an exact private launch signature, never a bypass."""
+
+
+class QuietArgumentParser(argparse.ArgumentParser):
+    def error(self, _message):
+        raise ValueError("invalid DAST arguments")
+
+
+class Diagnostics:
+    """Public diagnostics accept only code-owned finite identifiers, never text."""
+    def __init__(self):
+        self.stage = "ARGUMENTS"
+        self.first_failure = None
+
+    def enter(self, stage):
+        self.stage = stage if type(stage) is str and stage in DIAGNOSTIC_STAGES else "UNKNOWN_STAGE"
+
+    def call(self, stage, operation, *args, **kwargs):
+        self.enter(stage)
+        return operation(*args, **kwargs)
+
+    def failed(self, error=None, *, error_class=None):
+        if self.first_failure is not None:
+            return
+        if error_class is None:
+            if isinstance(error, BrowserSandboxUnavailable):
+                error_class = "SANDBOX_UNAVAILABLE"
+            elif isinstance(error, KeyboardInterrupt):
+                error_class = "INTERRUPTED"
+            elif isinstance(error, subprocess.TimeoutExpired):
+                error_class = "TIMEOUT"
+            elif isinstance(error, subprocess.CalledProcessError):
+                error_class = "PROCESS_FAILED"
+            elif isinstance(error, AssertionError):
+                error_class = "CHECK_FAILED"
+            elif isinstance(error, OSError):
+                error_class = "IO_FAILED"
+            elif isinstance(error, (ValueError, TypeError, KeyError, IndexError)):
+                error_class = "INVALID_DATA"
+            else:
+                error_class = "INTERNAL_ERROR"
+        if type(error_class) is not str or error_class not in DIAGNOSTIC_ERROR_CLASSES:
+            error_class = "INTERNAL_ERROR"
+        stage = self.stage if type(self.stage) is str and self.stage in DIAGNOSTIC_STAGES else "UNKNOWN_STAGE"
+        self.first_failure = {"stage": stage, "errorClass": error_class}
+
+    def emit(self, reasons=None):
+        self.failed(error_class="REPORT_INCOMPLETE")
+        safe_reasons = sorted({reason for reason in reasons
+                               if type(reason) is str and reason in DIAGNOSTIC_REASONS}) if type(reasons) is list else []
+        first = self.first_failure if type(self.first_failure) is dict else {}
+        stage, error_class = first.get("stage"), first.get("errorClass")
+        receipt = {
+            "stage": stage if type(stage) is str and stage in DIAGNOSTIC_STAGES else "UNKNOWN_STAGE",
+            "errorClass": error_class if type(error_class) is str and error_class in DIAGNOSTIC_ERROR_CLASSES else "INTERNAL_ERROR",
+            "reasons": safe_reasons,
+        }
+        print("ingress DAST diagnostic: " + json.dumps(receipt, sort_keys=True), file=sys.stderr)
 
 
 def response_headers(headers):
@@ -706,15 +801,41 @@ class DastHarness(Harness):
                          for name in ("plinth_session", "plinth_csrf"))
 
     def browser(self):
+        diagnostics = getattr(self, "diagnostics_state", None) or Diagnostics()
         env = self.env.copy()
         env.update(PLINTH_DAST_ORIGIN=self.origin,
                    PLINTH_DAST_PROXY=self.scanner.proxy,
                    PLINTH_DAST_USERNAME=ADMIN_NAME, PLINTH_DAST_PASSWORD=ADMIN_PASSWORD,
                    PLINTH_DAST_RESULT_FILE=str(self.root / "browser-private.json"))
-        with (self.root / "browser-private.log").open("w") as log:
-            run_browser(["node", str(ROOT / "tests/browser/ingress-dast.mjs")],
-                        timeout=120, env=env, cwd=ROOT, stdout=log,
-                        stderr=subprocess.STDOUT)
+        diagnostics.enter("BROWSER_EXECUTION")
+        try:
+            with (self.root / "browser-private.log").open("w") as log:
+                run_browser(["node", str(ROOT / "tests/browser/ingress-dast.mjs")],
+                            timeout=120, env=env, cwd=ROOT, stdout=log,
+                            stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError:
+            # The browser receipt/log are private, bounded and never printed.
+            # A failed launch stage alone is not proof of a sandbox failure.
+            try:
+                receipt = self.root / "browser-private.json"
+                if receipt.is_file() and receipt.stat().st_size <= 4 * 1024 * 1024:
+                    private = json.loads(receipt.read_text())
+                    if type(private) is dict and type(private.get("stage")) is str:
+                        known = BROWSER_DIAGNOSTIC_STAGES.get(private["stage"])
+                        if known is not None:
+                            diagnostics.enter(known)
+                log_path = self.root / "browser-private.log"
+                if log_path.is_file() and log_path.stat().st_size <= 4 * 1024 * 1024:
+                    text = log_path.read_text(encoding="utf-8", errors="replace")
+                    if diagnostics.stage == "BROWSER_START" and any(signature in text for signature in (
+                            "No usable sandbox!",
+                            "Running as root without --no-sandbox is not supported",
+                    )):
+                        raise BrowserSandboxUnavailable("private browser sandbox launch failed")
+            except (OSError, ValueError, TypeError):
+                pass  # Incomplete private diagnostics never weaken the original failure.
+            raise
+        diagnostics.enter("BROWSER_RECEIPT")
         result = json.loads((self.root / "browser-private.json").read_text())
         self.private_details["browser"] = result
         self.validate_browser_receipt(result)
@@ -1024,38 +1145,41 @@ class DastHarness(Harness):
                 for label, (kind, rule) in rules.items()}
 
     def execute_dast(self):
-        self.create_infrastructure()
-        self.monitor_ingress()
-        self.create_namespace_dependencies()
-        self.install_chart()
-        self.bootstrap_admin()
-        self.remove_bootstrap_authority()
-        self.enable_public_route()
-        self.scanner.start()
-        self.browser()
+        diagnostics = getattr(self, "diagnostics_state", None) or Diagnostics()
+        diagnostics.call("DEPLOYMENT", self.create_infrastructure)
+        diagnostics.call("INGRESS_SETUP", self.monitor_ingress)
+        diagnostics.call("NAMESPACE_SETUP", self.create_namespace_dependencies)
+        diagnostics.call("CHART_INSTALL", self.install_chart)
+        diagnostics.call("BOOTSTRAP", self.bootstrap_admin)
+        diagnostics.call("BOOTSTRAP_REMOVAL", self.remove_bootstrap_authority)
+        diagnostics.call("ROUTE_ENABLE", self.enable_public_route)
+        diagnostics.call("SCANNER_START", self.scanner.start)
+        diagnostics.call("BROWSER_EXECUTION", self.browser)
         # New valid session after the real browser logout; no stale-session
         # credentials are reused for scanner traffic.
-        self.verify_login()
-        self.verify_http()
+        diagnostics.call("LOGIN", self.verify_login)
+        diagnostics.call("HTTP_CHECKS", self.verify_http)
+        diagnostics.enter("SCANNER_AUTH")
         self.scanner.install_cookie(self.cookie_header())
         self.verify_scanner_session()
-        self.scanner.active_scan()
-        self.verify_scanner_session()
-        self.verify_request_limits()
-        self.verify_concurrency_limits()
-        self.verify_rate_limits()
+        diagnostics.call("ACTIVE_SCAN", self.scanner.active_scan)
+        diagnostics.call("SCANNER_AUTH", self.verify_scanner_session)
+        diagnostics.call("INGRESS_LIMITS", self.verify_request_limits)
+        diagnostics.call("INGRESS_LIMITS", self.verify_concurrency_limits)
+        diagnostics.call("INGRESS_LIMITS", self.verify_rate_limits)
+        diagnostics.enter("SCANNER_DRAIN")
         require(self.request("/healthz")[0] == 200, "scan target is no longer healthy")
         self.scanner.passive_remaining = self.scanner.remaining()
         wait_until(lambda: self.scanner.remaining() == 0, timeout=90,
                    label="final passive scanner drain")
         self.scanner.passive_remaining = self.scanner.remaining()
-        self.raw_alerts, self.raw_messages = self.scanner.results()
-        self.capture_review_context()
+        self.raw_alerts, self.raw_messages = diagnostics.call("SCANNER_RESULTS", self.scanner.results)
+        diagnostics.call("REVIEW_CONTEXT", self.capture_review_context)
         # Route coverage comes from observed engine messages, not a planned
         # control list or a direct-backend mock. Query values stay private.
-        self.route_labels = observed_routes(self.raw_messages, self.origin)
-        self.observe_ingress()
-        self.verify_clean_removal()
+        self.route_labels = diagnostics.call("COVERAGE", observed_routes, self.raw_messages, self.origin)
+        diagnostics.call("INGRESS_OBSERVATION", self.observe_ingress)
+        diagnostics.call("REMOVAL_CHECK", self.verify_clean_removal)
 
     def capture_review_context(self):
         """Bind bounded reviews to independent source bytes and fixture DB owners."""
@@ -1204,29 +1328,36 @@ def source_identity():
     status = subprocess.check_output([
         "git", "status", "--porcelain=v1", "--untracked-files=all",
         "--ignore-submodules=none",
-    ], cwd=ROOT, text=True)
+    ], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     require(not status.strip(), "source-candidate checkout must be clean")
     chart_additions = subprocess.check_output([
         "git", "ls-files", "--others", "--", "deploy/helm/plinth",
-    ], cwd=ROOT, text=True)
+    ], cwd=ROOT, text=True, stderr=subprocess.PIPE)
     require(not chart_additions.strip(), "source-candidate chart contains untracked inputs")
-    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True).strip()
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True,
+                                       stderr=subprocess.PIPE).strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT, text=True,
+                                   stderr=subprocess.PIPE).strip()
     return revision, tree
 
 
-def run(args):
+def run(args, diagnostics=None):
+    diagnostics = diagnostics or Diagnostics()
+    diagnostics.enter("PREFLIGHT")
     os.umask(0o077)
     require(platform_is_amd64(), "DAST uses reviewed linux/amd64 scanner identity")
     for executable in ("docker", "curl", "openssl", "node", args.helm, args.kubectl, args.k3d):
         require(shutil.which(executable), "required DAST executable is unavailable")
-    revision, tree = source_identity()
+    revision, tree = diagnostics.call("SOURCE_INITIAL", source_identity)
+    diagnostics.enter("IMAGE_IDENTITY")
     version = (ROOT / "VERSION").read_text().strip()
-    inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", args.image], text=True))[0]
+    inspected = json.loads(subprocess.check_output(["docker", "image", "inspect", args.image], text=True,
+                                                  stderr=subprocess.PIPE))[0]
     labels = inspected["Config"]["Labels"]
     require(labels.get("org.opencontainers.image.revision") == revision
             and labels.get("org.opencontainers.image.version") == version,
             "runtime image must match the exact current source revision/version")
+    diagnostics.enter("DESTINATIONS")
     require(not args.report.exists(), "refusing to overwrite a report")
     require(not args.private_report.exists(), "refusing to overwrite private evidence")
     for destination in (args.report, args.private_report):
@@ -1234,44 +1365,53 @@ def run(args):
         require(absolute.parent.is_dir() and absolute.parent.resolve() == absolute.parent
                 and re.match(r"^/tmp/plinth-issue40[^/]*/", str(absolute)),
                 "report destination must be an owned non-repository path")
-    harness = DastHarness(args)
+    harness = diagnostics.call("HARNESS_INIT", DastHarness, args)
+    harness.diagnostics_state = diagnostics
     error = None
     dispositions = []
     cleaned = False
     try:
-        harness.execute_dast()
-    except BaseException:
+        diagnostics.call("EXECUTION", harness.execute_dast)
+    except BaseException as exception:
+        diagnostics.failed(exception)
         error = traceback.format_exc()
     finally:
         try:
-            harness.retain_private_failure_evidence()
-        except BaseException:
+            diagnostics.call("EVIDENCE_CAPTURE", harness.retain_private_failure_evidence)
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "private evidence capture failed"
         try:
-            harness.inventory_owned_volumes()
-        except BaseException:
+            diagnostics.call("VOLUME_INVENTORY", harness.inventory_owned_volumes)
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "owned volume inventory failed"
         try:
-            harness.scanner.cleanup()
-        except BaseException:
+            diagnostics.call("SCANNER_CLEANUP", harness.scanner.cleanup)
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "owned scanner cleanup failed"
         try:
-            harness.cleanup()
-        except BaseException:
+            diagnostics.call("DEPLOYMENT_CLEANUP", harness.cleanup)
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "owned deployment cleanup failed"
         try:
-            remaining_volumes = harness.remove_owned_volumes()
+            remaining_volumes = diagnostics.call("VOLUME_CLEANUP", harness.remove_owned_volumes)
             cleaned = harness.cleanup_complete and remaining_volumes == 0
-        except BaseException:
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "owned volume cleanup failed"
             remaining_volumes = None
         try:
-            require(source_identity() == (revision, tree),
+            require(diagnostics.call("SOURCE_FINAL", source_identity) == (revision, tree),
                     "source-candidate identity changed during the scan")
-        except BaseException:
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "source-candidate checkout changed during the scan"
         if error is None:
             try:
+                diagnostics.enter("REVIEW")
                 require(isinstance(harness.review_context, ReviewContext),
                         "independent fixture review context is missing")
                 dispositions = reviewed_dispositions(harness.raw_alerts, harness.raw_messages,
@@ -1280,7 +1420,8 @@ def run(args):
                     submitted = json.loads(args.dispositions.read_text())
                     require(submitted == dispositions,
                             "manual review differs from the independently proven present observations")
-            except BaseException:
+            except BaseException as exception:
+                diagnostics.failed(exception)
                 error = "exact observation review did not complete"
                 dispositions = []
         # Cleanup diagnostics must survive, including a failure of an earlier
@@ -1290,11 +1431,15 @@ def run(args):
                "reviews": dispositions,
                "sourceRevision": revision, "sourceTree": tree}
         try:
-            private_json(args.private_report, raw)
-        except BaseException:
+            diagnostics.call("PRIVATE_REPORT", private_json, args.private_report, raw)
+        except BaseException as exception:
+            diagnostics.failed(exception)
             error = error or "private evidence retention failed"
-    containers = subprocess.check_output(["docker", "ps", "-a", "--format", "{{.Names}}"], text=True).splitlines()
-    networks = subprocess.check_output(["docker", "network", "ls", "--format", "{{.Name}}"], text=True).splitlines()
+    diagnostics.enter("FINAL_INVENTORY")
+    containers = subprocess.check_output(["docker", "ps", "-a", "--format", "{{.Names}}"], text=True,
+                                         stderr=subprocess.PIPE).splitlines()
+    networks = subprocess.check_output(["docker", "network", "ls", "--format", "{{.Name}}"], text=True,
+                                       stderr=subprocess.PIPE).splitlines()
     remaining = sum(name == harness.scanner.name or name == "k3d-" + harness.registry
                     or name.startswith("k3d-" + harness.cluster + "-") for name in containers)
     remaining_networks = int("k3d-" + harness.cluster in networks)
@@ -1314,14 +1459,17 @@ def run(args):
     identity = {"sourceRevision": revision, "sourceTree": tree,
                 "imageDigest": harness.candidate_digest or "sha256:" + "0" * 64,
                 "scannerDigest": SCANNER_DIGEST, "scannerVersion": SCANNER_VERSION}
-    report = public_report(identity, [{"id": name, "passed": passed}
-                                     for name, passed in harness.controls.items()], scanner,
-                           harness.raw_alerts, dispositions, cleanup)
-    private_json(args.report, report)
+    report = diagnostics.call("PUBLIC_REPORT", public_report, identity,
+                              [{"id": name, "passed": passed} for name, passed in harness.controls.items()],
+                              scanner, harness.raw_alerts, dispositions, cleanup)
+    diagnostics.call("PUBLIC_RETENTION", private_json, args.report, report)
     print("ingress DAST: " + ("complete" if report.get("status") == "COMPLETE"
                               else "incomplete; private triage/evidence required"))
     if report.get("status") == "COMPLETE":
         print("ingress DAST identity: " + json.dumps(identity, sort_keys=True))
+    else:
+        diagnostics.enter("PUBLIC_REPORT")
+        diagnostics.emit(report.get("reasons"))
     return 0 if report.get("status") == "COMPLETE" else 1
 
 
@@ -1331,7 +1479,8 @@ def platform_is_amd64():
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    diagnostics = Diagnostics()
+    parser = QuietArgumentParser(prog="ingress_dast_test.py", description=__doc__)
     parser.add_argument("--image", required=True, help="exact locally built candidate image")
     parser.add_argument("--kubernetes", choices=("min", "max"), default="max")
     parser.add_argument("--report", required=True, type=Path, help="new sanitized JSON destination")
@@ -1342,18 +1491,26 @@ def main():
     parser.add_argument("--helm", default="helm")
     parser.add_argument("--kubectl", default="kubectl")
     parser.add_argument("--k3d", default="k3d")
-    args = parser.parse_args()
-
     def interrupted(signum, _frame):
-        raise KeyboardInterrupt(f"owned scan interrupted by signal {signum}")
+        raise KeyboardInterrupt("owned scan interrupted")
 
-    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-        signal.signal(signum, interrupted)
     try:
-        return run(args)
-    except BaseException:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            signal.signal(signum, interrupted)
+        args = parser.parse_args()
+        return run(args, diagnostics)
+    except SystemExit as exception:
+        if exception.code == 0:
+            return 0  # The fixed --help text is not a failed scan.
+        diagnostics.failed(exception)
+        diagnostics.emit()
+        print("ingress DAST: incomplete; private triage/evidence required", file=sys.stderr)
+        return 1
+    except BaseException as exception:
         # Never expose raw scanner errors, request bodies, credentials or
         # suspected vulnerability details through public CI stdout/stderr.
+        diagnostics.failed(exception)
+        diagnostics.emit()
         print("ingress DAST: incomplete; private triage/evidence required", file=sys.stderr)
         return 1
 

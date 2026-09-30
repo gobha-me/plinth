@@ -82,6 +82,8 @@ jobs:
           python3 tests/deployment/dast_report_test.py
           python3 tests/deployment/dast_review_test.py
           python3 tests/deployment/ingress_dast_unit_test.py
+          node --test tests/browser/ingress-browser-sandbox.test.mjs
+          python3 tests/browser/run_ingress_browser_sandbox_test.py
 
       - name: Verify deployment PostgreSQL readiness
         run: python3 tests/deployment/postgres_readiness_test.py
@@ -160,6 +162,10 @@ jobs:
         run: |
           npm ci --prefix tests/browser
           (cd tests/browser && npx playwright install --with-deps chromium)
+
+      - name: Prepare the owned sandboxed ingress browser
+        if: ${{ matrix.arch == 'amd64' }}
+        run: python3 tests/browser/run_ingress_browser_sandbox.py
 
       - name: Exercise the browser and retained upgrade journeys against the image
         if: ${{ matrix.browser }}
@@ -269,6 +275,10 @@ jobs:
           python3 tests/deployment/ingress_dast_test.py \
             --image "plinth-runtime:amd64-$GITHUB_RUN_ID" --kubernetes max \
             --report "$dast_dir/report.json" --private-report "$dast_dir/private.json"
+
+      - name: Remove the owned ingress browser sandbox profile
+        if: ${{ always() && matrix.arch == 'amd64' }}
+        run: python3 tests/browser/run_ingress_browser_sandbox.py --cleanup
 
       - name: Retain only a complete sanitized ingress report
         if: ${{ success() && matrix.arch == 'amd64' }}

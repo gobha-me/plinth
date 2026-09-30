@@ -112,6 +112,9 @@ async function run() {
     receipt.stage = 'BROWSER_START';
     browser = await bounded(chromium.launch({
         timeout: 15000,
+        // The CI sandbox prerequisite probes/profiles this exact pinned binary,
+        // not Playwright's separate default headless-shell executable.
+        executablePath: chromium.executablePath(),
         // Preserve sandboxing unless the owned local root fixture opts out.
         chromiumSandbox: process.env.PLINTH_BROWSER_NO_SANDBOX !== '1',
         args: ['--disable-background-networking', '--disable-component-update',
