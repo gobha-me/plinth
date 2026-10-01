@@ -705,6 +705,7 @@ add_executable(plinth_tests
   tests/kernel/js/audit_authority_regression_test.cpp
   tests/kernel/js/audit_corpus_test.cpp
   tests/kernel/js/pubsub_corpus_test.cpp
+  tests/kernel/js/cap_corpus_test.cpp
   tests/kernel/js/log_corpus_test.cpp
   tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -925,7 +926,7 @@ add_test(NAME plinth_tests_ws_close_ownership
 set_tests_properties(plinth_tests_ws_close_ownership PROPERTIES TIMEOUT 40)
 
 set(PLINTH_GROUPED_JS_SELECTOR
-    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub]")
+    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap]")
 
 # spdlog's default free APIs cannot overlap a default-logger replacement.
 # These five synchronous capture fixtures must run before any background
@@ -1023,6 +1024,17 @@ add_test(NAME plinth_tests_pubsub_corpus
     --timeout 60
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pubsub_corpus PROPERTIES TIMEOUT 75)
+
+# Actual capability admission and simulated settlement are isolated from any
+# process-lifetime dispatcher/DB fixture. Missing cases and skipped XML fail.
+add_test(NAME plinth_tests_cap_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS capability calls have a bounded deterministic admission and batch corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_cap_corpus PROPERTIES TIMEOUT 75)
 
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
