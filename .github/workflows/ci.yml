@@ -396,6 +396,17 @@ jobs:
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_cap_corpus$'
 
+      - name: Focused QuickJS ordinary database admission and ownership sanitizer corpus
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_db_admission_corpus$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_db_admission_corpus$'
+
       - name: WebSocket close ownership and registry sanitizer regressions
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
