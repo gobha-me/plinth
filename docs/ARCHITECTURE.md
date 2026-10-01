@@ -72,18 +72,25 @@ the specific sub-document and section, not this index.
 | `architecture/shutdown.md` | Production/test lifecycle ownership, dependency order, bounds, partial-startup unwind, and database/event-loop shutdown. |
 | `architecture/extension-database-isolation.md` | Restricted runtime identities, provisioning, grants, migration guards, notification authority, and extension database ownership. |
 | `architecture/websocket-authority.md` | WebSocket credential/RBAC lease, renewal, fail-closed delivery, and shutdown ownership. |
+| [Living contract index](contracts/README.md) | Bounded adoption, current-authority entry points, protocol ratification and maintenance; not a completed subsystem fill. |
 
 Parenthetical legacy section numbers in the right column are orientation only;
 the pre-decomposition monolith is not retained in this repository. Cite current
 sections by document name and local number, for example
 `architecture/01-identity.md §2.1`.
 
-The current architecture files and dedicated authority documents in the table
-own present intent and shipped/planned classification. Design documents and
-ICDs preserve the mechanism proposed for their delivery arc; they are
-historical where a current architecture note, source owner, or regression test
-records a superseding implementation. A still-active design detail must not
-contradict its upward architecture contract.
+The architecture owns present intent, trust boundaries, commitment bands and
+shipped/planned classification. Ratified living contracts own current protocol
+behavior within their reviewed scope; the dedicated authority documents above
+retain their current paths and ownership. The [contract index](contracts/README.md)
+distinguishes those owners from drafts and candidates.
+
+Active approved ICDs describe delivery deltas consistent with those authorities.
+Shipped ICDs/designs preserve their delivery history and deviations; a reviewed
+supersession reference retires only the affected surface. Source owners and
+regression tests provide reconciliation evidence, not automatic policy
+supersession. A still-active design detail must not contradict its upward
+architecture contract.
 
 ---
 
@@ -384,8 +391,12 @@ renumber §3.1 in the capabilities doc.
 
 The current files in `docs/architecture/` own the architecture contract.
 Deviations require a reviewed revision of the relevant current document.
-Design docs and ICDs trace upward through that tree and do not override a
-newer current-state correction.
+Ratified living contracts own current protocol behavior within that intent;
+active ICDs specify delivery deltas, while shipped ICDs/designs retain history.
+The [authority and conflict rules](contracts/README.md#authority-and-conflicts)
+require explicit reconciliation, not silent overrides by newer prose or code.
+Structural changes require architect approval. The index itself does not
+ratify a subsystem or freeze an API.
 
 ---
 
@@ -407,7 +418,9 @@ See `architecture/06-frontend.md §1` and
 
 ---
 
-**This architecture tree is the current source of truth.** Design documents
-and ICDs trace upward to it and remain valuable historical delivery evidence.
-When shipped source/tests differ from a current contract, the mismatch must be
-resolved explicitly rather than silently treating either layer as current.
+**This architecture tree owns system intent and trust boundaries.** Current
+protocol owners and the ratification process are listed in the
+[living contract index](contracts/README.md). Design documents and ICDs trace
+upward and retain historical delivery evidence. When shipped source/tests
+differ from a current contract, reconcile the mismatch explicitly; neither
+accidental behavior nor an unratified draft becomes policy by default.

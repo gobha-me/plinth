@@ -56,7 +56,10 @@ failure modes. Mixing them is the primary source of problems.
 
 ### Architecture Document
 
-The source of truth. Everything else derives from it.
+The authority for system intent, trust boundaries and commitment bands.
+Ratified living contracts describe current protocol within those constraints;
+active ICDs specify delivery deltas. The bounded Plinth adoption and conflict
+rules are in the [living contract index](contracts/README.md).
 
 Contents:
 - System design (components, boundaries, data flow)
@@ -244,6 +247,12 @@ reinvent the decisions.
 
 **Participants:** Human + LLM (architecture session)
 **Output:** Interface Control Documents (ICDs)
+
+An active ICD is the handoff for a bounded delivery delta. Read any ratified
+current subsystem contract alongside it; the delta must identify its changes
+without silently overriding current authority. Shipped ICDs retain original
+scope, deviations and delivery rationale, with explicit supersession where a
+reviewed current contract replaces a particular surface.
 
 This is the single most impactful step for preventing the most common
 LLM failure mode: duplicate implementation.
@@ -520,6 +529,17 @@ boundary. Applying it at the boundary is strictly cheaper.
 
 ---
 
+### Current contract maintenance in the implementation PR
+
+When behavior owned by a ratified living contract changes, update that
+contract in the same PR, alongside the relevant tests and the active ICD's
+delivery/deviation record. The contract body describes the approved current
+protocol, not a concatenation of historical milestone additions. Structural
+or trust-boundary changes still require architect approval; source behavior
+alone does not ratify them. Documentation changes are part of the validated
+candidate, so renew checks after changing them. Re-evaluation recovers missed
+updates; it is not permission to defer the normal same-PR obligation.
+
 ### Caller-Triggered Implementation
 
 A named pattern that recurs when the architecture doc and ICDs are
@@ -684,6 +704,10 @@ The code-aware half of re-evaluation reads, at minimum:
   actually load-bearing and demoting it.
 - **Recently-merged PRs' diff against docs.** Changes to code that
   should have produced documentation updates and didn't.
+- **Ratified current contracts and active delivery deltas.** Check the
+  reviewed baseline, supported/planned/unsupported distinctions, verification
+  evidence and explicit supersession. A draft or index is not a completed
+  contract; historical proposal counts do not establish readiness.
 
 The session doesn't need to read every line. Strategic skimming,
 filtered by the sections currently being re-evaluated, is
@@ -700,10 +724,14 @@ that compiles and passes tests?"
   match the divergent code unless the divergence is an improvement
   the architect ratifies — in which case, update the architecture
   and note the change in the session's output.
-- **Arch-silent-on-code.** The code is right and the architecture
-  doesn't describe it. Update the architecture to document what
-  exists. If the new content is load-bearing for further work,
-  label it strong; otherwise band it appropriately.
+- **Arch-silent-on-code.** Implementation exists without an explicit owning
+  architectural description. Reconcile its intent and authorization before
+  documenting it as current policy; existence alone does not establish that
+  the code is right. Obtain architect ratification for structural or trust
+  decisions, then update the owner for approved behavior. If the new content
+  is load-bearing for further work, label it strong; otherwise band it
+  appropriately. Keep unresolved behavior visible rather than ratifying it
+  implicitly.
 - **Decision-embedded-in-comments.** A code comment captures a
   decision that should be in the architecture or a discussion doc.
   Extract it; cite the original code location; label the
@@ -713,10 +741,33 @@ that compiles and passes tests?"
   item (probably `[strong]` because it's near-term catch-up) or
   demote the section to a band that matches the level of commitment
   actually backed by tests.
-- **Interface-drift.** An ICD no longer matches the handler that
-  implements it. Fix one to match the other; prefer updating the
-  ICD if the code change was deliberate, prefer updating the code
-  if the divergence was accidental.
+- **Interface-drift.** Source/tests, the active ICD and a ratified current
+  contract disagree. Trace the discrepancy and its authorization: fix
+  accidental implementation drift, or reconcile the owning docs for an
+  approved change. Structural decisions need architect approval; deliberate
+  code alone is not ratification. Preserve historical deviations and mark
+  supersession for the affected surface explicitly.
+
+### 3.1.2 Living contract roll-forward
+
+Review merged behavior changes against their owning ratified contracts.
+Reconcile missed additions and cross-ICD drift using source, independent tests,
+the approved architecture and delivery history. Roll approved current behavior
+into the contract body, retaining supported/planned/unsupported distinctions,
+scope, reviewed source baseline and verification references. Keep engine-specific
+notes subordinate to the self-contained protocol.
+
+Retain shipped ICDs/designs and their deviation records; add explicit scoped
+supersession references instead of rewriting the original delivery history.
+An unresolved discrepancy stays visible until reconciliation and review; do
+not silently promote accidental behavior into policy or label a draft complete.
+This recovery step complements, rather than replaces, same-PR contract updates.
+
+The [Plinth adoption/index](contracts/README.md) preserves existing authority
+documents at their current paths. Initial auth/session/PAT and later capability
+fills each need a separate bounded plan, source/test reconciliation, independent
+review and maintainer/architect ratification. The index and historical candidate
+counts do not certify those fills, freeze compatibility, or authorize bulk work.
 
 ### 3.2 Scope of a Re-evaluation Session
 
@@ -988,36 +1039,42 @@ drifted.
 
 ## Document Hierarchy
 
-Every artifact traces upward. If the code contradicts the ICD, the
-code is wrong. If the ICD contradicts the architecture, the ICD needs
-updating through an architecture session.
+Every artifact traces to its scoped authority. Architecture owns why, system
+shape, trust boundaries and commitment bands. Ratified living contracts own
+current protocol behavior consistent with that intent. Active approved ICDs
+own delivery deltas; shipped ICDs/designs preserve history and explicitly
+superseded surfaces. Source/tests provide implementation and verification
+evidence, not automatic policy authority. Conflicts need traced reconciliation;
+structural changes require architect approval.
 
 ```
-Architecture Document (source of truth)
+Architecture (intent, trust boundaries, commitment bands)
 │
 ├── Roadmap (sequenced plan, derived from arch)
 │
-├── Design Documents (multi-version arcs)
-│   ├── Per-version scope, entry/exit criteria
-│   ├── Shared data model and patterns
-│   ├── Interface contracts between versions
-│   └── Explicit "do not decide yet" constraints
+├── Ratified living contracts (current scoped protocol)
+│   ├── Supported / planned / unsupported distinctions
+│   ├── Baseline, review and independent verification
+│   └── Engine notes subordinate to the protocol
 │
-├── ICDs / API Specs (single-version contracts)
-│   └── Implementation (code, derived from ICD or design doc)
-│       └── Tests (verification, derived from contracts)
+├── Design Documents (arc narrative and explicit open decisions)
+│   └── Active ICDs (approved delivery deltas)
+│       └── Implementation and tests (evidence against owned contracts)
+│
+├── Shipped ICDs / designs (history, deviations, scoped supersession)
 │
 └── Audit / Review (feedback into architecture)
     └── Gap Analysis (delta between plan and reality)
         └── Roadmap Update (re-sequencing based on findings)
 ```
 
-Design documents sit between the architecture and the ICD. They
-decompose a large architectural concept into versioned milestones,
-each with its own contracts. A code session working on version N
-reads the design doc's section for version N, not the full
-architecture document — the design doc has already translated the
-architectural intent into version-scoped constraints.
+Design documents translate architectural intent into bounded delivery arcs.
+Code sessions read the relevant design section, active ICD and current protocol
+owner together; none silently overrides the others. A living contract's body
+must be self-contained and engine-agnostic, not a header pointer requiring
+readers to reverse-engineer the implementation. The [decision/index](contracts/README.md) defines naming,
+placement, conflict handling and separate admission/ratification of initial
+fills; it is not itself a ratified subsystem contract.
 
 ---
 

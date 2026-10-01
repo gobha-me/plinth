@@ -6,7 +6,7 @@
 
 Plinth uses LLM-assisted development with strict role separation:
 
-- **Architecture sessions** (this Claude project) produce design docs, ICDs, and roadmap decisions.
+- **Architecture sessions** produce design docs, ICDs, contract ratification, and issue-owned sequencing decisions.
 - **Code sessions** implement from those documents. They do not make structural decisions.
 - **If you encounter a structural question, ask. Do not invent.**
 
@@ -14,23 +14,37 @@ Plinth uses LLM-assisted development with strict role separation:
 
 | Document | Location | Purpose |
 |----------|----------|---------|
-| Architecture | `docs/ARCHITECTURE.md` (+ `docs/architecture/*.md`) | Source of truth. Read the relevant sub-document before any work. |
-| Roadmap | `docs/ROADMAP.md` | What to build next. Each task is one squash-merge to main. |
+| Architecture | `docs/ARCHITECTURE.md` (+ `docs/architecture/*.md`) | System intent, trust boundaries and commitment bands. Read the relevant owner before work. |
+| Living contracts | [Decision/index](contracts/README.md) | Current-authority entry points and ratification rules. Only ratified scoped contracts describe current protocol; candidates and this index are not completed fills. |
+| Backlog | GitHub Issues; `docs/ROADMAP.md` is a navigation aid | Live scope, dependencies and approved sequencing. Check open PRs before new work. |
 | Changelog | `docs/CHANGELOG.md` | What shipped. Updated on each merge. |
-| ICDs | `docs/icd/` | Interface contracts. All implementations trace to these. |
+| ICDs | `docs/icd/` | Active delivery deltas and retained shipped/deviation history; explicit supersession distinguishes them. |
 | Design docs | `docs/design/` | Multi-version arc specs (e.g., QuickJS bridge). |
 
 ## Workflow
 
-1. Read the roadmap task you're implementing
-2. Read the relevant architecture section and ICD
-3. Create a branch: `git checkout -b 0.1.2-auth-sessions`
-4. Plan the work, present to human for approval
-5. Implement + write Catch2 tests
-6. Ensure CI passes: `mkdir -p build && cd build && cmake .. && make -j$(nproc) && ctest`
-7. Squash merge to main: one commit per task
-8. Tag: `git tag v0.1.2`
-9. Update CHANGELOG.md
+1. Read applicable tracked `AGENTS.md`, the live issue and open PRs.
+2. Read the relevant architecture owner, ratified current contract if present,
+   and active ICD/delivery history. Use the contract index; do not infer that a
+   draft or historical proposal is current policy.
+3. Plan bounded work and obtain human approval before implementation.
+4. Create an isolated topic branch/worktree; preserve unrelated changes.
+5. Implement and write tests. Update any owned current contract and the active
+   ICD's deviations in the same behavior-change PR.
+6. Validate under `AGENTS.md` and `CONTRIBUTING.md`, then independently review
+   and fix findings. Use at most two build jobs and one heavy local build at a
+   time in this shared environment.
+7. Push the candidate, open its PR, and require green candidate CI before merge.
+8. Verify terminal CI on the exact merge SHA and recheck open PRs before new work.
+9. Record delivered outcomes and remaining limitations. Tags, releases and
+   repository settings are separate maintainer operations, not automatic steps.
+
+For conflicting source/tests, active ICDs or current contracts, follow the
+[authority and conflict rules](contracts/README.md#authority-and-conflicts).
+Trace the discrepancy and seek architect approval for structural changes;
+do not normalize accidental implementation behavior into policy. Initial
+auth/session/PAT and later capability contract fills need separate plans,
+reconciliation, review and ratification.
 
 ## Rules
 
@@ -41,6 +55,14 @@ Plinth uses LLM-assisted development with strict role separation:
 5. **No structural decisions in code sessions.** Architecture sessions decide structure.
 
 ## Schema Rules — Two Phases
+
+The phase/version examples below are historical development guidance, not
+current migration or retained-data authority. Read the current
+[data architecture](architecture/03-data.md),
+[extension database authority](architecture/extension-database-isolation.md)
+and [deployment/recovery contract](KUBERNETES.md) before operating on data.
+Do not infer destructive reset permission or present upgrade guarantees from
+these legacy examples; unresolved freeze decisions remain issue-owned.
 
 **This is critical. Read carefully.**
 
@@ -93,14 +115,24 @@ actual use (API, UI, tests). The schema freezes.
 ## Build
 
 ```bash
-mkdir -p build && cd build
-cmake ..
-make -j$(nproc)
-ctest --output-on-failure
-./plinth --version
+plinth_build_dir="$(mktemp -d /tmp/plinth-topic-build.XXXXXX)"
+cmake -S . -B "$plinth_build_dir" -DCMAKE_BUILD_TYPE=Debug
+cmake --build "$plinth_build_dir" --parallel 2
+ctest --test-dir "$plinth_build_dir" --output-on-failure --parallel 1
 ```
 
+Use a fresh task-owned build directory and a disposable PostgreSQL fixture for
+the full PG/WebSocket surface. Focused tests, pinned format/lint, sanitizers and
+lifecycle checks follow `AGENTS.md`; unavailable checks are reported explicitly.
+
 ## Test grouping convention (since 0.4.5.1)
+
+This is a historical grouping account, not the complete current inventory or
+permission to bypass isolated tests. Current registered selectors, isolation
+gates and resource locks are owned by [CMakeLists.txt](../CMakeLists.txt);
+[AGENTS.md](../AGENTS.md) and [CONTRIBUTING.md](../CONTRIBUTING.md) own current
+validation guidance. Read those owners rather than relying on the legacy
+four-group count, line numbers or Gitea CI references below.
 
 CTest registers **four grouped subprocesses** (one Catch2 instance per group,
 with process-lifetime fixtures where required):
