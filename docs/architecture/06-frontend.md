@@ -22,6 +22,9 @@ alternative frontends.
 - `../icd/ICD-application-discovery-launcher.md` (the authoritative
   application-discovery, primary-panel tab, launcher, lifecycle, realtime,
   preference, accessibility, and implementation-verification contract).
+- [Shell float contract](../icd/ICD-shell-floats.md) (planned #43 delivery
+  specification; #44 mechanism and separately reviewed #45/#46 adapters,
+  not shipped behavior or a ratified current subsystem contract).
 - `DESIGN-shell-v06x.md` (the 0.6.x shell arc: bootstrap, schema, the
   panel SDK, the tab/launcher model, floating panels, the system
   tray, content-type negotiation, and intents).
@@ -65,12 +68,16 @@ Full shell design: `DESIGN-shell-v06x.md`. Full packaging contract:
 top-level Preact error boundary, first-boot shell companion package, strict-CSP asset
 handler, active-frontend lookup, manifest-declared mount, versioned asset
 base, design-token redirect, and SDK redirect are implemented and covered by
-kernel and browser tests. The bundled shell is intentionally still minimal:
-the application-discovery and launcher contract is now fixed by
-`ICD-application-discovery-launcher.md`, but launcher navigation, tabs, and the
-complete panel lifecycle are not shipped behavior. Implementation and proof
-remain [#31](https://github.com/gobha-me/plinth/issues/31) and
-[#32](https://github.com/gobha-me/plinth/issues/32), not shipped behavior.
+kernel and browser tests.
+
+**Current shell readiness (reconciled 2026-10-01).**
+[#31](https://github.com/gobha-me/plinth/issues/31) delivered authenticated
+application discovery, Home, app switching, primary-panel tabs and the bounded
+retained-primary lifecycle. [#32](https://github.com/gobha-me/plinth/issues/32)
+delivered smart snapshot reconciliation and its browser verification. These
+are source-backed development behavior, not a new release claim. Float
+management remains planned under the linked #43 contract: `openFloat`,
+`navigate` and `requestFocus` are still unsupported SDK stubs.
 
 ---
 
@@ -295,27 +302,31 @@ chase a moving target.
 
 ## 5. Panel System (Summary)
 
-**Status (reconciled 2026-09-16): contract fixed; primitives shipped;
-application shell journey not yet operational.** Per ICD-0.6.3 §3 (Panel SDK
-API surface) and §4 (Panel module loading), the repository contains a
-`panels.json` parser, panel-module loader, design-token endpoint, SDK endpoint,
-and focused fixture coverage. `ICD-application-discovery-launcher.md` now owns
-the discovery, navigation, replacement, realtime invalidation, preference,
-accessibility, and responsive contract. The production shell does not yet
-implement that contract. [#31](https://github.com/gobha-me/plinth/issues/31)
-owns implementation, and [#32](https://github.com/gobha-me/plinth/issues/32)
-owns the remaining historical browser/client-runtime coverage.
+**Status (reconciled 2026-10-01): primary launcher and smart client shipped
+in development source; floats planned.** The repository contains the
+`panels.json` parser, authenticated primary discovery, panel-module loader,
+design-token endpoint, SDK endpoint and kernel/browser verification.
+`ICD-application-discovery-launcher.md` owns primary discovery, navigation,
+replacement, realtime invalidation, preference, accessibility and responsive
+behavior delivered by #31. #32 supplies the smart client and reviewed browser
+coverage; neither closes the separate #42 sequence-policy decision nor
+implements resolver/navigation/floats.
 
 Extensions register UI panels via `panels.json`. The active frontend design
-calls for:
+provides:
 
-- **Panel container (planned in #31).** Topbar navigation, content area,
+- **Primary panel container.** Topbar navigation, content area,
   primary-panel tab strip, and launcher, bounded by
   `ICD-application-discovery-launcher.md`.
-- **Panel lifecycle (partially implemented).** The loader exposes activation,
-  deactivation, component unmount, and SDK unbinding primitives; it has no
-  public destroy callback. Production discovery, retained navigation, bounded
-  replacement, and failure containment remain #31 work.
+- **Primary panel lifecycle.** The loader owns bounded retained instances,
+  activation/deactivation, dirty navigation, generation replacement,
+  component unmount and SDK unbinding. It has no public destroy callback.
+  Minimized float lifetime is not inferred from the primary cache policy.
+- **Floats (planned).** [The #43 delivery specification](../icd/ICD-shell-floats.md)
+  defines five live owners including minimized ones, responsive chrome,
+  cleanup, focus, recovery and descriptor-only persistence. #44 owns the
+  mechanism; #45/#46 separately own content-type resolution and navigation adapters.
+  Primary-only discovery is not float authorization.
 - **Inter-panel communication.** Through the kernel realtime event
   system (`architecture/03-data.md §3`), not a frontend-specific bus.
   Panels talk to each other the same way services talk to each other.
@@ -462,7 +473,11 @@ there is no automatic retry loop. Expired/revoked sessions fail the next
 connection authentication. After successful sign-in, the shell calls
 `reconnectRealtime()` to explicitly retry current subscriptions.
 
-`useData` retains its last good data when a snapshot or live connection fails,
-exposes that error, and clears a live error when the next event arrives. Its
-snapshot request runs through `call`; its live subscription uses the same
-owned connection and cancellation behavior as `subscribe`.
+Snapshot-backed `useData` treats live events as invalidations, coalesces
+authoritative re-queries with bounded debounce/jitter advice, and permits only
+conservative projection-compatible optimistic changes. It retains last-good
+data and observable errors within the same query/session owner; replaced
+owners cannot display or commit stale data. Subscription-ready ordering and
+owned cancellation remain shared with `subscribe`. Without a snapshot,
+`useData` retains the outer live-event-frame behavior. This is #32's delivered
+smart-client behavior, not a source-sequence/replay guarantee from #42.
