@@ -1,11 +1,11 @@
-# Living subsystem contract docs — proposal
+# Living subsystem contract docs — historical proposal and bounded adoption
 
-**Status:** Discussion capture — decision owned by GitHub issue #41
+**Status:** Bounded adoption approved 2026-10-01; historical proposal retained
 **Source:** four-ICD audit pass (0.1.2, 0.3.3, 0.4.4, 0.5.2), 2026-04-24
 **Participants:** the maintainer (Architect) — proposal author
-**Decision owner:** [#41](https://github.com/gobha-me/plinth/issues/41), after
-the Dogfood architecture dependency #29; the historical `0.6.0.N` slot is not
-a release promise
+**Decision owner:** [#41](https://github.com/gobha-me/plinth/issues/41); the
+Dogfood architecture dependency #29 is closed. The historical `0.6.0.N` slot
+is not a release promise.
 **Feeds into:** new `docs/contracts/` tier; METHODOLOGY §Phase 3 update
 **References:**
 - `docs/METHODOLOGY-llm-assisted-development.md` §Phase 3 (Re-evaluation;
@@ -19,6 +19,32 @@ a release promise
   evidence cited below)
 
 **Scope:** tail cleanup mid-development; not a methodology redesign.
+
+## Accepted bounded decision (2026-10-01)
+
+The maintainer approved adoption of bounded living contracts. The
+[decision and authority index](../contracts/README.md) owns the adopted rules:
+descriptive unnumbered kebab-case names, coupled reader journeys, current
+protocol authority only after scoped reconciliation/review/ratification,
+same-PR behavior maintenance, and re-evaluation recovery of missed additions
+and cross-ICD drift. Existing shutdown, extension database and WebSocket
+authority documents remain at their current paths; they are linked, not copied
+or reclassified as completed subsystem fills by this decision.
+
+Auth/session/PAT is the first candidate fill, capability registry later. Each
+requires a separate plan, source/test reconciliation, independent review and
+maintainer/architect ratification. This adoption is not a bulk fill, API/semver
+freeze, schema change or production implementation change. Source/tests are
+evidence; accidental behavior does not silently become policy. Architecture
+continues to own why, trust boundaries, commitment bands and shipped/planned
+classification; active ICDs own delivery deltas, and shipped ICDs/designs retain
+history with explicit supersession for affected surfaces.
+
+Everything below is the historical proposal and assessment unless explicitly
+identified otherwise. Its estimates, six/seven-subsystem candidate counts,
+readiness assertions and semver analogy are not current commitments. Where its
+wording differs, the accepted bounded decision/index governs; no filled or
+ratified subsystem contract is delivered here.
 
 ---
 
@@ -192,9 +218,9 @@ they're made visible and considered.
 
 ---
 
-## Candidate subsystems under the completeness criterion
+## Historical candidate assessment (2026-04-24)
 
-**Ready now** — arcs closed, shipped, stable:
+**Ready now (historical proposal assessment)** — not a current readiness claim:
 
 | Subsystem | Arc | Size est. |
 |---|---|---|
@@ -372,15 +398,14 @@ demoted to implementation reality; the contract doc is normative.
 
 ---
 
-## Scheduling note (reconciled 2026-09-16)
+## Historical scheduling note (2026-09-16)
 
-The historical `0.6.0.N` slot did not become an active deliverable. GitHub
-issue [#41](https://github.com/gobha-me/plinth/issues/41) now owns the bounded
-adopt-or-reject decision after the Dogfood architecture dependency. No
-contract-fill session should be inferred from this discussion until #41 is
-resolved.
+At that assessment, the historical `0.6.0.N` slot had not become an active
+deliverable; #41 owned the adopt-or-reject decision after the Dogfood
+architecture dependency. The accepted 2026-10-01 decision above now settles
+bounded adoption, not initial-fill execution or candidate ratification.
 
-**Updated candidate list (post-0.5.5 ship):** the realtime pipeline
-("Wait for arc close" entry above) is now ready — 0.5.0/0.5.1/0.5.2/
-0.5.3/0.5.4/0.5.5 all shipped. Initial fill set is **seven**
-subsystems, not six.
+**Historical updated candidate list (post-0.5.5 ship):** that proposal counted
+the realtime pipeline after 0.5.0/0.5.1/0.5.2/0.5.3/0.5.4/0.5.5 ship, yielding
+**seven** potential subsystems rather than six. This preserved count is not
+evidence of present readiness or admission of seven fills.
