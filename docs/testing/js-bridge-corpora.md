@@ -15,9 +15,11 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
 | Pubsub (#148) | `plinth_tests_pubsub_corpus` | Publish/subscribe admission, callback replacement/invocation, returned unsubscribe enqueue and runtime ownership |
 | Capability (#150) | `plinth_tests_cap_corpus` | Call/batch admission, owned snapshots, real Promise.all composition with simulated host settlement and runtime ownership |
+| Ordinary database (#151) | `plinth_tests_db_admission_corpus` | Query/exec admission, parameter and client-manager snapshots, simulated host settlement and runtime ownership; no SQL execution |
 
-These are bounded slices, not comprehensive coverage claims. DB query/exec/
-batch and internal transaction callbacks, capability resolver/dispatch, extension
+These are bounded slices, not comprehensive coverage claims. DB batch and
+internal transaction callbacks, real DB dispatch/driver/result conversion,
+capability resolver/dispatch, extension
 module import, distinct conversion implementations and broader async dispatch
 remain separate requested targets. The separate JS/JSON implementations in
 `eval.cpp`, `runtime_pool.cpp`, `bridge_context.cpp` and the extension runtime
@@ -60,7 +62,7 @@ DB-free process without initialized logging, Drogon or broker background work,
 and is tagged `[isolated-pubsub]`. It is excluded only from the shared JS
 fixture process, not the full test suite. The independent isolation inventory
 requires exactly five known logger fixtures, this one exact pubsub case and
-the one exact capability corpus,
+the one exact capability corpus and the one exact ordinary DB admission corpus,
 preserves all other ordinary JS fixtures and pins the required strict gate.
 
 `plinth_tests_pubsub_corpus` uses `tests/tools/verify_catch_case.py` with the
@@ -107,6 +109,39 @@ survives its context or is used after destruction.
 assertions, zero failures/skips, a zero child exit, and 60/75-second inner/outer
 deadlines. `[isolated-cap]` separates it from the grouped dispatcher/DB fixture,
 not from full CTest. The independent known-case inventory requires exactly
-five logger fixtures, one pubsub case and one capability case and retains every
+five logger fixtures, one pubsub case, one capability case and one ordinary DB
+admission case and retains every
 ordinary JS fixture. Both sanitizer lanes explicitly discover and execute this
 gate; compiler and image suites keep the complete CTest inventory.
+
+## Ordinary database admission and ownership
+
+The database corpus calls the registered ordinary `db.query` and `db.exec`
+bindings without opening a database connection or dispatching SQL. Finite
+literal argument/error expectations and operation/callback snapshots are
+independent of production parameter/conversion helpers. It checks defaults,
+bounded plain inputs and byte views, validation/cancellation ordering, exec
+options and owned SQL/parameter/extension metadata. A real lazy database-client
+manager alias is observed without calling it to obtain a connection.
+
+Results and rejections are deliberately settled through the host seam as a
+simulation. This does not prove driver parameter binding, SQL authorization,
+PostgreSQL result/OID conversion, SQLSTATE fidelity, durable commits, production
+dispatch/backpressure or the production cancellation cascade. Transaction
+state, public/internal batch orchestration and denial ownership remain separate
+targets. Exotic accessors/proxies, allocation failure and broader numeric/coercion
+policy are outside this bounded slice; no production limits or policies change.
+
+Fresh replays, explicit family counts, corrupted-observation controls and bounded
+reduction prevent vacuous success. JS values are freed before lease changes;
+clean/dirty/cancelled release, held-owner rebuild and bounded shutdown preserve
+real ownership without fake transactions or dangling-context calls.
+
+`plinth_tests_db_admission_corpus` requires its exact case, fresh Catch/XML,
+positive assertions, zero failures/expected failures/skips and a zero child exit,
+with 60/75-second inner/outer deadlines. `[isolated-db-admission]` isolates it
+from the grouped DB/dispatcher fixture, not from full CTest. The independent
+inventory keeps exactly five logger fixtures and one each of pubsub, capability
+and ordinary DB admission, preserving every ordinary JS fixture. Both sanitizer
+lanes explicitly discover and execute it; full compiler/image suites remain
+required. Coverage is delivered only after candidate and exact-merge CI pass.
