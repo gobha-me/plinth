@@ -62,6 +62,9 @@ TRAEFIK_IMAGE_DIGEST = (
     "sha256:96780238b1bbda5a9bb997f4307ce69e798ad1cf6eb7f2dcc0a440823467d199"
 )
 POSTGRES_PASSWORD = "fake-issue36-postgres-password"
+# The controlled fixture retains the chart's five auth tokens per 60 seconds.
+# Each pre-forward 503 consumes a token, so allow a full 60/5 refill interval.
+AUTH_ROUTE_RETRY_BACKOFF_SECONDS = 12
 
 
 def require(condition, message):
@@ -950,6 +953,7 @@ service:
         csrf=False,
         cookie_jar=None,
         use_cookies=False,
+        timeout=30,
     ):
         output = self.root / ("curl-" + secrets.token_hex(4))
         argv = [
@@ -988,8 +992,10 @@ service:
         if use_cookies:
             argv.extend(["--cookie", self.cookies])
         argv.append(self.origin + path)
-        result = self.run(argv, timeout=30, check=False)
-        body = output.read_text(encoding="utf-8", errors="replace") if output.exists() else ""
+        result = self.run(argv, timeout=timeout, check=False)
+        # Read bytes first: universal-newline conversion would make a CRLF
+        # response indistinguishable from the exact LF-only readiness sentinel.
+        body = output.read_bytes().decode("utf-8", errors="replace") if output.exists() else ""
         return result.returncode, result.stdout.strip(), body
 
     def wait_for_https(self):
@@ -1275,7 +1281,7 @@ service:
         require(observed == marker, "persistent data did not survive pod restart")
         self.verify_ordered_transition(old_status, after)
         self.wait_for_https()
-        self.verify_login()
+        self.verify_login(replacement_phase="restart")
         return claims, after["metadata"]["uid"]
 
     def container_runtime_identity(self, pod):
@@ -1512,17 +1518,51 @@ service:
             f"old={old_status['finishedAt']} new={new_status['startedAt']}",
         )
 
-    def verify_login(self):
+    def verify_login(self, *, replacement_phase=None):
+        if replacement_phase not in (None, "restart", "sequential-rollout"):
+            raise RuntimeError("persisted account login: invalid replacement phase")
+        phase = replacement_phase or "single-shot"
+        deadline = time.monotonic() + 30
         credentials = json.dumps({
             "username": "issue36-admin",
             "password": "fake-password-for-issue36!",
         })
-        code, status, body = self.curl(
-            "/api/auth/login", data=credentials, origin=self.origin,
-            cookie_jar=self.cookies,
-        )
-        require(code == 0 and status == "200",
-                f"persisted account login failed: {status} {body}")
+        while True:
+            remaining = deadline - time.monotonic() if replacement_phase else 30
+            if remaining <= 0:
+                raise RuntimeError(f"persisted account login: phase={phase} outcome=deadline")
+            try:
+                code, status, body = self.curl(
+                    "/api/auth/login", data=credentials, origin=self.origin,
+                    cookie_jar=self.cookies, timeout=min(30, remaining),
+                )
+            except subprocess.TimeoutExpired:
+                raise RuntimeError(
+                    f"persisted account login: phase={phase} outcome=timeout"
+                ) from None
+            except OSError:
+                raise RuntimeError(
+                    f"persisted account login: phase={phase} outcome=transport-error"
+                ) from None
+            if replacement_phase and time.monotonic() >= deadline:
+                raise RuntimeError(f"persisted account login: phase={phase} outcome=deadline")
+            if code != 0:
+                raise RuntimeError(f"persisted account login: phase={phase} outcome=transport-exit")
+            if status == "200":
+                return
+            # Pinned Traefik's exact response means no backend was selected.
+            # Other responses or interrupted requests may have been forwarded
+            # and must never cause a second POST.
+            if replacement_phase and status == "503" and body == "no available server\n":
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"persisted account login: phase={phase} outcome=deadline")
+                time.sleep(min(AUTH_ROUTE_RETRY_BACKOFF_SECONDS, remaining))
+                continue
+            safe_status = status if isinstance(status, str) and re.fullmatch(r"[0-9]{3}", status) else "invalid"
+            raise RuntimeError(
+                f"persisted account login: phase={phase} outcome=response http_status={safe_status}"
+            )
 
     def verify_sequential_rollout(self, claims, old_uid):
         old_pod = self.active_pod()
@@ -1599,7 +1639,7 @@ service:
         require(observed.startswith("issue36-"), "persistent marker vanished during rollout")
         self.verify_ordered_transition(old_status, after)
         self.wait_for_https()
-        self.verify_login()
+        self.verify_login(replacement_phase="sequential-rollout")
 
         credentials = json.dumps({
             "username": "issue36-closed",
