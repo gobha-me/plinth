@@ -704,6 +704,7 @@ add_executable(plinth_tests
   tests/kernel/js/host_string_boundary_test.cpp
   tests/kernel/js/audit_authority_regression_test.cpp
   tests/kernel/js/audit_corpus_test.cpp
+  tests/kernel/js/pubsub_corpus_test.cpp
   tests/kernel/js/log_corpus_test.cpp
   tests/kernel/js/config_corpus_test.cpp
   tests/kernel/js/async_bridge_test.cpp
@@ -924,7 +925,7 @@ add_test(NAME plinth_tests_ws_close_ownership
 set_tests_properties(plinth_tests_ws_close_ownership PROPERTIES TIMEOUT 40)
 
 set(PLINTH_GROUPED_JS_SELECTOR
-    "[js] ~[batch-transaction] ~[isolated-logger]")
+    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub]")
 
 # spdlog's default free APIs cannot overlap a default-logger replacement.
 # These five synchronous capture fixtures must run before any background
@@ -1010,6 +1011,18 @@ add_test(NAME plinth_tests_audit_corpus
     --timeout 60
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_audit_corpus PROPERTIES TIMEOUT 75)
+
+# Admission and callback ownership run before any broker/logging fixture in
+# their process. The inventory gate keeps this exact exclusion independently
+# selected; absent cases, skips and nonzero teardown exits fail closed.
+add_test(NAME plinth_tests_pubsub_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS pubsub has a bounded deterministic admission and callback corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_pubsub_corpus PROPERTIES TIMEOUT 75)
 
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"

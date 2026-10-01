@@ -133,6 +133,11 @@ as a CI artifact.
 
 ## Security and privacy
 
+The [JavaScript bridge corpus guide](docs/testing/js-bridge-corpora.md) records
+bounded coverage and its exclusions. Preserve separately selected DB-free
+corpora and their strict discovery/execution gates; never substitute a missing
+case, skipped report or aggregate console summary for actual coverage.
+
 Use fictional data and fake credentials in tests and documentation. Report
 vulnerabilities privately as described in `SECURITY.md`. Pull requests that
 weaken authorization, validation, shutdown ownership, or secret handling need
