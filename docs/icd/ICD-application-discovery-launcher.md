@@ -11,6 +11,14 @@
 **Release numbering:** None. Historical references to “0.6.4” identify this
 work's origin, not a release-version promise.
 
+**Later float boundary (2026-10-01):** The planned
+[shell float contract](ICD-shell-floats.md) owns #43's delivery specification
+and #44's mechanism handoff, not this contract's primary cache/navigation
+rules. It preserves the existing SDK signatures and leaves content-type
+resolution, defaults and navigation/open-float adapters with #45/#46. The
+historical baseline and original #31/#32 scope below remain delivery history;
+this cross-reference does not add float behavior or a release promise.
+
 ## 1. Authority
 
 This document is authoritative for:
@@ -897,6 +905,17 @@ or accessibility acceptance tests to #32.
 #42 decides source sequences and `superseded_seqs`. The launcher uses opaque
 invalidation plus authoritative refetch and therefore does not depend on that
 decision.
+
+### #43/#44 — planned float mechanism
+
+[The shell float specification](ICD-shell-floats.md) defines chrome, the hard
+five-live-owner limit including minimized panels, cleanup, responsive focus,
+recovery and descriptor persistence. The shipped primary-only discovery
+catalog does not authorize float targets. Any needed typed target/admission
+seam requires separate implementation review. A #44 mechanism fixture is not
+proof of working extension `openFloat`; #45/#46 must supply the adapter.
+This sequencing dependency must be reconciled before claiming end-to-end
+float delivery, without silently absorbing later resolver/navigation scope.
 
 ### #45 — later navigation surfaces
 

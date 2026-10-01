@@ -18,6 +18,17 @@ application discovery, launcher, primary-panel tab, lifecycle replacement,
 realtime invalidation, preference, data-ipoint, accessibility, and responsive
 requirements. Legacy `0.6.4` wording is traceability only, not a release promise.
 
+**Float delivery note (2026-10-01):** The planned
+[shell float contract](../icd/ICD-shell-floats.md) supersedes the float-specific
+proposals in sections 3.2, 3.3, 3.5, 3.6, 3.7 and 3.8 and the float milestone
+summary in section 9. Five live owners, including minimized, loading, failed
+and retiring panels, share a document-lifetime ceiling. A sixth requires an
+explicit close and completed cleanup; automatic minimization does not create
+capacity. Historical `0.6.5` numbering and oldest-minimized behavior below are
+not current requirements. The new ICD specifies a delivery delta, not shipped
+floats or a ratified living subsystem contract. Resolver, tray and navigation
+intent policy remains separate #45/#46 work.
+
 ---
 
 ## 1. What the Shell Is
