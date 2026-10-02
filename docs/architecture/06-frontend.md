@@ -25,6 +25,9 @@ alternative frontends.
 - [Shell float contract](../icd/ICD-shell-floats.md) (planned #43 delivery
   specification; #44 mechanism and separately reviewed #45/#46 adapters,
   not shipped behavior or a ratified current subsystem contract).
+- [Trays, resolution and navigation specification](../icd/ICD-shell-trays-resolution-navigation.md)
+  (#45 delivery paper; prospective #46 typed authority, defaults and adapters,
+  not currently available endpoints or a production/API ratification).
 - `DESIGN-shell-v06x.md` (the 0.6.x shell arc: bootstrap, schema, the
   panel SDK, the tab/launcher model, floating panels, the system
   tray, content-type negotiation, and intents).
@@ -327,6 +330,15 @@ provides:
   cleanup, focus, recovery and descriptor-only persistence. #44 owns the
   mechanism; #45/#46 separately own content-type resolution and navigation adapters.
   Primary-only discovery is not float authorization.
+- **Trays/resolution/navigation (planned).** The #45 specification owns 32 live
+  document-lifetime tray owners including essential bell/avatar, 16 declared
+  states, one popover, personal/admin/earliest-authorized resolution and explicit
+  app:panel intents with unchanged SDK signatures. #46 must review and implement
+  typed admission, shell-owned administrative storage with caller-preserving
+  generation-bound dispatch, and protected administrator-reviewed local restore
+  policy. Existing own preferences are not administrator authority or persistence
+  approval. Notification data remains #81; current avatar/theme/scale/Sign Out
+  and primary navigation are not rewritten by this specification.
 - **Inter-panel communication.** Through the kernel realtime event
   system (`architecture/03-data.md §3`), not a frontend-specific bus.
   Panels talk to each other the same way services talk to each other.

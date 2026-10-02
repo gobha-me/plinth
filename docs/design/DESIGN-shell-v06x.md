@@ -29,6 +29,22 @@ not current requirements. The new ICD specifies a delivery delta, not shipped
 floats or a ratified living subsystem contract. Resolver, tray and navigation
 intent policy remains separate #45/#46 work.
 
+**Tray/resolution/navigation delivery note (2026-10-02):** The planned
+[issue-scoped specification](../icd/ICD-shell-trays-resolution-navigation.md)
+supersedes the relevant typed declarations, trays, Jump, defaults/storage and
+navigation sketches in sections 3.1, 3.4, 3.5, 3.7, 4, 5, 9 and 12. Current
+registration/discovery is primary-only and the SDK adapters remain stubs.
+The approved automatic fallback is personal default, administrator default,
+then earliest-installed authorized handler, without an ambiguity chooser.
+Navigation uses explicit `application_id:panel_id`, not content-type resolution.
+The approved cap is 32 document-lifetime tray owners including two essentials,
+16 states and one popover; extras stay off until explicit cleanup frees capacity.
+Protected reviewed site-administrator local restore policy is permitted; the
+proposed transport, storage dispatch, typed schema and policy loader remain #46
+architecture/source-review work, not shipped APIs. The old milestone numbers,
+array/icon-mutation sketches, `default_apps` table and shell `panels.json` sample
+below are historical, not current production declarations or release promises.
+
 ---
 
 ## 1. What the Shell Is
@@ -246,6 +262,10 @@ controls their chrome, position, lifecycle, and persistence.
   uninstalled), the float is silently dropped from the persisted state.
 
 ### 3.4 Tray Panels
+
+Historical sketch below; the linked #45 specification controls the future
+state-map/icon-token contract, retained ownership, dirty close, essential
+identity, unavailable notification data and accessible bounded overflow.
 
 Tray panels render as icons in the topbar tray zone. Clicking a tray
 icon opens an anchored popover; click-outside or Escape closes it.
@@ -475,6 +495,11 @@ client. One event system, not two.
 ---
 
 ## 5. Content Type Handler Resolution
+
+Historical sketch below. #45 supersedes the one-time ambiguity chooser and
+storage assumptions: automatic resolution is personal/admin/earliest authorized;
+manual Open with is a separate explicit action. `navigate` never uses MIME
+resolution, and `ext_shell.default_apps` is not currently created.
 
 When the shell (or an extension via the panel SDK) needs to open
 content by type, the resolution order is:
@@ -801,6 +826,10 @@ authority; see `DESIGN-admin-v06x.md` for its current contract.
   across reload.
 
 ### 0.6.6 — Tray System, Content Type Resolution, Navigation Intents
+
+Historical delivery horizon only. #45 specifies and #46 implements the reviewed
+delta; notification data remains #81 and #44 is not closed by a mechanism-only
+fixture before real resolver/browser delivery.
 
 - Tray panel type: icon rendering, popover lifecycle, badge/state API
 - Shell-owned bell and avatar converted to dogfooded tray panels

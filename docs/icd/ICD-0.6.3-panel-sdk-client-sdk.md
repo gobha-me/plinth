@@ -952,6 +952,17 @@ DOM listener installed once at shell mount.
 
 ### 3.6 `getContext()` — Live
 
+**Scoped future-context note (#45/#46):** The
+[tray/resolution/navigation specification](ICD-shell-trays-resolution-navigation.md#9-navigation-context-timing-and-jump)
+proposes a context cell only for explicitly v2 opted-in primary receivers on
+the new navigation path. Existing launcher-initial raw reference/default `{}`
+semantics below remain unchanged. For that future path, commit a validated
+frozen snapshot immediately before the ordered synchronous receiver chain;
+its argument and `getContext()` then return the same snapshot, without mutating
+previously returned references. A newly navigation-created instance receives
+it at factory entry. This is prospective implementation review, not a shipped
+clone/freeze guarantee or a new API method.
+
 **Signature:** `getContext(): unknown`
 
 **Semantics:** Returns the context object passed to the panel
@@ -985,6 +996,12 @@ panel API factory.
 
 ### 3.7 `navigate(target, context)` — Stub
 
+**Future handoff:** #45's linked specification controls the prospective
+explicit app:panel protocol, fresh typed receiver admission, dirty/stale fencing
+and bounded internal shell outcomes. It is not MIME resolution and introduces
+no caller acknowledgement promise. The signature and current exact stub below
+are unchanged.
+
 **Signature:** `navigate(target: string, context?: unknown): void`
 
 **0.6.3 status:** Stub. Throws synchronously:
@@ -1011,6 +1028,11 @@ method silently no-op or change its error shape without breaking
 the test.
 
 ### 3.8 `openFloat(contentType, context)` — Stub
+
+**Future handoff:** [The float specification](ICD-shell-floats.md) owns #44's
+mechanism; #45/#46 owns typed resolution/admission and the unchanged SDK adapter.
+No mechanism fixture alone closes #44's real caller/provider/browser outcome.
+Historical milestone dates below are not a claim of shipped resolution.
 
 **Signature:** `openFloat(contentType: string, context?:
 unknown): Promise<{ floatId: string }>`
@@ -1039,6 +1061,13 @@ rejected-Promise shape (`Promise.reject(NotImplementedError)` with
 the exact `.message`).
 
 ### 3.9 `onNavigationIntent(callback)` — Stub-receiver
+
+**Future delivery clarification:** #45 retains ordered first-synchronous-throw
+semantics and ignores ALL callback returns, including native Promises/thenables:
+no await, inspection, reactions or rejection sink/listener. Only current-token
+synchronous return proves internal shell handoff, not asynchronous application
+work. Committed context/selection and earlier effects are not rolled back after
+a throw. The callback target remains the local panel ID; no new public ack.
 
 **Signature:** `onNavigationIntent(callback: (target: string,
 context: unknown) => void): void`
@@ -1078,6 +1107,9 @@ as `onActivate` / `onDeactivate`.
 
 ### 3.10 `requestFocus()` — Stub
 
+**Future handoff:** #45/#46 must supply fresh owner authority and #43's float
+focus rules; this does not open a tray or alter the current void signature/stub.
+
 **Signature:** `requestFocus(): void`
 
 **0.6.3 status:** Stub. Throws synchronously:
@@ -1101,6 +1133,10 @@ sync throw with exact message.
 
 ### 3.11 `setTrayState(stateName)` — Stub
 
+**Future handoff:** #45 supersedes only the future `tray_states[]` sketch below
+with a declared name-to-icon-token map, at most 16 states. Current signature and
+exact stub remain unchanged; no arbitrary icon markup/mutation is admitted.
+
 **Signature:** `setTrayState(stateName: string): void`
 
 **0.6.3 status:** Stub. Throws synchronously:
@@ -1123,6 +1159,10 @@ the corresponding icon variant; out-of-list values throw
 sync throw with exact message.
 
 ### 3.12 `setTrayBadge(value)` — Stub
+
+**Future handoff:** #45 proposes null/dot/non-negative-safe-integer validation,
+zero clears and bounded accessible rendering. #46 supplies real tray ownership
+and updates; no shipped behavior or signature/stub change is implied here.
 
 **Signature:** `setTrayBadge(value: number | "dot" | null):
 void`
@@ -2805,6 +2845,11 @@ a stub method.
 
 ### Tray runtime: icon rendering, popover lifecycle, badge/state API, tray collection ordering
 
+**Later scoped supersession:** #45's linked specification now owns this future
+delivery delta; #46 implements it. The 32-owner/16-state/one-popover choices and
+essential identity/independent Sign Out replace unbounded historical sketches.
+Notification data is separately #81, not an implied tray-milestone requirement.
+
 Tray-panel runtime (icon → popover → state-driven icon variants
 → badge). Shell-owned bell + avatar converted to dogfooded tray
 panels. `chrome_essential` fallback rendering. Tray collection
@@ -2813,6 +2858,13 @@ ordering and position persistence to `ext_shell.user_preferences`.
 `setTrayBadge` ship as stub methods.
 
 ### Content-type handler resolution + navigation intents
+
+**Later scoped supersession:** #45 supersedes the ambiguity chooser and
+`navigate`-via-MIME wording below. Automatic resolution is personal default,
+administrator default, earliest-installed authorized; manual Open with is
+separate. `navigate` takes an explicit app:panel identifier with local-ID
+receiver delivery. Proposed typed REST, administrative storage/policy facilities
+and dispatch binding require #46 source review; none is current behavior.
 
 Per-extension content-type registration (e.g. Notes registers as
 `.md` handler), three-tier priority resolution
