@@ -923,6 +923,16 @@ float delivery, without silently absorbing later resolver/navigation scope.
 focus intents, `openFloat`, and missing-handler fallbacks. This contract's
 Home/app/primary-panel tab navigation must not predefine those protocols.
 
+The [#45 delivery specification](ICD-shell-trays-resolution-navigation.md)
+separately defines prospective typed trays/float admission, approved
+personal/admin/earliest-authorized defaults, explicit navigation and unchanged
+SDK adapters for #46. It does not reuse this primary catalog as float authority
+or alter this contract's primary retention/navigation. #44 may merge its
+mechanism while remaining open until real API-installed caller/provider/browser
+proof through #46, including approved descriptor persistence. Concrete typed
+transport, administrative dispatch and protected local restore-policy machinery
+remain implementation-review proposals, not current endpoints or grants.
+
 ## 14. Bounded acceptance matrix
 
 | Layer | Required #31 evidence |
