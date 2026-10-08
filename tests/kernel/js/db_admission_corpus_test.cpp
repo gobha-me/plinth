@@ -16,11 +16,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <json/reader.h>
 #include <json/value.h>
 #include <json/writer.h>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <quickjs.h>
@@ -1171,6 +1173,310 @@ auto ownership_controls() -> void {
   REQUIRE(pool.shutdown(SHUTDOWN_BOUND));
 }
 
+struct NumericCase {
+  std::string_view name;
+  double input;
+  bool int_tag;
+  Json::ValueType mapped_type;
+  Json::Int64 mapped_integer = 0;
+};
+
+// Literal expectations are independent of the production conversion helper.
+// Float constructors retain their actual float tag, including negative zero.
+constexpr std::array<NumericCase, 27> NUMERIC_CASES{{
+    {"integer zero", 0.0, true, Json::intValue, 0},
+    {"integer one", 1.0, true, Json::intValue, 1},
+    {"integer negative one", -1.0, true, Json::intValue, -1},
+    {"int32 minimum", -2147483648.0, true, Json::intValue, -2147483648LL},
+    {"int32 maximum", 2147483647.0, true, Json::intValue, 2147483647LL},
+    {"float 2^31", 2147483648.0, false, Json::intValue, 2147483648LL},
+    {"float -(2^31+1)", -2147483649.0, false, Json::intValue, -2147483649LL},
+    {"float 2^40", 1099511627776.0, false, Json::intValue, 1099511627776LL},
+    {"float -2^40", -1099511627776.0, false, Json::intValue, -1099511627776LL},
+    {"inclusive 2^53", 9007199254740992.0, false, Json::intValue,
+     9007199254740992LL},
+    {"inclusive -2^53", -9007199254740992.0, false, Json::intValue,
+     -9007199254740992LL},
+    {"positive half", 0.5, false, Json::realValue},
+    {"negative half", -0.5, false, Json::realValue},
+    {"positive fraction", 42.25, false, Json::realValue},
+    {"negative fraction", -42.25, false, Json::realValue},
+    {"nearest upper safe neighbour", 9007199254740994.0, false,
+     Json::realValue},
+    {"nearest lower safe neighbour", -9007199254740994.0, false,
+     Json::realValue},
+    {"int64 minimum double", -9223372036854775808.0, false, Json::realValue},
+    {"last double below 2^63", 9223372036854774784.0, false, Json::realValue},
+    {"first double above int64 maximum", 9223372036854775808.0, false,
+     Json::realValue},
+    {"first double below int64 minimum", -9223372036854777856.0, false,
+     Json::realValue},
+    {"largest finite double", std::numeric_limits<double>::max(), false,
+     Json::realValue},
+    {"most negative finite double", -std::numeric_limits<double>::max(), false,
+     Json::realValue},
+    {"NaN", std::numeric_limits<double>::quiet_NaN(), false, Json::realValue},
+    {"positive infinity", std::numeric_limits<double>::infinity(), false,
+     Json::realValue},
+    {"negative infinity", -std::numeric_limits<double>::infinity(), false,
+     Json::realValue},
+    {"float negative zero", -0.0, false, Json::intValue, 0},
+}};
+
+enum class NumericPhase { normal, cancelled, unavailable };
+
+class CancellationRestore {
+ public:
+  CancellationRestore(BridgeContext& ctx, bool cancelled)
+      : context(ctx), original(ctx.cancelled.load()) {
+    context.cancelled.store(cancelled);
+  }
+  ~CancellationRestore() { context.cancelled.store(original); }
+  CancellationRestore(const CancellationRestore&) = delete;
+  auto operator=(const CancellationRestore&) -> CancellationRestore& = delete;
+  CancellationRestore(CancellationRestore&&) = delete;
+  auto operator=(CancellationRestore&&) -> CancellationRestore& = delete;
+
+ private:
+  BridgeContext& context;
+  bool original;
+};
+
+auto require_numeric_clean(const BridgeContext& context) -> void {
+  REQUIRE(context.callbacks.empty());
+  REQUIRE(context.pending_ops.empty());
+  REQUIRE(context.persistent_callbacks.empty());
+  REQUIRE(context.concurrent_async_ops == 0);
+  REQUIRE(context.inflight_detached.load() == 0);
+  REQUIRE(context.pending_op_count() == 0);
+  REQUIRE_FALSE(JS_IsJobPending(context.rt));
+  REQUIRE_FALSE(JS_HasException(context.ctx));
+}
+
+auto require_numeric_double(double actual, double expected) -> void {
+  if (std::isnan(expected)) {
+    REQUIRE(std::isnan(actual));
+  } else if (std::isinf(expected)) {
+    REQUIRE(std::isinf(actual));
+    REQUIRE(std::signbit(actual) == std::signbit(expected));
+  } else {
+    REQUIRE(actual == expected);
+    REQUIRE(std::signbit(actual) == std::signbit(expected));
+  }
+}
+
+auto require_numeric_mapping(const Json::Value& actual, const NumericCase& item)
+    -> void {
+  REQUIRE(actual.type() == item.mapped_type);
+  if (item.mapped_type == Json::intValue) {
+    REQUIRE(actual.asInt64() == item.mapped_integer);
+  } else {
+    REQUIRE(item.mapped_type == Json::realValue);
+    require_numeric_double(actual.asDouble(), item.input);
+  }
+}
+
+auto call_numeric(BridgeContext& context, JSValue function, JSValue db,
+                  std::array<JSValue, 2>& arguments, NumericPhase phase)
+    -> OwnedValue {
+  OpaqueRestore opaque{context.ctx, phase == NumericPhase::unavailable};
+  CancellationRestore cancelled{context, phase == NumericPhase::cancelled};
+  // Both guards restore before the caller inspects or settles the promise.
+  return {context.ctx, JS_Call(context.ctx, function, db, 2, arguments.data())};
+}
+
+auto execute_numeric(BridgeContext& context, const NumericCase& item, bool exec,
+                     NumericPhase phase) -> void {
+  require_numeric_clean(context);
+  REQUIRE(JS_GetContextOpaque(context.ctx) == &context);
+  REQUIRE_FALSE(context.cancelled.load());
+  const auto manager = context.extension_database_clients;
+  REQUIRE(manager != nullptr);
+  const int initial_id = context.next_callback_id;
+  OwnedValue number{
+      context.ctx,
+      item.int_tag
+          ? JS_NewInt32(context.ctx, static_cast<std::int32_t>(item.input))
+          : JS_NewFloat64(context.ctx, item.input)};
+  REQUIRE(JS_VALUE_GET_NORM_TAG(number.get()) ==
+          (item.int_tag ? JS_TAG_INT : JS_TAG_FLOAT64));
+  double input = 0.0;
+  REQUIRE(JS_ToFloat64(context.ctx, &input, number.get()) == 0);
+  require_numeric_double(input, item.input);
+  OwnedValue params{context.ctx, JS_NewArray(context.ctx)};
+  REQUIRE_FALSE(JS_IsException(params.get()));
+  REQUIRE(JS_SetPropertyUint32(context.ctx, params.get(), 0,
+                               JS_DupValue(context.ctx, number.get())) == 1);
+  OwnedValue sql{context.ctx, JS_NewString(context.ctx, "SELECT $1")};
+  OwnedValue global{context.ctx, JS_GetGlobalObject(context.ctx)};
+  OwnedValue db{context.ctx,
+                JS_GetPropertyStr(context.ctx, global.get(), "db")};
+  OwnedValue function{context.ctx, JS_GetPropertyStr(context.ctx, db.get(),
+                                                     exec ? "exec" : "query")};
+  REQUIRE(JS_IsFunction(context.ctx, function.get()));
+  std::array<JSValue, 2> arguments{sql.get(), params.get()};
+  auto promise =
+      call_numeric(context, function.get(), db.get(), arguments, phase);
+  REQUIRE(JS_GetContextOpaque(context.ctx) == &context);
+  REQUIRE_FALSE(context.cancelled.load());
+  REQUIRE(context.extension_database_clients == manager);
+  REQUIRE(context.extension_name == "notes");
+  if (phase == NumericPhase::unavailable) {
+    REQUIRE(JS_IsException(promise.get()));
+    OwnedValue exception{context.ctx, JS_GetException(context.ctx)};
+    REQUIRE(property_text(context.ctx, exception.get(), "name") == "TypeError");
+    REQUIRE(property_text(context.ctx, exception.get(), "message") ==
+            std::string{exec ? "db.exec" : "db.query"} +
+                ": bridge context unavailable");
+    REQUIRE(context.next_callback_id == initial_id);
+    require_numeric_clean(context);
+    return;
+  }
+  REQUIRE_FALSE(JS_IsException(promise.get()));
+  REQUIRE(JS_PromiseState(context.ctx, promise.get()) ==
+          (phase == NumericPhase::normal ? JS_PROMISE_PENDING
+                                         : JS_PROMISE_REJECTED));
+  auto operations = context.take_pending_ops();
+  if (phase == NumericPhase::normal) {
+    REQUIRE(operations.size() == 1);
+    REQUIRE(context.callbacks.size() == 1);
+    REQUIRE(context.pending_op_count() == 1);
+    REQUIRE(context.concurrent_async_ops == 0);
+    REQUIRE(context.next_callback_id == initial_id + 1);
+    const auto& operation = operations.front();
+    REQUIRE(operation.callback_id == initial_id);
+    const auto callback = context.callbacks.find(initial_id);
+    REQUIRE(callback != context.callbacks.end());
+    REQUIRE(callback->second.ns_for_cancellation == "db");
+    REQUIRE(JS_IsFunction(context.ctx, callback->second.resolve));
+    REQUIRE(JS_IsFunction(context.ctx, callback->second.reject));
+    const auto snapshot = observe_operation(operation, manager);
+    REQUIRE(snapshot.type ==
+            (exec ? AsyncOp::Type::DB_EXEC : AsyncOp::Type::DB_QUERY));
+    REQUIRE(snapshot.sql == "SELECT $1");
+    REQUIRE(snapshot.params.size() == 1);
+    REQUIRE_FALSE(snapshot.silent);
+    REQUIRE(snapshot.extension == "notes");
+    REQUIRE(snapshot.manager_pointer);
+    REQUIRE(snapshot.manager_owner);
+    REQUIRE(snapshot.unrelated);
+    require_numeric_mapping(snapshot.params.front(), item);
+    // Caller mutation cannot change the separately owned operation snapshot.
+    REQUIRE(JS_SetPropertyUint32(context.ctx, params.get(), 0,
+                                 JS_NewInt32(context.ctx, 99)) == 1);
+    REQUIRE(operation.sql_params.size() == 1);
+    require_numeric_mapping(operation.sql_params.front(), item);
+  } else {
+    REQUIRE(operations.empty());
+    REQUIRE(context.callbacks.empty());
+    REQUIRE(context.pending_op_count() == 0);
+    REQUIRE(context.concurrent_async_ops == 0);
+    REQUIRE(context.next_callback_id == initial_id);
+  }
+  OwnedValue then{context.ctx,
+                  JS_GetPropertyStr(context.ctx, promise.get(), "then")};
+  auto handler = evaluate(context, "(value)=>value");
+  REQUIRE_FALSE(JS_IsException(handler.get()));
+  std::array<JSValue, 2> handlers{handler.get(), handler.get()};
+  OwnedValue observer{context.ctx, JS_Call(context.ctx, then.get(),
+                                           promise.get(), 2, handlers.data())};
+  REQUIRE_FALSE(JS_IsException(observer.get()));
+  if (phase == NumericPhase::normal) {
+    // Accounting and host settlement are simulated, never database dispatch.
+    context.concurrent_async_ops = 1;
+    context.resolve(operations.front().callback_id, Json::Value{37});
+  }
+  operations.clear();
+  REQUIRE(drain_jobs(context));
+  REQUIRE(JS_PromiseState(context.ctx, promise.get()) ==
+          (phase == NumericPhase::normal ? JS_PROMISE_FULFILLED
+                                         : JS_PROMISE_REJECTED));
+  REQUIRE(JS_PromiseState(context.ctx, observer.get()) == JS_PROMISE_FULFILLED);
+  OwnedValue result{context.ctx, JS_PromiseResult(context.ctx, promise.get())};
+  OwnedValue observed{context.ctx,
+                      JS_PromiseResult(context.ctx, observer.get())};
+  if (phase == NumericPhase::normal) {
+    int value = 0;
+    REQUIRE(JS_ToInt32(context.ctx, &value, result.get()) == 0);
+    REQUIRE(value == 37);
+    REQUIRE(JS_ToInt32(context.ctx, &value, observed.get()) == 0);
+    REQUIRE(value == 37);
+  } else {
+    REQUIRE(rejection_shape(context.ctx, result.get()));
+    REQUIRE(rejection_shape(context.ctx, observed.get()));
+    REQUIRE(property_text(context.ctx, result.get(), "code") == "db.cancelled");
+    REQUIRE(property_text(context.ctx, result.get(), "message") ==
+            "execution cancelled");
+    REQUIRE(property_text(context.ctx, observed.get(), "code") ==
+            "db.cancelled");
+    REQUIRE(property_text(context.ctx, observed.get(), "message") ==
+            "execution cancelled");
+  }
+  require_numeric_clean(context);
+}
+
+auto numeric_controls() -> void {
+  REQUIRE(NUMERIC_CASES.size() == 27);
+  std::array<int, 3> calls{};
+  std::array<int, 2> bindings{};
+  int contexts = 0;
+  int integers = 0;
+  int reals = 0;
+  for (const bool exec : {false, true}) {
+    for (int replay_index = 0; replay_index < 2; ++replay_index) {
+      for (const auto phase : {NumericPhase::normal, NumericPhase::cancelled,
+                               NumericPhase::unavailable}) {
+        plinth::Config config{};
+        RuntimePool pool(nullptr, plinth::js::default_runtime_limits(), config,
+                         1, nullptr, "notes");
+        int phase_calls = 0;
+        int phase_integers = 0;
+        int phase_reals = 0;
+        {
+          Lease lease{pool};
+          REQUIRE(lease.get() != nullptr);
+          ++contexts;
+          for (const auto& item : NUMERIC_CASES) {
+            INFO("numeric=" << item.name << " exec=" << exec
+                            << " replay=" << replay_index
+                            << " phase=" << static_cast<int>(phase));
+            execute_numeric(*lease.get(), item, exec, phase);
+            // execute_numeric's JS-value/operation owners have all died.
+            require_numeric_clean(*lease.get());
+            REQUIRE(JS_GetContextOpaque(lease.get()->ctx) == lease.get());
+            REQUIRE_FALSE(lease.get()->cancelled.load());
+            ++phase_calls;
+            ++calls.at(static_cast<std::size_t>(phase));
+            ++bindings.at(exec ? 1U : 0U);
+            if (phase == NumericPhase::normal) {
+              if (item.mapped_type == Json::intValue) {
+                ++phase_integers;
+                ++integers;
+              } else {
+                ++phase_reals;
+                ++reals;
+              }
+            }
+          }
+          REQUIRE(phase_calls == 27);
+          REQUIRE(phase_integers == (phase == NumericPhase::normal ? 12 : 0));
+          REQUIRE(phase_reals == (phase == NumericPhase::normal ? 15 : 0));
+          lease.release();
+        }
+        REQUIRE(pool.active_count() == 0);
+        REQUIRE(pool.free_count() == 1);
+        REQUIRE(pool.shutdown(SHUTDOWN_BOUND));
+      }
+    }
+  }
+  REQUIRE(contexts == 12);
+  REQUIRE(calls == std::array<int, 3>{108, 108, 108});
+  REQUIRE(calls[0] + calls[1] + calls[2] == 324);
+  REQUIRE(bindings == std::array<int, 2>{162, 162});
+  REQUIRE(integers == 48);
+  REQUIRE(reals == 60);
+}
+
 } // namespace
 
 TEST_CASE("QuickJS ordinary database calls have a bounded deterministic "
@@ -1228,5 +1534,6 @@ TEST_CASE("QuickJS ordinary database calls have a bounded deterministic "
   fixed_controls();
   durable_manager_control();
   ownership_controls();
+  numeric_controls();
   REQUIRE_FALSE(plinth::log::is_audit_ready());
 }
