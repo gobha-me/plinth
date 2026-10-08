@@ -124,12 +124,23 @@ bounded plain inputs and byte views, validation/cancellation ordering, exec
 options and owned SQL/parameter/extension metadata. A real lazy database-client
 manager alias is observed without calling it to obtain a connection.
 
+A separate 27-input numeric matrix calls both registered bindings in normal,
+cancelled and unavailable-context phases, with two independent owner replays:
+324 calls across 12 owned contexts. Literal expectations check integer tags,
+floating negative zero, fractions, inclusive safe-integer endpoints and their
+outer neighbours, int64 edges, finite extrema, NaN and infinities. Input tags
+and sign bits, stored JSON types and values, guard outcomes and complete
+between-call settlement are checked directly, without stringification or the
+production converter as oracle. Each context owns its 27 sequential calls;
+no JS value or operation survives its lease. This proves numeric admission
+mapping, not how a database driver accepts or persists nonfinite parameters.
+
 Results and rejections are deliberately settled through the host seam as a
 simulation. This does not prove driver parameter binding, SQL authorization,
 PostgreSQL result/OID conversion, SQLSTATE fidelity, durable commits, production
 dispatch/backpressure or the production cancellation cascade. Transaction
 state, public/internal batch orchestration and denial ownership remain separate
-targets. Exotic accessors/proxies, allocation failure and broader numeric/coercion
+targets. Exotic accessors/proxies, allocation failure and broader coercion
 policy are outside this bounded slice; no production limits or policies change.
 
 Fresh replays, explicit family counts, corrupted-observation controls and bounded

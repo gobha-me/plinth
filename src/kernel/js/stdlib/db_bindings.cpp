@@ -88,11 +88,13 @@ auto try_convert_number(JSContext* ctx, JSValueConst v)
   }
   // d is integral (no fraction lost in the round-trip) AND fits the
   // IEEE 754 safe-integer range → Json::Int64; otherwise Json::Real.
-  auto as_int = static_cast<int64_t>(d);
-  bool integral = (static_cast<double>(as_int) == d);
-  if (integral && d >= static_cast<double>(SAFE_INT_MIN) &&
+  // Prove representability before narrowing, including for nonfinite inputs.
+  if (d >= static_cast<double>(SAFE_INT_MIN) &&
       d <= static_cast<double>(SAFE_INT_MAX)) {
-    return Json::Value{static_cast<Json::Int64>(as_int)};
+    auto as_int = static_cast<int64_t>(d);
+    if (static_cast<double>(as_int) == d) {
+      return Json::Value{static_cast<Json::Int64>(as_int)};
+    }
   }
   return Json::Value{d};
 }

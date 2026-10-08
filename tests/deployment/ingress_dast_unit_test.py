@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import copy
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import runpy
+import stat
+import subprocess
+import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -20,6 +26,7 @@ from dast_report import REQUIRED_ROUTES
 ORIGIN = "https://plinth.test:8443"
 HOST = "plinth.test:8443"
 OWNER = "fake-exact-task-owner"
+SCANNER_CID = "a" * 64
 ACTIVE_SEED = "/app/?issue40_probe=read_only"
 SOURCE_STATUS_COMMAND = ["git", "status", "--porcelain=v1", "--untracked-files=all",
                          "--ignore-submodules=none"]
@@ -55,6 +62,8 @@ def scanner():
     value.name = "plinth-issue40-zap-fake-owned"
     value.owner = OWNER
     value.port = 12345
+    value.key = "fake-scanner-api-key"
+    value.container_id = None
     value.started = False
     value.creation_attempted = False
     value.scans = []
@@ -62,6 +71,13 @@ def scanner():
     value.passive_remaining = None
     value.scan_evidence = []
     return value
+
+
+def owned_scanner_info(value, *, container_id=SCANNER_CID, owner=OWNER):
+    return [{"Id": container_id, "Name": "/" + value.name,
+             "Config": {"Image": driver.SCANNER_IMAGE,
+                        "Labels": {"plinth.test.owner": owner}},
+             "State": {"Status": "created"}}]
 
 
 def harness():
@@ -1706,17 +1722,667 @@ class BrowserReceiptTest(unittest.TestCase):
                 driver.DastHarness.validate_browser_receipt(value)
 
 
+class PinnedPassiveRulesDownloadTest(unittest.TestCase):
+    artifact = b"fake checksum-pinned passive rule archive"
+    fixed_error = "^pinned passive rules download failed$"
+
+    def response(self, body=None, **headers):
+        body = self.artifact if body is None else body
+        return 200, {"content-length": str(len(body)), **headers}, body
+
+    def download(self, directory, responses):
+        with mock.patch.object(driver, "_download_passive_rules_hop", side_effect=responses) as hop, \
+                mock.patch.object(driver, "PINNED_PASSIVE_RULES_SHA256",
+                                  hashlib.sha256(self.artifact).hexdigest()):
+            path = driver.download_pinned_passive_rules(directory)
+        return path, hop
+
+    def test_production_source_digest_and_finite_budgets_are_literal(self):
+        self.assertEqual(driver.PINNED_PASSIVE_RULES_URL,
+                         "https://github.com/zaproxy/zap-extensions/releases/download/"
+                         "pscanrules-v76/pscanrules-release-76.zap")
+        self.assertEqual(driver.PINNED_PASSIVE_RULES_SHA256,
+                         "6201955247e538ddf8d11fd4332450e5821dbf419dbd29ed616b2909e9aabcaa")
+        self.assertEqual(driver.PINNED_PASSIVE_RULES_MAX_BYTES, 8 * 1024 * 1024)
+        self.assertEqual(driver.PINNED_PASSIVE_RULES_TIMEOUT_SECONDS, 60)
+        self.assertEqual(driver.PINNED_PASSIVE_RULES_REDIRECTS, 3)
+        self.assertEqual(driver.PINNED_PASSIVE_RULES_HEADER_BYTES, 16 * 1024)
+
+    def test_direct_download_uses_actual_hash_and_fixed_filename(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+            directory = Path(temporary)
+            path, hop = self.download(directory, [self.response()])
+            self.assertEqual(path, directory / "pscanrules-release-76.zap")
+            self.assertEqual(path.read_bytes(), self.artifact)
+            self.assertEqual(hop.call_count, 1)
+            self.assertEqual(hop.call_args.args[0], driver.PINNED_PASSIVE_RULES_URL)
+            self.assertIsInstance(hop.call_args.args[1], float)
+
+    def test_verified_nonsecret_archive_is_readable_under_private_umask(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+            previous = os.umask(0o077)
+            try:
+                path, _hop = self.download(Path(temporary), [self.response()])
+            finally:
+                os.umask(previous)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o444)
+            self.assertEqual(path.read_bytes(), self.artifact)
+            self.assertEqual(stat.S_IMODE(Path(temporary).stat().st_mode), 0o700)
+
+    def test_official_https_release_asset_redirect_retains_one_deadline(self):
+        destination = "https://release-assets.githubusercontent.com/github-production-release-asset/123/fake?sig=fake"
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+            path, hop = self.download(Path(temporary), [
+                (302, {"location": destination}, b""), self.response(),
+            ])
+            self.assertEqual(path.read_bytes(), self.artifact)
+            self.assertEqual([call.args[0] for call in hop.call_args_list],
+                             [driver.PINNED_PASSIVE_RULES_URL, destination])
+            self.assertEqual(hop.call_args_list[0].args[1], hop.call_args_list[1].args[1])
+
+    def test_unsafe_redirect_authorities_fail_before_another_network_hop(self):
+        destinations = (
+            "http://release-assets.githubusercontent.com/fake",
+            "https://private-user:private-token@release-assets.githubusercontent.com/fake",
+            "https://release-assets.githubusercontent.com:8443/fake",
+            "https://unowned.invalid/fake",
+            "https://release-assets.githubusercontent.com.unowned.invalid/fake",
+            "https://release-assets.githubusercontent.com/fake#fragment",
+        )
+        for destination in destinations:
+            with self.subTest(destination=destination), \
+                    tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                    mock.patch.object(driver, "_download_passive_rules_hop",
+                                      return_value=(302, {"location": destination}, b"")) as hop:
+                with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                    driver.download_pinned_passive_rules(Path(temporary))
+                self.assertEqual(hop.call_count, 1)
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_redirect_limit_is_finite_and_does_not_write_unverified_bytes(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                mock.patch.object(driver, "_download_passive_rules_hop", return_value=(
+                    302, {"location": "https://release-assets.githubusercontent.com/fake"}, b"")) as hop:
+            with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                driver.download_pinned_passive_rules(Path(temporary))
+            self.assertLessEqual(hop.call_count, driver.PINNED_PASSIVE_RULES_REDIRECTS + 1)
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_redirect_without_location_and_failure_status_are_rejected(self):
+        for response in ((302, {}, b""), (404, {}, b"private-error-body"),
+                         (500, {}, self.artifact)):
+            with self.subTest(status=response[0]), \
+                    tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                    mock.patch.object(driver, "_download_passive_rules_hop", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                    driver.download_pinned_passive_rules(Path(temporary))
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_empty_wrong_hash_and_malformed_lengths_are_rejected(self):
+        responses = (
+            (200, {"content-length": "0"}, b""),
+            self.response(b"not the pinned archive"),
+            self.response(**{"content-length": "-1"}),
+            self.response(**{"content-length": "not-a-size"}),
+            self.response(**{"content-length": str(len(self.artifact) + 1)}),
+        )
+        for response in responses:
+            with self.subTest(headers=response[1]), \
+                    tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                    mock.patch.object(driver, "_download_passive_rules_hop", return_value=response), \
+                    mock.patch.object(driver, "PINNED_PASSIVE_RULES_SHA256",
+                                      hashlib.sha256(self.artifact).hexdigest()):
+                with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                    driver.download_pinned_passive_rules(Path(temporary))
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_oversize_is_rejected_with_or_without_content_length(self):
+        for headers in ({"content-length": "65"}, {}):
+            with self.subTest(headers=headers), \
+                    tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                    mock.patch.object(driver, "PINNED_PASSIVE_RULES_MAX_BYTES", 64), \
+                    mock.patch.object(driver, "_download_passive_rules_hop",
+                                      return_value=(200, headers, b"x" * 65)):
+                with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                    driver.download_pinned_passive_rules(Path(temporary))
+                self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_headerless_complete_body_is_checked_by_actual_sha(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+            path, _hop = self.download(Path(temporary), [(200, {}, self.artifact)])
+            self.assertEqual(path.read_bytes(), self.artifact)
+
+    def test_download_exception_is_fixed_and_never_prints_private_details(self):
+        marker = "private-url-token-body"
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                mock.patch.object(driver, "_download_passive_rules_hop", side_effect=OSError(marker)), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaisesRegex(RuntimeError, self.fixed_error) as caught:
+                driver.download_pinned_passive_rules(Path(temporary))
+            self.assertIsNone(caught.exception.__cause__)
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertNotIn(marker, str(caught.exception))
+            self.assertEqual(list(Path(temporary).iterdir()), [])
+
+    def test_existing_asset_or_symlink_is_not_overwritten(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), \
+                    tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+                directory = Path(temporary)
+                original = directory / "existing-owner"
+                original.write_bytes(b"existing owner data")
+                path = directory / "pscanrules-release-76.zap"
+                if symlink:
+                    path.symlink_to(original)
+                else:
+                    path.write_bytes(b"existing owner data")
+                with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                    self.download(directory, [self.response()])
+                self.assertEqual(path.read_bytes(), b"existing owner data")
+                self.assertEqual(original.read_bytes(), b"existing owner data")
+
+    def test_symlink_directory_is_rejected_without_network_or_outside_write(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+            directory = Path(temporary)
+            outside = directory / "unowned-target"
+            outside.mkdir()
+            link = directory / "aliased-root"
+            link.symlink_to(outside, target_is_directory=True)
+            with mock.patch.object(driver, "_download_passive_rules_hop") as hop:
+                with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                    driver.download_pinned_passive_rules(link)
+                hop.assert_not_called()
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_mode_failure_removes_only_created_unverified_output(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                mock.patch.object(driver.os, "fchmod", side_effect=OSError("private-mode-error")):
+            directory = Path(temporary)
+            untouched = directory / "unrelated-owner"
+            untouched.write_bytes(b"retain owner data")
+            with self.assertRaisesRegex(RuntimeError, self.fixed_error):
+                self.download(directory, [self.response()])
+            self.assertFalse((directory / "pscanrules-release-76.zap").exists())
+            self.assertEqual(untouched.read_bytes(), b"retain owner data")
+
+    def test_interruption_after_exclusive_creation_removes_owned_asset_and_propagates(self):
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary, \
+                mock.patch.object(driver.os, "fchmod", side_effect=KeyboardInterrupt("fake-interrupt")):
+            directory = Path(temporary)
+            with self.assertRaises(KeyboardInterrupt):
+                self.download(directory, [self.response()])
+            self.assertEqual(list(directory.iterdir()), [])
+
+
+class PassiveRulesNetworkHopTest(unittest.TestCase):
+    wire = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody"
+
+    def invoke(self, chunks, *, select_ready=True, wait_status=0, clock=None, alive=False):
+        process = mock.Mock()
+        process.stdout.fileno.return_value = 17
+        process.wait.return_value = wait_status
+        process.poll.return_value = None if alive else wait_status
+        ready = mock.Mock()
+        ready.select.return_value = [(object(), driver.selectors.EVENT_READ)] if select_ready else []
+        selector = mock.MagicMock()
+        selector.__enter__.return_value = ready
+        clock = (lambda: 100.0) if clock is None else clock
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(driver.time, "monotonic", side_effect=clock))
+            stack.enter_context(mock.patch.object(driver.selectors, "DefaultSelector", return_value=selector))
+            popen = stack.enter_context(mock.patch.object(driver.subprocess, "Popen", return_value=process))
+            reads = stack.enter_context(mock.patch.object(driver.os, "read", side_effect=chunks))
+            result_value = driver._download_passive_rules_hop(driver.PINNED_PASSIVE_RULES_URL, 160.0)
+        return result_value, process, ready, popen, reads
+
+    def test_real_hop_disables_ambient_configuration_auth_and_proxy_credentials(self):
+        ambient = {"HTTPS_PROXY": "https://private:secret@proxy.invalid", "CURL_HOME": "/private/curl",
+                   "HOME": "/private/home", "NETRC": "/private/netrc", "PATH": "/fake-bin"}
+        with mock.patch.dict(driver.os.environ, ambient, clear=True):
+            reply, process, ready, popen, reads = self.invoke([self.wire, b""])
+        self.assertEqual(reply, (200, {"content-length": "4"}, b"body"))
+        argv = popen.call_args.args[0]
+        self.assertEqual(argv[:2], ["curl", "-q"])
+        for flag, expected in (("--proxy", ""), ("--noproxy", "*"),
+                               ("--netrc-file", os.devnull), ("--proto", "=https"),
+                               ("--proto-redir", "=https"), ("--url", driver.PINNED_PASSIVE_RULES_URL),
+                               ("--max-filesize", str(driver.PINNED_PASSIVE_RULES_MAX_BYTES))):
+            self.assertEqual(argv[argv.index(flag) + 1], expected)
+        self.assertIn("--no-netrc", argv)
+        self.assertIn("--no-netrc-optional", argv)
+        self.assertNotIn("--location", argv)
+        self.assertNotIn("-L", argv)
+        self.assertEqual(popen.call_args.kwargs["env"], {"PATH": "/fake-bin", "LC_ALL": "C"})
+        self.assertIs(popen.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertTrue(all(0 < call.args[0] <= 55 for call in ready.select.call_args_list))
+        self.assertTrue(all(call.args == (17, 8192) for call in reads.call_args_list))
+        process.stdout.close.assert_called_once_with()
+
+    def test_http_chunked_response_without_length_still_has_bounded_body(self):
+        wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nbody"
+        reply, process, _ready, _popen, _reads = self.invoke([wire[:20], wire[20:], b""])
+        self.assertEqual(reply, (200, {"transfer-encoding": "chunked"}, b"body"))
+        process.stdout.close.assert_called_once_with()
+
+    def test_selector_timeout_kills_reaps_and_closes_only_the_owned_child(self):
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        selector = mock.MagicMock()
+        selector.__enter__.return_value.select.return_value = []
+        with mock.patch.object(driver.time, "monotonic", return_value=100.0), \
+                mock.patch.object(driver.subprocess, "Popen", return_value=process), \
+                mock.patch.object(driver.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(driver.os, "read") as read:
+            with self.assertRaises(AssertionError):
+                driver._download_passive_rules_hop(driver.PINNED_PASSIVE_RULES_URL, 160.0)
+        read.assert_not_called()
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=60.0)
+        process.stdout.close.assert_called_once_with()
+
+    def test_slow_progress_cannot_reset_total_wall_clock_deadline(self):
+        values = iter([100.0, 100.0, 156.0, 156.0])
+        clock = lambda: next(values)
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        selector = mock.MagicMock()
+        selector.__enter__.return_value.select.return_value = [(object(), driver.selectors.EVENT_READ)]
+        with mock.patch.object(driver.time, "monotonic", side_effect=clock), \
+                mock.patch.object(driver.subprocess, "Popen", return_value=process), \
+                mock.patch.object(driver.selectors, "DefaultSelector", return_value=selector), \
+                mock.patch.object(driver.os, "read", return_value=self.wire) as read:
+            with self.assertRaises(AssertionError):
+                driver._download_passive_rules_hop(driver.PINNED_PASSIVE_RULES_URL, 160.0)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(selector.__enter__.return_value.select.call_count, 1)
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=4.0)
+        process.stdout.close.assert_called_once_with()
+
+    def test_expired_deadline_never_creates_download_child(self):
+        with mock.patch.object(driver.time, "monotonic", return_value=160.0), \
+                mock.patch.object(driver.subprocess, "Popen") as popen:
+            with self.assertRaises(AssertionError):
+                driver._download_passive_rules_hop(driver.PINNED_PASSIVE_RULES_URL, 160.0)
+        popen.assert_not_called()
+
+    def test_nonzero_exit_and_truncated_wire_never_return_an_artifact(self):
+        for chunks, status in (([self.wire, b""], 22), ([b"unfinished", b""], 0)):
+            with self.subTest(status=status, chunks=chunks):
+                with self.assertRaises(AssertionError):
+                    self.invoke(chunks, wait_status=status)
+
+    def test_header_and_lengthless_body_limits_apply_before_process_completion(self):
+        responses = (b"HTTP/1.1 200 OK\r\nX-Fake: " + b"a" * 65,
+                     b"HTTP/1.1 200 OK\r\n\r\n" + b"a" * 65)
+        for wire in responses:
+            with self.subTest(wire=wire[:20]), \
+                    mock.patch.object(driver, "PINNED_PASSIVE_RULES_MAX_BYTES", 64), \
+                    mock.patch.object(driver, "PINNED_PASSIVE_RULES_HEADER_BYTES", 64):
+                with self.assertRaises(AssertionError):
+                    self.invoke([wire, b""])
+
+    def test_malformed_duplicate_or_folded_identity_headers_fail_closed(self):
+        headers = (b"Content-Length: 4\r\ncontent-length: 4",
+                   b"Location: https://github.com/fake\r\nlocation: https://github.com/fake",
+                   b"Transfer-Encoding: chunked\r\ntransfer-encoding: chunked",
+                   b"bad-header", b" folded-header: value", b"bad header: value")
+        for header in headers:
+            with self.subTest(header=header):
+                with self.assertRaises(AssertionError):
+                    self.invoke([b"HTTP/1.1 200 OK\r\n" + header + b"\r\n\r\nbody", b""])
+
+    def local_child(self, program, *, budget=6.0):
+        """Real local pipe/selector lifecycle, replacing only curl's executable."""
+        original_popen = subprocess.Popen
+        children = []
+        commands = []
+
+        def launch(command, **kwargs):
+            commands.append((command, kwargs))
+            self.assertEqual(command[:2], ["curl", "-q"])
+            self.assertEqual(command[command.index("--url") + 1], driver.PINNED_PASSIVE_RULES_URL)
+            self.assertIs(kwargs["stderr"], subprocess.DEVNULL)
+            self.assertEqual(set(kwargs["env"]), {"PATH", "LC_ALL"})
+            child = original_popen([sys.executable, "-I", "-c", program], **kwargs)
+            children.append(child)
+            return child
+
+        deadline = driver.time.monotonic() + budget
+        try:
+            with mock.patch.object(driver.subprocess, "Popen", side_effect=launch):
+                result_value = driver._download_passive_rules_hop(driver.PINNED_PASSIVE_RULES_URL, deadline)
+            return result_value, children, commands
+        finally:
+            # Assert production cleanup before the test's emergency safety net.
+            try:
+                self.assertEqual(len(children), 1)
+                self.assertIsNotNone(children[0].poll())
+                self.assertTrue(children[0].stdout.closed)
+                self.assertLess(driver.time.monotonic(), deadline + 0.5)
+            finally:
+                for child in children:
+                    if child.poll() is None:
+                        child.kill()
+                    child.wait(timeout=5)
+                    child.stdout.close()
+
+    def test_real_owned_pipe_selector_and_wait_parse_without_network(self):
+        program = "import sys; sys.stdout.buffer.write(" + repr(self.wire) + "); sys.stdout.buffer.flush()"
+        reply, children, commands = self.local_child(program)
+        self.assertEqual(reply, (200, {"content-length": "4"}, b"body"))
+        self.assertEqual(children[0].returncode, 0)
+        self.assertEqual(len(commands), 1)
+
+    def test_real_stalled_child_is_killed_reaped_and_pipe_closed_within_total_bound(self):
+        program = ("import sys, threading; sys.stdout.buffer.write(b'HTTP/1.1 200 OK\\r\\n'); "
+                   "sys.stdout.buffer.flush(); threading.Event().wait()")
+        with self.assertRaisesRegex(AssertionError, "download deadline expired"):
+            self.local_child(program, budget=5.25)
+
+    def test_real_unbounded_body_is_stopped_before_a_download_can_complete(self):
+        wire = b"HTTP/1.1 200 OK\r\n\r\n" + b"x" * 128
+        program = "import sys; sys.stdout.buffer.write(" + repr(wire) + "); sys.stdout.buffer.flush()"
+        with mock.patch.object(driver, "PINNED_PASSIVE_RULES_MAX_BYTES", 64):
+            with self.assertRaisesRegex(AssertionError, "download body exceeded its bound"):
+                self.local_child(program)
+
+
+class FrozenScannerStartupTest(unittest.TestCase):
+    def configured(self, *, fail_action=None, inventory=None, addons=None,
+                   version=driver.SCANNER_VERSION, create_output=SCANNER_CID):
+        value = scanner()
+        value.harness.root = Path("/fake-owned-scanner-root")
+        value.harness.private_details = {}
+        events = []
+        inventory = owned_scanner_info(value) if inventory is None else inventory
+        addons = ([{"id": name, "version": release, "status": "release"}
+                   for name, release in driver.RULE_ADDONS.items()]
+                  if addons is None else addons)
+
+        def run(argv, **kwargs):
+            action = argv[1]
+            events.append(("docker", argv, kwargs))
+            if action == fail_action:
+                raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+            if argv[:3] == ["docker", "image", "inspect"]:
+                return result("[]")
+            if argv == ["docker", "inspect", value.name]:
+                return result(returncode=1, stderr="No such object")
+            if action == "create":
+                self.assertTrue(value.creation_attempted)
+                return result(create_output + "\n")
+            if argv == ["docker", "inspect", SCANNER_CID]:
+                return result(json.dumps(inventory))
+            if action in ("cp", "start"):
+                return result()
+            raise AssertionError("unexpected mocked scanner command")
+
+        def api(component, kind, action, **kwargs):
+            events.append(("api", (component, kind, action), kwargs))
+            if (component, kind, action) == ("core", "view", "version"):
+                return {"version": version}
+            if (component, kind, action) == ("autoupdate", "view", "installedAddons"):
+                return {"installedAddons": addons}
+            if (component, kind, action) == ("context", "action", "newContext"):
+                return {"contextId": "17"}
+            return {}
+
+        value.harness.run = mock.Mock(side_effect=run)
+        value.api = mock.Mock(side_effect=api)
+        return value, events
+
+    def start(self, value, events):
+        def downloaded(directory):
+            self.assertEqual(directory, value.harness.root)
+            self.assertFalse(value.creation_attempted)
+            events.append(("verified-download", directory))
+            return directory / "pscanrules-release-76.zap"
+
+        with mock.patch.object(driver, "download_pinned_passive_rules", side_effect=downloaded), \
+                mock.patch.object(driver, "wait_until", side_effect=lambda observe, **_kwargs: observe()):
+            value.start()
+
+    def test_actual_start_keeps_pinned_engine_resources_and_api_restrictions(self):
+        value, events = self.configured()
+        self.start(value, events)
+        create = next(event[1] for event in events if event[:1] == ("docker",)
+                      and event[1][1] == "create")
+        self.assertEqual(create, [
+            "docker", "create", "--name", value.name,
+            "--label", "plinth.test.owner=" + OWNER,
+            "--network", "host", "--add-host", "plinth.test:127.0.0.1",
+            "--memory", "1536m", "--memory-swap", "1536m", "--cpus", "1",
+            "--env", "JAVA_OPTS=-Xmx768m", driver.SCANNER_IMAGE,
+            "zap.sh", "-silent", "-daemon", "-host", "127.0.0.1", "-port", "12345",
+            "-config", "api.disablekey=false", "-config", "api.key=" + value.key,
+            "-config", "api.addrs.addr.name=127.0.0.1",
+            "-config", "api.addrs.addr.regex=false",
+            "-config", "autoupdate.checkOnStart=false",
+            "-config", "autoupdate.downloadNewRelease=false",
+        ])
+        self.assertEqual(driver.SCANNER_IMAGE,
+                         "ghcr.io/zaproxy/zaproxy:2.17.0@sha256:"
+                         "781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef")
+        self.assertEqual(driver.RULE_ADDONS, {"ascanrules": "83.0.0", "pscanrules": "76.0.0"})
+        self.assertTrue(value.started)
+        self.assertEqual(value.container_id, SCANNER_CID)
+        self.assertEqual(value.context_id, "17")
+
+    def test_verified_download_owned_create_copy_start_precede_any_api_initialization(self):
+        value, events = self.configured()
+        self.start(value, events)
+        self.assertEqual(events[0][0], "verified-download")
+        commands = [event[1] for event in events if event[0] == "docker"]
+        self.assertEqual(commands[0], ["docker", "image", "inspect", driver.SCANNER_IMAGE])
+        self.assertEqual(commands[1], ["docker", "inspect", value.name])
+        self.assertEqual(commands[2][1], "create")
+        self.assertEqual(commands[3], ["docker", "inspect", SCANNER_CID])
+        self.assertEqual(commands[4], ["docker", "cp",
+                                      str(value.harness.root / "pscanrules-release-76.zap"),
+                                      SCANNER_CID + ":/zap/plugin/pscanrules-release-76.zap"])
+        self.assertEqual(commands[5], ["docker", "start", SCANNER_CID])
+        self.assertEqual([event[0] for event in events[:7]],
+                         ["verified-download", "docker", "docker", "docker", "docker", "docker", "docker"])
+        self.assertEqual(events[7][1], ("core", "view", "version"))
+        self.assertEqual(events[8][1], ("autoupdate", "view", "installedAddons"))
+        self.assertEqual(events[9][1], ("core", "action", "setMode"))
+        self.assertTrue(all(0 < call.kwargs["timeout"] <= 60
+                            for call in value.harness.run.call_args_list))
+
+    def test_real_download_verified_readable_mode_reaches_copy_before_start_under_umask077(self):
+        value, events = self.configured()
+        body = PinnedPassiveRulesDownloadTest.artifact
+        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+            value.harness.root = Path(temporary)
+            original_run = value.harness.run.side_effect
+
+            def inspect_archive_before_docker(argv, **kwargs):
+                if argv[1] in ("create", "cp", "start"):
+                    archive = value.harness.root / "pscanrules-release-76.zap"
+                    self.assertEqual(archive.read_bytes(), body)
+                    self.assertEqual(stat.S_IMODE(archive.stat().st_mode), 0o444)
+                return original_run(argv, **kwargs)
+
+            value.harness.run.side_effect = inspect_archive_before_docker
+            old_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(driver, "_download_passive_rules_hop",
+                                       return_value=(200, {}, body)), \
+                        mock.patch.object(driver, "PINNED_PASSIVE_RULES_SHA256",
+                                          hashlib.sha256(body).hexdigest()), \
+                        mock.patch.object(driver, "wait_until",
+                                          side_effect=lambda observe, **_kwargs: observe()):
+                    value.start()
+            finally:
+                os.umask(old_umask)
+            self.assertTrue(value.started)
+
+    def test_download_failure_never_attempts_docker_or_allocates_ownership(self):
+        value, events = self.configured()
+        with mock.patch.object(driver, "download_pinned_passive_rules",
+                               side_effect=RuntimeError("pinned passive rules download failed")):
+            with self.assertRaises(RuntimeError):
+                value.start()
+        value.harness.run.assert_not_called()
+        value.api.assert_not_called()
+        self.assertFalse(value.creation_attempted)
+        self.assertFalse(value.started)
+        self.assertIsNone(value.container_id)
+
+    def test_partial_create_copy_and_start_failures_keep_cleanup_ownership(self):
+        for action in ("create", "cp", "start"):
+            with self.subTest(action=action):
+                value, events = self.configured(fail_action=action)
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    self.start(value, events)
+                self.assertTrue(value.creation_attempted)
+                self.assertFalse(value.started)
+                self.assertEqual(value.container_id, None if action == "create" else SCANNER_CID)
+                value.api.assert_not_called()
+                if action != "start":
+                    self.assertFalse(any(event[0] == "docker" and event[1][1] == "start"
+                                         for event in events))
+
+    def test_malformed_create_identity_never_copies_or_starts(self):
+        for identity in ("", "abc", "A" * 64, "a" * 63, "a" * 65, "a" * 64 + "\nforeign"):
+            with self.subTest(identity=identity):
+                value, events = self.configured(create_output=identity)
+                with self.assertRaises(AssertionError):
+                    self.start(value, events)
+                self.assertTrue(value.creation_attempted)
+                self.assertIsNone(value.container_id)
+                value.api.assert_not_called()
+                self.assertFalse(any(event[0] == "docker" and event[1][1] in ("cp", "start")
+                                     for event in events))
+
+    def test_owned_container_identity_image_name_label_and_state_cannot_be_substituted(self):
+        original = owned_scanner_info(scanner())
+        variants = []
+        for field, replacement in (("Id", "b" * 64), ("Name", "/foreign")):
+            invalid = copy.deepcopy(original)
+            invalid[0][field] = replacement
+            variants.append(invalid)
+        for field, replacement in (("Image", "mutable:foreign"),
+                                   ("Labels", {"plinth.test.owner": "foreign"})):
+            invalid = copy.deepcopy(original)
+            invalid[0]["Config"][field] = replacement
+            variants.append(invalid)
+        invalid = copy.deepcopy(original)
+        invalid[0]["State"]["Status"] = "running"
+        variants.append(invalid)
+        for inventory in variants:
+            with self.subTest(inventory=inventory):
+                value, events = self.configured(inventory=inventory)
+                with self.assertRaises(AssertionError):
+                    self.start(value, events)
+                self.assertEqual(value.container_id, SCANNER_CID)
+                value.api.assert_not_called()
+                self.assertFalse(any(event[0] == "docker" and event[1][1] in ("cp", "start")
+                                     for event in events))
+
+    def test_malformed_owned_inventory_is_rejected_before_copy(self):
+        for inventory in ([], [{}], [None], [{}, {}], "not-an-inventory",
+                          [{"Id": SCANNER_CID, "Name": "/plinth-issue40-zap-fake-owned",
+                            "Config": None, "State": {"Status": "created"}}]):
+            with self.subTest(inventory=inventory):
+                value, events = self.configured(inventory=inventory)
+                with self.assertRaises(AssertionError):
+                    self.start(value, events)
+                value.api.assert_not_called()
+                self.assertFalse(any(event[0] == "docker" and event[1][1] in ("cp", "start")
+                                     for event in events))
+
+    def test_wrong_engine_prevents_rule_and_context_initialization(self):
+        value, events = self.configured(version="2.18.0")
+        with self.assertRaises(AssertionError):
+            self.start(value, events)
+        self.assertEqual([event[1] for event in events if event[0] == "api"],
+                         [("core", "view", "version")])
+
+    def test_missing_duplicate_beta_or_wrong_rules_prevent_context_initialization(self):
+        valid = [{"id": name, "version": version, "status": "release"}
+                 for name, version in driver.RULE_ADDONS.items()]
+        variants = [[], valid[:1], [valid[0], valid[0]],
+                    [valid[0], {**valid[1], "version": "75.0.0"}],
+                    [{**valid[0], "version": "84.0.0"}, valid[1]],
+                    [{**valid[0], "status": "beta"}, valid[1]],
+                    [valid[0], {**valid[1], "status": "beta"}],
+                    valid + [valid[1]], "not-an-inventory"]
+        for addons in variants:
+            with self.subTest(addons=addons):
+                value, events = self.configured(addons=addons)
+                with self.assertRaises(AssertionError):
+                    self.start(value, events)
+                self.assertEqual([event[1] for event in events if event[0] == "api"],
+                                 [("core", "view", "version"),
+                                  ("autoupdate", "view", "installedAddons")])
+                self.assertEqual(value.harness.private_details, {})
+
+    def test_partial_create_timeout_is_cleaned_by_inspected_immutable_owner(self):
+        value, events = self.configured(fail_action="create")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.start(value, events)
+        self.assertTrue(value.creation_attempted)
+        self.assertIsNone(value.container_id)
+        value.harness.run = mock.Mock(side_effect=[
+            result(json.dumps(owned_scanner_info(value))), result(),
+            result(returncode=1, stderr="No such object"),
+            result(returncode=1, stderr="No such object"),
+        ])
+        value.cleanup()
+        self.assertEqual([call.args[0] for call in value.harness.run.call_args_list], [
+            ["docker", "inspect", value.name],
+            ["docker", "rm", "--force", "--volumes", SCANNER_CID],
+            ["docker", "inspect", SCANNER_CID],
+            ["docker", "inspect", value.name],
+        ])
+        value.api.assert_not_called()
+
+    def test_failed_inspection_after_create_retains_known_id_for_owned_cleanup(self):
+        value, events = self.configured()
+        original = value.harness.run.side_effect
+
+        def failed_inspection(argv, **kwargs):
+            if argv == ["docker", "inspect", SCANNER_CID]:
+                raise OSError("fake private inspect transport failure")
+            return original(argv, **kwargs)
+
+        value.harness.run.side_effect = failed_inspection
+        with self.assertRaises(OSError):
+            self.start(value, events)
+        self.assertEqual(value.container_id, SCANNER_CID)
+        self.assertFalse(value.started)
+        value.harness.run = mock.Mock(side_effect=[
+            result(json.dumps(owned_scanner_info(value))), result(),
+            result(returncode=1, stderr="No such object"),
+            result(returncode=1, stderr="No such object"),
+        ])
+        value.cleanup()
+        self.assertEqual(value.harness.run.call_args_list[0].args[0],
+                         ["docker", "inspect", SCANNER_CID])
+        self.assertEqual(value.harness.run.call_args_list[1].args[0],
+                         ["docker", "rm", "--force", "--volumes", SCANNER_CID])
+        value.api.assert_not_called()
+
+
 class ScannerOwnershipTest(unittest.TestCase):
     def test_partial_creation_is_cleaned_even_before_started_flag(self):
         value = scanner()
         value.creation_attempted = True
-        owned = [{"Config": {"Labels": {"plinth.test.owner": OWNER}}}]
+        owned = owned_scanner_info(value)
         value.harness.run.side_effect = [
             result(json.dumps(owned)), result(), result(returncode=1, stderr="No such object"),
+            result(returncode=1, stderr="No such object"),
         ]
         value.cleanup()
         commands = [call.args[0] for call in value.harness.run.call_args_list]
-        self.assertIn(["docker", "rm", "--force", "--volumes", value.name], commands)
+        self.assertIn(["docker", "rm", "--force", "--volumes", SCANNER_CID], commands)
         self.assertFalse(value.started)
 
     def test_owned_label_mismatch_never_removes_another_container(self):
@@ -1736,6 +2402,72 @@ class ScannerOwnershipTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             value.cleanup()
         self.assertFalse(any(call.args[0][1] == "rm" for call in value.harness.run.call_args_list))
+
+    def test_named_substitution_after_inspection_never_changes_immutable_delete_target(self):
+        value = scanner()
+        value.creation_attempted = True
+        replacement = owned_scanner_info(value, container_id="b" * 64, owner="foreign")
+        value.harness.run.side_effect = [
+            result(json.dumps(owned_scanner_info(value))), result(),
+            result(returncode=1, stderr="No such object"), result(json.dumps(replacement)),
+        ]
+        with self.assertRaises(AssertionError):
+            value.cleanup()
+        deletes = [call.args[0] for call in value.harness.run.call_args_list if call.args[0][1] == "rm"]
+        self.assertEqual(deletes, [["docker", "rm", "--force", "--volumes", SCANNER_CID]])
+        self.assertFalse(value.started)
+
+    def test_captured_container_id_cannot_be_replaced_even_with_same_owner_label(self):
+        value = scanner()
+        value.creation_attempted = True
+        value.container_id = SCANNER_CID
+        value.harness.run.return_value = result(json.dumps(owned_scanner_info(
+            value, container_id="b" * 64)))
+        with self.assertRaises(AssertionError):
+            value.cleanup()
+        self.assertEqual(value.harness.run.call_args.args[0], ["docker", "inspect", SCANNER_CID])
+        self.assertFalse(any(call.args[0][1] == "rm" for call in value.harness.run.call_args_list))
+
+    def test_malformed_partial_owner_inventory_is_never_deleted(self):
+        for inventory in ([], [None], [{}, {}], [{}],
+                          [{"Config": {"Labels": {"plinth.test.owner": OWNER}}, "Id": "short"}]):
+            with self.subTest(inventory=inventory):
+                value = scanner()
+                value.creation_attempted = True
+                value.harness.run.return_value = result(json.dumps(inventory))
+                with self.assertRaises(AssertionError):
+                    value.cleanup()
+                self.assertFalse(any(call.args[0][1] == "rm" for call in value.harness.run.call_args_list))
+
+    def test_remove_failure_is_red_and_does_not_claim_stopped_or_absent(self):
+        value = scanner()
+        value.creation_attempted = True
+        value.container_id = SCANNER_CID
+        value.started = True
+        value.harness.run.side_effect = [result(json.dumps(owned_scanner_info(value))),
+                                        subprocess.TimeoutExpired(["docker", "rm", SCANNER_CID], 45)]
+        with self.assertRaises(subprocess.TimeoutExpired):
+            value.cleanup()
+        self.assertTrue(value.started)
+        self.assertEqual(value.container_id, SCANNER_CID)
+        self.assertEqual(value.harness.run.call_count, 2)
+
+    def test_immutable_absence_and_name_absence_are_both_required(self):
+        for immutable_absent in (False, True):
+            with self.subTest(immutable_absent=immutable_absent):
+                value = scanner()
+                value.creation_attempted = True
+                value.container_id = SCANNER_CID
+                replies = [result(json.dumps(owned_scanner_info(value))), result()]
+                if immutable_absent:
+                    replies += [result(returncode=1, stderr="No such object"), result("[]")]
+                else:
+                    replies += [result("[]")]
+                value.harness.run.side_effect = replies
+                with self.assertRaises(AssertionError):
+                    value.cleanup()
+                self.assertEqual(value.harness.run.call_args.args[0],
+                                 ["docker", "inspect", value.name if immutable_absent else SCANNER_CID])
 
 
 class InfrastructureOwnershipTest(unittest.TestCase):
