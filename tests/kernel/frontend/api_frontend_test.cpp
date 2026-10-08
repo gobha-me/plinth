@@ -28,6 +28,7 @@
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/shell/firstboot.hpp"
+#include "plinth/version.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <drogon/HttpRequest.h>
@@ -217,7 +218,10 @@ TEST_CASE("B.01: GET /api/frontend/tokens.css returns 302 to "
   auto r = capture(s.db);
   REQUIRE(r.received);
   REQUIRE(r.status == drogon::k302Found);
-  REQUIRE(r.location == "/ext/shell/0.6.6/css/tokens.css");
+  const auto bundled_version = std::to_string(plinth::VERSION_MAJOR) + "." +
+                               std::to_string(plinth::VERSION_MINOR) + "." +
+                               std::to_string(plinth::VERSION_PATCH);
+  REQUIRE(r.location == "/ext/shell/" + bundled_version + "/css/tokens.css");
   REQUIRE(r.cache_control == "no-cache");
   REQUIRE(r.body.empty());
 }

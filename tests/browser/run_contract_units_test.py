@@ -136,9 +136,37 @@ class ContractUnitDiscoveryTest(unittest.TestCase):
     def test_fixed_real_file_counts_are_preserved(self):
         self.assertEqual(gate.GROUPS, {
             "transport": (("sdk-transport.test.mjs", 35), ("smart-data-controller.test.mjs", 30)),
-            "launcher": (("launcher-model.test.mjs", 2), ("launcher-owner.test.mjs", 51)),
+            "launcher": (("launcher-model.test.mjs", 2), ("launcher-owner.test.mjs", 59),
+                         ("float-model.test.mjs", 19), ("float-owner.test.mjs", 46),
+                         ("float-preferences.test.mjs", 30)),
             "admin": (("admin-package.test.mjs", 20),),
         })
+
+    def test_each_float_file_rejects_missing_or_partial_discovery(self):
+        for name, expected in gate.GROUPS["launcher"][2:]:
+            for actual in (0, expected - 1):
+                with self.subTest(name=name, actual=actual):
+                    with self.assertRaisesRegex(gate.GateError, "counts differ"):
+                        gate.validate_tap(name, expected, tap(actual), 0)
+
+    @mock.patch.object(gate, "run_file")
+    def test_launcher_command_includes_each_fixed_float_file(self, run):
+        with mock.patch.object(gate.sys, "argv", ["run-contract-units.py", "launcher"]), \
+                mock.patch("builtins.print"):
+            self.assertEqual(gate.main(), 0)
+        self.assertEqual([(call.args[1], call.args[2]) for call in run.call_args_list],
+                         list(gate.GROUPS["launcher"]))
+
+    @mock.patch.object(gate, "run_file")
+    def test_one_missing_float_file_fails_the_whole_launcher_gate(self, run):
+        def execute(_directory, name, _expected):
+            if name == "float-owner.test.mjs":
+                raise gate.GateError("float-owner.test.mjs: missing actual file")
+        run.side_effect = execute
+        with mock.patch.object(gate.sys, "argv", ["run-contract-units.py", "launcher"]), \
+                mock.patch("builtins.print"):
+            self.assertEqual(gate.main(), 1)
+        self.assertEqual(len(run.call_args_list), len(gate.GROUPS["launcher"]))
 
 
 if __name__ == "__main__":

@@ -1,6 +1,11 @@
 import { h, Component } from 'preact';
 import { call, reconnectRealtime, subscribe } from '@plinth/frontend/sdk';
 import { PanelManager } from '../panels/loader.js';
+import { FloatManager } from '../panels/float-manager.js';
+import { FloatLayer } from '../panels/float-chrome.js';
+import { FloatPreferences, FloatPreferenceIoOwner } from '../panels/float-preferences.js';
+import { createFloatReservations } from '../panels/float-reservations.js';
+import { DocumentInteractionOwner } from '../panels/interaction-owner.js';
 import {
     catalogTargetKeys, choosePanel, makeTarget, normalizeCatalog,
     normalizeLauncherPreference, orderApplications, updatePreference,
@@ -108,10 +113,20 @@ export class Launcher extends Component {
         this.recovering = false;
         this.preferenceWrite = Promise.resolve();
         this.menuItems = [];
+        this.floatReservations = props.floatReservations || createFloatReservations();
+        if (props.floatInteraction) this.interaction = props.floatInteraction;
+        else {
+            this.documentInteraction = new DocumentInteractionOwner({ reservations: this.floatReservations });
+            this.interaction = this.documentInteraction.beginFrame({ isCurrent: () => !this.retired });
+        }
+        this.floatPreferenceIoOwner = props.floatPreferenceIoOwner || new FloatPreferenceIoOwner();
+        this.switcherToken = Symbol();
+        this.primaryConfirmationToken = Symbol();
     }
 
     owns(owner = this.owner) {
-        return !this.retired && owner === this.owner;
+        return !this.retired && owner === this.owner &&
+            (!this.interaction || this.interaction.isCurrent());
     }
 
     setOwnedState(update, callback, current) {
@@ -134,7 +149,14 @@ export class Launcher extends Component {
         const owner = this.owner;
         const isCurrent = () => this.owns(owner);
         if (!isCurrent()) return;
+        // Mechanism only: #46 must supply reviewed authority and persistence
+        // adapters. Never substitute the unrestricted generic preferences API.
+        this.floatPreferences = new FloatPreferences({ ioOwner: this.floatPreferenceIoOwner });
+        this.unsubscribePreferenceRetire = this.interaction.onRetire(() => this.floatPreferences.retire());
+        this.floatManager = new FloatManager({ reservations: this.floatReservations,
+            interaction: this.interaction });
         this.panelManager = new PanelManager(this.panelHost, {
+            interaction: this.interaction,
             onFailure: (target, error, info) => {
                 if (isCurrent()) this.auditPanelFailure(target, error, info);
             },
@@ -144,6 +166,17 @@ export class Launcher extends Component {
             onHome: () => { if (isCurrent()) this.requestHome(); },
             onDirtyChange: () => { if (isCurrent()) this.forceOwnedUpdate(); },
         });
+        this.unsubscribePrimaryRetire = this.interaction.onRetire(() => this.panelManager.dispose());
+        this.unsubscribeInteraction = this.interaction.subscribe(() => {
+            if (!isCurrent()) return;
+            const blocked = !!this.interaction.modal;
+            this.props.onModalChange?.(blocked);
+            if (this.interaction.confirmation?.kind === 'float' && this.state.menuOpen) {
+                this.setOwnedState({ menuOpen: false });
+            }
+            this.forceOwnedUpdate();
+        });
+        this.floatPreferences.start();
         this.preferencePromise = this.loadPreference();
         this.unsubscribeApplications = subscribe(APPLICATIONS_CHANNEL,
             () => { if (isCurrent()) this.refreshWhenPreferencesReady(); }, {
@@ -166,6 +199,9 @@ export class Launcher extends Component {
     componentWillUnmount() {
         // Retire admission before cleanup invokes any panel or transport callbacks.
         this.retired = true;
+        this.interaction.retire();
+        this.unsubscribeInteraction?.();
+        this.documentInteraction?.dispose();
         this.recoveryToken++;
         this.subscriptionReady = false;
         this.recovering = false;
@@ -176,6 +212,30 @@ export class Launcher extends Component {
         document.removeEventListener('visibilitychange', this.visibility);
         this.narrowQuery?.removeEventListener('change', this.narrowChanged);
         this.panelManager?.dispose();
+    }
+
+    componentDidUpdate() {
+        if (!this.owns()) return;
+        if (this.state.menuOpen && this.state.narrow) this.interaction.setModal('switcher', this.switcherToken);
+        else this.interaction.clearModal(this.switcherToken);
+    }
+
+    backgroundElements() {
+        // Never inert the switcher's own ancestor while it holds the modal lease.
+        return this.interaction.modal?.kind === 'switcher'
+            ? [this.primaryMain, this.homeButton, this.appTrigger, this.tabs, this.userControlsHost, this.overlayButton]
+            : [this.primaryMain, this.topbar];
+    }
+
+    primaryFocusFallback() { return this.panelManager?.active?.container || this.homeHeading; }
+
+    beginPrimaryConfirmation(intent) {
+        this.focusBeforeDialog = document.activeElement;
+        this.interaction.clearModal(this.switcherToken);
+        const accepted = this.interaction.confirm({ kind: 'primary', recordToken: this.primaryConfirmationToken,
+            trigger: this.focusBeforeDialog, onCancel: () => this.finishCancelDirty(),
+            onDiscard: () => this.finishConfirmDirty() });
+        if (accepted) this.setOwnedState({ dirtyIntent: intent, menuOpen: false });
     }
 
     async loadPreference() {
@@ -241,6 +301,8 @@ export class Launcher extends Component {
         this.navigationToken++;
         this.catalogAbort?.abort();
         this.pendingTarget = null;
+        this.interaction.dismissConfirmation();
+        this.interaction.clearModal(this.switcherToken);
         this.panelManager?.destroyAll();
         this.setOwnedState({
             applications: [], navigation: { kind: 'home' }, catalogStatus: 'failed',
@@ -349,6 +411,7 @@ export class Launcher extends Component {
             const dirtyTargetRemoved = this.state.dirtyIntent?.kind === 'target' &&
                 !this.findTarget(applications, this.state.dirtyIntent.target);
             const dismissDirtyIntent = activeRemoved || dirtyTargetRemoved;
+            if (dismissDirtyIntent) this.interaction.dismissConfirmation(this.primaryConfirmationToken);
             let navigation = this.state.navigation;
             let replacement = null;
             if (navigation.kind === 'application') {
@@ -404,15 +467,14 @@ export class Launcher extends Component {
 
     requestNavigation(target, source) {
         if (!this.owns()) return;
-        if (this.state.dirtyIntent) return;
+        if (this.state.dirtyIntent || this.interaction.confirmation) return;
         const active = this.panelManager.activeTarget;
         if (active && active.generation === target.generation && active.panel.id === target.panel.id) {
             this.setOwnedState({ menuOpen: false });
             return;
         }
         if (this.panelManager.activeDirty) {
-            this.focusBeforeDialog = document.activeElement;
-            this.setOwnedState({ dirtyIntent: { kind: 'target', target, source }, menuOpen: false });
+            this.beginPrimaryConfirmation({ kind: 'target', target, source });
             return;
         }
         this.navigateTarget(target, { source });
@@ -420,27 +482,50 @@ export class Launcher extends Component {
 
     requestHome() {
         if (!this.owns()) return;
-        if (this.state.dirtyIntent) return;
+        if (this.state.dirtyIntent || this.interaction.confirmation) return;
         if (this.state.navigation.kind === 'home') return;
         if (this.panelManager.activeDirty) {
-            this.focusBeforeDialog = document.activeElement;
-            this.setOwnedState({ dirtyIntent: { kind: 'home' }, menuOpen: false });
+            this.beginPrimaryConfirmation({ kind: 'home' });
             return;
         }
         this.commitHome(false);
     }
 
     cancelDirty() {
+        if (!this.owns() || this.interaction.confirmation?.kind !== 'primary') return;
+        this.interaction.resolveConfirmation(false);
+    }
+
+    finishCancelDirty() {
         if (!this.owns()) return;
         const token = this.navigationToken;
-        this.setOwnedState({ dirtyIntent: null }, () => this.focusBeforeDialog?.focus(),
+        const trigger = this.focusBeforeDialog;
+        this.focusBeforeDialog = null;
+        this.setOwnedState({ dirtyIntent: null }, () => {
+            if (this.interaction.modal?.kind === 'float') {
+                this.floatManager.focus(this.interaction.modal.token);
+                return;
+            }
+            this.interaction.focusPrimary();
+            if (trigger?.isConnected && !trigger.closest?.('[inert], [hidden]')) trigger.focus();
+            else {
+                const fallback = this.primaryFocusFallback();
+                if (fallback?.isConnected && !fallback.closest?.('[inert], [hidden]')) fallback.focus();
+            }
+        },
             () => token === this.navigationToken);
     }
 
     confirmDirty() {
+        if (!this.owns() || this.interaction.confirmation?.kind !== 'primary') return;
+        this.interaction.resolveConfirmation(true);
+    }
+
+    finishConfirmDirty() {
         if (!this.owns()) return;
         const intent = this.state.dirtyIntent;
         if (!intent) return;
+        this.focusBeforeDialog = null;
         const token = this.navigationToken;
         this.setOwnedState({ dirtyIntent: null }, () => {
             if (intent.kind === 'home') this.commitHome(true);
@@ -457,6 +542,7 @@ export class Launcher extends Component {
         const token = ++this.navigationToken;
         this.pendingTarget = null;
         this.panelManager.deactivateToHome({ discardActive });
+        this.interaction.focusPrimary();
         this.setOwnedState({ navigation: { kind: 'home' }, menuOpen: false, panelFailure: null },
             () => this.homeHeading?.focus(), () => token === this.navigationToken);
     }
@@ -505,6 +591,7 @@ export class Launcher extends Component {
         }
         if (!isCurrent()) return;
         this.pendingTarget = null;
+        this.interaction.focusPrimary();
         this.preference = updatePreference(this.preference, target.applicationId, target.panel.id);
         this.writePreference();
         this.setOwnedState({
@@ -550,7 +637,10 @@ export class Launcher extends Component {
 
     openMenu() {
         if (!this.owns()) return;
+        if (this.interaction.modal && this.interaction.modal.token !== this.switcherToken) return;
         if (!this.state.applications.length) return;
+        if (this.state.narrow && !this.interaction.setModal('switcher', this.switcherToken)) return;
+        this.interaction.focusShell();
         const token = this.navigationToken;
         const current = this.state.navigation.applicationId;
         const index = Math.max(0, this.state.applications.findIndex(item => item.id === current));
@@ -561,6 +651,7 @@ export class Launcher extends Component {
 
     closeMenu() {
         if (!this.owns()) return;
+        this.interaction.clearModal(this.switcherToken);
         const token = this.navigationToken;
         this.setOwnedState({ menuOpen: false }, () => {
             if (!this.state.menuOpen) this.appTrigger?.focus();
@@ -639,7 +730,7 @@ export class Launcher extends Component {
         if (!application || application.panels.length < 2) return null;
         const selected = this.state.navigation.panelId;
         const focused = this.state.focusedPanel || selected || application.panels[0].id;
-        return h('div', { class: 'primary-tabs', role: 'tablist', 'aria-label': `${application.title} panels`,
+        return h('div', { ref: element => { this.tabs = element; }, class: 'primary-tabs', role: 'tablist', 'aria-label': `${application.title} panels`,
             'data-ipoint': `ext.${application.id}.primaryTabs`, 'data-ipoint-layer': 'extension' },
         application.panels.map((panel, index) => {
             const target = makeTarget(application, panel);
@@ -664,10 +755,12 @@ export class Launcher extends Component {
         const busy = ['loading', 'refreshing'].includes(this.state.catalogStatus);
         const showHome = onHome && !this.state.panelFailure;
         return h('div', { class: 'launcher-shell' },
-            h('header', { class: 'topbar', 'data-ipoint': 'shell.topbar', 'data-ipoint-layer': 'shell' },
+            h('header', { ref: element => { this.topbar = element; }, class: 'topbar', 'data-ipoint': 'shell.topbar', 'data-ipoint-layer': 'shell',
+                onFocusIn: () => this.interaction.focusShell() },
                 h('nav', { class: 'launcher-navigation', 'aria-label': 'Application navigation' },
                     h('button', {
                         type: 'button', class: 'home-button', 'aria-label': 'Home',
+                        ref: element => { this.homeButton = element; },
                         'aria-current': onHome ? 'page' : null,
                         'aria-pressed': onHome ? 'true' : 'false',
                         'data-ipoint': 'shell.home', 'data-ipoint-layer': 'shell',
@@ -709,12 +802,15 @@ export class Launcher extends Component {
                         }, h(ApplicationMark, { application, small: true }), application.title)))) : null),
                     this.renderTabs(currentApplication)),
                 h('div', { class: 'topbar-spacer' }),
-                this.props.userControls,
+                h('div', { ref: element => { this.userControlsHost = element; }, class: 'shell-user-controls' }, this.props.userControls),
                 DEVELOPMENT_MODE ? h('button', {
+                    ref: element => { this.overlayButton = element; },
                     type: 'button', class: 'ipoint-toggle',
                     onClick: () => this.setOwnedState({ overlay: !this.state.overlay }),
                 }, this.state.overlay ? 'Hide ownership' : 'Show ownership') : null),
             h('main', {
+                ref: element => { this.primaryMain = element; },
+                onFocusIn: () => this.interaction.focusPrimary(),
                 class: `launcher-main${this.state.overlay ? ' show-ipoints' : ''}`,
                 'aria-busy': busy ? 'true' : 'false',
                 'data-ipoint': 'shell.content', 'data-ipoint-layer': 'shell',
@@ -733,6 +829,9 @@ export class Launcher extends Component {
                     ref: element => { this.panelHost = element; } })),
             this.state.overlay ? h('div', { class: 'ipoint-legend', role: 'status' },
                 'Ownership: blue = shell, amber = extension') : null,
+            this.floatManager ? h(FloatLayer, { manager: this.floatManager, interaction: this.interaction,
+                topbarElement: () => this.topbar, backgroundElements: () => this.backgroundElements(),
+                focusFallback: () => this.primaryFocusFallback() }) : null,
             this.state.dirtyIntent ? h(DirtyDialog, {
                 onCancel: () => this.cancelDirty(), onDiscard: () => this.confirmDirty(),
                 isCurrent: () => this.owns(owner),

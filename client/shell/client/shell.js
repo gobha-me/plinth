@@ -12,6 +12,9 @@ import {
   withCsrf,
 } from '@plinth/frontend/sdk';
 import { Launcher } from './launcher/launcher.js';
+import { createFloatReservations } from './panels/float-reservations.js';
+import { DocumentInteractionOwner } from './panels/interaction-owner.js';
+import { FloatPreferenceIoOwner } from './panels/float-preferences.js';
 const html = htm.bind(h);
 
 // ICD-0.6.3 §6.5 — sanitize boundary detail before audit emission.
@@ -145,12 +148,24 @@ function errString(code, retryAfter) {
 const listeners = new Set();
 const state = { route: 'loading', user: null, errorCode: null, retryAfter: 0 };
 let sessionGeneration = 0;
+// These owners survive login/logout; native imports and preference I/O are not
+// cancelled merely by replacing a frame. No admission/storage port is installed.
+const floatReservations = createFloatReservations();
+const floatPreferenceIoOwner = new FloatPreferenceIoOwner();
+const floatInteractionOwner = new DocumentInteractionOwner({ reservations: floatReservations });
+let currentFloatFrame = null;
+function retireFloatFrame() {
+  currentFloatFrame?.retire();
+  currentFloatFrame = null;
+}
 function endSession(code) {
+  retireFloatFrame();
   sessionGeneration++;
   retireRealtimeSession(code || 'session_ended');
   setState({ route: 'login', user: null, errorCode: code || null, retryAfter: 0 });
 }
 function beginSession(user) {
+  retireFloatFrame();
   sessionGeneration++;
   activateRealtimeSession();
   setState({ route: 'authenticated', user, errorCode: null });
@@ -446,14 +461,17 @@ class LoginForm extends Component {
 class AuthFrame extends Component {
   constructor(props) {
     super(props);
-    this.state = { popoverOpen: false, prefs: preferenceValues(readPrefs()), preferenceError: null };
+    this.state = { popoverOpen: false, floatModalActive: false,
+      prefs: preferenceValues(readPrefs()), preferenceError: null };
     this.retired = false;
     this.generation = sessionGeneration;
+    this.floatInteraction = floatInteractionOwner.beginFrame({ isCurrent: () => this.isCurrent() });
+    currentFloatFrame = this.floatInteraction;
     this.preferenceVersions = new Map(Object.values(PREF_KEYS).map(key => [key, 0]));
     this.appliedVersions = new Map(Object.values(PREF_KEYS).map(key => [key, 0]));
     this.preferenceWrites = new Map();
     this.onDocClick = (ev) => {
-      if (!this.isCurrent() || !this.avatarRef) return;
+      if (!this.isCurrent() || this.state.floatModalActive || !this.avatarRef) return;
       if (this.avatarRef.contains(ev.target)) return;
       if (this.state.popoverOpen) this.setState({ popoverOpen: false });
     };
@@ -465,12 +483,18 @@ class AuthFrame extends Component {
   }
   componentWillUnmount() {
     this.retired = true;
+    this.floatInteraction.retire();
+    if (currentFloatFrame === this.floatInteraction) currentFloatFrame = null;
     document.removeEventListener('click', this.onDocClick);
   }
   preferenceFailed() {
     if (!this.isCurrent()) return;
     this.setState(() => this.isCurrent()
       ? { preferenceError: 'Preferences could not be saved or loaded.' } : null);
+  }
+  floatModalChanged(blocked) {
+    if (!this.isCurrent() || this.state.floatModalActive === blocked) return;
+    this.setState({ floatModalActive: blocked, popoverOpen: false });
   }
   applyPreference(key, value, version) {
     if (!this.isCurrent()) return;
@@ -549,11 +573,14 @@ class AuthFrame extends Component {
                   ? prefs[PREF_KEYS.SCALE] : 100;
     const userControls = html`
       <div class="zone zone-avatar"
+           inert=${this.state.floatModalActive ? true : undefined}
            ref=${(el) => { this.avatarRef = el; }}
            style="position: relative;">
           <button onClick=${() => {
-            if (this.isCurrent()) this.setState({ popoverOpen: !this.state.popoverOpen });
-          }}>
+            if (this.isCurrent() && !this.state.floatModalActive) {
+              this.setState({ popoverOpen: !this.state.popoverOpen });
+            }
+          }} disabled=${this.state.floatModalActive}>
             <span class="avatar-circle">${initial}</span>
             <svg class="chev" viewBox="0 0 16 16" aria-hidden="true">
               <path d="M4 6 L8 10 L12 6" fill="none"
@@ -588,6 +615,10 @@ class AuthFrame extends Component {
       </div>`;
     return html`<${Launcher}
       user=${props.user}
+      floatInteraction=${this.floatInteraction}
+      floatReservations=${floatReservations}
+      floatPreferenceIoOwner=${floatPreferenceIoOwner}
+      onModalChange=${(blocked) => this.floatModalChanged(blocked)}
       userControls=${userControls}
       onSessionEnd=${(code) => this.sessionEnded(code)} />`;
   }

@@ -23,7 +23,7 @@ FROM debian-snapshot AS build-base
 
 # Defaults keep the development Compose path usable without claiming a release
 # identity. Release automation supplies the exact VERSION/revision/epoch.
-ARG PLINTH_VERSION=0.6.6
+ARG PLINTH_VERSION=0.6.7
 ARG PLINTH_REVISION=0000000000000000000000000000000000000000
 ARG PLINTH_RELEASE=0
 ARG SOURCE_DATE_EPOCH=1789689600
@@ -77,7 +77,7 @@ ENTRYPOINT ["ctest", "--test-dir", "build", "--output-on-failure", "--parallel",
 
 FROM debian-snapshot AS runtime
 
-ARG PLINTH_VERSION=0.6.6
+ARG PLINTH_VERSION=0.6.7
 ARG PLINTH_REVISION=0000000000000000000000000000000000000000
 ARG PLINTH_RELEASE=0
 ARG SOURCE_DATE_EPOCH=1789689600
