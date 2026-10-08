@@ -29,7 +29,31 @@ ghcr.io/zaproxy/zaproxy:2.17.0@sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61
 ```
 
 The running ZAP version must be `2.17.0`, with release add-ons `ascanrules`
-`83.0.0` and `pscanrules` `76.0.0`. Automatic scanner updates are disabled.
+`83.0.0` and `pscanrules` `76.0.0`. The immutable image bundles active rules
+`83.0.0` but passive rules `75.0.0`. Before startup, the harness downloads the
+fixed official [passive-76 release artifact](https://github.com/zaproxy/zap-extensions/releases/download/pscanrules-v76/pscanrules-release-76.zap)
+and verifies its complete SHA-256:
+
+```text
+6201955247e538ddf8d11fd4332450e5821dbf419dbd29ed616b2909e9aabcaa
+```
+
+This scratch-only scanner dependency is not installed in Plinth or shipped in
+its runtime image. Downloading has an 8-MiB body limit, a 16-KiB header limit per
+response, at most three redirects and one 60-second total deadline, including
+owned download-process cleanup. Only HTTPS `github.com` followed by HTTPS
+`release-assets.githubusercontent.com` is allowed; credentials, nondefault ports,
+fragments, ambient proxy/netrc/curl configuration and arbitrary URL/hash input
+are forbidden. Download failures expose only a fixed error, never raw asset
+URLs or responses. The verified file is made non-secret, read-only `0444` even
+under `umask 077`, then copied into the created scanner's `/zap/plugin` directory
+after its immutable container ID, exact image and owner label are verified.
+
+The scanner starts explicitly with `-silent`. Its startup update path can run
+before ordinary `-config` arguments apply, so the configuration flags alone do
+not freeze addons. Silent startup prevents unsolicited updates; the unchanged
+exact engine/addon guard still rejects missing, updated or incorrectly loaded
+rules. No automatic addon update or mutable scanner image is used.
 Missing or different rules fail the gate rather than silently reducing coverage.
 The scanner is an owned, bounded container with a loopback-only control API and
 proxy. Browser targets are restricted to

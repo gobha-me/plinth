@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import shutil
 import signal
 import socket
@@ -57,6 +58,15 @@ SCANNER_VERSION = "2.17.0"
 SCANNER_DIGEST = "sha256:781a2bdaea47324e7bab583e2263f21d257b0aee61ed51521a5be45f5f5081ef"
 SCANNER_IMAGE = f"ghcr.io/zaproxy/zaproxy:{SCANNER_VERSION}@{SCANNER_DIGEST}"
 RULE_ADDONS = {"ascanrules": "83.0.0", "pscanrules": "76.0.0"}
+PINNED_PASSIVE_RULES_URL = (
+    "https://github.com/zaproxy/zap-extensions/releases/download/"
+    "pscanrules-v76/pscanrules-release-76.zap"
+)
+PINNED_PASSIVE_RULES_SHA256 = "6201955247e538ddf8d11fd4332450e5821dbf419dbd29ed616b2909e9aabcaa"
+PINNED_PASSIVE_RULES_MAX_BYTES = 8 * 1024 * 1024
+PINNED_PASSIVE_RULES_TIMEOUT_SECONDS = 60
+PINNED_PASSIVE_RULES_REDIRECTS = 3
+PINNED_PASSIVE_RULES_HEADER_BYTES = 16 * 1024
 ACTIVE_RULES = ("40012", "40018")  # Reflected XSS and SQL injection; GET only.
 ACTIVE_PATHS = ("/app/?issue40_probe=read_only",
                 "/api/auth/session?issue40_probe=read_only",
@@ -367,6 +377,132 @@ def completed_scanner_messages(messages, alerts, origin):
     return completed, proofs
 
 
+def _download_passive_rules_hop(url, deadline):
+    """One non-following HTTPS request; cap stdout and the entire child lifetime."""
+    # Reserve five seconds inside the total budget to kill/reap our own child.
+    remaining = deadline - time.monotonic() - 5
+    require(remaining > 0, "download deadline expired")
+    command = [
+        "curl", "-q", "--silent", "--http1.1", "--include", "--no-buffer",
+        "--proxy", "", "--noproxy", "*", "--no-netrc", "--no-netrc-optional",
+        "--netrc-file", os.devnull, "--proto", "=https", "--proto-redir", "=https",
+        "--max-time", str(remaining), "--connect-timeout", str(min(10, remaining)),
+        "--max-filesize", str(PINNED_PASSIVE_RULES_MAX_BYTES), "--url", url,
+    ]
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        env={"PATH": os.environ.get("PATH", os.defpath), "LC_ALL": "C"},
+    )
+    output = bytearray()
+    header_end = None
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(process.stdout, selectors.EVENT_READ)
+            while True:
+                remaining = deadline - time.monotonic() - 5
+                require(remaining > 0, "download deadline expired")
+                require(ready.select(remaining), "download deadline expired")
+                chunk = os.read(process.stdout.fileno(), 8192)
+                if not chunk:
+                    break
+                output.extend(chunk)
+                if header_end is None:
+                    boundary = output.find(b"\r\n\r\n")
+                    if boundary >= 0:
+                        header_end = boundary + 4
+                        require(header_end <= PINNED_PASSIVE_RULES_HEADER_BYTES,
+                                "download headers exceeded their bound")
+                    else:
+                        require(len(output) <= PINNED_PASSIVE_RULES_HEADER_BYTES,
+                                "download headers exceeded their bound")
+                if header_end is not None:
+                    require(len(output) - header_end <= PINNED_PASSIVE_RULES_MAX_BYTES,
+                            "download body exceeded its bound")
+            remaining = deadline - time.monotonic() - 5
+            require(remaining > 0 and process.wait(timeout=remaining) == 0,
+                    "download process failed")
+    finally:
+        try:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        finally:
+            process.stdout.close()
+    require(time.monotonic() < deadline and header_end is not None,
+            "download did not finish within its bound")
+    lines = bytes(output[:header_end - 4]).decode("ascii").split("\r\n")
+    match = re.fullmatch(r"HTTP/1\.[01] ([1-5][0-9]{2})(?: [^\r\n]*)?", lines[0])
+    require(match is not None, "invalid download response")
+    headers = {}
+    for line in lines[1:]:
+        require(":" in line and not line.startswith((" ", "\t")), "invalid download header")
+        name, value = line.split(":", 1)
+        require(re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name), "invalid download header")
+        require(all(character == "\t" or 32 <= ord(character) <= 126 for character in value),
+                "invalid download header")
+        name = name.lower()
+        if name in ("location", "content-length", "transfer-encoding"):
+            require(name not in headers, "ambiguous download header")
+        headers[name] = value.strip()
+    body = bytes(output[header_end:])
+    return int(match.group(1)), headers, body
+
+
+def download_pinned_passive_rules(directory: Path) -> Path:
+    """Only the reviewed passive-76 artifact; no caller URL/hash or ambient auth."""
+    destination = directory / "pscanrules-release-76.zap"
+    created = False
+    try:
+        require(directory.is_dir() and not directory.is_symlink()
+                and directory.resolve() == directory, "invalid download directory")
+        deadline = time.monotonic() + PINNED_PASSIVE_RULES_TIMEOUT_SECONDS
+        url = PINNED_PASSIVE_RULES_URL
+        for redirect in range(PINNED_PASSIVE_RULES_REDIRECTS + 1):
+            parsed = urllib.parse.urlsplit(url)
+            require(parsed.scheme == "https" and parsed.hostname in (
+                        "github.com", "release-assets.githubusercontent.com")
+                    and parsed.netloc == parsed.hostname and parsed.fragment == ""
+                    and parsed.path.startswith("/")
+                    and all(ord(character) >= 33 and ord(character) <= 126 for character in url),
+                    "unreviewed download authority")
+            require(redirect == 0 or parsed.hostname == "release-assets.githubusercontent.com",
+                    "unreviewed redirect authority")
+            status, headers, body = _download_passive_rules_hop(url, deadline)
+            require(time.monotonic() < deadline and len(body) <= PINNED_PASSIVE_RULES_MAX_BYTES,
+                    "download exceeded its bound")
+            length = headers.get("content-length")
+            if length is not None:
+                require(re.fullmatch(r"0|[1-9][0-9]*", length) is not None
+                        and int(length) == len(body) and "transfer-encoding" not in headers,
+                        "invalid download length")
+            if status in (301, 302, 303, 307, 308):
+                require(redirect < PINNED_PASSIVE_RULES_REDIRECTS
+                        and isinstance(headers.get("location"), str), "invalid download redirect")
+                url = urllib.parse.urljoin(url, headers["location"])
+                continue
+            require(status == 200 and body
+                    and hashlib.sha256(body).hexdigest() == PINNED_PASSIVE_RULES_SHA256,
+                    "download artifact identity failed")
+            descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
+            created = True
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(body)
+                output.flush()
+                os.fchmod(output.fileno(), 0o444)
+            require(time.monotonic() < deadline, "download deadline expired")
+            return destination
+        raise AssertionError("download redirect bound exceeded")
+    except BaseException as error:
+        if created:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass  # Failure remains red; raw paths/errors never cross this boundary.
+        if not isinstance(error, Exception):
+            raise
+        raise RuntimeError("pinned passive rules download failed") from None
+
+
 class Scanner:
     def __init__(self, harness):
         self.harness = harness
@@ -380,6 +516,7 @@ class Scanner:
         self.owner = secrets.token_hex(16)
         self.passive_remaining = None
         self.scan_evidence = []
+        self.container_id = None
 
     @property
     def proxy(self):
@@ -398,24 +535,45 @@ class Scanner:
         return body
 
     def start(self):
+        passive_rules = download_pinned_passive_rules(self.harness.root)
         self.harness.run(["docker", "image", "inspect", SCANNER_IMAGE], timeout=30)
         absent = self.harness.run(["docker", "inspect", self.name], check=False, timeout=15)
         require(absent.returncode != 0 and "no such" in absent.stderr.lower(),
                 "scanner name must be absent before task-owned creation")
         self.creation_attempted = True
-        self.harness.run([
-            "docker", "run", "--detach", "--name", self.name,
+        created = self.harness.run([
+            "docker", "create", "--name", self.name,
             "--label", "plinth.test.owner=" + self.owner,
             "--network", "host", "--add-host", "plinth.test:127.0.0.1",
             "--memory", "1536m", "--memory-swap", "1536m", "--cpus", "1",
             "--env", "JAVA_OPTS=-Xmx768m", SCANNER_IMAGE,
-            "zap.sh", "-daemon", "-host", "127.0.0.1", "-port", str(self.port),
+            "zap.sh", "-silent", "-daemon", "-host", "127.0.0.1", "-port", str(self.port),
             "-config", "api.disablekey=false", "-config", "api.key=" + self.key,
             "-config", "api.addrs.addr.name=127.0.0.1",
             "-config", "api.addrs.addr.regex=false",
             "-config", "autoupdate.checkOnStart=false",
             "-config", "autoupdate.downloadNewRelease=false",
         ], timeout=60)
+        container_id = created.stdout.strip()
+        require(re.fullmatch(r"[0-9a-f]{64}", container_id) is not None,
+                "scanner creation did not return an immutable container identity")
+        # Retain the immutable allocation identity even if inspection/copy fails;
+        # cleanup still requires its exact owner label before removing it.
+        self.container_id = container_id
+        info = json.loads(self.harness.run(["docker", "inspect", container_id], timeout=15).stdout)
+        require(isinstance(info, list) and len(info) == 1 and isinstance(info[0], dict),
+                "scanner creation inventory is malformed")
+        owned = info[0]
+        require(isinstance(owned.get("Config"), dict) and isinstance(owned.get("State"), dict)
+                and isinstance(owned["Config"].get("Labels"), dict)
+                and owned.get("Id") == container_id and owned.get("Name") == "/" + self.name
+                and owned.get("Config", {}).get("Image") == SCANNER_IMAGE
+                and owned.get("Config", {}).get("Labels", {}).get("plinth.test.owner") == self.owner
+                and owned.get("State", {}).get("Status") == "created",
+                "scanner creation identity or ownership changed")
+        self.harness.run(["docker", "cp", str(passive_rules),
+                          container_id + ":/zap/plugin/pscanrules-release-76.zap"], timeout=30)
+        self.harness.run(["docker", "start", container_id], timeout=60)
         self.started = True
 
         def version():
@@ -611,16 +769,35 @@ class Scanner:
         return alerts, completed
 
     def cleanup(self):
+        identity = getattr(self, "container_id", None) or self.name
         if self.creation_attempted:
-            existing = self.harness.run(["docker", "inspect", self.name], check=False,
+            existing = self.harness.run(["docker", "inspect", identity], check=False,
                                         timeout=15)
             if existing.returncode == 0:
-                info = json.loads(existing.stdout)[0]
-                require(info["Config"].get("Labels", {}).get("plinth.test.owner") == self.owner,
+                inventory = json.loads(existing.stdout)
+                require(isinstance(inventory, list) and len(inventory) == 1
+                        and isinstance(inventory[0], dict), "scanner cleanup inventory is malformed")
+                info = inventory[0]
+                require(isinstance(info.get("Config"), dict)
+                        and isinstance(info["Config"].get("Labels"), dict)
+                        and info["Config"]["Labels"].get("plinth.test.owner") == self.owner,
                         "refusing to remove an unowned scanner container")
-                self.harness.run(["docker", "rm", "--force", "--volumes", self.name],
+                require(isinstance(info.get("Id"), str)
+                        and re.fullmatch(r"[0-9a-f]{64}", info["Id"]) is not None
+                        and info.get("Name") == "/" + self.name
+                        and info["Config"].get("Image") == SCANNER_IMAGE
+                        and (getattr(self, "container_id", None) is None
+                             or info["Id"] == self.container_id),
+                        "refusing to remove a substituted scanner container")
+                identity = info["Id"]
+                self.container_id = identity
+                self.harness.run(["docker", "rm", "--force", "--volumes", identity],
                                  timeout=45)
                 self.started = False
+        if identity != self.name:
+            absent = self.harness.run(["docker", "inspect", identity], check=False, timeout=15)
+            require(absent.returncode != 0 and "no such" in absent.stderr.lower(),
+                    "task-owned immutable scanner absence was not proven")
         absent = self.harness.run(["docker", "inspect", self.name], check=False,
                                   timeout=15)
         require(absent.returncode != 0 and "no such" in absent.stderr.lower(),
