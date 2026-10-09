@@ -54,6 +54,14 @@ COMMENT_DIGESTS = {
         "5c5e225167c0bb0b34c497137412efa92909e1067fd2d0596eb7ab443b994883",
         "1f9c10f9ac25d4952c77d2d68b7ccc8591c2a09d2948dbfeae498a37cf500b1c",
     }),
+    "interaction-owner.js": frozenset({
+        # Public confirmation reentrancy-fencing explanation, not a credential.
+        "614c3f7e51ed11947694df4ab133c21be27f9566f81d39d98d7221e827ed378b",
+    }),
+    "float-chrome.js": frozenset({
+        # Public layer-owned UI-reference cleanup explanation before unmount.
+        "afac0b3696d45db69b08f192d63e6589b639f0c5a16eeaf871b93f770dd05b6e",
+    }),
 }
 
 
