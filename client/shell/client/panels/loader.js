@@ -51,7 +51,13 @@ export class PanelManager {
             event.returnValue = '';
         };
         this.keydown = event => this.dispatchShortcut(event);
-        document.addEventListener('keydown', this.keydown);
+        if (options.interaction) {
+            this.unregisterInteraction = options.interaction.registerPrimary({
+                isDirty: () => this.activeDirty,
+                isEligible: () => this.active?.status === 'active',
+                dispatch: event => this.dispatchShortcut(event),
+            });
+        } else document.addEventListener('keydown', this.keydown);
     }
 
     dispatchShortcut(event) {
@@ -249,6 +255,10 @@ export class PanelManager {
     }
 
     syncUnloadGuard() {
+        if (this.options.interaction) {
+            this.options.interaction.publish();
+            return;
+        }
         const required = this.active?.dirty === true;
         if (required && !this.beforeUnloadInstalled) {
             window.addEventListener('beforeunload', this.beforeUnload);
@@ -306,7 +316,8 @@ export class PanelManager {
 
     dispose() {
         this.destroyAll();
-        document.removeEventListener('keydown', this.keydown);
+        this.unregisterInteraction?.();
+        if (!this.options.interaction) document.removeEventListener('keydown', this.keydown);
         if (this.beforeUnloadInstalled) window.removeEventListener('beforeunload', this.beforeUnload);
         this.beforeUnloadInstalled = false;
     }

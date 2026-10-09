@@ -1,0 +1,196 @@
+/* Shell-owned chrome only. Extension content keeps its own retained root. */
+.float-layer {
+  position: fixed;
+  pointer-events: none;
+  z-index: 50;
+  isolation: isolate;
+}
+.float-safe-area {
+  position: fixed;
+  width: 0;
+  height: 0;
+  visibility: hidden;
+  pointer-events: none;
+  padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px)
+    env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+}
+.float-window {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  pointer-events: auto;
+  color: var(--text-0);
+  background: var(--bg-1);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg, 10px);
+  box-shadow: 0 12px 40px rgb(0 0 0 / 35%);
+}
+.float-window[hidden], .float-list[hidden] { display: none; }
+.float-window[data-mode="slide-over"], .float-window[data-mode="full-modal"] {
+  border-radius: 0;
+}
+.float-window[data-editing="true"] { outline: 2px solid var(--focus-ring); }
+.float-header {
+  flex: none;
+  min-width: 0;
+  padding: .4rem;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+.float-titlebar {
+  display: flex;
+  align-items: center;
+  gap: .5rem;
+  min-height: 44px;
+  min-width: 0;
+  touch-action: none;
+}
+.float-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.float-mark {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: 2rem;
+  height: 2rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r, 5px);
+  background: var(--accent-soft);
+}
+.float-badge, .float-status, .float-live-only, .float-geometry-help {
+  margin: .25rem 0;
+  overflow-wrap: anywhere;
+  color: var(--text-1);
+}
+.float-actions, .float-list-actions, .float-switcher {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .25rem;
+  min-width: 0;
+}
+.float-layer button {
+  min-width: min(44px, 100%);
+  min-height: 44px;
+  max-width: 100%;
+  padding: .4rem .65rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r, 5px);
+  color: var(--text-0);
+  background: var(--bg-3);
+  font: inherit;
+  line-height: 1.3;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+.float-layer button:disabled { cursor: default; opacity: .7; }
+.float-layer button:focus-visible, .float-window:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -2px;
+}
+.float-content {
+  flex: 1 0 auto;
+  min-width: 0;
+  min-height: min(120px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.float-content > .float-panel-content { min-width: 0; min-height: 0; }
+.float-status { padding: .5rem; }
+.float-geometry-help { font-size: .9rem; }
+.float-resize {
+  flex: none;
+  align-self: flex-end;
+  touch-action: none;
+}
+.float-list {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  z-index: 6;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  pointer-events: auto;
+  padding: .4rem;
+  background: var(--bg-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r, 5px);
+}
+.float-list h2 { margin: 0 0 .25rem; font-size: 1rem; }
+.float-list ul { list-style: none; margin: 0; padding: 0; }
+.float-list li { margin: .25rem 0; }
+.float-switcher { margin-top: .25rem; }
+.float-switcher button { flex: 1 1 auto; }
+.float-confirmation-backdrop {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  z-index: 10;
+  pointer-events: auto;
+  background: rgb(0 0 0 / 55%);
+  overflow: auto;
+}
+.float-confirmation {
+  width: min(100%, 640px);
+  max-height: 100%;
+  overflow: auto;
+  padding: 1rem;
+  color: var(--text-0);
+  background: var(--bg-1);
+  border: 1px solid var(--border-strong);
+}
+.float-budget-warning {
+  position: relative;
+  z-index: 7;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: auto;
+  pointer-events: auto;
+  padding: .5rem;
+  background: var(--bg-1);
+  border: 1px solid var(--danger);
+}
+.float-budget-warning p { margin: 0 0 .25rem; overflow-wrap: anywhere; }
+.float-budget-waiting {
+  margin: 0;
+  padding: .5rem;
+  pointer-events: auto;
+  background: var(--bg-1);
+  border: 1px solid var(--border-strong);
+  overflow-wrap: anywhere;
+}
+@media (forced-colors: active) {
+  .float-window, .float-header, .float-list, .float-confirmation,
+  .float-budget-warning, .float-budget-waiting {
+    color: CanvasText;
+    background: Canvas;
+    border-color: CanvasText;
+    box-shadow: none;
+  }
+  .float-layer button { color: ButtonText; background: ButtonFace; border-color: ButtonText; }
+  .float-badge, .float-status, .float-live-only, .float-geometry-help { color: CanvasText; }
+  .float-mark { background: Canvas; border-color: CanvasText; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .float-layer *, .float-layer *::before, .float-layer *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

@@ -9,7 +9,9 @@ import vm from 'node:vm';
 // are controlled here; these tests do not emulate a deployed backend.
 const client = resolve(dirname(fileURLToPath(import.meta.url)), '../../client/shell/client');
 const paths = ['launcher/launcher.js', 'launcher/model.js', 'sdk.js',
-    'panels/loader.js', 'panels/panel_api.js', 'data-query.js', 'data-controller.js'];
+    'panels/loader.js', 'panels/panel_api.js', 'data-query.js', 'data-controller.js',
+    'panels/float-manager.js', 'panels/float-chrome.js', 'panels/float-model.js',
+    'panels/float-preferences.js', 'panels/float-reservations.js', 'panels/interaction-owner.js'];
 const sources = new Map(await Promise.all(paths.map(async path =>
     [resolve(client, path), await readFile(resolve(client, path), 'utf8')])));
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -49,20 +51,26 @@ async function fixture() {
     const effects = [];
     const sessionEnds = [];
     const listeners = new Map();
+    const documentEvents = [], windowEvents = [], windowListeners = new Map();
     let nextTimer = 0;
     let account = 'A';
     const document = {
         cookie: 'plinth_csrf=fake-A', visibilityState: 'visible', activeElement: null,
-        addEventListener(type, fn) { listeners.set(type, fn); },
-        removeEventListener(type, fn) { if (listeners.get(type) === fn) listeners.delete(type); },
+        addEventListener(type, fn) { documentEvents.push(['add', type, fn]); listeners.set(type, fn); },
+        removeEventListener(type, fn) { documentEvents.push(['remove', type, fn]); if (listeners.get(type) === fn) listeners.delete(type); },
         getElementById(id) { return new Element(id); },
         createElement(tag) { return new Element(tag); },
     };
     class Element {
-        constructor(name) { this.name = name; this.dataset = {}; this.children = []; }
+        constructor(name) { this.name = name; this.dataset = {}; this.children = [];
+            this.attributes = new Map(); this.isConnected = true; this.inert = false; }
         append(child) { this.children.push(child); child.parent = this; }
-        setAttribute() {}
-        remove() { if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); }
+        setAttribute(key, value) { this.attributes.set(key, value); }
+        getAttribute(key) { return this.attributes.get(key) ?? null; }
+        removeAttribute(key) { this.attributes.delete(key); }
+        contains(element) { return element === this || this.children.some(child => child.contains(element)); }
+        closest() { return this.inert || this.hidden ? this : this.parent?.closest() || null; }
+        remove() { this.isConnected = false; if (this.parent) this.parent.children = this.parent.children.filter(c => c !== this); }
         focus() { effects.push(['focus', this.name]); document.activeElement = this; }
         scrollIntoView() { effects.push(['scroll', this.name]); }
         querySelector() { return new Element('dirty-cancel'); }
@@ -115,8 +123,10 @@ async function fixture() {
         window: { __PLINTH_PRODUCTION__: true, matchMedia: () => media,
             location: { origin: 'https://plinth.test', href: 'https://plinth.test/app/',
                 protocol: 'https:', host: 'plinth.test' },
-            addEventListener() {}, removeEventListener() {} },
-        document, URL, Headers, AbortController, DOMException,
+            addEventListener(type, fn) { windowEvents.push(['add', type, fn]); windowListeners.set(type, fn); },
+            removeEventListener(type, fn) { windowEvents.push(['remove', type, fn]); if (windowListeners.get(type) === fn) windowListeners.delete(type); } },
+        document, URL, Headers, AbortController, DOMException, TextEncoder,
+        performance: { now: () => 0 },
         console: { error() {} }, WebSocket: Socket,
         queueMicrotask(fn) { microtasks.push(fn); },
         setTimeout(fn, milliseconds) { const id = ++nextTimer; timers.set(id, { fn, milliseconds }); return id; },
@@ -154,7 +164,9 @@ async function fixture() {
         return load(resolve(dirname(importer.identifier), specifier));
     });
     await launcherModule.evaluate();
-    assert.equal(modules.size, 7, 'must evaluate the complete actual module graph');
+    assert.equal(modules.size, paths.length, 'must evaluate the complete actual module graph');
+    assert.deepEqual([...modules.keys()].sort(), [...sources.keys()].sort(),
+        'the evaluated imports must exactly match the reviewed shipping graph');
     const Launcher = launcherModule.namespace.Launcher;
     const model = modules.get(resolve(client, 'launcher/model.js')).namespace;
     const sdk = modules.get(resolve(client, 'sdk.js')).namespace;
@@ -166,6 +178,8 @@ async function fixture() {
     const launcher = createLauncher();
     await launcher.preferencePromise;
     const f = { launcher, model, sdk, requests, sockets, effects, sessionEnds, media,
+        documentEvents, windowEvents, listeners, windowListeners,
+        FloatLayer: modules.get(resolve(client, 'panels/float-chrome.js')).namespace.FloatLayer,
         document, microtasks, createLauncher,
         run(promise) { operations.push(promise); promise.catch(() => {}); return promise; },
         hold(url) {
@@ -510,4 +524,148 @@ ownerTest('U07 retired existing callback and recovery entry points admit nothing
     await f.run(f.launcher.refreshCatalog()); await turns();
     assert.equal(f.requests.length, requests); assert.equal(f.launcher.publications.length, publications);
     assert.deepEqual(f.sessionEnds, []);
+});
+
+async function activePrimary(f, configure = () => {}) {
+    await f.run(f.launcher.refreshCatalog());
+    const application = f.launcher.state.applications[0];
+    const target = f.model.makeTarget(application, application.panels[0]);
+    let api;
+    f.launcher.panelManager.options.importModule = async () => ({ default: value => {
+        api = value; configure(value); return () => null;
+    } });
+    await f.run(f.launcher.navigateTarget(target));
+    await f.run(f.launcher.preferenceWrite);
+    return api;
+}
+
+ownerTest('F01 actual shipping float ports remain unavailable without generic preference fallback', async f => {
+    const before = f.requests.length;
+    assert.equal(f.launcher.floatPreferences.status().available, false);
+    assert.equal(f.launcher.floatPreferences.status().restore, 'unavailable');
+    assert.equal(f.launcher.floatPreferences.layoutChanged(), false);
+    assert.equal(f.launcher.floatManager.admit({}).status, 'target-unavailable');
+    await turns();
+    assert.equal(f.requests.length, before);
+    assert.equal(f.launcher.floatReservations.status().count, 0);
+});
+
+ownerTest('F02 actual primary loader uses one shared shortcut dispatcher and document unload guard', async f => {
+    let invoked = 0;
+    const api = await activePrimary(f, value => value.registerShortcut('Ctrl+K', () => invoked++));
+    const keydown = f.listeners.get('keydown');
+    assert.equal(f.documentEvents.filter(([action, type]) => action === 'add' && type === 'keydown').length, 1);
+    assert.notEqual(keydown, f.launcher.panelManager.keydown);
+    keydown({ key: 'k', ctrlKey: true }); assert.equal(invoked, 1);
+    f.launcher.interaction.focusShell(); keydown({ key: 'k', ctrlKey: true }); assert.equal(invoked, 1);
+    api.setDirty(true);
+    assert.equal(f.launcher.panelManager.beforeUnloadInstalled, false);
+    assert.equal(f.windowEvents.filter(([action, type]) => action === 'add' && type === 'beforeunload').length, 1);
+    let prevented = 0; const event = { preventDefault() { prevented++; } };
+    f.windowListeners.get('beforeunload')(event);
+    assert.equal(prevented, 1); assert.equal(event.returnValue, '');
+    api.setDirty(false); assert.equal(f.windowListeners.has('beforeunload'), false);
+});
+
+ownerTest('F03 primary and float confirmations share one lease without queued navigation', async f => {
+    const api = await activePrimary(f); api.setDirty(true);
+    const scope = f.launcher.interaction;
+    f.launcher.requestHome();
+    const primary = scope.confirmation;
+    assert.equal(primary.kind, 'primary'); assert.equal(f.launcher.state.dirtyIntent.kind, 'home');
+    assert.equal(scope.confirm({ kind: 'float', recordToken: Symbol(), onCancel() {}, onDiscard() {} }), false);
+    f.launcher.requestHome(); assert.equal(scope.confirmation, primary);
+    f.launcher.cancelDirty();
+    assert.equal(scope.confirmation, null); assert.equal(f.launcher.state.dirtyIntent, null);
+    let cancelled = 0;
+    assert.equal(scope.confirm({ kind: 'float', recordToken: Symbol(), onCancel() { cancelled++; }, onDiscard() {} }), true);
+    const floating = scope.confirmation;
+    f.launcher.requestHome(); f.launcher.confirmDirty(); f.launcher.cancelDirty();
+    assert.equal(scope.confirmation, floating); assert.equal(f.launcher.state.dirtyIntent, null);
+    scope.resolveConfirmation(false); assert.equal(cancelled, 1);
+});
+
+ownerTest('F04 primary dirty Cancel restores an eligible trigger or current primary fallback', async f => {
+    const api = await activePrimary(f); api.setDirty(true);
+    const trigger = f.document.createElement('trigger'); f.document.activeElement = trigger;
+    f.launcher.requestHome(); f.launcher.cancelDirty();
+    assert.deepEqual(f.effects.at(-1), ['focus', 'trigger']);
+    trigger.inert = true; f.document.activeElement = trigger;
+    f.launcher.requestHome(); f.launcher.cancelDirty();
+    assert.equal(f.document.activeElement, f.launcher.panelManager.active.container);
+    assert.equal(f.launcher.interaction.focused.kind, 'primary');
+});
+
+ownerTest('F05 scope retirement fences actual asynchronous primary publication before idempotent disposal', async f => {
+    await f.run(f.launcher.refreshCatalog());
+    const application = f.launcher.state.applications[0];
+    const target = f.model.makeTarget(application, application.panels[0]);
+    const imported = deferred(); f.launcher.panelManager.options.importModule = () => imported.promise;
+    const operation = f.run(f.launcher.navigateTarget(target));
+    const publications = f.launcher.publications.length, requests = f.requests.length;
+    f.launcher.interaction.retire();
+    assert.equal(f.launcher.owns(), false);
+    assert.equal(f.launcher.floatManager.retired, true);
+    assert.equal(f.launcher.floatPreferences.status().retired, true);
+    assert.equal(f.launcher.floatPreferenceIoOwner.pending().liveFrames, 0);
+    imported.resolve({ default: () => () => null }); await operation;
+    assert.equal(f.launcher.publications.length, publications); assert.equal(f.requests.length, requests);
+    assert.equal(f.launcher.panelManager.active, null);
+    f.launcher.componentWillUnmount(); f.launcher.componentWillUnmount();
+    assert.equal(f.listeners.has('keydown'), false);
+});
+
+ownerTest('F06 narrow switcher owns its lease and never inerts its own topbar ancestor', async f => {
+    await f.run(f.launcher.refreshCatalog());
+    const names = ['primaryMain', 'topbar', 'homeButton', 'appTrigger', 'tabs', 'userControlsHost', 'overlayButton'];
+    for (const name of names) f.launcher[name] = f.document.createElement(name);
+    for (const name of names.slice(2)) f.launcher.topbar.append(f.launcher[name]);
+    f.launcher.state.narrow = true; f.launcher.openMenu(); f.launcher.componentDidUpdate();
+    assert.equal(f.launcher.interaction.modal.kind, 'switcher');
+    assert.equal(f.launcher.interaction.modal.token, f.launcher.switcherToken);
+    assert.deepEqual(plain(f.launcher.backgroundElements().map(element => element.name)), names.filter(name => name !== 'topbar'));
+    f.launcher.closeMenu(); f.launcher.componentDidUpdate();
+    assert.equal(f.launcher.interaction.modal, null);
+    assert.deepEqual(plain(f.launcher.backgroundElements().map(element => element.name)), ['primaryMain', 'topbar']);
+    f.launcher.interaction.setModal('float', Symbol()); f.launcher.openMenu();
+    assert.equal(f.launcher.state.menuOpen, false);
+    assert.equal(f.launcher.interaction.modal.kind, 'float');
+});
+
+ownerTest('F07 actual FloatLayer preserves narrow switcher lease and restores background isolation', async f => {
+    await f.run(f.launcher.refreshCatalog());
+    const names = ['primaryMain', 'topbar', 'homeButton', 'appTrigger', 'tabs', 'userControlsHost', 'overlayButton'];
+    for (const name of names) f.launcher[name] = f.document.createElement(name);
+    for (const name of names.slice(2)) f.launcher.topbar.append(f.launcher[name]);
+    const layer = new f.FloatLayer({ manager: f.launcher.floatManager, interaction: f.launcher.interaction,
+        backgroundElements: () => f.launcher.backgroundElements() });
+    layer.mounted = true;
+    layer.state.area = { left: 0, top: 0, width: 800, height: 600 };
+    const token = Symbol(); layer.state.records = [{ token, presentation: 'shown', rank: 0, retiring: false }];
+    f.launcher.state.narrow = true; f.launcher.openMenu();
+    layer.componentDidUpdate();
+    assert.equal(f.launcher.interaction.modal.kind, 'switcher');
+    assert.equal(f.launcher.topbar.inert, false); assert.equal(f.launcher.appTrigger.inert, true);
+    f.launcher.closeMenu(); layer.componentDidUpdate();
+    assert.equal(f.launcher.interaction.modal.kind, 'float');
+    assert.equal(f.launcher.topbar.inert, true); assert.equal(f.launcher.appTrigger.inert, false);
+    layer.state.records = []; layer.componentDidUpdate();
+    assert.equal(f.launcher.interaction.modal, null);
+    assert.equal(f.launcher.topbar.inert, false); assert.equal(f.launcher.primaryMain.inert, false);
+    assert.equal(f.launcher.floatReservations.status().poisoned, false);
+    layer.retireLayer();
+});
+
+ownerTest('F08 authority retirement deactivates actual primary once before repeated unmount and late callbacks', async f => {
+    let deactivated = 0;
+    const api = await activePrimary(f, value => value.onDeactivate(() => { deactivated++; }));
+    api.setDirty(true);
+    const before = f.requests.length;
+    f.launcher.interaction.retire();
+    assert.equal(deactivated, 1); assert.equal(f.launcher.panelManager.active, null);
+    assert.equal(f.windowListeners.has('beforeunload'), false);
+    f.launcher.componentWillUnmount(); f.launcher.componentWillUnmount();
+    api.setDirty(true); await turns();
+    assert.equal(deactivated, 1); assert.equal(f.requests.length, before);
+    assert.equal(f.launcher.documentInteraction.beforeUnloadInstalled, false);
 });

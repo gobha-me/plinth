@@ -4,10 +4,13 @@ import base64
 import copy
 import hashlib
 import json
+from pathlib import Path
+import re
 import unittest
 from unittest.mock import patch
 
-from dast_review import ReviewContext, _csrf_value, reviewed_dispositions
+from dast_report import _review_class
+from dast_review import COMMENT_DIGESTS, ReviewContext, _csrf_value, reviewed_dispositions
 
 
 ORIGIN = "https://plinth.test:8443"
@@ -26,6 +29,18 @@ PRIVATE_HEADERS = [("Cache-Control", "no-store"), ("Vary", "Cookie, Authorizatio
 COOKIE = "plinth_session=" + TOKEN + "; plinth_csrf=" + CSRF
 LIVE_SESSION = "plinth_session=" + TOKEN + "; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=86400"
 LIVE_CSRF = "plinth_csrf=" + CSRF + "; Path=/; Secure; SameSite=Strict; Max-Age=86400"
+ROOT = Path(__file__).resolve().parents[2]
+# Exact substrings of tracked public comments, not private scanner fixtures.
+# The pinned engine may retain only a suffix; the whole current asset must
+# independently match, and each suffix remains filename-scoped.
+PUBLIC_OWNERSHIP_COMMENTS = (
+    ("interaction-owner.js", "// Fence re-entrant actions before invoking user code.",
+     "ons before invoking user code.",
+     "614c3f7e51ed11947694df4ab133c21be27f9566f81d39d98d7221e827ed378b"),
+    ("float-chrome.js", "// references before the parent Preact frame's later unmount callback.",
+     "rent Preact frame's later unmount callback.",
+     "afac0b3696d45db69b08f192d63e6589b639f0c5a16eeaf871b93f770dd05b6e"),
+)
 
 
 def context():
@@ -53,6 +68,22 @@ def run(records, ctx=None):
 
 
 class DastReviewTest(unittest.TestCase):
+    def public_ownership_records(self):
+        version = (ROOT / "VERSION").read_text().strip()
+        self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertEqual(json.loads((ROOT / "client/shell/manifest.json").read_text())["version"], version)
+        ctx, records = context(), []
+        for number, (filename, comment, evidence, digest) in enumerate(PUBLIC_OWNERSHIP_COMMENTS, 1):
+            body = (ROOT / "client/shell/client/panels" / filename).read_text()
+            self.assertIn(comment, body)
+            self.assertTrue(comment.endswith(evidence))
+            self.assertEqual(hashlib.sha256(evidence.encode()).hexdigest(), digest)
+            self.assertEqual(COMMENT_DIGESTS[filename], frozenset({digest}))
+            path = f"/ext/shell/{version}/panels/{filename}"
+            ctx.assets[path] = body
+            records.append(pair(10027, path, evidence=evidence, body=body, mid=str(number)))
+        return records, ctx
+
     def session(self, **changes):
         return pair(10010, "/api/auth/session", risk=1, param="plinth_csrf", evidence="Set-Cookie: plinth_csrf",
                     response=[*PRIVATE_HEADERS, ("Set-Cookie", LIVE_CSRF)],
@@ -180,6 +211,105 @@ class DastReviewTest(unittest.TestCase):
             changed = copy.deepcopy(records)
             changed[1][0]["evidence"] = "// fake unreviewed query"
             self.assertEqual(run(changed, ctx), [])
+
+    def test_actual_public_ownership_comment_suffixes_match_exact_source_hashes_and_whole_group(self):
+        records, ctx = self.public_ownership_records()
+        result = run(records, ctx)
+        self.assertEqual(len(result), 1)
+        self.assertEqual((result[0]["dispositionId"], result[0]["reviewId"]),
+                         ("INFORMATIONAL", "REVIEWED_PUBLIC_SOURCE_COMMENT"))
+        self.assertEqual(result[0]["risk"], 0)
+
+    def test_public_ownership_comment_changed_truncated_unknown_or_empty_evidence_rejects_group(self):
+        records, ctx = self.public_ownership_records()
+        for index, record in enumerate(records):
+            evidence = record[0]["evidence"]
+            for altered in (evidence[:-1], evidence[1:], evidence + " changed", "// unknown comment", ""):
+                with self.subTest(member=index, change=altered):
+                    bad = copy.deepcopy(records)
+                    bad[index][0]["evidence"] = altered
+                    self.assertEqual(run(bad, ctx), [])
+
+    def test_public_ownership_comment_changed_full_asset_stale_version_or_wrong_file_rejects_group(self):
+        records, ctx = self.public_ownership_records()
+        for index in range(len(records)):
+            with self.subTest(member=index, change="asset"):
+                bad = copy.deepcopy(records)
+                bad[index][1]["responseBody"] += "\n// unreviewed addition"
+                self.assertEqual(run(bad, ctx), [])
+            for change in ("version", "file"):
+                with self.subTest(member=index, change=change):
+                    bad = copy.deepcopy(records)
+                    old = bad[index][0]["url"]
+                    path = old.removeprefix(ORIGIN)
+                    if change == "version":
+                        new_path = re.sub(r"/shell/[^/]+/", "/shell/0.0.0/", path)
+                    else:
+                        new_path = records[1 - index][0]["url"].removeprefix(ORIGIN)
+                        bad[index][1]["responseBody"] = ctx.assets[new_path]
+                    bad[index][0]["url"] = ORIGIN + new_path
+                    bad[index][1]["requestHeader"] = bad[index][1]["requestHeader"].replace(old, ORIGIN + new_path)
+                    self.assertEqual(run(bad, ctx), [])
+
+    def test_public_ownership_comment_http_rule_variant_and_severity_boundaries_remain_exact(self):
+        records, ctx = self.public_ownership_records()
+        changes = (("method", "POST"), ("pluginId", "10028"), ("alertRef", "10027-1"),
+                   ("alertRef", "10027-*"), ("risk", 1), ("confidence", 1), ("confidence", 3))
+        for index in range(len(records)):
+            for field, value in changes:
+                with self.subTest(member=index, field=field, value=value):
+                    bad = copy.deepcopy(records)
+                    bad[index][0][field] = value
+                    if field == "method":
+                        bad[index][1]["requestHeader"] = bad[index][1]["requestHeader"].replace("GET ", "POST ", 1)
+                    self.assertEqual(run([bad[index]], ctx), [])
+                    # Method stays in the original group: one unmatched member
+                    # rejects that whole group. Other key changes do not erase
+                    # an independently reviewed group; public_report separately
+                    # rejects malformed or unresolved observations.
+                    expected = [] if field == "method" else run([records[1 - index]], ctx)
+                    self.assertEqual(run(bad, ctx), expected)
+            for change in ("status", "origin", "host", "route"):
+                with self.subTest(member=index, change=change):
+                    bad = copy.deepcopy(records)
+                    if change == "status":
+                        bad[index][1]["responseHeader"] = bad[index][1]["responseHeader"].replace("200 Fixture", "404 Fixture")
+                    elif change == "origin":
+                        bad[index][0]["url"] = bad[index][0]["url"].replace(ORIGIN, "https://other.test:8443")
+                        bad[index][1]["requestHeader"] = bad[index][1]["requestHeader"].replace(ORIGIN, "https://other.test:8443")
+                    elif change == "route":
+                        old = bad[index][0]["url"]
+                        bad[index][0]["url"] = ORIGIN + "/app/"
+                        bad[index][1]["requestHeader"] = bad[index][1]["requestHeader"].replace(old, ORIGIN + "/app/")
+                    else:
+                        bad[index][1]["requestHeader"] = bad[index][1]["requestHeader"].replace("Host: plinth.test:8443", "Host: other.test:8443")
+                    self.assertEqual(run([bad[index]], ctx), [])
+                    expected = run([records[1 - index]], ctx) if change in ("origin", "route") else []
+                    self.assertEqual(run(bad, ctx), expected)
+
+    def test_public_ownership_comment_message_joins_are_unique_exact_and_required_for_every_member(self):
+        records, ctx = self.public_ownership_records()
+        alerts, messages = [item[0] for item in records], [item[1] for item in records]
+        self.assertEqual(reviewed_dispositions(alerts, messages[:1], ORIGIN, ctx), [])
+        self.assertEqual(reviewed_dispositions(alerts, messages + [messages[0]], ORIGIN, ctx), [])
+        for index in range(len(records)):
+            for identifier in ("99", "01", records[1 - index][1]["id"]):
+                with self.subTest(member=index, identifier=identifier):
+                    bad = copy.deepcopy(records)
+                    bad[index][0]["messageId"] = identifier
+                    self.assertEqual(run(bad, ctx), [])
+        self.assertEqual(run([], ctx), [])
+
+    def test_public_ownership_comment_nonempty_parameter_still_fails_the_public_policy_boundary(self):
+        records, ctx = self.public_ownership_records()
+        review = run(records, ctx)[0]
+        self.assertTrue(_review_class(review["dispositionId"], review["reviewId"],
+                                      review["pluginId"], review["risk"], review["confidence"],
+                                      review["routeLabel"], "", review["alertRef"]))
+        for parameter in ("fake-field", "username", " "):
+            self.assertFalse(_review_class(review["dispositionId"], review["reviewId"],
+                                           review["pluginId"], review["risk"], review["confidence"],
+                                           review["routeLabel"], parameter, review["alertRef"]))
 
     def test_discovery_markers_require_actual_expected_request_or_response(self):
         app = pair(10109, "/app/", body=APP, evidence='id="root"')

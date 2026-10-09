@@ -101,8 +101,9 @@ The transport command also runs the pure smart query/controller tests: captured
 JSON, bounded fixed-window debounce/jitter, dirty follow-up, admission and
 stale responses, and conservative/conditional eq/in view optimization. Each
 actual Node file must execute its fixed named count with no fail/cancel/skip/
-TODO. The fail-closed discovery parser has its own 24 regressions. Current
-counts are SDK35 + controller30; Launcher model2 + original-owner51.
+TODO. The fail-closed discovery parser has its own 27 regressions. Current
+counts are SDK35 + controller30; Launcher model2 + owner59 (the original51
+remain), plus float model19, document/frame owner46 and preference controller30.
 
 `npm run test:launcher --prefix tests/browser` covers pure discovery/preference
 normalization and the whole linked Launcher graph's original-owner boundaries.
@@ -122,6 +123,31 @@ as CI does, to cover hard interruption during a browser launch:
 ```sh
 python3 tests/browser/process_cleanup.py -- npm run test:launcher-browser --prefix tests/browser
 ```
+
+The same command runs 18 actual float-mechanism browser cases. They evaluate
+the shipping manager, responsive chrome, interaction/reservation/model modules
+and vendored Preact, with explicitly local resolved-target and panel fixtures.
+They prove retained input/effect identity, 768/1024 CSS-pixel transitions,
+maximize/minimize, pointer capture and keyboard geometry commit/cancel, modal
+Tab/inertness, one dirty confirmation/unload warning, five live owners including
+pending/failure/minimized/retiring owners, no late old-frame factories, and
+synchronous pointer/DOM/provider cleanup before reentrant capacity reuse.
+An integrated Launcher case also verifies that cancelling a dirty primary
+confirmation after resizing restores eligible float focus and shortcut
+ownership, without focusing the inert primary or stealing an eligible Cancel
+trigger. Injected cleanup failures retain a document-wide fail-closed/manual-reload
+warning even when no record remains. Browser/context/server/probe/DOM/capture
+cleanup and unchanged source hashes are checked on the actual execution.
+
+Production instances deliberately have no reviewed admission or persistence
+ports, so the existing public `openFloat`, `navigate` and `requestFocus` stubs
+remain unsupported. Float preference tests exercise safe projections and
+guarded acknowledgements only through local ports, never the ordinary generic
+preferences API. These checks do not prove installed-extension authorization,
+resolver tiers, persisted safe descriptors or Jump to app; #46 owns those
+adapters and the real installed caller/provider journey. #44 remains open
+until that integration is verified. No oldest-minimized eviction is permitted:
+all five live owners count, and successful explicit Close/cleanup is required.
 
 Snapshot-backed `useData` captures one capability query and re-queries after
 events; raw no-snapshot mode still forwards envelopes. Supply a new args/view

@@ -4,8 +4,9 @@
 
 **Implementation owner:** [#44](https://github.com/gobha-me/plinth/issues/44)
 
-**Status:** Independently reviewed delivery specification; float
-implementation is planned, not shipped. The five-live-owner policy was selected
+**Status:** Independently reviewed delivery specification with a bounded shell
+mechanism implementation under #44; the production extension journey and
+persistence adapters remain pending #46. The five-live-owner policy was selected
 by the maintainer on 2026-10-01. The remaining rules define the bounded delivery
 delta, not a ratified current subsystem or an API stability promise.
 
@@ -40,8 +41,8 @@ Current, independently implemented behavior remains distinct:
   float policy. A minimized float may remain dirty and alive.
 - `plinth.panel.openFloat(contentType, context)` currently rejects with
   `NotImplementedError`; `navigate` and `requestFocus` are also stubs. There
-  is no shipped float manager, float permission catalog or float preference
-  validator. This specification does not change those SDK signatures.
+  is no production float permission catalog or admission adapter. Internal
+  mechanism and data validators do not change those SDK signatures.
 - User-scoped shell preferences and theme/scale primitives exist. They are
   storage and presentation substrates, not evidence of implemented float
   restore, UTF-8 descriptor validation or five-owner enforcement.
@@ -57,6 +58,38 @@ cannot be advertised as working extension `openFloat` resolution. A missing
 adapter remains unsupported rather than selecting a guessed handler. The
 sequencing discrepancy between #44's broad outcome and the later adapter is
 an explicit review dependency, not permission to absorb #45/#46.
+
+### 1.1 Implemented mechanism versus pending delivery
+
+The shell owns one document-wide five-reservation controller and one
+interaction dispatcher above authenticated frames. A frame owns its float
+manager, retained Preact content, responsive chrome, geometry leases and shared
+primary/float dirty-confirmation lease. Session replacement retires those
+owners synchronously before realtime callbacks or new-session publication.
+Unsettled native imports retain opaque document reservations, not old-user
+labels, descriptors, APIs or DOM. Verified cleanup releases capacity;
+uncertain cleanup permanently refuses admission for that document and exposes
+a manual reload warning. Minimizing does not release a reservation.
+
+`FloatManager` accepts an explicitly injected, synchronous reviewed-target
+port. No production instance installs that port: admission refuses without
+importing or reserving capacity. Real-browser mechanism tests supply local
+resolved-target and panel fixtures, not an extension API or permission grant.
+The shell does not expose the manager through globals or `plinth.panel`.
+
+The internal preference controller implements bounded reads, sequential
+restore, trailing writes and truthful timeout/acknowledgement fencing through
+optional reviewed ports. Production ports remain absent. In particular,
+the ordinary generic preferences capability is **not** used as a substitute
+for a reviewed safe projection or owner/generation/policy-guarded commit.
+All mechanism-only panels are live-only; Jump to app is visibly disabled.
+
+#46 must deliver and independently review current target authority,
+`openFloat` resolution, safe persistence projection and guarded commits,
+restore/navigation adapters, and the actual API-installed caller/provider
+browser journey. #44 stays open until that journey and its applicable
+candidate and exact-merge gates pass. Mechanism fixtures do not prove this
+remaining integration or descriptor confidentiality in unreviewed adapters.
 
 Non-goals are tray/chrome-essential policies, new panel SDK methods, default
 permission grants, resolver ranking, notification navigation, primary cache
