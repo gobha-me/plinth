@@ -216,6 +216,8 @@ def main():
                     run_browser(["npm", "test", "--prefix", str(repo / "tests/browser")],
                                 env=child_env, timeout=180)
                     if args.realtime:
+                        run_browser(["node", str(repo / "tests/browser/auth-readiness.mjs")],
+                                    env=child_env, timeout=90)
                         run_browser(["npm", "run", "test:realtime", "--prefix",
                                      str(repo / "tests/browser")],
                                     env=child_env, timeout=180)

@@ -71,6 +71,9 @@ try {
         if (request.postDataJSON()?.args?.key === key) snapshotRequests.push(request);
     });
     await page.goto(baseURL + '/app/');
+    // Authentication activates a fresh SDK session owner. Subscribe only after
+    // its real frame mounts; a pre-auth subscription is intentionally retired.
+    await page.getByRole('heading', { name: 'Home', exact: true }).waitFor();
     await page.evaluate(async ({ channel, key }) => {
         const sdk = await import('@plinth/frontend/sdk');
         const { h, render } = await import('preact');
