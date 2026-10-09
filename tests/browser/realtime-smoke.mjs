@@ -76,6 +76,9 @@ try {
     // This remains the raw-stream contract. Snapshot-backed hooks are tested
     // separately against actual preference capability reads/native data events.
     await page.goto(baseURL + '/app/');
+    // Authentication activates a fresh SDK session owner. Subscribe only after
+    // its real frame mounts; a pre-auth subscription is intentionally retired.
+    await page.getByRole('heading', { name: 'Home', exact: true }).waitFor();
     assert.match(await page.evaluate(() => new URL(document.baseURI).pathname),
         /^\/ext\/shell\/[^/]+\/$/, 'production document selects versioned module assets');
     assert.equal(await page.evaluate(() => document.cookie.includes('plinth_session')), false);
