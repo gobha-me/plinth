@@ -8,7 +8,7 @@ const osRelease = 'ID=ubuntu\nVERSION_ID="24.04"\n';
 const executablePath = '/home/runner/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
 function fixture(probes = [null]) {
     const context = { platform: 'linux', uid, home: '/home/runner', repo: '/work/plinth',
-        playwrightVersion: '1.63.0', executablePath,
+        playwrightVersion: '1.64.0', executablePath,
         env: { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'Linux',
             GITHUB_RUN_ID: '123456', GITHUB_RUN_ATTEMPT: '2', RUNNER_TEMP: '/runner/temp',
             GITHUB_WORKSPACE: '/work/plinth', GITHUB_ENV: '/runner/temp/env' } };
@@ -169,7 +169,8 @@ test('root, foreign hosts, unsupported OS, ambiguous IDs and runner paths fail b
         f => { f.files.get('/etc/os-release').text = osRelease + 'ID=ubuntu\n'; },
         f => { f.context.env.GITHUB_WORKSPACE = '/foreign'; },
         f => { f.context.env.RUNNER_TEMP = '/runner/temp/../foreign'; },
-        f => { f.context.playwrightVersion = '1.62.0'; }];
+        f => { f.context.playwrightVersion = '1.62.0'; },
+        f => { f.context.playwrightVersion = '1.63.0'; }];
     for (const field of ['GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT']) {
         for (const value of ['', '0', '01', '-1', '1\nOTHER=x', '../foreign', '1*', '1'.repeat(21)]) {
             mutations.push(f => { f.context.env[field] = value; });
