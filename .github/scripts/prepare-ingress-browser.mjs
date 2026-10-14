@@ -178,7 +178,7 @@ export async function cleanup(context, io) {
 
 export async function prepare(context, io) {
     const identity = await scope(context, io);
-    check(context.playwrightVersion === '1.63.0');
+    check(context.playwrightVersion === '1.64.0');
     await executable(context, io, context.executablePath);
     check(await absent(io, identity.directory) && await absent(io, identity.profilePath) &&
         await absent(io, identity.stagingDirectory) &&
