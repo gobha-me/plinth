@@ -10,6 +10,7 @@
 // in this file cover the schema-level and RBAC-grant-level contracts
 // the full suite assumes hold.
 
+#include "../ws/ws_test_fixture.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
@@ -103,6 +104,7 @@ struct PrefScratch {
 
   PrefScratch() {
     db = pg_config();
+    plinth::ws_test::settle_fixture_work();
     auto id = std::to_string(::getpid()) + "_" +
               std::to_string(g_pf_scratch_counter.fetch_add(1));
     base = fs::temp_directory_path() / ("plinth_pf_" + id);
@@ -133,16 +135,17 @@ struct PrefScratch {
 
     REQUIRE(
         plinth::shell::ensure_bundled_shell_installed(cfg, ctx).has_value());
+    plinth::ws_test::settle_fixture_work();
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
   }
   ~PrefScratch() {
-    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::ws_test::settle_fixture_work_or_exit();
     plinth::packages::asset_server::cancel_all_registrations();
     static_cast<void>(plinth::extensions::shutdown_registry());
     plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(base, ec);
     drop_all_ext_schemas(db);
-    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
   PrefScratch(const PrefScratch&) = delete;
   auto operator=(const PrefScratch&) -> PrefScratch& = delete;

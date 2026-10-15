@@ -8,6 +8,7 @@
 // install a fixture package as the transition precondition, then
 // drive disable/enable/uninstall directly.
 
+#include "../ws/ws_test_fixture.hpp"
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
@@ -16,6 +17,7 @@
 #include "kernel/groups/handlers.hpp"
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/rbac_test_runner.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
@@ -106,6 +108,7 @@ struct Scratch {
 
   Scratch() {
     db = pg_config();
+    plinth::ws_test::settle_fixture_work();
     auto id = std::to_string(::getpid()) + "_" +
               std::to_string(g_scratch_counter.fetch_add(1));
     base = fs::temp_directory_path() / ("plinth_lifecycle_" + id);
@@ -136,8 +139,10 @@ struct Scratch {
     plinth::extensions::init_registry(cfg);
 
     conn = PQconnectdb(conninfo_of(db).c_str());
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
   }
   ~Scratch() {
+    plinth::ws_test::settle_fixture_work_or_exit();
     if (conn != nullptr) {
       PQfinish(conn);
     }

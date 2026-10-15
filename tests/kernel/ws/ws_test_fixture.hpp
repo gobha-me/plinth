@@ -35,7 +35,16 @@ namespace plinth::ws_test {
 
 auto pg_available() -> bool;
 auto test_config() -> plinth::Config;
-auto reset_schema(const plinth::Config::Database& db) -> void;
+// Serialized fixture boundaries only: no HTTP request producer may remain.
+// A clean drain seals RBAC admission; reset reopens only after DDL and optional
+// fixture file cleanup succeed. Any failure leaves admission sealed.
+auto settle_fixture_work(
+    std::chrono::milliseconds timeout = std::chrono::seconds{5}) -> void;
+// Destructors cannot propagate failures or destroy dependencies after one.
+auto settle_fixture_work_or_exit() noexcept -> void;
+auto reset_schema(const plinth::Config::Database& db,
+                  std::chrono::milliseconds timeout = std::chrono::seconds{5},
+                  const std::function<void()>& after_reset = {}) -> void;
 
 // Synchronous seeding helpers (libpq directly).
 struct TestPg {

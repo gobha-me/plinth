@@ -11,6 +11,7 @@
 // separate public route registered by asset_server::register_drogon_handler.
 
 #include "kernel/config.hpp"
+#include "kernel/packages/install_lifecycle.hpp"
 
 #include <drogon/HttpRequest.h>
 #include <drogon/HttpResponse.h>
@@ -20,6 +21,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <string_view>
 
 namespace plinth::packages {
 
@@ -44,6 +46,11 @@ auto register_package_routes(const PackageRoutesConfig& cfg) -> void;
 //
 // Same pattern as `plinth::shell::test_seam::dispatch_app` (0.6.0).
 namespace test_seam {
+
+// Pure observation of the production mapper; no fault injection or override.
+[[nodiscard]] auto install_failure_status(InstallStage stage,
+                                          std::string_view kind)
+    -> drogon::HttpStatusCode;
 
 auto dispatch_post(const drogon::HttpRequestPtr& req,
                    std::function<void(const drogon::HttpResponsePtr&)> cb,

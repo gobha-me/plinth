@@ -31,7 +31,9 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <ostream>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -119,6 +121,15 @@ auto run_rbac_test(std::string_view package_id,
 [[nodiscard]] auto shutdown_async_workers(
     std::chrono::milliseconds timeout = std::chrono::seconds{35}) -> bool;
 
+// After external producers have stopped, let owned workers (including nested
+// capability calls) finish WITHOUT cancellation. Atomically seal admission at
+// zero and join retired owners before returning true. Timeout/unclean results
+// also leave admission closed: dependencies must stay alive and callers must
+// not reopen or reset them. Explicit start_async_workers reopens after a clean
+// dependency boundary. Used by serialized fixture resets/teardown.
+[[nodiscard]] auto quiesce_async_workers(std::chrono::milliseconds timeout)
+    -> bool;
+
 // Test-visible ownership diagnostic.
 [[nodiscard]] auto active_async_worker_count_for_test() -> std::size_t;
 
@@ -133,6 +144,15 @@ auto run_rbac_test(std::string_view package_id,
 auto schedule_rbac_test(std::string_view package_id,
                         const plinth::packages::InstallerContext& ctx,
                         std::string_view triggered_by) -> void;
+
+namespace test_seam {
+
+// Exercise the real ownership registry with controlled task/capture lifetimes.
+// No runtime flag, dispatch route, or replacement registry is installed.
+[[nodiscard]] auto schedule_worker(std::function<void(std::stop_token)> task)
+    -> bool;
+
+} // namespace test_seam
 
 // CLI options for the `plinth test rbac` subcommand. Populated by
 // main.cpp's argparse block; consumed by `run_cli_test_rbac`.

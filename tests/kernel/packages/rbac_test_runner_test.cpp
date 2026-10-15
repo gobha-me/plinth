@@ -5,6 +5,7 @@
 // Tier 2 cache rows that an install would otherwise produce. Slice B
 // adds install-driven PB.* cases once the trigger edits land.
 
+#include "../ws/ws_test_fixture.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/types.hpp"
 #include "kernel/config.hpp"
@@ -17,6 +18,7 @@
 #include "kernel/packages/rbac_test_runner.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
@@ -24,12 +26,14 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <expected>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -37,6 +41,7 @@
 #include <spdlog/sinks/sink.h>
 #include <spdlog/spdlog.h>
 #include <sstream>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -117,12 +122,7 @@ std::atomic<std::uint64_t> g_scratch_counter{0};
 // worker still uses it. Destructors fail the process without throwing through
 // Catch's assertion unwinding if the bounded join cannot establish ownership.
 auto drain_fixture_workers() -> void {
-  if (!plinth::packages::rbac_test::shutdown_async_workers(
-          std::chrono::seconds{5})) {
-    std::fputs("RBAC fixture cleanup failed: worker drain did not complete\n",
-               stderr);
-    std::_Exit(2);
-  }
+  plinth::ws_test::settle_fixture_work_or_exit();
 }
 
 auto reopen_fixture_workers() -> void {
@@ -145,7 +145,6 @@ struct Scratch {
     // The first Scratch can follow a different package fixture that scheduled
     // workers. Join those owners before resetting their resolver/database.
     drain_fixture_workers();
-    reopen_fixture_workers();
     drop_all_schemas(db);
     plinth::db::bootstrap_schema(
         db, std::string{CMAKE_SOURCE_DIR} + "/migrations", true);
@@ -171,6 +170,7 @@ struct Scratch {
     auto resolver = plinth::capabilities::init_resolver(db);
     REQUIRE(resolver.has_value());
     plinth::extensions::init_registry(cfg);
+    reopen_fixture_workers();
   }
   ~Scratch() {
     drain_fixture_workers();
@@ -183,7 +183,6 @@ struct Scratch {
     drop_all_schemas(db);
     std::error_code ec;
     fs::remove_all(base, ec);
-    reopen_fixture_workers();
   }
   Scratch(const Scratch&) = delete;
   auto operator=(const Scratch&) -> Scratch& = delete;
@@ -330,13 +329,220 @@ struct AsyncWorkersRestore {
 
   ~AsyncWorkersRestore() {
     handler->release();
-    (void)plinth::packages::rbac_test::shutdown_async_workers(
-        std::chrono::seconds{2});
-    (void)plinth::packages::rbac_test::start_async_workers();
+    if (!plinth::packages::rbac_test::shutdown_async_workers(
+            std::chrono::seconds{2}) ||
+        !plinth::packages::rbac_test::start_async_workers()) {
+      std::fputs("RBAC cancellation test cleanup could not join owners\n",
+                 stderr);
+      std::_Exit(EXIT_FAILURE);
+    }
+  }
+};
+
+struct QuiescenceRestore {
+  std::function<void()> release;
+
+  ~QuiescenceRestore() {
+    release();
+    if (!plinth::packages::rbac_test::shutdown_async_workers(
+            std::chrono::seconds{2}) ||
+        !plinth::packages::rbac_test::start_async_workers()) {
+      std::fputs("RBAC quiescence test cleanup could not join owners\n",
+                 stderr);
+      std::_Exit(EXIT_FAILURE);
+    }
+  }
+};
+
+auto count_audit(PGconn* conn, std::string_view action, std::string_view pkg_id)
+    -> long;
+
+struct TailState {
+  std::mutex mu;
+  std::condition_variable cv;
+  bool entered = false;
+  bool released = false;
+  bool expired = false;
+  std::size_t active_during_retirement = 0;
+  std::stop_token task_stop;
+
+  auto release() -> void {
+    std::lock_guard lock(mu);
+    released = true;
+    cv.notify_all();
+  }
+};
+
+struct CaptureTail {
+  std::shared_ptr<TailState> state;
+
+  ~CaptureTail() {
+    // Re-enter the actual registry from the owned capture destructor. Joining
+    // a retiring worker while holding its registry mutex would deadlock here.
+    const auto active =
+        plinth::packages::rbac_test::active_async_worker_count_for_test();
+    std::unique_lock lock(state->mu);
+    state->active_during_retirement = active;
+    state->entered = true;
+    state->cv.notify_all();
+    if (!state->cv.wait_for(lock, std::chrono::seconds{5},
+                            [&] { return state->released; })) {
+      state->expired = true;
+    }
   }
 };
 
 } // namespace
+
+TEST_CASE("RBAC quiescence includes capture retirement and reentrant tails",
+          "[rbac_test][lifecycle][worker-quiescence]") {
+  bool throwing = false;
+  SECTION("normal task") {
+  }
+  SECTION("throwing task still retires its owners") {
+    throwing = true;
+  }
+
+  auto state = std::make_shared<TailState>();
+  QuiescenceRestore restore{[state] { state->release(); }};
+  REQUIRE(plinth::packages::rbac_test::quiesce_async_workers(
+      std::chrono::seconds{2}));
+  REQUIRE(plinth::packages::rbac_test::start_async_workers());
+  auto tail = std::make_shared<CaptureTail>(state);
+  REQUIRE(plinth::packages::rbac_test::test_seam::schedule_worker(
+      [tail = std::move(tail), state, throwing](std::stop_token stop) {
+        {
+          std::lock_guard lock(state->mu);
+          state->task_stop = stop;
+        }
+        if (throwing) {
+          throw std::runtime_error("controlled worker retirement test");
+        }
+      }));
+  {
+    std::unique_lock lock(state->mu);
+    REQUIRE(state->cv.wait_for(lock, std::chrono::seconds{2},
+                               [&] { return state->entered; }));
+    REQUIRE(state->active_during_retirement == 1);
+  }
+  REQUIRE_FALSE(plinth::packages::rbac_test::quiesce_async_workers(
+      std::chrono::milliseconds{0}));
+  REQUIRE_FALSE(plinth::packages::rbac_test::start_async_workers());
+  REQUIRE_FALSE(plinth::packages::rbac_test::test_seam::schedule_worker(
+      [](std::stop_token) {}));
+  {
+    std::lock_guard lock(state->mu);
+    REQUIRE_FALSE(state->task_stop.stop_requested());
+  }
+  state->release();
+  REQUIRE(plinth::packages::rbac_test::quiesce_async_workers(
+      std::chrono::seconds{2}));
+  REQUIRE(plinth::packages::rbac_test::active_async_worker_count_for_test() ==
+          0);
+  {
+    std::lock_guard lock(state->mu);
+    REQUIRE_FALSE(state->expired);
+  }
+  REQUIRE(plinth::packages::rbac_test::start_async_workers());
+}
+
+TEST_CASE("schema reset settles real RBAC workers and refuses unsafe DDL",
+          "[rbac_test][integration][lifecycle][worker-quiescence]") {
+  if (!pg_available()) {
+    SKIP("PG unavailable");
+  }
+  Scratch s;
+  std::future<void> settled;
+  auto pid = seed_package(s.conn, "notes", "1.0.0");
+  seed_rule(s.conn, "notes.block", "notes", "notes",
+            test_contract_for("notes:1:block"));
+  auto handler = std::make_shared<BlockingHandlerState>();
+  QuiescenceRestore restore{[handler] { handler->release(); }};
+  plinth::capabilities::register_tier1_handler(
+      "notes:1:block", "notes.block",
+      [handler](const Json::Value&, const plinth::capabilities::UserContext&,
+                int) -> plinth::capabilities::HandlerOutcome {
+        std::unique_lock lock(handler->mu);
+        handler->entered = true;
+        handler->cv.notify_all();
+        handler->cv.wait(lock, [&] { return handler->released; });
+        return Json::Value{Json::objectValue};
+      });
+  plinth::packages::rbac_test::schedule_rbac_test(pid, s.ctx, "install");
+  {
+    std::unique_lock lock(handler->mu);
+    REQUIRE(handler->cv.wait_for(lock, std::chrono::seconds{2},
+                                 [&] { return handler->entered; }));
+  }
+  REQUIRE(plinth::packages::rbac_test::active_async_worker_count_for_test() >=
+          2);
+
+  SECTION("held worker prevents DDL and reopening after timeout") {
+    bool files_reset = false;
+    REQUIRE_THROWS_WITH(
+        plinth::ws_test::reset_schema(s.db, std::chrono::milliseconds{0},
+                                      [&] { files_reset = true; }),
+        "fixture reset requires settled workers and audits");
+    REQUIRE_FALSE(files_reset);
+    REQUIRE(pkg_state(s.conn, pid) == "ACTIVE");
+    REQUIRE_FALSE(plinth::packages::rbac_test::start_async_workers());
+    REQUIRE_FALSE(plinth::packages::rbac_test::test_seam::schedule_worker(
+        [](std::stop_token) {}));
+    handler->release();
+    REQUIRE(plinth::packages::rbac_test::quiesce_async_workers(
+        std::chrono::seconds{2}));
+    // A failed noncancelling drain did not interrupt the running real check.
+    REQUIRE_FALSE(pkg_result(s.conn, pid).is_null());
+    REQUIRE(count_audit(s.conn, "packages.rbac_test_passed", pid) == 1);
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
+  }
+  SECTION("clean drain preserves completion then permits schema reset") {
+    settled = std::async(std::launch::async,
+                         [] { plinth::ws_test::settle_fixture_work(); });
+    REQUIRE(settled.wait_for(std::chrono::milliseconds{0}) ==
+            std::future_status::timeout);
+    handler->release();
+    REQUIRE(settled.wait_for(std::chrono::seconds{5}) ==
+            std::future_status::ready);
+    settled.get();
+    REQUIRE(plinth::packages::rbac_test::active_async_worker_count_for_test() ==
+            0);
+    auto result = pkg_result(s.conn, pid);
+    REQUIRE(result.at("failed").empty());
+    REQUIRE(result.at("passed").size() == 2);
+    REQUIRE(count_audit(s.conn, "packages.rbac_test_passed", pid) == 1);
+    REQUIRE_FALSE(plinth::packages::rbac_test::test_seam::schedule_worker(
+        [](std::stop_token) {}));
+    bool files_reset_while_sealed = false;
+    plinth::ws_test::reset_schema(s.db, std::chrono::seconds{5}, [&] {
+      files_reset_while_sealed =
+          !plinth::packages::rbac_test::test_seam::schedule_worker(
+              [](std::stop_token) {});
+    });
+    REQUIRE(files_reset_while_sealed);
+    REQUIRE(count(s.conn, "SELECT COUNT(*) FROM plinth.packages") == 0);
+    REQUIRE(plinth::packages::rbac_test::test_seam::schedule_worker(
+        [](std::stop_token) {}));
+    REQUIRE(plinth::packages::rbac_test::quiesce_async_workers(
+        std::chrono::seconds{2}));
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
+  }
+  SECTION("file reset failure leaves admission sealed") {
+    handler->release();
+    REQUIRE(plinth::packages::rbac_test::quiesce_async_workers(
+        std::chrono::seconds{2}));
+    REQUIRE_THROWS_WITH(plinth::ws_test::reset_schema(
+                            s.db, std::chrono::seconds{5},
+                            [] {
+                              throw std::runtime_error(
+                                  "controlled fixture file reset failure");
+                            }),
+                        "controlled fixture file reset failure");
+    REQUIRE_FALSE(plinth::packages::rbac_test::test_seam::schedule_worker(
+        [](std::stop_token) {}));
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
+  }
+}
 
 TEST_CASE("PB.01 happy — all rules pass, skipped counted",
           "[rbac_test][integration]") {

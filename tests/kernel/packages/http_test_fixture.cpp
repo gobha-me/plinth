@@ -45,7 +45,15 @@ auto clear_packages_dir() -> void {
       fs::path{plinth::ws_test::packages_data_dir()} / "data" / "extensions";
   std::error_code ec;
   fs::remove_all(extensions_dir, ec);
+  if (ec) {
+    throw fs::filesystem_error("HTTP fixture could not clear packages",
+                               extensions_dir, ec);
+  }
   fs::create_directories(extensions_dir, ec);
+  if (ec) {
+    throw fs::filesystem_error("HTTP fixture could not recreate packages",
+                               extensions_dir, ec);
+  }
 }
 
 auto add_cookie_auth(const drogon::HttpRequestPtr& request,
@@ -67,13 +75,25 @@ HttpTestFixture::HttpTestFixture()
   // (route registration was added to `start_test_server()` in 0.6.0.N
   // session 2). Reset DB schema so each test sees a fresh
   // `plinth.packages` and `plinth.users`/`plinth.sessions`.
-  auto port = plinth::ws_test::test_server_port();
   auto cfg = plinth::ws_test::test_config();
-  plinth::ws_test::reset_schema(cfg.db);
-  clear_packages_dir();
+  plinth::ws_test::reset_schema(cfg.db, std::chrono::seconds{5},
+                                clear_packages_dir);
+  // The preceding fixture may have removed the schema. First server startup
+  // initializes the resolver/extension registry, so restore tables BEFORE it
+  // starts. Do not put this reset in the singleton: WS tests seed before use.
+  auto port = plinth::ws_test::test_server_port();
 
   auto base = "http://127.0.0.1:" + std::to_string(port);
   client = drogon::HttpClient::newHttpClient(base);
+}
+
+HttpTestFixture::~HttpTestFixture() {
+  // HTTP responses precede post-install RBAC work. Finish those owners before
+  // member PG/files or the next fixture's schema can be destroyed. Do not
+  // cancel a legitimate check merely because its request already completed.
+  // Keep admission sealed through member destruction; only the next explicit
+  // reset may reopen after its schema and file cleanup succeeds.
+  plinth::ws_test::settle_fixture_work_or_exit();
 }
 
 auto HttpTestFixture::seed_admin(std::string_view username) -> std::string {
