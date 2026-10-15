@@ -1,0 +1,17 @@
+diff --git a/orm_lib/inc/drogon/orm/SqlBinder.h b/orm_lib/inc/drogon/orm/SqlBinder.h
+--- a/orm_lib/inc/drogon/orm/SqlBinder.h
++++ b/orm_lib/inc/drogon/orm/SqlBinder.h
+@@ -599,4 +599,12 @@ class DROGON_EXPORT SqlBinder : public trantor::NonCopyable
+     void exec() noexcept(false);
+-
++
++    // Abandon an unexecuted binder without destructor auto-execution. This
++    // supports exception-safe parameter/callback setup. It does not cancel
++    // SQL which exec() has already handed to the database client.
++    void cancel() noexcept
++    {
++        execed_ = true;
++    }
++
+   private:
+     static int getMysqlTypeBySize(size_t size);

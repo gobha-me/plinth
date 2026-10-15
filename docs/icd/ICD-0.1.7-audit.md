@@ -40,6 +40,38 @@ All error responses in this ICD use:
 
 ## Data Model
 
+### Current storage repair (approved 2026-10-15)
+
+This narrowly supersedes the historical assumption that every possible JSON
+detail can be stored directly as JSONB. PostgreSQL JSONB cannot represent U+0000,
+including in object names. Both kernel writers now share lossless detail encoding;
+the caller API, input validation, provenance, admission/drain deadlines and
+fire-and-forget behavior are unchanged.
+
+An additive `detail_encoding SMALLINT NOT NULL DEFAULT 0` column, constrained to
+`0` or `1`, distinguishes storage without interpreting caller-supplied markers.
+Bootstrap upgrades retained installations before startup writers or routes run.
+An existing discriminator with incompatible type, default, nullability or check
+constraint, or a generated/identity column rather than an ordinary writable
+column, makes startup fail closed rather than guessing its meaning.
+Existing rows default to `0` without rewriting their detail. Ordinary details,
+including literal backslash-u0000 strings and marker-shaped objects, remain
+ordinary JSONB (`0`). A NUL-bearing detail is serialized in full, then that JSON
+text is stored as a JSONB string (`1`); the encoding preserves that full existing
+JSON serialization instead of truncating or replacing NUL-bearing keys or values.
+The second serialization makes the inner NUL escape literal text
+that JSONB can store. The representation costs at most twice the original
+serialized size plus fixed string framing and does not add a new input limit.
+
+`GET /api/audit` uses the explicit column to decode once, returning the original
+detail shape. Unknown encodings, wrong encoded types or malformed inner JSON
+produce the existing `internal_error` response, never an empty/successful event
+or raw-content diagnostic. Direct SQL readers must inspect the column before
+interpreting newly encoded details. Old binaries do not decode new encoding-1
+rows; retaining their bytes on rollback is not a promise of transparent old-reader
+support. This does not change permissions, retention, table append-only rules,
+audit acknowledgement, release policy or the future schema-freeze milestone.
+
 ### `plinth.audit_log` table
 
 | Column       | Type        | Constraints                          | Notes |

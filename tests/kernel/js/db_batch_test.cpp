@@ -230,6 +230,8 @@ TEST_CASE("batch query reads its own exec writes and commits returning DML",
   REQUIRE(r.value.has_value());
   REQUIRE(r.value->asString() == "ok");
   REQUIRE(pg.count_rows("ext_batch.notes") == 2);
+  REQUIRE(plinth::log::wait_for_audits(std::chrono::seconds{2}));
+  REQUIRE(pg.count_audit("db.batch.committed", "batch") == 1);
 }
 
 TEST_CASE("batch query returning DML rolls back with exec on user exception",

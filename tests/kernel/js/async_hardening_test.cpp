@@ -29,14 +29,19 @@
 #include "kernel/capabilities/types.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 
 #include <chrono>
 #include <cstddef>
 #include <drogon/utils/coroutine.h>
+#include <future>
 #include <json/value.h>
 #include <json/writer.h>
+#include <libpq-fe.h>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 
 using plinth::async_bridge_test::ensure_drogon_running;
 using plinth::async_bridge_test::ensure_drogon_with_db_running;
@@ -131,6 +136,57 @@ auto register_pad_stub(Json::Value payload) -> void {
 auto measured_size(const Json::Value& v) -> std::size_t {
   return Json::FastWriter{}.write(v).size();
 }
+
+// A real PostgreSQL gate keeps native completion pending independently of
+// JavaScript's deadline. The controller connection is not the runtime client.
+class CancellationPgGate {
+ public:
+  explicit CancellationPgGate(const plinth::Config::Database& db) {
+    const auto conninfo = "host=" + db.host +
+                          " port=" + std::to_string(db.port) +
+                          " dbname=" + db.database + " user=" + db.user +
+                          " password=" + db.password + " connect_timeout=3";
+    conn.reset(PQconnectdb(conninfo.c_str()));
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    REQUIRE(query("SELECT pg_advisory_lock(53144, 954)"));
+  }
+
+  ~CancellationPgGate() { unlock(); }
+
+  auto unlock() noexcept -> void {
+    if (locked) {
+      static_cast<void>(query("SELECT pg_advisory_unlock(53144, 954)"));
+      locked = false;
+    }
+  }
+
+  [[nodiscard]] auto has_waiter() const -> bool {
+    const std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexec(conn.get(),
+               "SELECT COUNT(*) FROM pg_locks WHERE locktype='advisory' "
+               "AND classid=53144 AND objid=954 AND objsubid=2 "
+               "AND NOT granted"),
+        PQclear};
+    return PQresultStatus(result.get()) == PGRES_TUPLES_OK &&
+           PQntuples(result.get()) == 1 &&
+           std::string_view(PQgetvalue(result.get(), 0, 0)) != "0";
+  }
+
+  [[nodiscard]] auto query(const char* sql) const -> bool {
+    const std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexec(conn.get(), sql), PQclear};
+    return PQresultStatus(result.get()) == PGRES_TUPLES_OK;
+  }
+
+ private:
+  std::unique_ptr<PGconn, decltype(&PQfinish)> conn{nullptr, PQfinish};
+  bool locked{true};
+};
+
+struct UnlockBeforeJoin {
+  CancellationPgGate& gate;
+  ~UnlockBeforeJoin() { gate.unlock(); }
+};
 
 } // namespace
 
@@ -313,6 +369,100 @@ TEST_CASE(
   // preemptible, so the ceiling governs upper bound.
   REQUIRE(std::chrono::duration_cast<std::chrono::seconds>(DUR) <
           std::chrono::seconds(10));
+}
+
+TEST_CASE("async cancellation retires context before gated late completion",
+          "[js][async][hardening][cancel-retirement]") {
+  REQUIRE(pg_available());
+  ensure_drogon_with_db_running();
+  const auto cfg = test_config();
+
+  for (const bool release : {false, true}) {
+    INFO("caller uses " << (release ? "release" : "destroy"));
+    CancellationPgGate gate(cfg.db);
+    auto limits = default_runtime_limits();
+    limits.wall_clock_limit = std::chrono::milliseconds(200);
+    RuntimePool pool(nullptr, limits, cfg, 1);
+    auto* bc = pool.acquire();
+    std::promise<EvalResult> promise;
+    auto finished = promise.get_future();
+    std::jthread worker([&promise, bc] {
+      try {
+        promise.set_value(
+            drive(*bc, "db.query('SELECT pg_advisory_xact_lock($1::int8::int4, "
+                       "$2::int8::int4)', [53144, 954])"));
+      } catch (...) {
+        promise.set_exception(std::current_exception());
+      }
+    });
+    // Destruction releases the SQL gate before the jthread joins, including
+    // assertion/exception exits. Never detach a worker or free its context.
+    const UnlockBeforeJoin unlock_before_join{gate};
+    const auto waiter_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool observed_waiter = gate.has_waiter();
+    while (!observed_waiter &&
+           std::chrono::steady_clock::now() < waiter_deadline) {
+      std::this_thread::yield();
+      observed_waiter = gate.has_waiter();
+    }
+    const bool retired_while_blocked =
+        finished.wait_for(std::chrono::seconds(6)) == std::future_status::ready;
+    bool native_owned = false;
+    bool drain_retained = false;
+    bool replacement_ok = false;
+    if (retired_while_blocked) {
+      worker.join();
+      native_owned = plinth::lifecycle::async_tasks().active_for_test() > 0;
+      drain_retained = !plinth::lifecycle::async_tasks().drain(
+          std::chrono::milliseconds(10));
+      if (release) {
+        pool.release(bc);
+      } else {
+        pool.destroy(bc);
+      }
+      bc = nullptr;
+      auto* replacement = pool.acquire();
+      const auto replacement_result = drive(*replacement, "21 * 2");
+      replacement_ok = replacement_result.value.has_value() &&
+                       replacement_result.value->asInt() == 42;
+      pool.destroy(replacement);
+    }
+    const bool still_blocked_at_retirement =
+        retired_while_blocked && gate.has_waiter();
+    gate.unlock();
+    if (finished.wait_for(std::chrono::seconds(10)) !=
+        std::future_status::ready) {
+      // Fail the isolated process, rather than detach a live native owner.
+      std::terminate();
+    }
+    if (worker.joinable()) {
+      worker.join();
+    }
+    const auto result = finished.get();
+    if (bc != nullptr) {
+      pool.destroy(bc);
+    }
+    const bool joined_native =
+        plinth::lifecycle::async_tasks().drain(std::chrono::seconds(3));
+    REQUIRE(observed_waiter);
+    REQUIRE(retired_while_blocked);
+    REQUIRE(still_blocked_at_retirement);
+    REQUIRE_FALSE(result.value.has_value());
+    REQUIRE(result.value.error().kind == EvalErrorKind::WALL_CLOCK_EXCEEDED);
+    REQUIRE(result.duration < std::chrono::seconds(6));
+    REQUIRE(native_owned);
+    REQUIRE(drain_retained);
+    REQUIRE(replacement_ok);
+    REQUIRE(joined_native);
+    REQUIRE(plinth::lifecycle::async_tasks().active_for_test() == 0);
+    auto* database_check = pool.acquire();
+    const auto database_result = drive(
+        *database_check, "db.query('SELECT 42 AS x').then(r => r.rows[0].x)");
+    pool.destroy(database_check);
+    REQUIRE(database_result.value.has_value());
+    REQUIRE(database_result.value->asInt() == 42);
+  }
 }
 
 // ─── N.46 — Result size exceeded ─────────────────────────────────

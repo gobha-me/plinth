@@ -7,6 +7,7 @@
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/js/db_batch_audit.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/lifecycle/shutdown_coordinator.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
@@ -86,6 +87,16 @@ auto test_config() -> plinth::Config {
 }
 
 auto reset_schema(const plinth::Config::Database& db) -> void {
+  // A JavaScript result is not a native completion/audit persistence barrier.
+  // Settle previous producers, then their accepted audit callbacks before DDL.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  if (!plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}) ||
+      !plinth::log::wait_for_audits(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now()))) {
+    throw std::runtime_error("schema reset requires settled native audits");
+  }
   auto migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
   plinth::db::bootstrap_schema(db, migrations_dir, /*dev_mode=*/true);
   plinth::groups::bootstrap_groups(db);
@@ -116,6 +127,10 @@ auto start_drogon(bool with_db) -> void {
   // tests still guard with pg_available() before driving the
   // client.
   if (with_db && pg_available()) {
+    // Pubsub denial paths may audit before a later DB case requests a reset.
+    // Establish the sink schema before exposing the framework client, instead
+    // of depending on a previous CTest process having left its schema behind.
+    reset_schema(cfg.db);
     drogon::app().createDbClient("postgresql", cfg.db.host, cfg.db.port,
                                  cfg.db.database, cfg.db.user, cfg.db.password,
                                  cfg.db.pool_size);

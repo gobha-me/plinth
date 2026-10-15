@@ -5,6 +5,7 @@
 // §BridgeContext Async Activation).
 
 #include "kernel/js/bridge_context.hpp"
+#include "kernel/js/execution_lifetime.hpp"
 
 #include <json/value.h>
 #include <quickjs.h>
@@ -303,6 +304,10 @@ auto BridgeContext::pending_op_count() const noexcept -> int {
 }
 
 auto BridgeContext::signal_completion() -> void {
+  if (auto lifetime = execution_lifetime.load(std::memory_order_acquire)) {
+    lifetime->wake();
+    return;
+  }
   // Invariants:
   //   - Called from main loop (queueInLoop callback site).
   //   - Mutex serializes the waiter-vs-signaler transition so that

@@ -42,6 +42,8 @@ namespace plinth::js {
 // extension installer. 0.3.1 callers (tests + future host-eval paths)
 // pass nullptr.
 struct Extension;
+class ExecutionLifetime;
+class NativeRollbackOwner;
 
 // ConfigProjection — the value-copy slice of `plinth::Config` that
 // `config.get()` from JS is allowed to read. Populated by RuntimePool
@@ -71,6 +73,9 @@ struct ConfigProjection {
 };
 
 struct BridgeContext {
+  // Strong only during the admitted JS execution; reset at EVERY exit.
+  // Native children retain their independently revocable generation instead.
+  std::atomic<std::shared_ptr<ExecutionLifetime>> execution_lifetime;
   std::shared_ptr<ExtensionDatabaseClients> extension_database_clients;
   // --- QuickJS handles (owned by the RuntimePool, not by this struct) ---
   JSRuntime* rt = nullptr;
@@ -169,6 +174,9 @@ struct BridgeContext {
   //                     (ICD-0.3.3 §Resource Limits item 1) — not
   //                     enforced in 0.3.3.
   std::vector<AsyncOp> pending_ops;
+  // Exception-safe native handoff: moved, without allocation, from a failed
+  // fanout. These are cleanup owners only and MUST never be dispatched again.
+  std::vector<AsyncOp> retired_pending_ops;
   std::unordered_map<int, PromiseCallbacks> callbacks;
 
   // ICD-0.5.2 §pubsub.subscribe JS Binding → Handler invocation on
@@ -233,6 +241,7 @@ struct BridgeContext {
     int depth = 0;
     std::uint64_t scope_id = 0;
     std::shared_ptr<drogon::orm::Transaction> pinned_conn;
+    std::shared_ptr<NativeRollbackOwner> rollback_owner;
     std::size_t ops_in_batch = 0;
     // Mutated only on the main loop (timer fires via queueInLoop /
     // runAfter on `timer_loop`; db.exec / db.query / db.batch

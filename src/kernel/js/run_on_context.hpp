@@ -16,6 +16,7 @@
 
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/js/eval.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 
 #include <chrono>
 #include <drogon/utils/coroutine.h>
@@ -41,7 +42,9 @@ struct EvalResult {
 // all surface here.
 //
 // BridgeContext outlives the coroutine; copying is not an option.
-auto run_on_context(BridgeContext& bc, std::string_view source)
-    -> drogon::Task<EvalResult>;
+// Internal ancestor ownership, never exposed through the JS/SDK data plane.
+auto run_on_context(BridgeContext& bc, std::string_view source,
+                    std::shared_ptr<lifecycle::AsyncTaskLease> accepted =
+                        nullptr) -> drogon::Task<EvalResult>;
 
 } // namespace plinth::js

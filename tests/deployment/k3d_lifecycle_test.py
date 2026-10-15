@@ -67,6 +67,10 @@ POSTGRES_PASSWORD = "fake-issue36-postgres-password"
 AUTH_ROUTE_RETRY_BACKOFF_SECONDS = 12
 
 
+class ExternalCommandFailure(RuntimeError):
+    """A nonzero owned command; its text remains private to its caller."""
+
+
 def require(condition, message):
     if not condition:
         raise AssertionError(message)
@@ -177,7 +181,7 @@ class Harness:
             timeout=timeout,
         )
         if check and result.returncode != 0:
-            raise RuntimeError(
+            raise ExternalCommandFailure(
                 f"command failed ({result.returncode}): "
                 + " ".join(str(item) for item in argv)
                 + "\nstdout:\n"
@@ -657,16 +661,21 @@ service:
             yaml.safe_dump(values, sort_keys=False), encoding="utf-8"
         )
 
+    def install_stage(self, _stage):
+        """Optional diagnostic hook, with no ordinary lifecycle behavior."""
+
     def install_chart(self):
         # Install the supported isolated boundary first. The administrator is
         # bootstrapped through a local API-server port-forward before any
         # Internet-facing Traefik object exists.
+        self.install_stage("CHART_VALUES")
         self.write_values(self.values(
             registration=False,
             nonce="install",
             traefik_enabled=False,
             bootstrap_secret_name=self.bootstrap_secret_name,
         ))
+        self.install_stage("CHART_HELM")
         self.helm(
             "upgrade", "--install", self.release, CHART,
             "--namespace", self.namespace,
@@ -675,10 +684,12 @@ service:
             timeout=330,
         )
         self.chart_installed = True
+        self.install_stage("CHART_ROLLOUT")
         self.kubectl(
             "rollout", "status", "statefulset/" + self.workload_name,
             "-n", self.namespace, "--timeout=240s", timeout=260,
         )
+        self.install_stage("CHART_ISOLATION_CHECK")
         exposed = self.kubectl(
             "get", "ingressroute.traefik.io,middleware.traefik.io,"
             "serverstransport.traefik.io",
