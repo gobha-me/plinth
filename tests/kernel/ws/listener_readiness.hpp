@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -113,6 +114,81 @@ class ListenerReadiness final
     return ready_locked();
   }
 
+  // Listening sockets alone do not mean asynchronously connecting DB pools
+  // are usable. Observe their real state on an owned loop, within the SAME
+  // startup deadline. Cancellation/drain also owns this timer before teardown.
+  [[nodiscard]] auto wait_for_dependencies(
+      trantor::EventLoop* owner, std::function<bool()> available,
+      std::chrono::steady_clock::time_point deadline) -> bool {
+    auto self = shared_from_this();
+    auto timer = std::make_shared<trantor::TimerId>(trantor::InvalidTimerId);
+    auto probe = std::make_shared<std::function<bool()>>(std::move(available));
+    {
+      std::lock_guard lock(mu);
+      if (owner == nullptr || owner->isInLoopThread() || !*probe ||
+          !ready_locked()) {
+        fail_locked("invalid dependency readiness owner or state");
+        return false;
+      }
+      dependencies_pending = true;
+      ++pending;
+    }
+    try {
+      owner->queueInLoop([self, owner, timer, probe, deadline] {
+        try {
+          *timer = owner->runEvery(0.01, [self, owner, timer, probe, deadline] {
+            std::unique_lock lock(self->mu);
+            bool complete = self->cancelled || self->failed;
+            if (!complete && std::chrono::steady_clock::now() >= deadline) {
+              self->fail_locked("dependency startup deadline expired");
+              complete = true;
+            }
+            if (!complete) {
+              lock.unlock();
+              bool check_failed = false;
+              try {
+                complete = (*probe)();
+              } catch (...) {
+                check_failed = true;
+              }
+              lock.lock();
+              if (check_failed) {
+                self->fail_locked("dependency readiness check failed");
+              } else if (std::chrono::steady_clock::now() >= deadline) {
+                self->fail_locked("dependency startup deadline expired");
+              }
+              complete = complete || self->cancelled || self->failed;
+            }
+            if (complete) {
+              lock.unlock();
+              owner->invalidateTimer(*timer);
+              // Captured-owner destructors may reenter readiness. Retire them
+              // outside mu, while the pending drain reservation is still held.
+              *probe = {};
+              lock.lock();
+              self->dependencies_pending = false;
+              --self->pending;
+              self->cv.notify_all();
+            }
+          });
+        } catch (...) {
+          *probe = {};
+          std::lock_guard lock(self->mu);
+          self->dependencies_pending = false;
+          --self->pending;
+          self->fail_locked("could not start dependency readiness timer");
+        }
+      });
+    } catch (...) {
+      *probe = {};
+      std::lock_guard lock(mu);
+      dependencies_pending = false;
+      --pending;
+      fail_locked("could not queue dependency readiness check");
+    }
+    return wait_until(deadline);
+  }
+
   auto cancel() -> void {
     std::lock_guard lock(mu);
     cancelled = true;
@@ -139,7 +215,7 @@ class ListenerReadiness final
  private:
   [[nodiscard]] auto ready_locked() const -> bool {
     return !failed && !cancelled && expected_owners != 0 &&
-           acknowledgements == expected_owners;
+           acknowledgements == expected_owners && !dependencies_pending;
   }
 
   auto fail_locked(std::string message) -> void {
@@ -160,6 +236,7 @@ class ListenerReadiness final
   std::size_t pending{0};
   bool failed{false};
   bool cancelled{false};
+  bool dependencies_pending{false};
   std::string error;
 };
 

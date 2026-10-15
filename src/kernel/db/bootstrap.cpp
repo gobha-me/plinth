@@ -203,6 +203,33 @@ auto bootstrap_schema(const Config::Database& db_cfg,
     }
   }
 
+  // Existing rows remain ordinary JSONB. Only explicitly marked new rows may
+  // contain serialized detail, so historical caller data cannot impersonate an
+  // encoding marker. Run before any startup seeding/writer or audit route.
+  if (!pg.has_rows("SELECT 1 FROM information_schema.columns "
+                   "WHERE table_schema='plinth' AND table_name='audit_log' "
+                   "AND column_name='detail_encoding'")) {
+    pg.exec("ALTER TABLE plinth.audit_log ADD COLUMN IF NOT EXISTS "
+            "detail_encoding SMALLINT NOT NULL DEFAULT 0 "
+            "CONSTRAINT chk_audit_log_detail_encoding "
+            "CHECK (detail_encoding IN (0, 1))");
+  }
+  if (!pg.has_rows(
+          "SELECT 1 FROM pg_attribute a "
+          "JOIN pg_attrdef d ON d.adrelid=a.attrelid AND d.adnum=a.attnum "
+          "JOIN pg_constraint c ON c.conrelid=a.attrelid "
+          "WHERE a.attrelid='plinth.audit_log'::regclass "
+          "AND a.attname='detail_encoding' AND NOT a.attisdropped "
+          "AND a.attgenerated='' AND a.attidentity='' "
+          "AND a.atttypid='smallint'::regtype AND a.attnotnull "
+          "AND pg_get_expr(d.adbin,d.adrelid)='0' "
+          "AND c.conname='chk_audit_log_detail_encoding' "
+          "AND c.contype='c' AND c.convalidated "
+          "AND pg_get_expr(c.conbin,c.conrelid)="
+          "'(detail_encoding = ANY (ARRAY[0, 1]))'")) {
+    throw std::runtime_error("incompatible audit detail encoding schema");
+  }
+
   // Kernel-owned, idempotent upgrade for the #31 launcher visibility marker.
   // Existing installations skip schema.sql, so additive kernel schema changes
   // must be applied before any startup reconciler or route queries the column.

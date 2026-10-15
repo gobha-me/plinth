@@ -10,6 +10,7 @@
 #include "kernel/js/conversion.hpp"
 #include "kernel/js/eval.hpp"
 #include "kernel/js/eval_guard.hpp"
+#include "kernel/js/execution_lifetime.hpp"
 #include "kernel/js/extension_database.hpp"
 #include "kernel/js/stdlib_inject.hpp"
 #include "kernel/logging.hpp"
@@ -624,6 +625,13 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
   if (bc == nullptr) {
     return;
   }
+  auto execution = bc->execution_lifetime.load(std::memory_order_acquire);
+  if (execution && execution->request_cancel()) {
+    // The outer coroutine still owns a raw BC parameter. Request termination
+    // but retain the checked-out owner; never recycle/free a running frame.
+    plinth::log::error("RuntimePool::release refused an active JS owner");
+    return;
+  }
   std::lock_guard<std::mutex> lock(mu);
   auto it = std::ranges::find_if(
       checked_out, [bc](const EntryPtr& e) { return &e->bc == bc; });
@@ -729,6 +737,11 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
 
 auto RuntimePool::destroy(BridgeContext* bc) -> void {
   if (bc == nullptr) {
+    return;
+  }
+  auto execution = bc->execution_lifetime.load(std::memory_order_acquire);
+  if (execution && execution->request_cancel()) {
+    plinth::log::error("RuntimePool::destroy refused an active JS owner");
     return;
   }
   std::lock_guard<std::mutex> lock(mu);

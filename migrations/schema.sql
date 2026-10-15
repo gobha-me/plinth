@@ -276,6 +276,8 @@ CREATE TABLE plinth.audit_log (
     user_id     UUID,
     session_id  UUID,
     detail      JSONB       NOT NULL,
+    detail_encoding SMALLINT NOT NULL DEFAULT 0
+        CONSTRAINT chk_audit_log_detail_encoding CHECK (detail_encoding IN (0, 1)),
     ip_address  INET,
     node_id     TEXT        NOT NULL
 );

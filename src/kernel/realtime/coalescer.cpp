@@ -614,6 +614,11 @@ auto CoalescerRegistry::open_window_count_for_test() const -> std::size_t {
   return g_windows.size();
 }
 
+auto CoalescerRegistry::batch_scope_count_for_test() const -> std::size_t {
+  std::lock_guard lock(g_scope_mu);
+  return g_scope_to_buckets.size();
+}
+
 auto CoalescerRegistry::set_emit_hook_for_test(EmitHook hook) -> void {
   std::lock_guard lock(g_hook_mu);
   g_emit_hook = std::move(hook);

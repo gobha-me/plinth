@@ -33,8 +33,11 @@ CAP_GATE = "plinth_tests_cap_corpus"
 DB_ADMISSION_TAG = "[isolated-db-admission]"
 DB_ADMISSION_CASE = "QuickJS ordinary database calls have a bounded deterministic admission and ownership corpus"
 DB_ADMISSION_GATE = "plinth_tests_db_admission_corpus"
+AUDIT_DRAIN_TAG = "[isolated-audit-drain]"
+AUDIT_DRAIN_CASE = "audit drain retains blocked writes before Drogon shutdown and retries"
+AUDIT_DRAIN_GATE = "plinth_tests_audit_drain"
 GROUPED_JS_BASELINE = "[js] ~[batch-transaction]"
-GROUPED_JS_SELECTOR = GROUPED_JS_BASELINE + " ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission]"
+GROUPED_JS_SELECTOR = GROUPED_JS_BASELINE + " ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-audit-drain]"
 EXPECTED_GATES = {
     "plinth_tests_logger_capture_isolated": ISOLATION_TAG,
     "plinth_tests_log_regression": "[js][stdlib][log][regression]",
@@ -117,7 +120,13 @@ def validate_inventory(
     }
     if baseline_db_admission != db_admission:
         raise AssertionError("baseline JS discovery lost or changed the database admission corpus")
-    exclusions = EXPECTED_NAMES | {PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE}
+    audit_drain = {name: tags for name, tags in baseline.items() if AUDIT_DRAIN_TAG in tags}
+    if set(audit_drain) != {AUDIT_DRAIN_CASE}:
+        raise AssertionError("audit drain requires exactly its named isolated fixture")
+    if any(tag in audit_drain[AUDIT_DRAIN_CASE] for tag in
+           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG)):
+        raise AssertionError("audit drain must not enter another isolation group")
+    exclusions = EXPECTED_NAMES | {PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, AUDIT_DRAIN_CASE}
     expected_grouped = {
         name: tags for name, tags in baseline.items() if name not in exclusions
     }
@@ -140,6 +149,7 @@ def validate_inventory(
         (DB_ADMISSION_GATE, DB_ADMISSION_CASE),
     ):
         validate_strict_gate(gates, gate_name, case_name, binary)
+    validate_strict_gate(gates, AUDIT_DRAIN_GATE, AUDIT_DRAIN_CASE, binary, 30, 40)
     for gate in gates:
         for gate_name, case_name, isolation_tag in (
             (CAP_GATE, CAP_CASE, CAP_TAG),
@@ -151,7 +161,8 @@ def validate_inventory(
                 raise AssertionError("isolated corpus must not have an extra discovery or execution gate")
 
 
-def validate_strict_gate(gates: list[dict], gate_name: str, case_name: str, binary: Path) -> None:
+def validate_strict_gate(gates: list[dict], gate_name: str, case_name: str, binary: Path,
+                         child_timeout: int = 60, outer_timeout: int = 75) -> None:
     matches = [gate for gate in gates if gate.get("name") == gate_name]
     if len(matches) != 1:
         raise AssertionError("named strict isolated gate must occur exactly once")
@@ -164,14 +175,14 @@ def validate_strict_gate(gates: list[dict], gate_name: str, case_name: str, bina
         or Path(command[1]).resolve() != Path(__file__).with_name("verify_catch_case.py").resolve()
         or command[2] != "--binary"
         or Path(command[3]).resolve() != binary.resolve()
-        or command[4:] != ["--case", case_name, "--timeout", "60"]
+        or command[4:] != ["--case", case_name, "--timeout", str(child_timeout)]
     ):
         raise AssertionError("named isolated gate must use its exact strict verifier command")
     deadlines = [
         prop.get("value") for prop in matches[0].get("properties", [])
         if prop.get("name") == "TIMEOUT"
     ]
-    if len(deadlines) != 1 or type(deadlines[0]) not in (int, float) or deadlines[0] != 75:
+    if len(deadlines) != 1 or type(deadlines[0]) not in (int, float) or deadlines[0] != outer_timeout:
         raise AssertionError("named isolated gate must have the exact outer deadline")
 
 
@@ -183,7 +194,8 @@ def self_test() -> int:
     pubsub = {PUBSUB_CASE: f"[js][pubsub][corpus]{PUBSUB_TAG}"}
     cap = {CAP_CASE: f"[js][cap][corpus]{CAP_TAG}"}
     db_admission = {DB_ADMISSION_CASE: f"[js][db][corpus]{DB_ADMISSION_TAG}"}
-    baseline = {**isolated, **grouped, **pubsub, **cap, **db_admission}
+    audit_drain = {AUDIT_DRAIN_CASE: "[js][audit]" + AUDIT_DRAIN_TAG}
+    baseline = {**isolated, **grouped, **pubsub, **cap, **db_admission, **audit_drain}
     gates = [
         {"name": name, "command": ["plinth_tests", selector]}
         for name, selector in {**EXPECTED_GATES, "plinth_tests_js": grouped_selector}.items()
@@ -206,6 +218,12 @@ def self_test() -> int:
     db_admission_gate["command"][5] = DB_ADMISSION_CASE
     # Preserve the existing cap/pubsub/grouped gate positions for old controls.
     gates.insert(-3, db_admission_gate)
+    audit_gate = copy.deepcopy(pubsub_gate)
+    audit_gate["name"] = AUDIT_DRAIN_GATE
+    audit_gate["command"][5] = AUDIT_DRAIN_CASE
+    audit_gate["command"][7] = "30"
+    audit_gate["properties"][0]["value"] = 40
+    gates.insert(1, audit_gate)
     validate_inventory(isolated, grouped, gates, grouped_selector, binary, baseline, pubsub, cap, db_admission)
     malformed = [
         ({}, grouped, gates),
@@ -291,13 +309,13 @@ def self_test() -> int:
         raise AssertionError("pubsub grouped leakage was not rejected")
 
     # These ordinary fixtures share descriptive tags with the isolated corpora;
-    # only the explicit, independently named eight-case exclusion set may leave.
+    # only the explicit, independently named nine-case exclusion set may leave.
     ordinary = {
         **grouped,
         "ordinary pubsub integration fixture": "[js][pubsub][integration]",
         "ordinary capability fixture": "[js][cap]",
     }
-    ordinary_baseline = {**isolated, **ordinary, **pubsub, **cap, **db_admission}
+    ordinary_baseline = {**isolated, **ordinary, **pubsub, **cap, **db_admission, **audit_drain}
     validate_inventory(isolated, ordinary, gates, grouped_selector, binary,
                        ordinary_baseline, pubsub, cap, db_admission)
 
@@ -402,7 +420,7 @@ def self_test() -> int:
     # Keep the independent logger/pubsub/cap names, rather than subtracting
     # whatever an isolated discovery happens to return from the baseline.
     ordinary_db = {**ordinary, "ordinary database fixture": "[js][db]"}
-    db_baseline = {**isolated, **ordinary_db, **pubsub, **cap, **db_admission}
+    db_baseline = {**isolated, **ordinary_db, **pubsub, **cap, **db_admission, **audit_drain}
     validate_inventory(isolated, ordinary_db, gates, grouped_selector, binary,
                        db_baseline, pubsub, cap, db_admission)
 
@@ -421,6 +439,25 @@ def self_test() -> int:
             rejected += 1
             return
         raise AssertionError("database admission inventory negative control was not rejected")
+
+    reject_db_control(grouped={**ordinary_db, **audit_drain})
+    reject_db_control(baseline={name: tags for name, tags in db_baseline.items()
+                                if name != AUDIT_DRAIN_CASE})
+    reject_db_control(baseline={**db_baseline, "unexpected audit drain": AUDIT_DRAIN_TAG})
+    reject_db_control(grouped_selector=grouped_selector.replace(" ~[isolated-audit-drain]", ""))
+    reject_db_control(gates=[gate for gate in gates if gate["name"] != AUDIT_DRAIN_GATE])
+    reject_db_control(gates=gates + [copy.deepcopy(audit_gate)])
+    audit_index = next(index for index, gate in enumerate(gates) if gate["name"] == AUDIT_DRAIN_GATE)
+    for index, replacement in ((0, "true"), (3, "stale-tests"), (5, "stale case"), (7, "31")):
+        mutated = copy.deepcopy(gates)
+        mutated[audit_index]["command"][index] = replacement
+        reject_db_control(gates=mutated)
+    for properties in ([], [{"name": "TIMEOUT", "value": "40"}],
+                       [{"name": "TIMEOUT", "value": 41}],
+                       [{"name": "TIMEOUT", "value": 40}] * 2):
+        mutated = copy.deepcopy(gates)
+        mutated[audit_index]["properties"] = properties
+        reject_db_control(gates=mutated)
 
     for candidate_db in (
         {},
@@ -570,7 +607,7 @@ def main() -> int:
                        baseline, pubsub, cap, db_admission)
     print(
         "logger/pubsub/cap/database inventory: exactly 5 logger fixtures, 1 pubsub corpus, 1 cap corpus "
-        "and 1 database admission corpus isolated, 0 grouped, "
+        "and 1 database admission corpus plus 1 audit drain isolated, 0 grouped, "
         f"{len(grouped)} ordinary JS fixtures retained, one of each named gate"
     )
     return 0

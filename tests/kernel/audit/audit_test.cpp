@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "../packages/http_test_fixture.hpp"
 #include "kernel/audit/handlers.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
@@ -128,14 +129,14 @@ auto clear_audit_log(TestPg& pg) -> void {
 // validates the same WHERE semantics the handler composes.
 constexpr const char* SELECT_SQL =
     "SELECT id, timestamp, action, user_id, session_id, "
-    "       detail, ip_address, node_id "
+    "       detail, detail_encoding, ip_address, node_id "
     "FROM plinth.audit_log "
     "WHERE CASE WHEN $1 = '' THEN TRUE ELSE action = $1 END "
     "  AND CASE WHEN $2 = '' THEN TRUE ELSE user_id = $2::uuid END "
     "  AND CASE WHEN $3 = '' THEN TRUE ELSE timestamp >= $3::timestamptz END "
     "  AND CASE WHEN $4 = '' THEN TRUE ELSE timestamp <= $4::timestamptz END "
     "ORDER BY timestamp DESC "
-    "LIMIT $5 OFFSET $6";
+    "LIMIT $5::integer OFFSET $6::integer";
 
 constexpr const char* COUNT_SQL =
     "SELECT COUNT(*) AS total FROM plinth.audit_log "
@@ -168,6 +169,115 @@ constexpr const char* UUID_B = "22222222-2222-2222-2222-222222222222";
 } // namespace
 
 // ── Query-layer tests ───────────────────────────────────────────────
+
+TEST_CASE("Audit HTTP restores encoded details and rejects corrupt storage",
+          "[audit][ws][integration]") {
+  using namespace std::chrono_literals;
+  if (!plinth::ws_test::pg_available()) {
+    SKIP("PG not available");
+  }
+  plinth::http_test::HttpTestFixture fixture;
+  const auto admin = fixture.seed_admin("audit-storage-admin");
+  const auto non_admin = fixture.seed_non_admin("audit-storage-reader");
+  const auto cfg = plinth::ws_test::test_config();
+  TestPg pg{cfg.db};
+  Json::Value detail{Json::objectValue};
+  detail["channel"] = std::string{"before\0after", 12};
+  detail[std::string{"key\0end", 7}] = std::string{"\0", 1};
+  detail["nested"][0] = R"(\u0000)";
+  plinth::log::audit("test.audit.http.async", detail, plinth::log::AuditCtx{});
+  plinth::log::audit_sync(cfg.db, "test.audit.http.sync", detail);
+  Json::Value legacy{Json::objectValue};
+  legacy["detail_encoding"] = 1;
+  legacy["json"] = "not encoded";
+  plinth::log::audit_sync(cfg.db, "test.audit.http.legacy", legacy);
+  REQUIRE(plinth::log::wait_for_audits(2s));
+
+  const auto get = [&fixture](const std::string& token,
+                              const std::string& action) {
+    auto request = drogon::HttpRequest::newHttpRequest();
+    request->setMethod(drogon::Get);
+    request->setPath("/api/audit");
+    request->setParameter("action", action);
+    if (!token.empty()) {
+      request->addCookie("plinth_session", token);
+    }
+    return fixture.dispatch(request);
+  };
+  for (const auto* action : {"test.audit.http.async", "test.audit.http.sync"}) {
+    const auto response = get(admin, action);
+    REQUIRE(response->statusCode() == drogon::k200OK);
+    const auto body = response->getJsonObject();
+    REQUIRE(body != nullptr);
+    REQUIRE((*body)["total"].asInt() == 1);
+    REQUIRE((*body)["events"].size() == 1);
+    REQUIRE((*body)["events"][0]["detail"] == detail);
+  }
+  const auto legacy_response = get(admin, "test.audit.http.legacy");
+  REQUIRE(legacy_response->statusCode() == drogon::k200OK);
+  const auto legacy_body = legacy_response->getJsonObject();
+  REQUIRE(legacy_body != nullptr);
+  REQUIRE((*legacy_body)["events"][0]["detail"] == legacy);
+  REQUIRE(get("", "test.audit.http.async")->statusCode() ==
+          drogon::k401Unauthorized);
+  REQUIRE(get(non_admin, "test.audit.http.async")->statusCode() ==
+          drogon::k403Forbidden);
+
+  {
+    plinth::ws_test::WsTestClient client;
+    REQUIRE(client.connect(2s));
+    Json::Value auth{Json::objectValue};
+    auth["type"] = "auth";
+    // Administrators intentionally retain the legacy channel-shape bypass;
+    // exercise rejection as an ordinary user without changing that policy.
+    auth["token"] = non_admin;
+    client.send_json(auth);
+    const auto connected = client.receive_json(3s);
+    REQUIRE(connected.has_value());
+    REQUIRE((*connected)["type"].asString() == "connected");
+    const auto channel = std::string{"plinth:ext:storage:event"} +
+                         std::string(1, '\0') + "suffix";
+    Json::Value subscribe{Json::objectValue};
+    subscribe["type"] = "subscribe";
+    subscribe["channels"].append(channel);
+    client.send_json(subscribe);
+    const auto subscribed = client.receive_json(3s);
+    REQUIRE(subscribed.has_value());
+    REQUIRE((*subscribed)["type"].asString() == "subscribed");
+    REQUIRE((*subscribed)["channels"].isArray());
+    REQUIRE((*subscribed)["channels"].empty());
+    // The production handler submits the denial before sending this ack.
+    REQUIRE(plinth::log::wait_for_audits(2s));
+    const auto persisted = get(admin, "realtime.broker.subscribe_denied");
+    REQUIRE(persisted->statusCode() == drogon::k200OK);
+    const auto body = persisted->getJsonObject();
+    REQUIRE(body != nullptr);
+    REQUIRE((*body)["events"].size() == 1);
+    const auto& denial = (*body)["events"][0]["detail"];
+    REQUIRE(denial["channel"].asString() == channel);
+    REQUIRE(denial["reason"].asString() == "channel_invalid");
+    REQUIRE(denial["source"].asString() == "ws");
+  }
+
+  for (const auto* corrupt : {R"({})", R"("private-test-only")",
+                              R"("/* private-test-only */{}")", R"("[1,]")"}) {
+    auto cleared = pg.exec(
+        "DELETE FROM plinth.audit_log WHERE action='test.audit.http.corrupt'");
+    REQUIRE(PQresultStatus(cleared.get()) == PGRES_COMMAND_OK);
+    auto inserted = pg.exec_params(
+        "INSERT INTO plinth.audit_log(action,detail,detail_encoding,node_id) "
+        "VALUES ('test.audit.http.corrupt',$1::jsonb,1,'test-node')",
+        {corrupt});
+    REQUIRE(PQresultStatus(inserted.get()) == PGRES_COMMAND_OK);
+    const auto response = get(admin, "test.audit.http.corrupt");
+    REQUIRE(response->statusCode() == drogon::k500InternalServerError);
+    const auto body = response->getJsonObject();
+    REQUIRE(body != nullptr);
+    REQUIRE((*body)["error"].asString() == "internal_error");
+    REQUIRE(response->body().find("private-test-only") == std::string::npos);
+    REQUIRE_FALSE(body->isMember("events"));
+  }
+}
 
 TEST_CASE("Audit query: no filters returns all rows ordered DESC",
           "[audit][integration]") {

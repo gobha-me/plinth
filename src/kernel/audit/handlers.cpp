@@ -1,4 +1,5 @@
 #include "kernel/audit/handlers.hpp"
+#include "kernel/audit/detail_encoding.hpp"
 #include "kernel/auth/middleware.hpp"
 #include "kernel/db/connection_info.hpp"
 #include "kernel/db/operations.hpp"
@@ -162,14 +163,16 @@ auto parse_query(const drogon::HttpRequestPtr& req, AuditQuery& q,
 // fail on an empty string.
 constexpr const char* SELECT_SQL =
     "SELECT id, timestamp, action, user_id, session_id, "
-    "       detail, ip_address, node_id "
+    "       detail, detail_encoding, ip_address, node_id "
     "FROM plinth.audit_log "
     "WHERE CASE WHEN $1 = '' THEN TRUE ELSE action = $1 END "
     "  AND CASE WHEN $2 = '' THEN TRUE ELSE user_id = $2::uuid END "
     "  AND CASE WHEN $3 = '' THEN TRUE ELSE timestamp >= $3::timestamptz END "
     "  AND CASE WHEN $4 = '' THEN TRUE ELSE timestamp <= $4::timestamptz END "
     "ORDER BY timestamp DESC "
-    "LIMIT $5 OFFSET $6";
+    // SqlBinder binds the parsed C++ ints as four-byte binary parameters;
+    // PostgreSQL otherwise infers eight-byte LIMIT/OFFSET parameters.
+    "LIMIT $5::integer OFFSET $6::integer";
 
 constexpr const char* COUNT_SQL =
     "SELECT COUNT(*) AS total FROM plinth.audit_log "
@@ -180,7 +183,7 @@ constexpr const char* COUNT_SQL =
 
 // ── Response shaping ────────────────────────────────────────────────
 
-auto row_to_event(const drogon::orm::Row& row) -> Json::Value {
+auto row_to_event(const drogon::orm::Row& row) -> std::optional<Json::Value> {
   Json::Value e;
   e["id"] = row["id"].as<std::string>();
   e["timestamp"] = row["timestamp"].as<std::string>();
@@ -192,15 +195,12 @@ auto row_to_event(const drogon::orm::Row& row) -> Json::Value {
     e["session_id"] = row["session_id"].as<std::string>();
   }
 
-  Json::Value detail_json(Json::objectValue);
   auto detail_str = row["detail"].as<std::string>();
-  Json::CharReaderBuilder reader_b;
-  std::unique_ptr<Json::CharReader> reader(reader_b.newCharReader());
-  std::string errs;
-  // Json::CharReader::parse takes a (begin, end) pointer pair
-  reader->parse(detail_str.data(), detail_str.data() + detail_str.size(),
-                &detail_json, &errs);
-  e["detail"] = detail_json;
+  auto detail = decode_detail(detail_str, row["detail_encoding"].as<int>());
+  if (!detail) {
+    return std::nullopt;
+  }
+  e["detail"] = std::move(*detail);
 
   if (!row["ip_address"].isNull()) {
     e["ip_address"] = row["ip_address"].as<std::string>();
@@ -236,7 +236,15 @@ auto handle_list_audit(const drogon::HttpRequestPtr& req, Callback&& callback)
       [cb, q, db](const drogon::orm::Result& select_result) {
         Json::Value events(Json::arrayValue);
         for (const auto& row : select_result) {
-          events.append(row_to_event(row));
+          auto event = row_to_event(row);
+          if (!event) {
+            // Corrupt encoded data is not an empty/ordinary event. Do not
+            // expose raw audit content in the error response or diagnostics.
+            (*cb)(json_error(drogon::k500InternalServerError, "internal_error",
+                             "Failed to query audit log"));
+            return;
+          }
+          events.append(std::move(*event));
         }
 
         // Sequential COUNT: keeps control flow linear. Admin endpoint,

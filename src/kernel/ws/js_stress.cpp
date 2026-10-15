@@ -4,6 +4,7 @@
 #include "kernel/js/eval.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/ws/messages.hpp"
 
 #include <drogon/drogon.h>
@@ -169,6 +170,12 @@ auto try_dispatch_js_stress(const drogon::WebSocketConnectionPtr& conn,
   }
 
   std::string script = args[0].asString();
+  auto accepted = plinth::lifecycle::async_tasks().try_acquire();
+  if (!accepted) {
+    send_if_connected(conn, make_call_error(call_id, "server_shutting_down",
+                                            "server is shutting down"));
+    return true;
+  }
   std::weak_ptr<drogon::WebSocketConnection> weak_conn = conn;
 
   std::shared_ptr<DispatchLease> lease;
@@ -186,7 +193,7 @@ auto try_dispatch_js_stress(const drogon::WebSocketConnectionPtr& conn,
   // captures are owned values: weak_conn is a non-owning weak_ptr, call_id is a
   // string copy, script is moved, and lease keeps the pool alive while also
   // publishing completion to shutdown. No references to caller frame.
-  drogon::async_run([weak_conn, call_id, lease,
+  drogon::async_run([weak_conn, call_id, lease, accepted,
                      script = std::move(script)]() -> drogon::Task<> {
     plinth::js::BridgeContext* bc = lease->pool->acquire();
     if (bc == nullptr) {
@@ -196,7 +203,7 @@ auto try_dispatch_js_stress(const drogon::WebSocketConnectionPtr& conn,
       co_return;
     }
 
-    auto result = co_await plinth::js::run_on_context(*bc, script);
+    auto result = co_await plinth::js::run_on_context(*bc, script, accepted);
 
     auto locked = weak_conn.lock();
     if (result.value.has_value()) {

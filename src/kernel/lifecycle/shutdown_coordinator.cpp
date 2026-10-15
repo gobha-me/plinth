@@ -100,9 +100,9 @@ auto production_shutdown_hooks() -> ShutdownHooks {
             return true;
           },
       .close_audit_gate =
-          [](std::chrono::milliseconds) {
+          [](std::chrono::milliseconds timeout) {
             plinth::log::shutdown();
-            return true;
+            return plinth::log::wait_for_audits(timeout);
           },
       .stop_drogon =
           [](std::chrono::milliseconds timeout) {

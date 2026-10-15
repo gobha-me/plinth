@@ -632,7 +632,8 @@ auto emit_extension_error_audit(std::string_view extension_name,
 // JSON hop and defeat the pool contract.
 auto invoke_handler(plinth::js::BridgeContext& bc,
                     std::string_view extension_name, std::string_view function,
-                    const Json::Value& args, std::string_view data_dir)
+                    const Json::Value& args, std::string_view data_dir,
+                    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>> {
 
   using plinth::js::PromiseRejection;
@@ -703,7 +704,8 @@ auto invoke_handler(plinth::js::BridgeContext& bc,
 
   // Step 4 — eval. run_on_context drives the async-bridge loop; the
   // top-level promise (returned by the async IIFE) is settled inside.
-  auto eval_outcome = co_await plinth::js::run_on_context(bc, WRAPPER_SRC);
+  auto eval_outcome =
+      co_await plinth::js::run_on_context(bc, WRAPPER_SRC, std::move(accepted));
 
   // Step 5 — classify outcome.
   if (eval_outcome.value.has_value()) {
@@ -1057,7 +1059,8 @@ auto failed_pool_count_for_test() -> std::size_t {
 auto dispatch(std::string_view extension_name, std::string_view function,
               const Json::Value& args,
               const plinth::capabilities::UserContext& caller,
-              int caller_call_depth)
+              int caller_call_depth,
+              std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>> {
 
   using plinth::js::PromiseRejection;
@@ -1067,6 +1070,16 @@ auto dispatch(std::string_view extension_name, std::string_view function,
   ident_outer.append(extension_name);
   ident_outer.push_back(':');
   ident_outer.append(function);
+
+  if (!accepted) {
+    accepted = plinth::lifecycle::async_tasks().try_acquire();
+  }
+  if (!accepted) {
+    co_return std::unexpected(
+        PromiseRejection{.code = "cap.cancelled",
+                         .message = ident_outer + ": server is shutting down",
+                         .sqlstate = std::nullopt});
+  }
 
   std::shared_ptr<DispatchLease> lease;
   std::string packages_data_dir;
@@ -1114,7 +1127,7 @@ auto dispatch(std::string_view extension_name, std::string_view function,
   bc->call_depth = caller_call_depth + 1;
 
   auto result = co_await invoke_handler(*bc, extension_name, function, args,
-                                        packages_data_dir);
+                                        packages_data_dir, std::move(accepted));
 
   if (result.has_value()) {
     lease->pool->release(bc);

@@ -10,6 +10,17 @@ upstreamable. Breaking changes belong in a fork.
 
 ## Patches
 
+### `sql-binder-cancel.patch`
+
+Adds a small `SqlBinder::cancel() noexcept` operation against the same pinned
+Drogon source. Unexecuted binders normally execute in their destructor, even
+if parameter or callback setup unwinds. Plinth's owned SQL awaiters use a
+stack setup guard to abandon incomplete binders and explicitly execute only
+after both callbacks are installed. Already-dispatched SQL is not cancelled.
+Callback completion state remains separately owned and revocable if dispatch
+throws. This is an internal native lifetime repair, not a new SDK cancellation
+API; no change to the upstream version, source pin or license is made.
+
 ### `ftype-accessor.patch`
 
 Added **0.5.3** (ICD-0.5.3-db-batch-silent-mode §OID-Driven PG-Type →

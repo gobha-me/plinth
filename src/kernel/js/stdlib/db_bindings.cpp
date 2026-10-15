@@ -329,6 +329,7 @@ auto db_query(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
     op.batch_scope_id = bc->batch_state.scope_id;
     // Capture the owning transaction on the JS loop, as db.exec does.
     op.batch_pinned_conn = bc->batch_state.pinned_conn;
+    op.batch_rollback_owner = bc->batch_state.rollback_owner;
     ++bc->batch_state.ops_in_batch;
   }
   bc->pending_ops.push_back(std::move(op));
@@ -415,6 +416,7 @@ auto db_exec(JSContext* ctx, JSValue /*this_val*/, int argc, JSValue* argv)
     // Snapshot the pinned connection so the outcome helper can
     // route through it without reading bc from the worker thread.
     op.batch_pinned_conn = bc->batch_state.pinned_conn;
+    op.batch_rollback_owner = bc->batch_state.rollback_owner;
     ++bc->batch_state.ops_in_batch;
   }
   bc->pending_ops.push_back(std::move(op));
@@ -466,12 +468,14 @@ auto enqueue_batch_op(JSContext* ctx, AsyncOp::Type type,
   op.bc_extension_name = bc->extension_name;
   op.extension_database_clients = bc->extension_database_clients;
   op.batch_scope_id = scope_id;
+  op.batch_operation_count = bc->batch_state.ops_in_batch;
   if (type == AsyncOp::Type::DB_BATCH_COMMIT ||
       type == AsyncOp::Type::DB_BATCH_ROLLBACK) {
     // Transfer the main-loop owner to the detached terminal arm. This makes
     // its commit/rollback lifetime explicit and prevents BridgeContext from
     // retaining the transaction while the arm waits for database completion.
     op.batch_pinned_conn = std::move(bc->batch_state.pinned_conn);
+    op.batch_rollback_owner = std::move(bc->batch_state.rollback_owner);
   }
   if (rollback_err.has_value()) {
     op.rollback_error = std::move(*rollback_err);

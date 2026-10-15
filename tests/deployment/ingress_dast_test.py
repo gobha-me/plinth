@@ -39,7 +39,7 @@ try:
 
     from dast_report import REQUIRED_CONTROLS, classify_route, public_report
     from dast_review import ReviewContext, reviewed_dispositions
-    from k3d_lifecycle_test import Harness, K3S_TRAEFIK_CHART_VERSION, ROOT, free_port, require
+    from k3d_lifecycle_test import ExternalCommandFailure, Harness, K3S_TRAEFIK_CHART_VERSION, ROOT, free_port, require
 
     sys.path.insert(0, str(ROOT / "tests/browser"))
     from process_cleanup import run_browser  # noqa: E402
@@ -87,6 +87,7 @@ RESPONSE_POLICY_HEADERS = {
 DIAGNOSTIC_STAGES = frozenset({
     "ARGUMENTS", "PREFLIGHT", "SOURCE_INITIAL", "IMAGE_IDENTITY", "DESTINATIONS", "HARNESS_INIT",
     "EXECUTION", "DEPLOYMENT", "INGRESS_SETUP", "NAMESPACE_SETUP", "CHART_INSTALL", "BOOTSTRAP",
+    "CHART_VALUES", "CHART_HELM", "CHART_ROLLOUT", "CHART_ISOLATION_CHECK",
     "BOOTSTRAP_REMOVAL", "ROUTE_ENABLE", "SCANNER_START", "BROWSER_EXECUTION", "BROWSER_RECEIPT",
     "BROWSER_START", "BROWSER_ROOT", "BROWSER_LOGIN", "BROWSER_COOKIE_POLICY", "BROWSER_NATIVE_HTTP",
     "BROWSER_STYLE_POLICY", "BROWSER_LOGOUT", "BROWSER_COMPLETE_CHECK", "LOGIN", "HTTP_CHECKS",
@@ -108,6 +109,109 @@ BROWSER_DIAGNOSTIC_STAGES = {
     "COOKIE_POLICY": "BROWSER_COOKIE_POLICY", "NATIVE_HTTP": "BROWSER_NATIVE_HTTP",
     "STYLE_POLICY": "BROWSER_STYLE_POLICY", "LOGOUT": "BROWSER_LOGOUT", "COMPLETE": "BROWSER_COMPLETE_CHECK",
 }
+
+
+def finite_enum(value, allowed):
+    return value if type(value) is str and value in allowed else "UNKNOWN"
+
+
+def finite_count(value, maximum=1024):
+    return value if type(value) is int and 0 <= value <= maximum else None
+
+
+def finite_cleanup_observation(cleanup, diagnostic_processes=None):
+    # Observed zero counts do not change cleanup.verified or COMPLETE semantics.
+    return {
+        "remainingDiagnosticProcesses": finite_count(diagnostic_processes, 7),
+        **{name: cleanup.get(name) if type(cleanup.get(name)) is bool else None for name in (
+            "namespaceAbsent", "clusterAbsent", "registryAbsent", "scannerContainerAbsent",
+            "temporaryFilesAbsent",
+        )},
+        **{name: finite_count(cleanup.get(name)) for name in (
+            "remainingContainers", "remainingNetworks", "remainingVolumes",
+        )},
+    }
+
+
+def finite_deployment_observation(raw, kind):
+    """Project only finite status fields; metadata/spec/message text is private."""
+    require(type(raw) is dict, "invalid diagnostic object")
+    if kind in {"node", "job"}:
+        records = [raw]
+    else:
+        metadata = raw.get("metadata", {})
+        require(type(metadata) is dict, "invalid diagnostic metadata")
+        if metadata.get("continue"):
+            return {"status": "LIMIT_REACHED"}
+        records = raw.get("items")
+        require(type(records) is list and len(records) <= 32, "invalid diagnostic inventory")
+    projected = []
+    for record in records:
+        require(type(record) is dict, "invalid diagnostic record")
+        status = record.get("status", {})
+        require(type(status) is dict, "invalid diagnostic status")
+        if kind == "event":
+            projected.append({
+                "type": finite_enum(record.get("type"), {"Normal", "Warning"}),
+                "reason": finite_enum(record.get("reason"), {
+                    "BackOff", "Failed", "FailedScheduling", "FailedMount", "FailedAttachVolume",
+                    "FailedBinding", "FailedCreatePodSandBox", "FailedCreate", "Unhealthy", "Evicted",
+                    "NodeNotReady", "Pulling", "Pulled", "Created", "Started", "Scheduled",
+                    "ProvisioningFailed", "ExternalProvisioning", "WaitForFirstConsumer",
+                    "DeadlineExceeded", "OOMKilling",
+                }),
+            })
+            continue
+        if kind == "claim":
+            projected.append({"phase": finite_enum(status.get("phase"), {"Pending", "Bound", "Lost"})})
+            continue
+        conditions = status.get("conditions", [])
+        require(type(conditions) is list and len(conditions) <= 16
+                and all(type(item) is dict for item in conditions), "invalid diagnostic conditions")
+        if kind in {"node", "job"}:
+            allowed = ({"Ready", "DiskPressure", "MemoryPressure", "PIDPressure", "NetworkUnavailable"}
+                       if kind == "node" else {"Complete", "Failed", "Suspended", "FailureTarget", "SuccessCriteriaMet"})
+            item = {"conditions": [{"type": finite_enum(condition.get("type"), allowed),
+                                    "status": finite_enum(condition.get("status"), {"True", "False", "Unknown"})}
+                                   for condition in conditions]}
+            if kind == "job":
+                item.update({name: finite_count(status.get(name), 32) for name in ("active", "succeeded", "failed")})
+            projected.append(item)
+            continue
+        require(kind == "pod", "unknown diagnostic kind")
+        ready = [condition.get("status") for condition in conditions if condition.get("type") == "Ready"]
+        containers = status.get("initContainerStatuses", [])
+        ordinary = status.get("containerStatuses", [])
+        require(type(containers) is list and type(ordinary) is list
+                and len(containers) + len(ordinary) <= 16, "invalid diagnostic containers")
+        states = []
+        for index, container in enumerate(containers + ordinary):
+            require(type(container) is dict and type(container.get("state")) is dict,
+                    "invalid diagnostic container state")
+            state = container["state"]
+            names = [name for name in ("running", "waiting", "terminated") if name in state]
+            require(len(names) == 1 and len(state) == 1 and type(state[names[0]]) is dict,
+                    "ambiguous diagnostic container state")
+            name = names[0]
+            states.append({
+                "role": "INIT" if index < len(containers) else "APP",
+                "state": name.upper(),
+                "reason": finite_enum(state[name].get("reason"), {
+                    "PodInitializing", "ContainerCreating", "ErrImagePull", "ImagePullBackOff",
+                    "CrashLoopBackOff", "CreateContainerConfigError", "RunContainerError",
+                    "CreateContainerError", "InvalidImageName", "RegistryUnavailable", "Completed",
+                    "Error", "OOMKilled", "ContainerCannotRun", "DeadlineExceeded",
+                }),
+                "exitCode": finite_count(state[name].get("exitCode"), 255),
+                "ready": container.get("ready") if type(container.get("ready")) is bool else None,
+                "restarts": finite_count(container.get("restartCount")),
+            })
+        projected.append({
+            "phase": finite_enum(status.get("phase"), {"Pending", "Running", "Succeeded", "Failed", "Unknown"}),
+            "ready": finite_enum(ready[0], {"True", "False", "Unknown"}) if len(ready) == 1 else "UNKNOWN",
+            "containers": states,
+        })
+    return {"status": "OBSERVED", "count": len(projected), "records": projected}
 
 
 class BrowserSandboxUnavailable(RuntimeError):
@@ -142,7 +246,7 @@ class Diagnostics:
                 error_class = "INTERRUPTED"
             elif isinstance(error, subprocess.TimeoutExpired):
                 error_class = "TIMEOUT"
-            elif isinstance(error, subprocess.CalledProcessError):
+            elif isinstance(error, (subprocess.CalledProcessError, ExternalCommandFailure)):
                 error_class = "PROCESS_FAILED"
             elif isinstance(error, AssertionError):
                 error_class = "CHECK_FAILED"
@@ -835,6 +939,107 @@ class DastHarness(Harness):
             "docker", "volume", "ls", "--format", "{{.Name}}"], timeout=15).stdout.splitlines())
         self.owned_volumes = set()
         self.infrastructure_attempted = False
+        self._diagnostic_children = []
+
+    def install_stage(self, stage):
+        diagnostics = getattr(self, "diagnostics_state", None)
+        if diagnostics is not None:
+            diagnostics.enter(stage)
+
+    def diagnostic_query(self, path, deadline):
+        """Read at most 64 KiB under one shared budget; never emit raw bytes."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "TIMEOUT", None
+        process = None
+        try:
+            process = subprocess.Popen(
+                [self.args.kubectl, "--kubeconfig", str(self.kubeconfig), "get", "--raw", path],
+                cwd=ROOT, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            )
+            if not hasattr(self, "_diagnostic_children"):
+                self._diagnostic_children = []
+            self._diagnostic_children.append(process)
+            output = bytearray()
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return "TIMEOUT", None
+                    for key, _mask in selector.select(remaining):
+                        chunk = os.read(key.fd, min(16384, 65537 - len(output)))
+                        if not chunk:
+                            selector.unregister(key.fileobj)
+                            break
+                        output.extend(chunk)
+                        if len(output) > 65536:
+                            return "LIMIT_REACHED", None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "TIMEOUT", None
+            if process.wait(timeout=remaining) != 0:
+                return "QUERY_FAILED", None
+            return "OBSERVED", json.loads(output)
+        except subprocess.TimeoutExpired:
+            return "TIMEOUT", None
+        except (OSError, ValueError):
+            return "INVALID_DATA", None
+        finally:
+            if process is not None:
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    # One second is a separate bounded reap reserve. A failed
+                    # reap stays owned for independent cleanup, never a leak.
+                    process.wait(timeout=1)
+                    self._diagnostic_children.remove(process)
+                finally:
+                    process.stdout.close()
+
+    def reap_diagnostic_child(self, process, deadline):
+        try:
+            if process.poll() is None:
+                process.kill()
+            remaining = deadline - time.monotonic()
+            process.wait(timeout=max(0.001, remaining))
+            self._diagnostic_children.remove(process)
+        finally:
+            process.stdout.close()
+
+    def deployment_diagnostic(self):
+        """Six-second shared read budget, plus a one-second reap reserve."""
+        if (not self.kubeconfig.is_file()
+                or re.fullmatch(r"plinth-issue40-[0-9a-f]{8}", self.namespace) is None
+                or self.cluster != self.namespace):
+            return {"status": "UNAVAILABLE"}
+        namespace = self.namespace
+        selector = urllib.parse.quote(
+            "batch.kubernetes.io/job-name in (helm-install-traefik,helm-install-traefik-crd)", safe="")
+        queries = (
+            ("ownedPods", f"/api/v1/namespaces/{namespace}/pods?limit=32", "pod"),
+            ("ownedClaims", f"/api/v1/namespaces/{namespace}/persistentvolumeclaims?limit=32", "claim"),
+            ("ownedEvents", f"/api/v1/namespaces/{namespace}/events?limit=32&fieldSelector=type%3DWarning", "event"),
+            ("ownedNode", f"/api/v1/nodes/k3d-{self.cluster}-server-0", "node"),
+            ("traefikInstallerPods", f"/api/v1/namespaces/kube-system/pods?limit=32&labelSelector={selector}", "pod"),
+            ("traefikInstaller", "/apis/batch/v1/namespaces/kube-system/jobs/helm-install-traefik", "job"),
+            ("traefikCrdInstaller", "/apis/batch/v1/namespaces/kube-system/jobs/helm-install-traefik-crd", "job"),
+        )
+        deadline = time.monotonic() + 6
+        observations = {}
+        for label, path, kind in queries:
+            if getattr(self, "_diagnostic_children", []):
+                observations[label] = {"status": "UNAVAILABLE"}
+                continue
+            state, raw = self.diagnostic_query(path, deadline)
+            if state == "OBSERVED":
+                try:
+                    observations[label] = finite_deployment_observation(raw, kind)
+                except (AssertionError, ValueError, TypeError, KeyError):
+                    observations[label] = {"status": "INVALID_DATA"}
+            else:
+                observations[label] = {"status": state}
+        return observations
 
     def create_infrastructure(self):
         tag = self.run(["docker", "image", "inspect", self.local_tag], check=False, timeout=15)
@@ -1411,6 +1616,19 @@ class DastHarness(Harness):
         pass
 
     def retain_private_failure_evidence(self):
+        diagnostics = getattr(self, "diagnostics_state", None)
+        first = getattr(diagnostics, "first_failure", None)
+        if type(first) is dict and first.get("stage") in {
+                "DEPLOYMENT", "INGRESS_SETUP", "NAMESPACE_SETUP", "CHART_INSTALL",
+                "CHART_VALUES", "CHART_HELM", "CHART_ROLLOUT", "CHART_ISOLATION_CHECK"}:
+            try:
+                observation = self.deployment_diagnostic()
+            except Exception:
+                # Diagnostic failure is secondary; retain other private
+                # evidence and always continue independent owned cleanup.
+                observation = {"status": "UNAVAILABLE"}
+            self.private_details["deploymentDiagnostic"] = observation
+            print("ingress DAST deployment diagnostic: " + json.dumps(observation, sort_keys=True), file=sys.stderr)
         for name in ("browser-private.json", "browser-private.log"):
             path = self.root / name
             if path.is_file():
@@ -1466,6 +1684,10 @@ class DastHarness(Harness):
             except BaseException:
                 errors.append({"stage": label, "error": traceback.format_exc()})
 
+        diagnostic_deadline = time.monotonic() + 1
+        for process in list(getattr(self, "_diagnostic_children", [])):
+            attempt("DIAGNOSTIC_PROCESS", lambda process=process:
+                    self.reap_diagnostic_child(process, diagnostic_deadline))
         for watcher in list(self._exit_watchers):
             attempt("EXIT_OBSERVER", lambda watcher=watcher: self._stop_container_exit_watch(watcher))
         if self._exit_watchers:
@@ -1645,6 +1867,8 @@ def run(args, diagnostics=None):
     if report.get("status") == "COMPLETE":
         print("ingress DAST identity: " + json.dumps(identity, sort_keys=True))
     else:
+        print("ingress DAST cleanup diagnostic: " + json.dumps(finite_cleanup_observation(
+            cleanup, len(getattr(harness, "_diagnostic_children", []))), sort_keys=True), file=sys.stderr)
         diagnostics.enter("PUBLIC_REPORT")
         diagnostics.emit(report.get("reasons"))
     return 0 if report.get("status") == "COMPLETE" else 1

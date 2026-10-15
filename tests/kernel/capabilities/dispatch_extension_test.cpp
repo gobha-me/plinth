@@ -17,6 +17,7 @@
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/types.hpp"
 #include "kernel/config.hpp"
+#include "kernel/db/connection_info.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/js/async_op.hpp"
 #include "kernel/logging.hpp"
@@ -148,13 +149,37 @@ auto seed_tier2(std::string_view signature, std::string_view extension_name,
 
 auto admin_ctx() -> plinth::capabilities::UserContext {
   return plinth::capabilities::UserContext{
-      .user_id = "u-test",
+      .user_id = "11111111-1111-1111-1111-111111111111",
       .username = "tester",
       .auth_type = "session",
       .effective_rules = {"kernel.admin"}, // universal match
       .session_id = {},
       .ip_address = {},
   };
+}
+
+auto require_persisted_audit(std::string_view action, std::string_view user,
+                             std::string_view code = {}) -> void {
+  REQUIRE(plinth::log::wait_for_audits(2s));
+  const auto conninfo =
+      plinth::db::connection_info(test_config().db) + " connect_timeout=3";
+  std::unique_ptr<PGconn, decltype(&PQfinish)> connection{
+      PQconnectdb(conninfo.c_str()), PQfinish};
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  const std::array<std::string, 3> values{std::string{action},
+                                          std::string{user}, std::string{code}};
+  const std::array<const char*, 3> params{values[0].c_str(), values[1].c_str(),
+                                          values[2].c_str()};
+  std::unique_ptr<PGresult, decltype(&PQclear)> result{
+      PQexecParams(connection.get(),
+                   "SELECT count(*) FROM plinth.audit_log "
+                   "WHERE action=$1 AND user_id=$2::uuid "
+                   "AND ($3='' OR detail->>'code'=$3)",
+                   3, nullptr, params.data(), nullptr, nullptr, 0),
+      PQclear};
+  REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(result.get()) == 1);
+  REQUIRE(std::string_view{PQgetvalue(result.get(), 0, 0)} == "1");
 }
 
 auto run_dispatch(std::string_view ext_name, std::string_view fn,
@@ -316,6 +341,8 @@ TEST_CASE("E.01: handler_throw_maps_to_cap_handler_threw",
           plinth::capabilities::CapabilityError::EXTENSION_DISPATCH_FAILED);
   REQUIRE(code == "cap.handler_threw");
   REQUIRE(msg.find("boom") != std::string::npos);
+  require_persisted_audit("capability.extension.error", admin_ctx().user_id,
+                          "cap.handler_threw");
 }
 
 TEST_CASE("E.02: unknown_signature_rejects_at_resolver",
@@ -381,6 +408,8 @@ TEST_CASE("E.04: handler_syntax_error_rejects_cap_handler_load_failed",
   auto r = run_resolver("extdispatch:1:broken", Json::Value{}, &code, &msg);
   REQUIRE_FALSE(r.has_value());
   REQUIRE(code == "cap.handler_load_failed");
+  require_persisted_audit("capability.extension.error", admin_ctx().user_id,
+                          "cap.handler_load_failed");
 }
 
 TEST_CASE("E.05: destroyed_pool_rejects_extension_not_loaded",
@@ -471,7 +500,7 @@ TEST_CASE("P.03: rbac_enforced_at_resolver_not_callee",
 
   // Non-admin, no matching rules → resolver denies BEFORE dispatch.
   plinth::capabilities::UserContext no_rules{
-      .user_id = "u-no-rules",
+      .user_id = "22222222-2222-2222-2222-222222222222",
       .username = "nobody",
       .auth_type = "session",
       .effective_rules = {},
@@ -488,6 +517,7 @@ TEST_CASE("P.03: rbac_enforced_at_resolver_not_callee",
   REQUIRE_FALSE(r.has_value());
   REQUIRE(r.error() ==
           plinth::capabilities::CapabilityError::PERMISSION_DENIED);
+  require_persisted_audit("capability.rbac.denied", no_rules.user_id);
 }
 
 TEST_CASE("P.04: handler_receives_ctx_with_caller_identity_and_audit_frame",

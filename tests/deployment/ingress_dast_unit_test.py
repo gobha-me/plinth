@@ -2680,6 +2680,23 @@ class IndependentCleanupTest(unittest.TestCase):
                 self.assertEqual([item["stage"] for item in value.private_details["cleanupErrors"]],
                                  [failure])
 
+    def test_failed_diagnostic_reap_stays_owned_without_skipping_independent_cleanup(self):
+        value, events = self.configured()
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired(["fake-owned-kubectl"], 1)
+        value._diagnostic_children = [process]
+        with self.assertRaises(AssertionError):
+            value.cleanup()
+        self.assertEqual(events, ["HELM", "NAMESPACE", "CLUSTER", "REGISTRY", "LOCAL_TAG", "TEMPORARY"])
+        self.assertEqual(value._diagnostic_children, [process])
+        self.assertFalse(value.cleanup_complete)
+        self.assertEqual([item["stage"] for item in value.private_details["cleanupErrors"]], ["DIAGNOSTIC_PROCESS"])
+        process.kill.assert_called_once_with()
+        process.stdout.close.assert_called_once_with()
+        self.assertGreater(process.wait.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(process.wait.call_args.kwargs["timeout"], 1)
+
     def test_successful_cleanup_is_idempotent(self):
         value, events = self.configured()
         value.cleanup()
@@ -3494,6 +3511,193 @@ class WorkflowPrivacyTest(unittest.TestCase):
                     prepare["run"] += "\nnode browser.mjs --no-sandbox"
                 with self.assertRaises(AssertionError):
                     self.assert_private_artifact_boundary(workflow)
+
+
+class DeploymentDiagnosticTest(unittest.TestCase):
+    marker = "fake-private-marker https://private.invalid/token /private/path"
+
+    def test_typed_command_failure_preserves_runtimeerror_without_public_text(self):
+        value = object.__new__(driver.Harness)
+        value.env = {}
+        with mock.patch.object(driver.subprocess, "run", return_value=result(
+                self.marker, returncode=1, stderr=self.marker)):
+            with self.assertRaises(driver.ExternalCommandFailure) as failure:
+                value.run([self.marker])
+        self.assertIsInstance(failure.exception, RuntimeError)
+        self.assertIn(self.marker, str(failure.exception))
+        diagnostic = driver.Diagnostics()
+        diagnostic.enter("CHART_HELM")
+        diagnostic.failed(failure.exception)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            diagnostic.emit()
+        self.assertNotIn(self.marker, stderr.getvalue())
+        self.assertEqual(diagnostic.first_failure, {"stage": "CHART_HELM", "errorClass": "PROCESS_FAILED"})
+
+    def install_fixture(self):
+        value = object.__new__(driver.DastHarness)
+        value.namespace = "fake-owned-namespace"
+        value.release = "fake-owned-release"
+        value.bootstrap_secret_name = "fake-bootstrap-secret"
+        value.values_path = Path("/fake-owned/values.yaml")
+        value.chart_installed = False
+        value.values = mock.Mock(return_value={})
+        value.write_values = mock.Mock()
+        value.helm = mock.Mock()
+        value.kubectl = mock.Mock(return_value=result())
+        value.diagnostics_state = driver.Diagnostics()
+        return value
+
+    def test_shared_install_algorithm_keeps_order_and_original_bounds(self):
+        value = self.install_fixture()
+        value.install_chart()
+        self.assertTrue(value.chart_installed)
+        self.assertEqual(value.diagnostics_state.stage, "CHART_ISOLATION_CHECK")
+        self.assertEqual(value.helm.call_args.args[-4:], ("--atomic", "--wait", "--timeout", "5m"))
+        self.assertEqual(value.helm.call_args.kwargs, {"timeout": 330})
+        self.assertEqual(value.kubectl.call_args_list[0].args[-1], "--timeout=240s")
+        self.assertEqual(value.kubectl.call_args_list[0].kwargs, {"timeout": 260})
+        self.assertEqual(value.kubectl.call_args_list[1].args[0], "get")
+        ordinary = object.__new__(driver.Harness)
+        self.assertIsNone(ordinary.install_stage(self.marker))
+
+    def test_each_install_failure_keeps_exact_stage_and_no_later_operation(self):
+        for stage in ("CHART_VALUES", "CHART_HELM", "CHART_ROLLOUT", "CHART_ISOLATION_CHECK"):
+            with self.subTest(stage=stage):
+                value = self.install_fixture()
+                error = driver.ExternalCommandFailure(self.marker)
+                if stage == "CHART_VALUES":
+                    value.write_values.side_effect = error
+                elif stage == "CHART_HELM":
+                    value.helm.side_effect = error
+                else:
+                    value.kubectl.side_effect = ([error] if stage == "CHART_ROLLOUT" else [result(), error])
+                with self.assertRaises(driver.ExternalCommandFailure):
+                    value.install_chart()
+                value.diagnostics_state.failed(error)
+                self.assertEqual(value.diagnostics_state.first_failure["stage"], stage)
+                self.assertEqual(value.chart_installed, stage in {"CHART_ROLLOUT", "CHART_ISOLATION_CHECK"})
+                if stage in {"CHART_VALUES", "CHART_HELM"}:
+                    value.kubectl.assert_not_called()
+
+    def test_external_fields_are_projected_to_finite_codes_only(self):
+        record = {
+            "metadata": {"name": self.marker}, "spec": {"env": self.marker},
+            "status": {"phase": self.marker, "conditions": [{"type": "Ready", "status": "False"}],
+                       "containerStatuses": [{"name": self.marker, "ready": True, "restartCount": True,
+                                              "state": {"waiting": {"reason": self.marker, "message": self.marker}}}]},
+        }
+        observed = driver.finite_deployment_observation({"items": [record]}, "pod")
+        self.assertNotIn(self.marker, json.dumps(observed))
+        self.assertEqual(observed["records"][0], {
+            "phase": "UNKNOWN", "ready": "False", "containers": [{"role": "APP", "state": "WAITING",
+            "reason": "UNKNOWN", "exitCode": None, "ready": True, "restarts": None}],
+        })
+        for kind, raw in (("event", {"items": [{"type": "Warning", "reason": "FailedScheduling", "message": self.marker}]}),
+                          ("claim", {"items": [{"status": {"phase": "Pending"}, "metadata": {"name": self.marker}}]}),
+                          ("node", {"status": {"conditions": [{"type": "DiskPressure", "status": "True", "message": self.marker}]}}),
+                          ("job", {"status": {"active": 1, "failed": True, "conditions": [{"type": self.marker}]}})):
+            self.assertNotIn(self.marker, json.dumps(driver.finite_deployment_observation(raw, kind)))
+
+    def test_inventory_bounds_and_unknown_cleanup_never_become_zero_or_green(self):
+        self.assertEqual(driver.finite_deployment_observation(
+            {"metadata": {"continue": self.marker}, "items": []}, "pod"), {"status": "LIMIT_REACHED"})
+        for raw in ({"items": [None]}, {"items": [{}] * 33}, {"items": "invalid"},
+                    {"items": [{"status": {"conditions": [{}] * 17}}]}):
+            with self.assertRaises(AssertionError):
+                driver.finite_deployment_observation(raw, "pod")
+        cleanup = driver.finite_cleanup_observation({"verified": True, "remainingContainers": 0,
+                                                    "remainingNetworks": True, "remainingVolumes": self.marker})
+        self.assertEqual(cleanup["remainingContainers"], 0)
+        self.assertIsNone(cleanup["remainingNetworks"])
+        self.assertIsNone(cleanup["remainingVolumes"])
+        self.assertNotIn("verified", cleanup)
+        self.assertNotIn(self.marker, json.dumps(cleanup))
+
+    def test_observation_uses_one_shared_budget_and_exact_owned_cluster_only(self):
+        value = object.__new__(driver.DastHarness)
+        value.kubeconfig = mock.Mock(is_file=mock.Mock(return_value=True))
+        value.namespace = value.cluster = "plinth-issue40-a123abcd"
+        value.diagnostic_query = mock.Mock(return_value=("OBSERVED", {"items": []}))
+        observation = value.deployment_diagnostic()
+        calls = value.diagnostic_query.call_args_list
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(len({call.args[1] for call in calls}), 1)
+        self.assertTrue(all("/namespaces/plinth-issue40-a123abcd/" in call.args[0]
+                            or "/namespaces/kube-system/" in call.args[0]
+                            or call.args[0] == "/api/v1/nodes/k3d-plinth-issue40-a123abcd-server-0" for call in calls))
+        self.assertEqual(set(observation), {"ownedPods", "ownedClaims", "ownedEvents", "ownedNode",
+                                            "traefikInstallerPods", "traefikInstaller", "traefikCrdInstaller"})
+        value.kubeconfig.is_file.return_value = False
+        value.diagnostic_query.reset_mock()
+        self.assertEqual(value.deployment_diagnostic(), {"status": "UNAVAILABLE"})
+        value.diagnostic_query.assert_not_called()
+
+    def test_expired_budget_never_spawns_command(self):
+        value = object.__new__(driver.DastHarness)
+        with mock.patch.object(driver.subprocess, "Popen") as spawn:
+            self.assertEqual(value.diagnostic_query("/fake-owned", driver.time.monotonic() - 1), ("TIMEOUT", None))
+            spawn.assert_not_called()
+
+    def test_failed_query_reap_retains_owner_and_closes_stdout(self):
+        value = object.__new__(driver.DastHarness)
+        value.args = SimpleNamespace(kubectl="fake-owned-kubectl")
+        value.kubeconfig = Path("/fake-owned/kubeconfig")
+        value.env = {}
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired(["fake-owned-kubectl"], 1)
+        with mock.patch.object(driver.subprocess, "Popen", return_value=process), \
+                mock.patch.object(driver.selectors, "DefaultSelector") as selector:
+            selector.return_value.__enter__.return_value.get_map.return_value = {}
+            with self.assertRaises(subprocess.TimeoutExpired):
+                value.diagnostic_query("/fake-owned", driver.time.monotonic() + 3)
+        self.assertEqual(value._diagnostic_children, [process])
+        self.assertEqual(process.wait.call_args.kwargs, {"timeout": 1})
+        process.stdout.close.assert_called_once_with()
+
+    def test_secondary_diagnostic_failure_keeps_original_and_other_private_evidence(self):
+        value = object.__new__(driver.DastHarness)
+        value.diagnostics_state = driver.Diagnostics()
+        value.diagnostics_state.enter("CHART_HELM")
+        value.diagnostics_state.failed(driver.ExternalCommandFailure(self.marker))
+        first = value.diagnostics_state.first_failure.copy()
+        value.deployment_diagnostic = mock.Mock(side_effect=RuntimeError(self.marker))
+        value.private_details = {}
+        value.scanner = SimpleNamespace(started=False, scan_evidence=[])
+        value.raw_messages = []
+        with tempfile.TemporaryDirectory(prefix="plinth-issue40-unit-") as directory:
+            value.root = Path(directory)
+            stderr = io.StringIO()
+            with redirect_stderr(stderr):
+                value.retain_private_failure_evidence()
+        self.assertEqual(value.diagnostics_state.first_failure, first)
+        self.assertIs(value.private_details["activeScans"], value.scanner.scan_evidence)
+        self.assertEqual(value.private_details["deploymentDiagnostic"], {"status": "UNAVAILABLE"})
+        self.assertNotIn(self.marker, stderr.getvalue())
+
+    def test_real_oversized_and_timed_out_diagnostic_children_are_reaped(self):
+        value = object.__new__(driver.DastHarness)
+        value.args = SimpleNamespace(kubectl="fake-owned-kubectl")
+        value.kubeconfig = Path("/fake-owned/kubeconfig")
+        value.env = os.environ.copy()
+        real_spawn = subprocess.Popen
+        for program, expected in (("import sys; sys.stdout.write('x' * 65537)", "LIMIT_REACHED"),
+                                  ("import time; time.sleep(30)", "TIMEOUT")):
+            children = []
+
+            def spawn(argv, **kwargs):
+                self.assertEqual(argv[:3], ["fake-owned-kubectl", "--kubeconfig", "/fake-owned/kubeconfig"])
+                child = real_spawn([sys.executable, "-c", program], **kwargs)
+                children.append(child)
+                return child
+
+            with mock.patch.object(driver.subprocess, "Popen", side_effect=spawn):
+                budget = 3 if expected == "LIMIT_REACHED" else 0.3
+                self.assertEqual(value.diagnostic_query("/fake-owned", driver.time.monotonic() + budget), (expected, None))
+            self.assertEqual(len(children), 1)
+            self.assertIsNotNone(children[0].poll())
+            self.assertTrue(children[0].stdout.closed)
 
 
 if __name__ == "__main__":
