@@ -151,7 +151,7 @@ struct TypedSchemaFixture {
                     .declaration = {{"id", panel_id}, {"type", "float"}},
                     .validated_format_version = marker,
                     .logical_install_order = std::nullopt});
-    INFO(registered ? "registered" : registered.error());
+    INFO((registered ? "registered" : registered.error()));
     REQUIRE(registered.has_value());
   }
 
@@ -165,7 +165,7 @@ struct TypedSchemaFixture {
   auto finalize(const std::string& package_id) const -> void {
     auto result =
         plinth::packages::finalize_panel_install_order(*pg->conn, package_id);
-    INFO(result ? "finalized" : result.error());
+    INFO((result ? "finalized" : result.error()));
     REQUIRE(result.has_value());
   }
 
@@ -188,24 +188,52 @@ struct BlockedOrderWorker {
 
   BlockedOrderWorker(plinth::ws_test::TestPg& held,
                      std::shared_ptr<plinth::ws_test::TestPg> second,
-                     std::string package_id)
+                     std::string package_id, std::string lock_timeout = {},
+                     std::string statement_timeout = "5s")
       : first(held) {
     std::promise<std::string> promise;
     result = promise.get_future();
     thread = std::thread([second = std::move(second),
                           package_id = std::move(package_id),
+                          lock_timeout = std::move(lock_timeout),
+                          statement_timeout = std::move(statement_timeout),
                           promise = std::move(promise)]() mutable {
       try {
-        auto begin = second->exec("BEGIN; SET LOCAL statement_timeout='5s'");
+        auto begin = second->exec("BEGIN");
         if (PQresultStatus(begin.get()) != PGRES_COMMAND_OK) {
           promise.set_value("worker BEGIN failed");
           return;
         }
+        auto statement = second->exec_params(
+            "SELECT set_config('statement_timeout',$1,true)",
+            {statement_timeout});
+        if (PQresultStatus(statement.get()) != PGRES_TUPLES_OK) {
+          auto rollback = second->exec("ROLLBACK");
+          promise.set_value("worker statement timeout setup failed");
+          return;
+        }
+        if (!lock_timeout.empty()) {
+          auto timeout = second->exec_params(
+              "SELECT set_config('lock_timeout',$1,true)", {lock_timeout});
+          if (PQresultStatus(timeout.get()) != PGRES_TUPLES_OK) {
+            auto rollback = second->exec("ROLLBACK");
+            promise.set_value("worker lock timeout setup failed");
+            return;
+          }
+        }
         auto assigned = plinth::packages::finalize_panel_install_order(
             *second->conn, package_id);
         if (!assigned) {
+          const auto error =
+              assigned.error() + ": " + PQerrorMessage(second->conn);
+          const auto aborted =
+              PQtransactionStatus(second->conn) == PQTRANS_INERROR;
           auto rollback = second->exec("ROLLBACK");
-          promise.set_value(assigned.error());
+          promise.set_value(
+              aborted && PQresultStatus(rollback.get()) == PGRES_COMMAND_OK &&
+                      PQtransactionStatus(second->conn) == PQTRANS_IDLE
+                  ? "owner rolled back allocator refusal: " + error
+                  : "worker rollback failed after allocator refusal: " + error);
           return;
         }
         auto active = second->exec_params(
@@ -333,6 +361,24 @@ TEST_CASE("typed float order is transactional exact and lifetime-stable",
           "[typed-surface-foundation][packages_schema][integration]") {
   REQUIRE(pg_available());
   TypedSchemaFixture s;
+  const auto policy = s.package("allocator-timeout-policy");
+  s.panel(policy, "handler");
+  for (const auto* timeout : {"0", "25ms", "20s"}) {
+    INFO("original allocator lock timeout: " << timeout);
+    s.command("BEGIN");
+    s.command("SET LOCAL lock_timeout='" + std::string{timeout} + "'");
+    s.command("SET LOCAL statement_timeout='3s'");
+    const auto original_lock = s.scalar("SHOW lock_timeout");
+    const auto original_statement = s.scalar("SHOW statement_timeout");
+    s.finalize(policy);
+    REQUIRE(s.scalar("SHOW lock_timeout") == original_lock);
+    REQUIRE(s.scalar("SHOW statement_timeout") == original_statement);
+    REQUIRE(s.rank(policy, "handler") == "1");
+    s.command("ROLLBACK");
+    REQUIRE(s.rank(policy, "handler") == "NULL");
+    REQUIRE(s.scalar("SELECT last_value::text FROM "
+                     "plinth.handler_install_order_allocator") == "0");
+  }
   const auto invalid = s.package("invalid-rank-input");
   for (const auto* value :
        {"1.5", "01", "1e1", "+1", " 1", "-1", "0", "18446744073709551616"}) {
@@ -468,6 +514,46 @@ TEST_CASE("typed float order allocation follows committed installation order",
   const auto second = s.package("second-order");
   s.panel(first, "handler");
   s.panel(second, "handler");
+  struct TimeoutControl {
+    const char* lock_timeout;
+    const char* statement_timeout;
+    std::chrono::seconds observation_bound;
+  };
+  for (const auto& control :
+       {TimeoutControl{"25ms", "5s", std::chrono::seconds{3}},
+        TimeoutControl{"0", "15s", std::chrono::seconds{20}}}) {
+    INFO("held allocator with original lock_timeout=" << control.lock_timeout);
+    // A real held singleton must respect a shorter configured limit and
+    // impose the default ceiling when locking was originally unlimited.
+    // The 15s statement deadline deliberately exceeds the 10s lock ceiling:
+    // without the cap that control fails with a statement timeout instead.
+    // Both failures must roll back without rank/high-water writes.
+    auto bounded_connection = std::make_shared<plinth::ws_test::TestPg>(s.db);
+    REQUIRE(PQstatus(bounded_connection->conn) == CONNECTION_OK);
+    s.command("BEGIN");
+    auto held = s.pg->exec("SELECT last_value FROM "
+                           "plinth.handler_install_order_allocator "
+                           "WHERE id=1 FOR UPDATE");
+    REQUIRE(PQresultStatus(held.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(held.get()) == 1);
+    BlockedOrderWorker timed_out{*s.pg, std::move(bounded_connection), second,
+                                 control.lock_timeout,
+                                 control.statement_timeout};
+    REQUIRE(timed_out.result.wait_for(control.observation_bound) ==
+            std::future_status::ready);
+    const auto refusal = timed_out.result.get();
+    timed_out.thread.join();
+    INFO(refusal);
+    REQUIRE(refusal.starts_with("owner rolled back allocator refusal: "));
+    REQUIRE(refusal.find("lock timeout") != std::string::npos);
+    REQUIRE(refusal.find("statement timeout") == std::string::npos);
+    REQUIRE(s.rank(first, "handler") == "NULL");
+    REQUIRE(s.rank(second, "handler") == "NULL");
+    REQUIRE(s.scalar("SELECT last_value::text FROM "
+                     "plinth.handler_install_order_allocator") == "0");
+    s.command("ROLLBACK");
+    REQUIRE(PQtransactionStatus(s.pg->conn) == PQTRANS_IDLE);
+  }
   auto worker_connection = std::make_shared<plinth::ws_test::TestPg>(s.db);
   REQUIRE(PQstatus(worker_connection->conn) == CONNECTION_OK);
   const auto worker_pid = std::to_string(PQbackendPID(worker_connection->conn));

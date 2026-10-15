@@ -319,7 +319,7 @@ TEST_CASE("typed panel lifecycle validates every explicit surface without "
   const auto blob = fixture::package(declarations);
   const auto installed = plinth::packages::install_package(
       blob, plinth::packages::Provenance::USER, s.ctx);
-  INFO(installed ? "installed" : installed.error().message);
+  INFO((installed ? "installed" : installed.error().message));
   REQUIRE(installed.has_value());
   settle_typed_transition();
   const auto types = [&](const std::string& id) {
@@ -390,7 +390,7 @@ TEST_CASE("typed panel lifecycle validates every explicit surface without "
   const auto successor_blob = fixture::package(declarations, "1.2.4");
   const auto successor = plinth::packages::install_package(
       successor_blob, plinth::packages::Provenance::USER, s.ctx);
-  INFO(successor ? "upgraded" : successor.error().message);
+  INFO((successor ? "upgraded" : successor.error().message));
   REQUIRE(successor.has_value());
   settle_typed_transition();
   REQUIRE(types(successor->id) == expected_types);
@@ -409,7 +409,7 @@ TEST_CASE("typed panel lifecycle validates every explicit surface without "
               .has_value());
   const auto reinstalled = plinth::packages::install_package(
       successor_blob, plinth::packages::Provenance::USER, s.ctx);
-  INFO(reinstalled ? "reinstalled" : reinstalled.error().message);
+  INFO((reinstalled ? "reinstalled" : reinstalled.error().message));
   REQUIRE(reinstalled.has_value());
   settle_typed_transition();
   REQUIRE(ranks(reinstalled->id) == (has_float ? "preview:2" : ""));

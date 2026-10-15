@@ -123,6 +123,15 @@ by bytewise panel ID. Exhaustion refuses the transaction; no reset, wrapping,
 gapless numbering or caller-selected rank is promised. No public rank API is
 introduced in this slice.
 
+The new cross-package singleton lock acquisition uses a transaction-local
+`lock_timeout` of at most 10,000 ms, retaining any shorter configured nonzero
+limit and leaving `statement_timeout` and existing cancellation unchanged.
+Restore the caller's prior setting immediately after successful acquisition;
+the acquired row lock still lasts through COMMIT. A failed acquisition/restoration
+returns to the transaction owner's rollback/fence path without retry. This is
+a bound on that one new server-side lock wait, not a whole-helper, runtime
+socket or broader legacy transport deadline.
+
 Copy a rank only from the immediate explicitly validated float predecessor
 with the same application/panel identity. A new or removed-then-reintroduced
 handler, non-float-to-float transition or uninstall/reinstall receives a new

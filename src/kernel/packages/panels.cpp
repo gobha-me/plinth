@@ -171,13 +171,64 @@ auto finalize_panel_install_order(PGconn& conn, std::string_view package_id)
   }
   std::uint64_t last = 0;
   if (PQntuples(panels.get()) != 0) {
+    // This singleton serializes otherwise unrelated installations. Bound
+    // only its lock acquisition, retaining a shorter configured timeout and
+    // the caller's existing cancellation/statement deadline unchanged.
+    PgResultPtr timeout(
+        plinth::db::exec(
+            &conn, "SELECT setting, current_setting('lock_timeout') "
+                   "FROM pg_catalog.pg_settings WHERE name='lock_timeout'"),
+        PQclear);
+    if (PQresultStatus(timeout.get()) != PGRES_TUPLES_OK ||
+        PQntuples(timeout.get()) != 1 ||
+        PQgetisnull(timeout.get(), 0, 0) != 0 ||
+        PQgetisnull(timeout.get(), 0, 1) != 0) {
+      return std::unexpected("handler order lock timeout unavailable");
+    }
+    const auto configured_ms =
+        parse_order(PQgetvalue(timeout.get(), 0, 0), true);
+    if (!configured_ms) {
+      return std::unexpected("handler order lock timeout invalid");
+    }
+    const std::string previous_timeout{PQgetvalue(timeout.get(), 0, 1)};
+    constexpr std::uint64_t maximum_wait_ms = 10000;
+    const auto wait_ms = *configured_ms == 0
+                             ? maximum_wait_ms
+                             : std::min(*configured_ms, maximum_wait_ms);
+    const auto bounded_timeout = std::to_string(wait_ms) + "ms";
+    std::array<const char*, 1> timeout_values{bounded_timeout.c_str()};
+    PgResultPtr bounded(
+        plinth::db::exec_params(
+            &conn, "SELECT pg_catalog.set_config('lock_timeout',$1,true)", 1,
+            nullptr, timeout_values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(bounded.get()) != PGRES_TUPLES_OK ||
+        PQntuples(bounded.get()) != 1) {
+      return std::unexpected("handler order lock timeout setup failed");
+    }
     PgResultPtr allocator(
         plinth::db::exec(&conn, "SELECT last_value::text FROM "
                                 "plinth.handler_install_order_allocator "
                                 "WHERE id=1 FOR UPDATE"),
         PQclear);
-    if (PQresultStatus(allocator.get()) != PGRES_TUPLES_OK ||
-        PQntuples(allocator.get()) != 1) {
+    if (PQresultStatus(allocator.get()) != PGRES_TUPLES_OK) {
+      // The transaction owner rolls back any failed acquisition. Do not
+      // retry or issue restoration SQL in an aborted/cancelled transaction.
+      return std::unexpected("handler order allocator unavailable");
+    }
+    timeout_values[0] = previous_timeout.c_str();
+    PgResultPtr restored(
+        plinth::db::exec_params(
+            &conn, "SELECT pg_catalog.set_config('lock_timeout',$1,true)", 1,
+            nullptr, timeout_values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(restored.get()) != PGRES_TUPLES_OK ||
+        PQntuples(restored.get()) != 1) {
+      return std::unexpected("handler order lock timeout restoration failed");
+    }
+    // Restoration changes policy only; the allocator row remains locked
+    // until the enclosing ACTIVE transaction commits or rolls back.
+    if (PQntuples(allocator.get()) != 1) {
       return std::unexpected("handler order allocator unavailable");
     }
     auto parsed = parse_order(PQgetvalue(allocator.get(), 0, 0), true);

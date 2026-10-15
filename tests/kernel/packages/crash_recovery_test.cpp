@@ -281,7 +281,7 @@ TEST_CASE("typed surface recovery preserves committed order and provenance",
   const auto first = plinth::packages::install_package(
       fixture::package(declarations), plinth::packages::Provenance::USER,
       s.ctx);
-  INFO(first ? "installed" : first.error().message);
+  INFO((first ? "installed" : first.error().message));
   REQUIRE(first.has_value());
   plinth::ws_test::settle_fixture_work();
   REQUIRE(plinth::packages::rbac_test::start_async_workers());
@@ -291,7 +291,7 @@ TEST_CASE("typed surface recovery preserves committed order and provenance",
     const auto next = plinth::packages::install_package(
         fixture::package(declarations, "1.2.4"),
         plinth::packages::Provenance::USER, s.ctx);
-    INFO(next ? "upgraded" : next.error().message);
+    INFO((next ? "upgraded" : next.error().message));
     REQUIRE(next.has_value());
     plinth::ws_test::settle_fixture_work();
     REQUIRE(plinth::packages::rbac_test::start_async_workers());
@@ -334,7 +334,7 @@ TEST_CASE("typed surface recovery preserves committed order and provenance",
     INFO("recovery pass " << pass);
     const auto reconciled =
         plinth::packages::reconcile_in_flight_installs(s.ctx);
-    INFO(reconciled ? "reconciled" : reconciled.error());
+    INFO((reconciled ? "reconciled" : reconciled.error()));
     REQUIRE(reconciled.has_value());
     plinth::packages::asset_server::restore_routes(s.db, s.ctx.data_dir);
     REQUIRE(
