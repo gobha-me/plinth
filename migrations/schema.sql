@@ -222,8 +222,29 @@ CREATE TABLE plinth.panels (
     slot_type     TEXT        CHECK (slot_type IN ('home')),
     declaration   JSONB       NOT NULL,
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    validated_format_version SMALLINT NOT NULL DEFAULT 0,
+    logical_install_order NUMERIC(20,0),
+    CONSTRAINT chk_panels_validated_format_version
+        CHECK (validated_format_version IN (0, 2)),
+    CONSTRAINT chk_panels_logical_install_order
+        CHECK (logical_install_order IS NULL OR
+               (validated_format_version = 2 AND panel_type = 'float' AND
+                logical_install_order >= 1 AND
+                logical_install_order <= 18446744073709551615)),
     PRIMARY KEY (package_id, panel_id)
 );
+
+-- Allocated only in the transaction that first commits an installed ACTIVE
+-- generation. Its row lock remains held through COMMIT; generation rows carry
+-- their own rank copies, independently of predecessor garbage collection.
+CREATE TABLE plinth.handler_install_order_allocator (
+    id SMALLINT PRIMARY KEY DEFAULT 1,
+    last_value NUMERIC(20,0) NOT NULL DEFAULT 0,
+    CONSTRAINT chk_handler_install_order_allocator_id CHECK (id = 1),
+    CONSTRAINT chk_handler_install_order_allocator_value
+        CHECK (last_value >= 0 AND last_value <= 18446744073709551615)
+);
+INSERT INTO plinth.handler_install_order_allocator (id, last_value) VALUES (1, 0);
 
 -- ── Realtime ─────────────────────────────────────────────────
 -- Added in 0.5.0; plinth.events + plinth.user_event_cursors added in 0.5.4

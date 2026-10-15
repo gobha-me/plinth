@@ -919,6 +919,43 @@ add_test(NAME plinth_tests_pure
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
 
+# Exact positive/no-skip receipts for the typed-install foundation. Keep these
+# independent of the grouped PG/WS entries: a missing database, renamed case or
+# teardown failure must not masquerade as successful typed lifecycle evidence.
+add_test(NAME plinth_tests_typed_surface_parser
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "typed surfaces: strict v2 manifest contract"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_typed_surface_parser PROPERTIES TIMEOUT 45)
+
+set(PLINTH_TYPED_SURFACE_CASES
+    "schema|typed surface schema preserves legacy provenance during retained bootstrap"
+    "order|typed float order is transactional exact and lifetime-stable"
+    "commit_order|typed float order allocation follows committed installation order"
+    "lifecycle|typed panel lifecycle validates every explicit surface without primary leakage"
+    "discovery|primary discovery excludes validated float and tray registrations"
+    "package_api|typed package API registration preserves surface types"
+    "recovery|typed surface recovery preserves committed order and provenance")
+foreach(ENTRY IN LISTS PLINTH_TYPED_SURFACE_CASES)
+  string(REPLACE "|" ";" PARTS "${ENTRY}")
+  list(GET PARTS 0 NAME)
+  list(GET PARTS 1 CASE)
+  add_test(NAME plinth_tests_typed_surface_${NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${CASE}"
+      --timeout 90
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_typed_surface_${NAME}
+    PROPERTIES RESOURCE_LOCK plinth_pg_schema
+               LABELS "needs_pg"
+               TIMEOUT 105)
+endforeach()
+
 # Repeat the WS group's map, displacement and bounded owner-release cases in
 # a focused positive inventory gate alongside the exact close gate.
 add_test(NAME plinth_tests_ws_registry

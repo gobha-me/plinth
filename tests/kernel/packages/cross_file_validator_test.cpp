@@ -1,5 +1,7 @@
 #include "kernel/packages/validator.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -146,6 +148,63 @@ TEST_CASE("cross-file: panel rbac_rule must be declared by the same package",
   auto r = plinth::packages::validate(copy.root());
   REQUIRE(r.disposition() == 1);
   REQUIRE(has_phase_rule(r, Phase::CROSS_FILE, "panel-rbac-rule-unknown"));
+}
+
+TEST_CASE("cross-file: typed floats require an exact package-owned provided "
+          "capability",
+          "[packages][cross-file][typed-surfaces]") {
+  FixtureCopy copy{"typed-surface-capability"};
+  auto panel = nlohmann::json{{"id", "list"},
+                              {"type", "float"},
+                              {"client_path", "list.js"},
+                              {"rbac_rule", "notes.read"},
+                              {"capability", "notes:1:read"},
+                              {"content_types", {"text/plain"}},
+                              {"context_schema",
+                               {{"version", 1},
+                                {"fields", nlohmann::json::object()},
+                                {"persist_keys", nlohmann::json::array()}}}};
+  const auto write_panel = [&](bool typed) {
+    auto document = nlohmann::json{{"panels", nlohmann::json::array({panel})}};
+    if (typed) document["format_version"] = 2;
+    std::ofstream output{copy.root() / "panels.json", std::ios::trunc};
+    REQUIRE(output.is_open());
+    output << document.dump();
+    output.close();
+    REQUIRE(output.good());
+  };
+  write_panel(true);
+  auto accepted = plinth::packages::validate(copy.root());
+  CHECK(accepted.disposition() == 0);
+  CHECK_FALSE(has_rule(accepted, "panel-capability-not-provided"));
+  for (const auto* signature :
+       {"notes:2:read", "notes:1:missing", "other:1:read"}) {
+    panel["capability"] = signature;
+    write_panel(true);
+    auto rejected = plinth::packages::validate(copy.root());
+    CHECK(rejected.disposition() == 1);
+    CHECK(has_phase_rule(rejected, Phase::CROSS_FILE,
+                         "panel-capability-not-provided"));
+  }
+  panel["capability"] = "notes:1:read";
+  panel["rbac_rule"] = "other.read";
+  write_panel(true);
+  auto unknown_rule = plinth::packages::validate(copy.root());
+  CHECK(has_phase_rule(unknown_rule, Phase::CROSS_FILE,
+                       "panel-rbac-rule-unknown"));
+  // A provided capability and the panel declaration may have independently
+  // declared rules. This linkage does not equate their runtime permissions.
+  panel["capability"] = "notes:1:create";
+  panel["rbac_rule"] = "notes.read";
+  write_panel(true);
+  auto independent_rules = plinth::packages::validate(copy.root());
+  CHECK(independent_rules.disposition() == 0);
+  CHECK_FALSE(has_rule(independent_rules, "panel-capability-not-provided"));
+  panel["capability"] = "other:1:missing";
+  write_panel(false);
+  auto legacy = plinth::packages::validate(copy.root());
+  CHECK(legacy.disposition() == 0);
+  CHECK_FALSE(has_rule(legacy, "panel-capability-not-provided"));
 }
 
 // ─── CF4 + flag-flip with --structure-only ───────────────────────────

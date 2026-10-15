@@ -18,8 +18,10 @@
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
+#include "typed_surface_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 
 #include <atomic>
@@ -228,7 +230,216 @@ auto install_valid_notes(Scratch& s) -> plinth::packages::PackageRecord {
   return *r;
 }
 
+auto settle_typed_transition() -> void {
+  plinth::ws_test::settle_fixture_work();
+  REQUIRE(plinth::packages::rbac_test::start_async_workers());
+}
+
+auto typed_command(Scratch& s, const std::string& sql) -> void {
+  std::unique_ptr<PGresult, decltype(&PQclear)> result(
+      PQexec(s.conn, sql.c_str()), PQclear);
+  INFO(PQresultErrorMessage(result.get()));
+  REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+}
+
 } // namespace
+
+TEST_CASE("typed panel lifecycle validates every explicit surface without "
+          "primary leakage",
+          "[typed-surface-foundation][lifecycle_transitions][integration]["
+          "packages]") {
+  REQUIRE(pg_available());
+  namespace fixture = plinth::typed_surface_test;
+  auto declarations = fixture::panels(nlohmann::json::array());
+  std::string expected_types;
+  std::string expected_markers;
+  bool has_float = false;
+  bool legacy = false;
+  const auto kind = GENERATE(0, 1, 2, 3, 4);
+  INFO("surface fixture kind " << kind);
+  if (kind == 4) {
+    Scratch failed;
+    fixture::NotesFenceCleanup fence_cleanup;
+    typed_command(failed, "UPDATE plinth.handler_install_order_allocator SET "
+                          "last_value=18446744073709551615");
+    const auto rejected = plinth::packages::install_package(
+        fixture::package(fixture::panels({fixture::floating()})),
+        plinth::packages::Provenance::USER, failed.ctx);
+    REQUIRE_FALSE(rejected.has_value());
+    REQUIRE(rejected.error().failed_at ==
+            plinth::packages::InstallStage::ACTIVATING);
+    REQUIRE(rejected.error().kind == "activation-failed");
+    REQUIRE(rejected.error().message.find("exhausted") != std::string::npos);
+    settle_typed_transition();
+    REQUIRE(failed.scalar("SELECT state FROM plinth.packages WHERE id='" +
+                          rejected.error().package_id + "'") ==
+            "INSTALL_FAILED");
+    REQUIRE(
+        failed.scalar(
+            "SELECT application_ready::text FROM plinth.packages WHERE id='" +
+            rejected.error().package_id + "'") == "false");
+    REQUIRE(failed.scalar("SELECT count(*) FROM plinth.panels WHERE "
+                          "logical_install_order IS NOT NULL") == "0");
+    REQUIRE(failed.scalar("SELECT last_value::text FROM "
+                          "plinth.handler_install_order_allocator") ==
+            "18446744073709551615");
+    REQUIRE_FALSE(plinth::extensions::has_pool("notes"));
+    REQUIRE_FALSE(
+        plinth::packages::asset_server::has_registered_route("notes", "1.2.3"));
+    REQUIRE(plinth::capabilities::drain::is_fenced("notes"));
+    REQUIRE(plinth::capabilities::drain::is_application_blocked("notes"));
+    return;
+  }
+  if (kind == 0) {
+    declarations = fixture::panels({fixture::floating()});
+    expected_types = "preview:float";
+    expected_markers = "2";
+    has_float = true;
+  }
+  if (kind == 1) {
+    declarations = fixture::panels({fixture::tray()});
+    expected_types = "status:tray";
+    expected_markers = "2";
+  }
+  if (kind == 2) {
+    declarations = fixture::panels(
+        {fixture::primary(), fixture::floating(), fixture::tray()});
+    expected_types = "editor:primary,preview:float,status:tray";
+    expected_markers = "2,2,2";
+    has_float = true;
+  }
+  if (kind == 3) {
+    declarations = {{"panels", {fixture::floating()}}};
+    expected_types = "preview:primary";
+    expected_markers = "0";
+    legacy = true;
+  }
+  Scratch s;
+  fixture::NotesFenceCleanup fence_cleanup;
+  const auto blob = fixture::package(declarations);
+  const auto installed = plinth::packages::install_package(
+      blob, plinth::packages::Provenance::USER, s.ctx);
+  INFO(installed ? "installed" : installed.error().message);
+  REQUIRE(installed.has_value());
+  settle_typed_transition();
+  const auto types = [&](const std::string& id) {
+    return s.scalar(
+        "SELECT string_agg(panel_id||':'||panel_type,',' ORDER BY "
+        "panel_id COLLATE \"C\") FROM plinth.panels WHERE package_id='" +
+        id + "'");
+  };
+  const auto markers = [&](const std::string& id) {
+    return s.scalar("SELECT string_agg(validated_format_version::text,',' "
+                    "ORDER BY panel_id COLLATE \"C\") FROM plinth.panels WHERE "
+                    "package_id='" +
+                    id + "'");
+  };
+  const auto ranks = [&](const std::string& id) {
+    return s.scalar(
+        "SELECT COALESCE(string_agg(panel_id||':'||"
+        "logical_install_order::text,',' ORDER BY panel_id COLLATE \"C\"),'') "
+        "FROM plinth.panels WHERE package_id='" +
+        id + "'");
+  };
+  REQUIRE(types(installed->id) == expected_types);
+  REQUIRE(markers(installed->id) == expected_markers);
+  REQUIRE(ranks(installed->id) == (has_float ? "preview:1" : ""));
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   installed->id + "'") == "true");
+  REQUIRE(plinth::extensions::has_pool("notes"));
+  REQUIRE(
+      plinth::packages::asset_server::has_registered_route("notes", "1.2.3"));
+  REQUIRE(plinth::packages::disable_package(installed->id, s.ctx).has_value());
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   installed->id + "'") == "false");
+  REQUIRE_FALSE(
+      plinth::packages::asset_server::has_registered_route("notes", "1.2.3"));
+  REQUIRE(plinth::packages::enable_package(installed->id, s.ctx).has_value());
+  settle_typed_transition();
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   installed->id + "'") == "true");
+  REQUIRE(ranks(installed->id) == (has_float ? "preview:1" : ""));
+
+  // Startup does not infer trust from newly encountered raw JSON. Existing
+  // legacy registrations retain their original PRIMARY provenance and order.
+  if (legacy) {
+    const auto panels_path =
+        s.ctx.data_dir / "extensions" / "notes" / "1.2.3" / "panels.json";
+    std::ofstream output(panels_path);
+    REQUIRE(output.is_open());
+    output << fixture::panels({fixture::floating()}).dump();
+    output.close();
+    REQUIRE(output.good());
+  }
+  plinth::packages::asset_server::cancel_all_registrations();
+  plinth::extensions::destroy_pool("notes");
+  REQUIRE(plinth::packages::reconcile_in_flight_installs(s.ctx).has_value());
+  REQUIRE(plinth::extensions::create_pool("notes"));
+  plinth::packages::asset_server::restore_routes(s.db, s.ctx.data_dir);
+  REQUIRE(plinth::packages::reconcile_application_readiness(s.ctx).has_value());
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   installed->id + "'") == "true");
+  REQUIRE(types(installed->id) == expected_types);
+  REQUIRE(markers(installed->id) == expected_markers);
+  REQUIRE(ranks(installed->id) == (has_float ? "preview:1" : ""));
+
+  const auto successor_blob = fixture::package(declarations, "1.2.4");
+  const auto successor = plinth::packages::install_package(
+      successor_blob, plinth::packages::Provenance::USER, s.ctx);
+  INFO(successor ? "upgraded" : successor.error().message);
+  REQUIRE(successor.has_value());
+  settle_typed_transition();
+  REQUIRE(types(successor->id) == expected_types);
+  REQUIRE(markers(successor->id) == expected_markers);
+  REQUIRE(ranks(successor->id) == (has_float ? "preview:1" : ""));
+  typed_command(s, "UPDATE plinth.packages SET retired_at=NOW()-INTERVAL '25 "
+                   "hours' WHERE id='" +
+                       installed->id + "'");
+  const auto collected = plinth::packages::garbage_collect_superseded_versions(
+      std::chrono::hours{24}, s.ctx);
+  REQUIRE(collected.has_value());
+  REQUIRE(s.scalar("SELECT count(*) FROM plinth.packages WHERE id='" +
+                   installed->id + "'") == "0");
+  REQUIRE(ranks(successor->id) == (has_float ? "preview:1" : ""));
+  REQUIRE(plinth::packages::uninstall_package(successor->id, true, s.ctx)
+              .has_value());
+  const auto reinstalled = plinth::packages::install_package(
+      successor_blob, plinth::packages::Provenance::USER, s.ctx);
+  INFO(reinstalled ? "reinstalled" : reinstalled.error().message);
+  REQUIRE(reinstalled.has_value());
+  settle_typed_transition();
+  REQUIRE(ranks(reinstalled->id) == (has_float ? "preview:2" : ""));
+  REQUIRE(types(reinstalled->id) == expected_types);
+  REQUIRE(markers(reinstalled->id) == expected_markers);
+  REQUIRE(
+      plinth::packages::disable_package(reinstalled->id, s.ctx).has_value());
+  const auto asset = s.ctx.data_dir / "extensions" / "notes" / "1.2.4" /
+                     "client" / "panels" / "editor.js";
+  REQUIRE(fs::is_regular_file(asset));
+  SECTION("missing registered asset fails closed") {
+    REQUIRE(fs::remove(asset));
+  }
+  if (!legacy) {
+    SECTION("persisted panel ID mismatch fails closed") {
+      typed_command(s, "UPDATE plinth.panels SET declaration="
+                       "jsonb_set(declaration,'{id}','\"wrong-identity\"') "
+                       "WHERE package_id='" +
+                           reinstalled->id + "'");
+    }
+  }
+  const auto broken = plinth::packages::enable_package(reinstalled->id, s.ctx);
+  REQUIRE_FALSE(broken.has_value());
+  REQUIRE(broken.error().report["kind"] == "readiness-verification-failed");
+  REQUIRE(s.scalar("SELECT application_ready::text FROM plinth.packages "
+                   "WHERE id='" +
+                   reinstalled->id + "'") == "false");
+  REQUIRE(plinth::capabilities::drain::is_fenced("notes"));
+  REQUIRE(ranks(reinstalled->id) == (has_float ? "preview:2" : ""));
+}
 
 // ── D.01: disable ACTIVE package ─────────────────────────────────
 

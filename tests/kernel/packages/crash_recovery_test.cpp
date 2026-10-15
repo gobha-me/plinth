@@ -26,6 +26,7 @@
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/shell/firstboot.hpp"
+#include "typed_surface_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
@@ -245,6 +246,120 @@ auto write_tree(const fs::path& root, const std::string& file,
 }
 
 } // namespace
+
+TEST_CASE("typed surface recovery preserves committed order and provenance",
+          "[typed-surface-foundation][crash_recovery][integration][packages]") {
+  REQUIRE(pg_available());
+  namespace fixture = plinth::typed_surface_test;
+  Scratch s;
+  fixture::NotesFenceCleanup fence_cleanup;
+  plinth::ws_test::TestPg pg{s.db};
+  const auto scalar = [&](const std::string& sql) -> std::string {
+    const auto result = pg.exec(sql);
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(result.get()) == 1);
+    REQUIRE(PQgetisnull(result.get(), 0, 0) == 0);
+    return PQgetvalue(result.get(), 0, 0);
+  };
+  const auto command = [&](const std::string& sql) {
+    const auto result = pg.exec(sql);
+    INFO(PQresultErrorMessage(result.get()));
+    REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+  };
+  auto declarations = fixture::panels({fixture::floating()});
+  bool legacy = false;
+  bool first_active = false;
+  SECTION("committed typed upgrade repairs pointer without reallocating") {
+  }
+  SECTION("first ACTIVE recovery allocates once inside its transition") {
+    first_active = true;
+  }
+  SECTION("legacy root and entry collisions do not acquire provenance") {
+    declarations = {{"panels", {fixture::floating()}}};
+    legacy = true;
+  }
+  const auto first = plinth::packages::install_package(
+      fixture::package(declarations), plinth::packages::Provenance::USER,
+      s.ctx);
+  INFO(first ? "installed" : first.error().message);
+  REQUIRE(first.has_value());
+  plinth::ws_test::settle_fixture_work();
+  REQUIRE(plinth::packages::rbac_test::start_async_workers());
+  std::string current_id = first->id;
+  std::string current_version = first->version;
+  if (!first_active) {
+    const auto next = plinth::packages::install_package(
+        fixture::package(declarations, "1.2.4"),
+        plinth::packages::Provenance::USER, s.ctx);
+    INFO(next ? "upgraded" : next.error().message);
+    REQUIRE(next.has_value());
+    plinth::ws_test::settle_fixture_work();
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
+    current_id = next->id;
+    current_version = next->version;
+    const auto active = s.ctx.data_dir / "extensions" / "notes" / "active";
+    REQUIRE(fs::remove(active));
+    fs::create_symlink(first->version, active);
+  } else {
+    // Manufactured pre-COMMIT state, as in the existing reconciler tests.
+    // This is disposition coverage, not a SIGKILL/uncertain-COMMIT claim.
+    command("BEGIN");
+    command(
+        "UPDATE plinth.packages SET state='ACTIVATING',application_ready=FALSE "
+        "WHERE id='" +
+        first->id + "'");
+    command("UPDATE plinth.panels SET logical_install_order=NULL WHERE "
+            "package_id='" +
+            first->id + "'");
+    command("UPDATE plinth.handler_install_order_allocator SET last_value=0");
+    command("COMMIT");
+  }
+  if (legacy) {
+    const auto path = s.ctx.data_dir / "extensions" / "notes" /
+                      current_version / "panels.json";
+    std::ofstream output(path);
+    REQUIRE(output.is_open());
+    output << fixture::panels({fixture::floating()}).dump();
+    output.close();
+    REQUIRE(output.good());
+    command("UPDATE plinth.panels SET declaration=declaration||"
+            "'{\"format_version\":2}'::jsonb WHERE package_id='" +
+            current_id + "'");
+  }
+  command("UPDATE plinth.packages SET application_ready=FALSE WHERE id='" +
+          current_id + "'");
+  plinth::extensions::destroy_pool("notes");
+  plinth::packages::asset_server::cancel_all_registrations();
+  for (int pass = 0; pass < 2; ++pass) {
+    INFO("recovery pass " << pass);
+    const auto reconciled =
+        plinth::packages::reconcile_in_flight_installs(s.ctx);
+    INFO(reconciled ? "reconciled" : reconciled.error());
+    REQUIRE(reconciled.has_value());
+    plinth::packages::asset_server::restore_routes(s.db, s.ctx.data_dir);
+    REQUIRE(
+        plinth::packages::reconcile_application_readiness(s.ctx).has_value());
+    REQUIRE(state_of(s.db, current_id) == "ACTIVE");
+    REQUIRE(plinth::extensions::has_pool("notes"));
+    REQUIRE(fs::read_symlink(s.ctx.data_dir / "extensions" / "notes" /
+                             "active") == current_version);
+    REQUIRE(
+        scalar(
+            "SELECT application_ready::text FROM plinth.packages WHERE id='" +
+            current_id + "'") == "true");
+    REQUIRE(scalar("SELECT validated_format_version::text FROM plinth.panels "
+                   "WHERE package_id='" +
+                   current_id + "'") == (legacy ? "0" : "2"));
+    REQUIRE(scalar("SELECT panel_type FROM plinth.panels WHERE package_id='" +
+                   current_id + "'") == (legacy ? "primary" : "float"));
+    REQUIRE(scalar("SELECT COALESCE(logical_install_order::text,'NULL') FROM "
+                   "plinth.panels WHERE package_id='" +
+                   current_id + "'") == (legacy ? "NULL" : "1"));
+    REQUIRE(scalar("SELECT last_value::text FROM "
+                   "plinth.handler_install_order_allocator") ==
+            (legacy ? "0" : "1"));
+  }
+}
 
 // ── I.11 variant: MIGRATING row + ext schema present → INSTALL_FAILED, drop ──
 
