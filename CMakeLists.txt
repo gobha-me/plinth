@@ -1079,6 +1079,30 @@ set_tests_properties(plinth_tests_batch_transaction
              ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1"
              TIMEOUT 60)
 
+set(PLINTH_BATCH_TIMEOUT_CASE
+    "batch commit-time timeout permits reuse in the same evaluation")
+foreach(case_name IN ITEMS hermetic cleanup native_rejection)
+  if(case_name STREQUAL "hermetic")
+    set(batch_selector
+        "installed batch orchestrator requests rollback before timeout rejection")
+  elseif(case_name STREQUAL "cleanup")
+    set(batch_selector "${PLINTH_BATCH_TIMEOUT_CASE}")
+  else()
+    set(batch_selector
+        "installed batch orchestrator preserves enqueued commit rejection")
+  endif()
+  add_test(NAME plinth_tests_batch_timeout_${case_name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${batch_selector}" --timeout 30
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_batch_timeout_${case_name} PROPERTIES TIMEOUT 40)
+endforeach()
+set_tests_properties(plinth_tests_batch_timeout_cleanup PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg"
+  ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1")
+
 set(PLINTH_AUDIT_DRAIN_CASE
     "audit drain retains blocked writes before Drogon shutdown and retries")
 add_test(NAME plinth_tests_audit_drain
@@ -1340,6 +1364,9 @@ if(PLINTH_TSAN)
   add_plinth_tsan_case(js_query_audit
     "async_bridge: F.23 two threads query and audit independently" 180)
   add_plinth_tsan_case(audit_drain "${PLINTH_AUDIT_DRAIN_CASE}" 30)
+  add_plinth_tsan_case(batch_timeout "${PLINTH_BATCH_TIMEOUT_CASE}" 30)
+  set_tests_properties(plinth_tsan_batch_timeout PROPERTIES
+    ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1")
   set_tests_properties(plinth_tsan_audit_drain PROPERTIES
     ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1")
   add_plinth_tsan_case(audit_admission_race

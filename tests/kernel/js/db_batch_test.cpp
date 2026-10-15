@@ -15,24 +15,39 @@
 
 #include "kernel/config.hpp"
 #include "kernel/js/bridge_context.hpp"
+#include "kernel/js/conversion.hpp"
 #include "kernel/js/db_batch_audit.hpp"
 #include "kernel/js/db_batch_schema_check.hpp"
 #include "kernel/js/db_search_path.hpp"
+#include "kernel/js/execution_lifetime.hpp"
+#include "kernel/js/native_rollback_owner.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/realtime/coalescer.hpp"
 
+#include <catch2/catch_message.hpp>
 #include <catch2/catch_test_macros.hpp>
+#include <drogon/HttpAppFramework.h>
 #include <drogon/utils/coroutine.h>
 #include <libpq-fe.h>
+#include <poll.h>
+#include <quickjs.h>
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
+#include <exception>
+#include <future>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using plinth::async_bridge_test::ensure_drogon_with_db_running;
@@ -147,6 +162,281 @@ auto setup_ext_batch(const TestPg& pg) -> void {
   pg.exec("DROP SCHEMA IF EXISTS ext_batch CASCADE");
   pg.exec("CREATE SCHEMA ext_batch");
   pg.exec("CREATE TABLE ext_batch.notes (id serial primary key, body text)");
+}
+
+// Fixture-only observation called synchronously by the original rejection
+// handler, BEFORE its second batch or the driver's exit cleanup can run.
+auto batch_rejection_snapshot(JSContext* ctx, JSValueConst /*this_value*/,
+                              int /*argc*/, JSValue* /*argv*/) -> JSValue {
+  auto* context = static_cast<BridgeContext*>(JS_GetContextOpaque(ctx));
+  if (context == nullptr) {
+    return JS_ThrowInternalError(ctx, "batch fixture context unavailable");
+  }
+  const auto& batch = context->batch_state;
+  const std::array<std::pair<const char*, std::int64_t>, 10> fields{{
+      {"depth", batch.depth},
+      {"scopeLive", batch.scope_id != 0},
+      {"operations", static_cast<std::int64_t>(batch.ops_in_batch)},
+      {"timedOut", batch.timed_out},
+      {"pinned", batch.pinned_conn != nullptr},
+      {"rollbackOwner", batch.rollback_owner != nullptr},
+      {"timerLive", batch.timer_id != trantor::InvalidTimerId ||
+                        batch.timer_loop != nullptr},
+      {"callbacks", static_cast<std::int64_t>(context->callbacks.size())},
+      {"pending", static_cast<std::int64_t>(context->pending_ops.size())},
+      {"detached", context->inflight_detached.load()},
+  }};
+  JSValue snapshot = JS_NewObject(ctx);
+  if (JS_IsException(snapshot)) {
+    return snapshot;
+  }
+  for (const auto& [name, value] : fields) {
+    if (JS_SetPropertyStr(ctx, snapshot, name, JS_NewInt64(ctx, value)) < 0) {
+      JS_FreeValue(ctx, snapshot);
+      return JS_EXCEPTION;
+    }
+  }
+  return snapshot;
+}
+
+// These helpers belong to the regression fixture, not the production runtime.
+// No sleep, replacement orchestrator, replacement deadline, or DB mock is used
+// by the PostgreSQL case below.
+class BatchLease {
+ public:
+  explicit BatchLease(RuntimePool& owner) : pool(owner), bc(pool.acquire()) {}
+  explicit BatchLease(std::shared_ptr<RuntimePool> owner)
+      : owned_pool(std::move(owner)), pool(*owned_pool), bc(pool.acquire()) {}
+  ~BatchLease() { destroy(); }
+  BatchLease(const BatchLease&) = delete;
+  auto operator=(const BatchLease&) -> BatchLease& = delete;
+  BatchLease(BatchLease&&) = delete;
+  auto operator=(BatchLease&&) -> BatchLease& = delete;
+  auto get() const -> BridgeContext* { return bc; }
+  auto destroy() -> void {
+    if (bc != nullptr) {
+      if (bc->execution_lifetime.load(std::memory_order_acquire)) {
+        // Never discard the caller handle if a driver is still using it.
+        std::terminate();
+      }
+      // Cancel the fixture's remaining timer before normal pool retirement.
+      plinth::js::clear_batch_timer(bc->batch_state.scope_id);
+      pool.destroy(bc);
+      bc = nullptr;
+    }
+  }
+
+ private:
+  std::shared_ptr<RuntimePool> owned_pool;
+  RuntimePool& pool;
+  BridgeContext* bc;
+};
+
+struct BatchRegressionReset {
+  BatchRegressionReset() = default;
+  ~BatchRegressionReset() {
+    plinth::js::set_batch_timeout_ms(30000);
+    CoalescerRegistry::instance().clear_emit_hook_for_test();
+    plinth::js::discard_batches_for_extension("batch");
+    CoalescerRegistry::instance().clear_windows_for_test();
+  }
+  BatchRegressionReset(const BatchRegressionReset&) = delete;
+  auto operator=(const BatchRegressionReset&) -> BatchRegressionReset& = delete;
+  BatchRegressionReset(BatchRegressionReset&&) = delete;
+  auto operator=(BatchRegressionReset&&) -> BatchRegressionReset& = delete;
+};
+
+struct TimeoutObservation {
+  std::uint64_t scope = 0;
+  std::size_t operations = 0;
+  bool pinned = false;
+};
+
+class BatchTimeoutGate {
+ public:
+  BatchTimeoutGate(TestPg& controller, std::shared_ptr<BatchLease> context)
+      : pg(controller), state(std::make_shared<State>(std::move(context))),
+        observed(state->observation.get_future()),
+        result(state->result.get_future()), loop(drogon::app().getLoop()) {
+    // Session lock and transaction lock use the same PostgreSQL key space.
+    const std::unique_ptr<PGresult, decltype(&PQclear)> acquired{
+        PQexec(pg.conn, "SELECT pg_try_advisory_lock(53144, 953)"), PQclear};
+    REQUIRE(PQresultStatus(acquired.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(acquired.get()) == 1);
+    REQUIRE(std::string_view{PQgetvalue(acquired.get(), 0, 0)} == "t");
+    timer = loop->runEvery(0.005, [owned = state] {
+      if (!owned->active.load(std::memory_order_acquire) || owned->reported) {
+        return;
+      }
+      // Read only on the actual JS/deadline owner loop. This observes the real
+      // production timer flag; it does not set it or infer it from elapsed
+      // time.
+      if (auto lifetime = owned->context->get()->execution_lifetime.load(
+              std::memory_order_acquire)) {
+        lifetime->visit([&](BridgeContext& context) {
+          const auto& batch = context.batch_state;
+          if (batch.timed_out) {
+            owned->reported = true;
+            owned->observation.set_value({batch.scope_id, batch.ops_in_batch,
+                                          batch.pinned_conn != nullptr});
+          }
+        });
+      }
+    });
+  }
+  ~BatchTimeoutGate() { finish(); }
+  BatchTimeoutGate(const BatchTimeoutGate&) = delete;
+  auto operator=(const BatchTimeoutGate&) -> BatchTimeoutGate& = delete;
+  BatchTimeoutGate(BatchTimeoutGate&&) = delete;
+  auto operator=(BatchTimeoutGate&&) -> BatchTimeoutGate& = delete;
+
+  auto start() -> void {
+    worker = std::thread([owned = state, context = state->context] {
+      try {
+        owned->result.set_value(drive(*context->get(), R"JS(
+          globalThis.__batch_callback_finished = false;
+          db.batch(async () => {
+            await db.exec("INSERT INTO notes(body) VALUES('timed-out')");
+            await db.query("SELECT pg_advisory_xact_lock(53144, 953)");
+            __batch_callback_finished = true;
+            return 'body-finished';
+          }).then(
+            v => ({first: 'unexpected:' + v}),
+            e => {
+              const beforeReuse = __batch_rejection_snapshot();
+              return db.batch(async () => {
+                await db.exec("INSERT INTO notes(body) VALUES('subsequent')");
+                return 'second-ok';
+              }).then(
+                v => ({first: e.code, second: v, beforeReuse,
+                       bodyFinished: __batch_callback_finished}),
+                later => ({first: e.code, second: 'err:' + later.code,
+                           beforeReuse, bodyFinished: __batch_callback_finished})
+              );
+            }
+          )
+        )JS"));
+      } catch (...) {
+        owned->result.set_exception(std::current_exception());
+      }
+    });
+  }
+
+  auto observation() -> std::optional<TimeoutObservation> {
+    if (observed.wait_for(std::chrono::seconds{3}) !=
+        std::future_status::ready) {
+      return std::nullopt;
+    }
+    return observed.get();
+  }
+
+  auto finish() -> void {
+    if (finished) {
+      return;
+    }
+    // Every path releases the blocker before joining the runtime driver.
+    const std::unique_ptr<PGresult, decltype(&PQclear)> unlocked{
+        PQexec(pg.conn, "SELECT pg_advisory_unlock(53144, 953)"), PQclear};
+    unlock_verified = PQresultStatus(unlocked.get()) == PGRES_TUPLES_OK &&
+                      PQntuples(unlocked.get()) == 1 &&
+                      std::string_view{PQgetvalue(unlocked.get(), 0, 0)} == "t";
+    if (!unlock_verified) {
+      // Closing this fixture-only session also releases its advisory lock.
+      PQfinish(pg.conn);
+      pg.conn = nullptr;
+    }
+    state->active.store(false, std::memory_order_release);
+    loop->invalidateTimer(timer);
+    auto barrier = std::make_shared<std::promise<void>>();
+    auto completion = barrier->get_future();
+    loop->queueInLoop([owned = state, barrier] {
+      // Release the observer's actual context/pool owner on its own loop;
+      // the worker independently retains its owner until it has joined.
+      owned->context.reset();
+      barrier->set_value();
+    });
+    observer_joined = completion.wait_for(std::chrono::seconds{3}) ==
+                      std::future_status::ready;
+    if (!observer_joined) {
+      // An unjoined observer may still be reading its owner. An assertion
+      // unwind must never destroy that owner after an unverified barrier.
+      std::terminate();
+    }
+    if (worker.joinable()) {
+      if (result.wait_for(std::chrono::seconds{5}) !=
+          std::future_status::ready) {
+        // A stuck owned worker cannot safely outlive its context. Fail the
+        // isolated test process rather than detach it or destroy its owner.
+        std::terminate();
+      }
+      worker.join();
+    }
+    finished = true;
+  }
+  auto outcome() -> EvalResult { return result.get(); }
+  bool unlock_verified = false;
+  bool observer_joined = false;
+
+ private:
+  struct State {
+    explicit State(std::shared_ptr<BatchLease> owner)
+        : context(std::move(owner)) {}
+    std::shared_ptr<BatchLease> context;
+    std::atomic<bool> active{true};
+    bool reported = false; // owner-loop only
+    std::promise<TimeoutObservation> observation;
+    std::promise<EvalResult> result;
+  };
+  TestPg& pg;
+  std::shared_ptr<State> state;
+  std::future<TimeoutObservation> observed;
+  std::future<EvalResult> result;
+  trantor::EventLoop* loop;
+  trantor::TimerId timer;
+  std::thread worker;
+  bool finished = false;
+};
+
+// The disposable DB's AFTER INSERT notification acknowledges an actually
+// committed audit row. A socket deadline replaces the older sleep/poll helper.
+auto wait_for_batch_audit_notification(PGconn* conn) -> bool {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{3};
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (PQconsumeInput(conn) == 0) {
+      return false;
+    }
+    while (auto* notification = PQnotifies(conn)) {
+      const bool matches = std::string_view{notification->relname} ==
+                           "plinth_batch_timeout_audit";
+      PQfreemem(notification);
+      if (matches) {
+        return true;
+      }
+    }
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0) {
+      break;
+    }
+    pollfd socket{PQsocket(conn), POLLIN, 0};
+    const int ready = poll(&socket, 1, static_cast<int>(remaining.count()));
+    if (ready < 0 && errno != EINTR) {
+      return false;
+    }
+  }
+  return false;
+}
+
+auto drain_batch_jobs(BridgeContext& context) -> bool {
+  for (int count = 0; count < 128 && JS_IsJobPending(context.rt); ++count) {
+    JSContext* job_context = nullptr;
+    if (JS_ExecutePendingJob(context.rt, &job_context) < 0) {
+      return false;
+    }
+  }
+  return !JS_IsJobPending(context.rt);
 }
 
 } // namespace
@@ -769,6 +1059,315 @@ TEST_CASE("B.06: timeout — second op rejects db.batch.timeout, rolls back",
 
   // Restore the default for any subsequent test in the same process.
   plinth::js::set_batch_timeout_ms(30000);
+}
+
+TEST_CASE("batch commit-time timeout permits reuse in the same evaluation",
+          "[js][async][db][batch][batch-timeout-cleanup]") {
+  REQUIRE(pg_available());
+  ensure_drogon_with_db_running();
+  auto cfg = test_config();
+  cfg.db.pool_size = 1;
+  reset_for_batch_test(cfg);
+  BatchRegressionReset reset;
+  plinth::js::set_batch_timeout_ms(500);
+  TestPg pg(cfg.db);
+  TestPg blocker(cfg.db);
+  setup_ext_batch(pg);
+  pg.exec(R"SQL(
+    CREATE FUNCTION ext_batch.notify_timeout_audit() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      PERFORM pg_notify('plinth_batch_timeout_audit', 'done');
+      RETURN NEW;
+    END $$;
+    CREATE TRIGGER batch_timeout_audit_notify AFTER INSERT ON plinth.audit_log
+    FOR EACH ROW WHEN (NEW.action='db.batch.rolled_back'
+                      AND NEW.detail->>'extension'='batch')
+    EXECUTE FUNCTION ext_batch.notify_timeout_audit();
+    LISTEN plinth_batch_timeout_audit;
+  )SQL");
+  auto emissions = std::make_shared<std::atomic<int>>(0);
+  CoalescerRegistry::instance().set_emit_hook_for_test(
+      [emissions](const Json::Value&) {
+        emissions->fetch_add(1, std::memory_order_relaxed);
+        return std::expected<void, plinth::realtime::NotifyError>{};
+      });
+
+  auto pool =
+      std::make_shared<RuntimePool>(nullptr, default_runtime_limits(), cfg, 1);
+  auto lease = std::make_shared<BatchLease>(pool);
+  auto& bc = *lease->get();
+  bc.extension_name = "batch";
+  JSValue global = JS_GetGlobalObject(bc.ctx);
+  const int installed =
+      JS_SetPropertyStr(bc.ctx, global, "__batch_rejection_snapshot",
+                        JS_NewCFunction(bc.ctx, &batch_rejection_snapshot,
+                                        "__batch_rejection_snapshot", 0));
+  JS_FreeValue(bc.ctx, global);
+  REQUIRE(installed >= 0);
+
+  BatchTimeoutGate gate(blocker, lease);
+  gate.start();
+  const auto observation = gate.observation();
+  // This changes only future BEGINs. The original real 500ms timer has
+  // already fired and its timed_out flag remains latched before unlock.
+  if (observation.has_value()) {
+    plinth::js::set_batch_timeout_ms(30000);
+  }
+  gate.finish();
+  REQUIRE(gate.observer_joined);
+  REQUIRE(gate.unlock_verified);
+  REQUIRE(observation.has_value());
+  REQUIRE(observation->scope != 0);
+  REQUIRE(observation->operations == 2);
+  REQUIRE(observation->pinned);
+  auto result = gate.outcome();
+
+  // Result delivery is not a native/audit persistence barrier. Drain accepted
+  // producers first, then their audit callback tails, before reading or DDL.
+  REQUIRE(plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}));
+  REQUIRE(plinth::log::wait_for_audits(std::chrono::seconds{2}));
+  CHECK(plinth::lifecycle::async_tasks().active_for_test() == 0);
+  CHECK_FALSE(bc.execution_lifetime.load(std::memory_order_acquire));
+  const bool state_reset =
+      bc.batch_state.depth == 0 && bc.batch_state.scope_id == 0 &&
+      bc.batch_state.ops_in_batch == 0 && !bc.batch_state.timed_out &&
+      !bc.batch_state.pinned_conn && !bc.batch_state.rollback_owner &&
+      bc.batch_state.timer_id == trantor::InvalidTimerId &&
+      bc.batch_state.timer_loop == nullptr;
+  const bool async_reset = bc.callbacks.empty() && bc.pending_ops.empty() &&
+                           bc.concurrent_async_ops == 0 &&
+                           bc.inflight_detached.load() == 0;
+  const int before_destroy = pg.count_rows("ext_batch.notes");
+  const bool audit_acknowledged = wait_for_batch_audit_notification(pg.conn);
+  const int committed = pg.count_audit("db.batch.committed", "batch");
+  const int rolled_back = pg.count_audit("db.batch.rolled_back", "batch");
+  const std::unique_ptr<PGresult, decltype(&PQclear)> audit{
+      PQexec(pg.conn,
+             "SELECT detail->>'reason', detail->>'error_code', detail_encoding "
+             "FROM plinth.audit_log WHERE action='db.batch.rolled_back' "
+             "AND detail->>'extension'='batch'"),
+      PQclear};
+  const bool audit_detail =
+      PQresultStatus(audit.get()) == PGRES_TUPLES_OK &&
+      PQntuples(audit.get()) == 1 &&
+      std::string_view{PQgetvalue(audit.get(), 0, 0)} == "timeout" &&
+      std::string_view{PQgetvalue(audit.get(), 0, 1)} == "db.batch.timeout" &&
+      std::string_view{PQgetvalue(audit.get(), 0, 2)} == "0";
+  const auto remaining_buckets =
+      CoalescerRegistry::instance().batch_scope_count_for_test();
+  const auto orphaned_scopes =
+      plinth::js::discard_batches_for_extension("batch");
+  // No callback replacement: the real NativeRollbackOwner keeps its lease.
+  lease->destroy();
+  REQUIRE(plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}));
+  REQUIRE(plinth::log::wait_for_audits(std::chrono::seconds{2}));
+  const int after_destroy = pg.count_rows("ext_batch.notes");
+  const std::unique_ptr<PGresult, decltype(&PQclear)> remaining{
+      PQexec(pg.conn, "SELECT body FROM ext_batch.notes ORDER BY id"), PQclear};
+  const bool only_second_row =
+      PQresultStatus(remaining.get()) == PGRES_TUPLES_OK &&
+      PQntuples(remaining.get()) == 1 &&
+      std::string_view{PQgetvalue(remaining.get(), 0, 0)} == "subsequent";
+
+  REQUIRE(result.value.has_value());
+  INFO("same-evaluation timeout result: " << result.value->toStyledString());
+  const auto& value = *result.value;
+  CHECK(value["first"].asString() == "db.batch.timeout");
+  CHECK(value["bodyFinished"].asBool());
+  CHECK(value["second"].asString() == "second-ok");
+  REQUIRE(value["beforeReuse"].isObject());
+  REQUIRE(value["beforeReuse"].size() == 10);
+  for (const auto& field : value["beforeReuse"].getMemberNames()) {
+    INFO("pre-reuse field: " << field);
+    CHECK(value["beforeReuse"][field].asInt64() == 0);
+  }
+  CHECK(state_reset);
+  CHECK(async_reset);
+  CHECK(before_destroy == 1);
+  CHECK(audit_acknowledged);
+  CHECK(rolled_back == 1);
+  CHECK(committed == 1);
+  CHECK(audit_detail);
+  CHECK(emissions->load() == 1); // Only the successful second batch emits.
+  CHECK(after_destroy == 1);
+  CHECK(only_second_row);
+  CHECK(orphaned_scopes == 0);
+  CHECK(remaining_buckets == 0);
+}
+
+TEST_CASE("installed batch orchestrator requests rollback before timeout "
+          "rejection",
+          "[js][db][batch][batch-timeout-hermetic]") {
+  // Actual registered db.batch/internal helpers and installed JS orchestrator;
+  // only host settlement/reset is simulated. No SQL, driver or timer claim.
+  auto cfg = test_config();
+  auto pool = make_pool(cfg);
+  BatchLease lease(pool);
+  auto& bc = *lease.get();
+  const std::string_view source = R"JS(
+    globalThis.__batch_settlements = 0;
+    globalThis.__batch_rejection = '';
+    globalThis.__batch_body_calls = 0;
+    db.batch(() => { __batch_body_calls++; return 'body-success'; }).then(
+      () => { __batch_settlements++; __batch_rejection = 'unexpected-success'; },
+      e => { __batch_settlements++; __batch_rejection = e.code; }
+    );
+  )JS";
+  JS_UpdateStackTop(bc.rt);
+  JSValue evaluation = JS_Eval(bc.ctx, source.data(), source.size(),
+                               "<batch-test>", JS_EVAL_TYPE_GLOBAL);
+  const bool evaluated = !JS_IsException(evaluation);
+  JS_FreeValue(bc.ctx, evaluation);
+  REQUIRE(evaluated);
+  auto operations = bc.take_pending_ops();
+  REQUIRE(operations.size() == 1);
+  CHECK(operations[0].type == plinth::js::AsyncOp::Type::DB_BATCH_BEGIN);
+  const auto scope = operations[0].batch_scope_id;
+  CHECK(scope != 0);
+  CHECK(bc.batch_state.scope_id == scope);
+  // An alias-null shared owner token proves ownership transfer without ever
+  // constructing or invoking a fake Transaction. Actual transactions are
+  // covered by the separate PG regression, not by this host simulation.
+  auto owner = std::make_shared<int>(953);
+  std::weak_ptr<int> lifetime = owner;
+  bc.batch_state.pinned_conn =
+      std::shared_ptr<drogon::orm::Transaction>{owner, nullptr};
+  bc.batch_state.rollback_owner =
+      std::make_shared<plinth::js::NativeRollbackOwner>(nullptr);
+  std::weak_ptr<plinth::js::NativeRollbackOwner> rollback_lifetime =
+      bc.batch_state.rollback_owner;
+  owner.reset();
+  bc.batch_state.timed_out = true;
+  bc.resolve(operations[0].callback_id, Json::Value{});
+  operations.clear();
+  REQUIRE(drain_batch_jobs(bc));
+  operations = bc.take_pending_ops();
+  // Baseline fails here: it rejects directly without enqueueing rollback.
+  REQUIRE(operations.size() == 1);
+  CHECK(operations[0].type == plinth::js::AsyncOp::Type::DB_BATCH_ROLLBACK);
+  CHECK(operations[0].batch_scope_id == scope);
+  CHECK(operations[0].rollback_error["code"].asString() == "db.batch.timeout");
+  CHECK(bc.batch_state.pinned_conn.use_count() == 0);
+  CHECK(operations[0].batch_pinned_conn.use_count() == 1);
+  CHECK_FALSE(bc.batch_state.rollback_owner);
+  CHECK(operations[0].batch_rollback_owner.use_count() == 1);
+  CHECK_FALSE(rollback_lifetime.expired());
+  CHECK_FALSE(lifetime.expired());
+  auto read = [&bc](const char* property) {
+    JSValue global = JS_GetGlobalObject(bc.ctx);
+    JSValue value = JS_GetPropertyStr(bc.ctx, global, property);
+    int32_t integer = -1;
+    const bool converted = JS_ToInt32(bc.ctx, &integer, value) == 0;
+    JS_FreeValue(bc.ctx, value);
+    JS_FreeValue(bc.ctx, global);
+    REQUIRE(converted);
+    return integer;
+  };
+  CHECK(read("__batch_body_calls") == 1);
+  CHECK(read("__batch_settlements") == 0);
+  const int rollback_callback = operations[0].callback_id;
+  // Simulate the owning host's terminal cleanup only AFTER observing enqueue.
+  bc.batch_state = BridgeContext::BatchState{};
+  operations.clear();
+  CHECK(lifetime.expired());
+  CHECK(rollback_lifetime.expired());
+  bc.resolve(rollback_callback, Json::Value{});
+  REQUIRE(drain_batch_jobs(bc));
+  CHECK(read("__batch_settlements") == 1);
+  JSValue global = JS_GetGlobalObject(bc.ctx);
+  JSValue rejection = JS_GetPropertyStr(bc.ctx, global, "__batch_rejection");
+  const char* text = JS_ToCString(bc.ctx, rejection);
+  const std::string code = text != nullptr ? text : "";
+  if (text != nullptr) {
+    JS_FreeCString(bc.ctx, text);
+  }
+  JS_FreeValue(bc.ctx, rejection);
+  JS_FreeValue(bc.ctx, global);
+  CHECK(code == "db.batch.timeout");
+  // Duplicate late completion has no callback owner and must not settle again.
+  bc.resolve(rollback_callback, Json::Value{});
+  REQUIRE(drain_batch_jobs(bc));
+  CHECK(read("__batch_settlements") == 1);
+  CHECK(bc.callbacks.empty());
+  CHECK(bc.pending_ops.empty());
+  CHECK(bc.concurrent_async_ops == 0);
+}
+
+TEST_CASE("installed batch orchestrator preserves enqueued commit rejection",
+          "[js][db][batch][batch-commit-rejection]") {
+  // The original helpers enqueue COMMIT and transfer both owners. Only its
+  // host completion is simulated: never dispatch this alias-null token.
+  auto cfg = test_config();
+  auto pool = make_pool(cfg);
+  BatchLease lease(pool);
+  auto& bc = *lease.get();
+  constexpr std::string_view source = R"JS(
+    globalThis.__native_commit_settlements = 0;
+    globalThis.__native_commit_rejection = null;
+    db.batch(() => 'body-success').then(
+      () => { __native_commit_settlements++; },
+      e => { __native_commit_settlements++; __native_commit_rejection = e; }
+    );
+  )JS";
+  JS_UpdateStackTop(bc.rt);
+  JSValue evaluation = JS_Eval(bc.ctx, source.data(), source.size(),
+                               "<batch-test>", JS_EVAL_TYPE_GLOBAL);
+  const bool evaluated = !JS_IsException(evaluation);
+  JS_FreeValue(bc.ctx, evaluation);
+  REQUIRE(evaluated);
+  auto operations = bc.take_pending_ops();
+  REQUIRE(operations.size() == 1);
+  REQUIRE(operations[0].type == plinth::js::AsyncOp::Type::DB_BATCH_BEGIN);
+  auto owner = std::make_shared<int>(954);
+  std::weak_ptr<int> transaction_lifetime = owner;
+  bc.batch_state.pinned_conn =
+      std::shared_ptr<drogon::orm::Transaction>{owner, nullptr};
+  owner.reset();
+  bc.batch_state.rollback_owner =
+      std::make_shared<plinth::js::NativeRollbackOwner>(nullptr);
+  std::weak_ptr<plinth::js::NativeRollbackOwner> rollback_lifetime =
+      bc.batch_state.rollback_owner;
+  bc.resolve(operations[0].callback_id, Json::Value{});
+  operations.clear();
+  REQUIRE(drain_batch_jobs(bc));
+  operations = bc.take_pending_ops();
+  REQUIRE(operations.size() == 1);
+  REQUIRE(operations[0].type == plinth::js::AsyncOp::Type::DB_BATCH_COMMIT);
+  CHECK(bc.batch_state.pinned_conn.use_count() == 0);
+  CHECK_FALSE(bc.batch_state.rollback_owner);
+  CHECK(operations[0].batch_pinned_conn.use_count() == 1);
+  CHECK(operations[0].batch_rollback_owner.use_count() == 1);
+  const int callback = operations[0].callback_id;
+  // Simulate terminal native ownership release, not another ROLLBACK.
+  bc.batch_state = BridgeContext::BatchState{};
+  operations.clear();
+  CHECK(transaction_lifetime.expired());
+  CHECK(rollback_lifetime.expired());
+  const plinth::js::PromiseRejection failure{.code = "db.internal",
+                                             .message = "native commit failed",
+                                             .sqlstate = "XX000"};
+  bc.reject(callback, failure);
+  REQUIRE(drain_batch_jobs(bc));
+  CHECK(bc.pending_ops.empty());
+  CHECK(bc.callbacks.empty());
+  JSValue global = JS_GetGlobalObject(bc.ctx);
+  JSValue rejected =
+      JS_GetPropertyStr(bc.ctx, global, "__native_commit_rejection");
+  auto converted = plinth::js::detail::js_to_json(bc.ctx, rejected);
+  JS_FreeValue(bc.ctx, rejected);
+  JSValue settlements =
+      JS_GetPropertyStr(bc.ctx, global, "__native_commit_settlements");
+  int32_t count = -1;
+  const int conversion = JS_ToInt32(bc.ctx, &count, settlements);
+  JS_FreeValue(bc.ctx, settlements);
+  JS_FreeValue(bc.ctx, global);
+  REQUIRE(converted.has_value());
+  CHECK((*converted)["code"].asString() == "db.internal");
+  CHECK((*converted)["message"].asString() == "native commit failed");
+  CHECK((*converted)["sqlstate"].asString() == "XX000");
+  REQUIRE(conversion == 0);
+  CHECK(count == 1);
+  CHECK(bc.concurrent_async_ops == 0);
 }
 
 // ─── P.02 ─────────────────────────────────────────────────────────
