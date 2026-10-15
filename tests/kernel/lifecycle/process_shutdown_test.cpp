@@ -604,12 +604,15 @@ auto receive_frame(int fd) -> nlohmann::json {
   return nlohmann::json::parse(receive_exact(fd, length));
 }
 
-auto authenticated_socket(std::uint16_t port, const std::string& token)
-    -> Socket {
+auto authenticated_socket(std::uint16_t port, const std::string& token,
+                          const std::filesystem::path& process_log) -> Socket {
   auto socket = open_unauthenticated_websocket(port);
   REQUIRE(socket.fd >= 0);
   send_frame(socket.fd, {{"type", "auth"}, {"token", token}});
-  REQUIRE(receive_frame(socket.fd).at("type") == "connected");
+  const auto response = receive_frame(socket.fd);
+  INFO(response.dump());
+  INFO(read_text(process_log));
+  REQUIRE(response.at("type") == "connected");
   return socket;
 }
 
@@ -718,7 +721,8 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
     // The blocking transaction caches PostgreSQL statistics snapshots. Use an
     // independent autocommit observer so every admission poll sees new work.
     auto observer = open_database(database.name);
-    auto websocket = authenticated_socket(port, token);
+    auto websocket =
+        authenticated_socket(port, token, tree.path / "process.log");
     sql(connection.get(), "BEGIN");
     sql(connection.get(),
         "LOCK TABLE ext_shell.user_preferences IN SHARE MODE");
@@ -772,7 +776,7 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
       tree.path / "restarted.log",
       &child_database};
   REQUIRE(wait_for_health(port, 30s));
-  auto replay = authenticated_socket(port, token);
+  auto replay = authenticated_socket(port, token, tree.path / "restarted.log");
   send_frame(replay.fd, {{"type", "subscribe"},
                          {"channels", {EVENT_CHANNEL}},
                          {"since_seq", control_seq}});

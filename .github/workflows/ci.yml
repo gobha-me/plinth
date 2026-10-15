@@ -557,5 +557,5 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:exitcode=66
         run: |
           set -euo pipefail
-          ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 8'
+          ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 12'
           ctest --test-dir build --output-on-failure --parallel 1 -R '^plinth_tsan_'

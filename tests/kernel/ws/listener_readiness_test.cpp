@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <chrono>
 #include <exception>
 #include <future>
@@ -89,6 +90,84 @@ class OwnedLoop {
  private:
   std::shared_ptr<ListenerReadiness> readiness;
 };
+
+struct ReentrantProbeOwner {
+  std::weak_ptr<ListenerReadiness> readiness;
+  std::shared_ptr<std::atomic<bool>> retired_while_owned;
+
+  ~ReentrantProbeOwner() {
+    if (auto state = readiness.lock()) {
+      retired_while_owned->store(state->snapshot().pending == 1);
+    }
+  }
+};
+
+auto require_dependency_controls() -> void {
+  for (int mode = 0; mode < 4; ++mode) {
+    CAPTURE(mode);
+    OwnedSocket socket;
+    auto readiness =
+        std::make_shared<ListenerReadiness>(1, socket.bound_port());
+    OwnedLoop owner(readiness);
+    auto* loop = owner.target.getLoop();
+    loop->queueInLoop([readiness, loop, fd = socket.fd()] {
+      readiness->before_listen(fd, loop, 0);
+      if (::listen(fd, 1) != 0) {
+        readiness->fail("control socket did not listen");
+      }
+    });
+    owner.target.run();
+    REQUIRE(readiness->wait_until(std::chrono::steady_clock::now() + 2s));
+    auto available = std::make_shared<std::atomic<bool>>(false);
+    auto first = std::make_shared<std::atomic<bool>>(true);
+    auto observed = std::make_shared<std::promise<void>>();
+    auto checked = observed->get_future();
+    auto completion = std::make_shared<std::promise<bool>>();
+    auto done = completion->get_future();
+    auto retired_while_owned = std::make_shared<std::atomic<bool>>(false);
+    auto captured = std::make_shared<ReentrantProbeOwner>();
+    captured->readiness = readiness;
+    captured->retired_while_owned = retired_while_owned;
+    std::weak_ptr<ReentrantProbeOwner> lifetime = captured;
+    std::jthread starter([readiness, loop, mode, available, first, observed,
+                          completion,
+                          captured = std::move(captured)]() mutable {
+      const auto deadline =
+          std::chrono::steady_clock::now() + (mode == 1 ? 50ms : 2s);
+      completion->set_value(readiness->wait_for_dependencies(
+          loop,
+          [mode, available, first, observed, captured = std::move(captured)] {
+            if (first->exchange(false)) {
+              observed->set_value();
+            }
+            if (mode == 2) {
+              throw std::runtime_error("controlled unavailable dependency");
+            }
+            return !captured->readiness.expired() && available->load();
+          },
+          deadline));
+    });
+    if (mode != 1) {
+      REQUIRE(checked.wait_for(2s) == std::future_status::ready);
+    }
+    if (mode == 0) {
+      REQUIRE_FALSE(readiness->snapshot().ready);
+      REQUIRE(readiness->snapshot().pending == 1);
+      available->store(true);
+    } else if (mode == 3) {
+      readiness->cancel();
+      available->store(true); // Late availability cannot resurrect startup.
+    }
+    REQUIRE(done.wait_for(2s) == std::future_status::ready);
+    REQUIRE(done.get() == (mode == 0));
+    starter.join();
+    REQUIRE(readiness->drain_until(std::chrono::steady_clock::now() + 2s));
+    REQUIRE(readiness->snapshot().pending == 0);
+    REQUIRE(readiness->snapshot().ready == (mode == 0));
+    REQUIRE(lifetime.expired());
+    REQUIRE(retired_while_owned->load());
+  }
+}
 
 auto require_bounded_negative_controls() -> void {
   {
@@ -202,6 +281,7 @@ TEST_CASE("WebSocket fixture waits for both owned listening sockets",
   // This named gate is mandatory: absent PG must fail, never SKIP green.
   REQUIRE(plinth::ws_test::pg_available());
   require_bounded_negative_controls();
+  require_dependency_controls();
   plinth::ws_test::reset_schema(plinth::ws_test::test_config().db);
 
   REQUIRE_FALSE(plinth::ws_test::server_startup_snapshot().thread_owned);

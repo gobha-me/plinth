@@ -17,6 +17,7 @@
 #include <json/value.h>
 #include <spdlog/spdlog.h>
 
+#include <chrono>
 #include <string>
 #include <string_view>
 
@@ -65,17 +66,26 @@ auto audit_sync(const Config::Database& db, std::string_view action,
 // AUDIT_WRITE op or reject inline with `audit.not_ready`.
 [[nodiscard]] auto is_audit_ready() noexcept -> bool;
 
-// Flip the audit-ready flag back to false so subsequent audit() calls
+// Permanently seal audit admission so subsequent audit() calls
 // short-circuit before touching any Drogon state. The coordinator invokes this
 // before drogon::app().quit() to avoid the bad_weak_ptr teardown race
-// documented in project_ws_flaky_segfault.md. No-op before init; idempotent.
+// documented in project_ws_flaky_segfault.md. Safe before init; idempotent.
+// Even a pre-init seal is permanent; later init() cannot reopen this
+// generation.
 auto shutdown() noexcept -> void;
 
+// Internal lifecycle/fixture barrier, not a caller persistence acknowledgement.
+// Wait for all admitted setup and callback owners within the supplied remaining
+// deadline. Does not close admission. Negative budgets mean zero wait. A real
+// write/setup failure or lost callback remains false even after active == 0.
+[[nodiscard]] auto wait_for_audits(std::chrono::milliseconds timeout) -> bool;
+
 #ifdef PLINTH_JS_TEST_SHIMS
-// Test-only: clear the g_audit_ready flag so the 0.3.3 JS binding
+// Test-only: pause admission so the 0.3.3 JS binding
 // surfaces audit.not_ready cleanly. Mirrors the shim convention in
 // tests/kernel/js/test_host_sleep.cpp. Compiled in only when
-// -DPLINTH_JS_TEST_SHIMS=ON.
+// -DPLINTH_JS_TEST_SHIMS=ON. Retains active work and sticky failure; init() may
+// resume this pause but cannot reopen a production-sealed generation.
 auto test_reset_ready() noexcept -> void;
 #endif
 

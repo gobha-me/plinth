@@ -26,6 +26,7 @@
 //   * Per-extension manifest-declared RuntimeLimits overrides.
 
 #pragma once
+#include "kernel/lifecycle/async_task_registry.hpp"
 
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
@@ -110,10 +111,11 @@ auto destroy_pool(std::string_view extension_name) -> void;
 //
 // and caller outlive the coroutine by resolver contract; copying would double
 // every JSON-arg hop.
-auto dispatch(std::string_view extension_name, std::string_view function,
-              const Json::Value& args,
-              const plinth::capabilities::UserContext& caller,
-              int caller_call_depth)
+auto dispatch(
+    std::string_view extension_name, std::string_view function,
+    const Json::Value& args, const plinth::capabilities::UserContext& caller,
+    int caller_call_depth,
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted = nullptr)
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>>;
 
 } // namespace plinth::extensions

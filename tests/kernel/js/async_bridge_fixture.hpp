@@ -28,7 +28,8 @@ namespace plinth::async_bridge_test {
 [[nodiscard]] auto test_config() -> plinth::Config;
 
 // Reset and re-bootstrap the plinth schema. Each test that needs a
-// known DB state calls this in its prologue.
+// known DB state calls this in its prologue. Previous native operations and
+// their audit callbacks must settle successfully before destructive DDL.
 auto reset_schema(const plinth::Config::Database& db) -> void;
 
 // Lazy-initialize Drogon's event loop on a background thread WITHOUT

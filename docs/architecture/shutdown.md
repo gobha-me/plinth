@@ -40,6 +40,16 @@ The coordinator executes these nodes in order:
 4. `drain_async_tasks`
    - Drain standalone WS capability and replay coroutines. Admission closes in
      `close_ingress`; every accepted coroutine owns a completion lease.
+   - Accepted HTTP/WS/capability ancestry is passed explicitly to extension
+     JavaScript and its native children. Closing ingress rejects new roots,
+     not descendants of an already admitted request.
+   - Drain native SQL workers and their queued/driver completion owners even
+     after JavaScript cancellation has retired its context. Retained failed
+     rollback requests keep this node failed until verified cleanup.
+   - Retry only extension database domains whose earlier lifecycle close
+     already entered `stopping`, using this node's remaining deadline. This
+     breaks the dependency on a later failed-pool retry at node 6; execution
+     cancellation never closes a running shared client.
 5. `drain_rbac_workers`
    - Close the owned RBAC worker registry, request cancellation, and join both
      top-level runs and their timed capability invocations.
@@ -64,8 +74,13 @@ The coordinator executes these nodes in order:
      subsequently becomes empty.
    - Stop and join the realtime listener, then stop the realtime broker.
 9. `close_audit_gate`
-   - Prevent any later audit call from entering Drogon's database manager.
-     The spdlog sinks remain open.
+   - Atomically seal audit admission and drain accepted audit submissions and
+     callback owners within this node's remaining shared deadline. Final
+     producers at node 8 may still submit audits before this seal.
+   - Accepted SQL failures remain an unclean result even after the pending
+     count reaches zero. A timeout retains callback ownership for retry; it
+     cannot permit destruction of Drogon's database manager or logging sinks.
+     The caller API remains fire-and-forget, not a persistence acknowledgment.
 10. `stop_drogon`
    - Release registry-owned WebSocket connections and state on their original
      IO loops, and wait for each release acknowledgment before stopping loops.
@@ -80,7 +95,8 @@ The first seven nodes establish this dependency relation:
 ```text
 ingress -> capability listener -> owned workers -> runtime leases
   -> coalescer flush -> realtime delivery acknowledgment -> durable writer drain
-  -> realtime listener/broker stop -> WS owner release on IO loops
+  -> realtime listener/broker stop -> audit admission seal and callback drain
+  -> WS owner release on IO loops
   -> Drogon database/event loops -> logging sinks
 ```
 
@@ -120,6 +136,31 @@ reference. A timed-out drain retains its durable owners for a retry instead of
 allowing a late coroutine to perform final destruction. Replacement and disable
 hand a last-lease release to Drogon's application loop, so successful pools do
 not accumulate.
+
+### JavaScript execution retirement
+
+An admitted asynchronous execution owns a revocable generation. Native workers
+use immutable snapshots; owner-loop completions may access the JavaScript
+context only through that still-active generation. A real deadline timer wakes
+an execution even if no SQL operation has completed. Cancellation retains the
+existing five-second JavaScript drain window; it does not physically preempt
+PostgreSQL statements. On every execution exit, pinned undispatched batch
+transactions are explicitly rollback-owned, timers and suspended handles are
+revoked, and context access is fenced before the caller destroys or releases it.
+An already dispatched, acknowledged COMMIT retains its native coalescer/audit
+bookkeeping independently of JavaScript delivery.
+
+Native worker frames, queued completions and database callback stacks retain
+the accepted process lease until actual completion. Failed rollback requests
+retain explicit retryable native owners; requesting rollback is not its
+acknowledgement. SQL/transaction callback setup failures revoke independently
+owned completion state. An incomplete, unexecuted SQL binder is abandoned
+before its destructor can dispatch it. Running clients remain lifecycle-owned.
+The pool refuses a return while its execution driver is still active; callers
+must retain checkout ownership until `run_on_context` completes. Concurrently
+starting a new execution and returning the same checkout is not supported.
+This protocol covers native asynchronous operations; it is not a claim that
+every separate broker/subscription callback family uses this generation.
 
 ## Bounds and failure policy
 

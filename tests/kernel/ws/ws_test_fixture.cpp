@@ -1,6 +1,7 @@
 #include "ws_test_fixture.hpp"
 #include "listener_readiness.hpp"
 
+#include "kernel/audit/handlers.hpp"
 #include "kernel/auth/crypto.hpp"
 #include "kernel/cap/api_cap.hpp"
 #include "kernel/capabilities/listener.hpp"
@@ -9,6 +10,7 @@
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/js/db_batch_audit.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/lifecycle/shutdown_coordinator.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/packages/asset_server.hpp"
@@ -139,6 +141,14 @@ auto test_config() -> plinth::Config {
 }
 
 auto reset_schema(const plinth::Config::Database& db) -> void {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{5};
+  if (!plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}) ||
+      !plinth::log::wait_for_audits(
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              deadline - std::chrono::steady_clock::now()))) {
+    throw std::runtime_error("schema reset requires settled native audits");
+  }
   auto migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
   plinth::db::bootstrap_schema(db, migrations_dir, /*dev_mode=*/true);
   plinth::groups::bootstrap_groups(db);
@@ -308,6 +318,7 @@ auto start_test_server() -> void {
   plinth::ws::init_js_stress_pool(cfg);
 
   plinth::ws::register_ws_routes(cfg);
+  plinth::audit::register_audit_routes();
   // Share the test server with asset-server tests (ICD-0.4.4 I.13-I.15).
   // Drogon's app() is a process-wide singleton; the asset handler's
   // wildcard regex /ext/{name}/{version}/* does not collide with WS
@@ -400,6 +411,18 @@ auto start_test_server() -> void {
       startup_control->release();
     }
     throw std::runtime_error("Drogon test server failed to start: " +
+                             readiness->snapshot().error);
+  }
+  if (!readiness->wait_for_dependencies(
+          drogon::app().getLoop(),
+          [] {
+            return drogon::app().getDbClient()->hasAvailableConnections() &&
+                   drogon::app()
+                       .getDbClient("ws_authority")
+                       ->hasAvailableConnections();
+          },
+          deadline)) {
+    throw std::runtime_error("Drogon test database failed to start: " +
                              readiness->snapshot().error);
   }
   g_server_ready.store(true);

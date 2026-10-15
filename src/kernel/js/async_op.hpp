@@ -8,6 +8,7 @@
 
 #include "kernel/capabilities/resolution.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <drogon/orm/DbClient.h>
 #include <json/value.h>
@@ -20,6 +21,7 @@
 namespace plinth::js {
 
 class ExtensionDatabaseClients;
+class NativeRollbackOwner;
 
 // Owning pair of QuickJS callable references obtained from
 // JS_NewPromiseCapability. Each JSValue carries refcount 1 on
@@ -149,6 +151,7 @@ struct AsyncOp {
   //   - the coalescer tags accumulated writes under the scope
   //     (no timer flush; released at COMMIT)
   std::uint64_t batch_scope_id = 0;
+  std::size_t batch_operation_count = 0;
 
   // ICD-0.5.3 §`db.batch()` §ROLLBACK orchestration — the error to
   // propagate out of the outer batch promise when the user callback
@@ -164,6 +167,8 @@ struct AsyncOp {
   // back into bc. Mirrors the existing bc_extension_name /
   // cap_user snapshot pattern. Non-null iff `batch_scope_id != 0`.
   std::shared_ptr<drogon::orm::Transaction> batch_pinned_conn;
+  std::shared_ptr<NativeRollbackOwner> batch_rollback_owner;
+  bool rollback_request_pending = false;
 };
 
 } // namespace plinth::js

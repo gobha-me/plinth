@@ -89,6 +89,9 @@ class CoalescerRegistry {
   // Test seam — currently-open window count.
   [[nodiscard]] auto open_window_count_for_test() const -> std::size_t;
 
+  // Test seam — batch-scope buckets are distinct from ordinary windows.
+  [[nodiscard]] auto batch_scope_count_for_test() const -> std::size_t;
+
   // Test seam — intercept the emit step and return a synthetic
   // result. Set to nullptr to clear. Used by E.03 to drive the
   // `flush_failed` audit path without a live PG failure.

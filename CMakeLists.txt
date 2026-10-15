@@ -145,6 +145,8 @@ set(PLINTH_DROGON_CONNINFO_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/connection-whitespace.patch)
 set(PLINTH_DROGON_SHUTDOWN_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/db-client-owned-shutdown.patch)
+set(PLINTH_DROGON_BINDER_PATCH
+    ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/sql-binder-cancel.patch)
 FetchContent_Declare(
   drogon
   GIT_REPOSITORY https://github.com/drogonframework/drogon.git
@@ -158,6 +160,9 @@ FetchContent_Declare(
   COMMAND sh -c
     "git apply --reverse --check '${PLINTH_DROGON_SHUTDOWN_PATCH}' 2>/dev/null \
      || git apply --whitespace=nowarn '${PLINTH_DROGON_SHUTDOWN_PATCH}'"
+  COMMAND sh -c
+    "git apply --reverse --check '${PLINTH_DROGON_BINDER_PATCH}' 2>/dev/null \
+     || git apply --whitespace=nowarn '${PLINTH_DROGON_BINDER_PATCH}'"
 )
 FetchContent_MakeAvailable(drogon)
 set(DROGON_TARGET drogon)
@@ -628,6 +633,7 @@ set_tests_properties(plinth_admin_browser_supervisor_units PROPERTIES TIMEOUT 30
 add_executable(plinth_tests
   tests/kernel/main_test.cpp
   tests/kernel/lifecycle/async_task_registry_test.cpp
+  tests/kernel/lifecycle/async_cleanup_registry_test.cpp
   tests/kernel/lifecycle/shutdown_coordinator_test.cpp
   tests/kernel/lifecycle/process_shutdown_test.cpp
   tests/kernel/config_test.cpp
@@ -636,6 +642,9 @@ add_executable(plinth_tests
   tests/kernel/db/connection_info_test.cpp
   tests/kernel/audit/audit_test.cpp
   tests/kernel/audit/audit_teardown_test.cpp
+  tests/kernel/audit/audit_drain_test.cpp
+  tests/kernel/audit/audit_write_registry_test.cpp
+  tests/kernel/audit/detail_encoding_test.cpp
   tests/kernel/auth/crypto_test.cpp
   tests/kernel/auth/csrf_test.cpp
   tests/kernel/auth/csrf_route_inventory_test.cpp
@@ -718,6 +727,8 @@ add_executable(plinth_tests
   tests/kernel/js/pubsub_subscribe_test.cpp
   tests/kernel/js/limits_test.cpp
   tests/kernel/js/async_hardening_test.cpp
+  tests/kernel/js/owned_database_completion_test.cpp
+  tests/kernel/js/native_setup_failure_test.cpp
   tests/kernel/js/eval_guard_test.cpp
   tests/kernel/packages/manifest_test.cpp
   tests/kernel/packages/capabilities_manifest_test.cpp
@@ -927,7 +938,7 @@ add_test(NAME plinth_tests_ws_close_ownership
 set_tests_properties(plinth_tests_ws_close_ownership PROPERTIES TIMEOUT 40)
 
 set(PLINTH_GROUPED_JS_SELECTOR
-    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission]")
+    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-audit-drain]")
 
 # spdlog's default free APIs cannot overlap a default-logger replacement.
 # These five synchronous capture fixtures must run before any background
@@ -1068,6 +1079,111 @@ set_tests_properties(plinth_tests_batch_transaction
              ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1"
              TIMEOUT 60)
 
+set(PLINTH_AUDIT_DRAIN_CASE
+    "audit drain retains blocked writes before Drogon shutdown and retries")
+add_test(NAME plinth_tests_audit_drain
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "${PLINTH_AUDIT_DRAIN_CASE}"
+    --timeout 30
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_audit_drain PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg"
+  ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1" TIMEOUT 40)
+
+# Real blocked SQL must outlive JS retirement without outliving its native
+# shutdown owner. Missing cases, skips and nonzero sanitizer exits fail closed.
+add_test(NAME plinth_tests_js_cancellation_retirement
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "async cancellation retires context before gated late completion"
+    --timeout 45
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_js_cancellation_retirement
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema
+             LABELS "needs_pg"
+             ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1"
+             TIMEOUT 55)
+
+# Actual registry/completion components with controlled native callback timing.
+# Each exact case runs alone; no database fixture or skipped oracle is accepted.
+function(add_plinth_native_owner_case name selector)
+  add_test(NAME plinth_tests_native_owner_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}"
+      --timeout 30
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_native_owner_${name} PROPERTIES
+    LABELS "native_ownership" TIMEOUT 40)
+endfunction()
+add_plinth_native_owner_case(retained_retry
+  "async cleanup failure retains owner and lease until explicit retry")
+add_plinth_native_owner_case(audit_callback_tail
+  "audit registry retains callback tail after successful settlement")
+add_plinth_native_owner_case(audit_sticky_failure
+  "audit registry failures stay unclean after owners retire")
+add_plinth_native_owner_case(audit_admission_race
+  "audit registry seal linearizes concurrent submissions without losing owners")
+add_plinth_native_owner_case(duplicate_retention
+  "async cleanup duplicate retention registers only one owner")
+add_plinth_native_owner_case(republished_revision
+  "async cleanup republished revision cannot be discarded as completed")
+add_plinth_native_owner_case(dependency_order
+  "async cleanup retries dependent records in either insertion order")
+add_plinth_native_owner_case(expired_deadline
+  "async cleanup expired deadline never launches cleanup work")
+add_plinth_native_owner_case(revoked_sql
+  "owned SQL callbacks cannot resume a destroyed revoked frame")
+add_plinth_native_owner_case(single_sql_wake
+  "owned SQL completion consumes exactly one successful wake")
+add_plinth_native_owner_case(partial_binder
+  "partial SQL binder setup cannot auto-dispatch on unwinding")
+add_plinth_native_owner_case(failed_acquisition
+  "retained transaction timeout callback survives failed acquisition setup")
+add_plinth_native_owner_case(late_acquisition
+  "revoked acquisition rolls back a late transaction without resuming")
+add_plinth_native_owner_case(rollback_retry
+  "native rollback failure remains retained through retry and callback release")
+
+# Inject one failure at an actual native setup boundary; durable state and
+# accepted cleanup ownership must agree. Keep each global checkpoint isolated.
+function(add_plinth_native_setup_case name selector)
+  add_test(NAME plinth_tests_native_setup_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}"
+      --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_native_setup_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg;native_ownership"
+    ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1" TIMEOUT 75)
+endfunction()
+add_plinth_native_setup_case(dispatcher_task
+  "batch dispatcher Task setup failure rolls back completed writes")
+add_plinth_native_setup_case(launcher_task
+  "batch launcher Task setup failure rolls back completed writes")
+add_plinth_native_setup_case(batch_child
+  "batch child Task setup failure rolls back completed writes")
+add_plinth_native_setup_case(commit_completion
+  "batch commit completion allocation failure rolls back completed writes")
+add_plinth_native_setup_case(commit_callback
+  "batch commit callback installation failure rolls back completed writes")
+add_plinth_native_setup_case(wrapper_task
+  "extension wrapper commit Task failure rolls back completed writes")
+add_plinth_native_setup_case(begin_metadata
+  "batch BEGIN metadata allocation failure retires its transaction")
+add_plinth_native_setup_case(begin_queue
+  "batch BEGIN queue allocation failure retires its transaction")
+add_plinth_native_setup_case(commit_bookkeeping
+  "batch post-ACK metadata failure preserves durable commit bookkeeping")
+add_plinth_native_setup_case(domain_retry
+  "private database domain failed close is retained until actual retry")
+
 add_test(NAME plinth_tests_pg
   COMMAND plinth_tests "[integration] ~[ws] ~[js] ~[subprocess]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -1196,6 +1312,19 @@ if(PLINTH_TSAN)
     "async_bridge: 10 concurrent contexts each run independent query" 180)
   add_plinth_tsan_case(js_query_audit
     "async_bridge: F.23 two threads query and audit independently" 180)
+  add_plinth_tsan_case(audit_drain "${PLINTH_AUDIT_DRAIN_CASE}" 30)
+  set_tests_properties(plinth_tsan_audit_drain PROPERTIES
+    ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1")
+  add_plinth_tsan_case(audit_admission_race
+    "audit registry seal linearizes concurrent submissions without losing owners" 30)
+  add_plinth_tsan_case(js_cancellation_retirement
+    "async cancellation retires context before gated late completion" 45)
+  set_tests_properties(plinth_tsan_js_cancellation_retirement PROPERTIES
+    ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1")
+  add_plinth_tsan_case(js_private_domain_retry
+    "private database domain failed close is retained until actual retry" 60)
+  set_tests_properties(plinth_tsan_js_private_domain_retry PROPERTIES
+    ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1")
   add_plinth_tsan_case(production_durable_shutdown
     "production shutdown persists and replays the last extension write" 480)
   add_plinth_tsan_case(production_partial_startup

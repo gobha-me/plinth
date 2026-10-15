@@ -1,4 +1,5 @@
 #pragma once
+#include "kernel/lifecycle/async_task_registry.hpp"
 
 // plinth::capabilities — capability dispatch / resolution (ICD-0.2.2).
 //
@@ -177,9 +178,11 @@ auto call_capability(const CapabilityCall& call, const UserContext& ctx)
 // reference parameters could dangle before the coroutine's first resume when
 // a caller supplied temporaries or retained the returned task. Callers that
 // already own these inputs should move them into the coroutine.
-auto call_capability_async(CapabilityCall call, UserContext ctx,
-                           std::string* ext_detail_code_out = nullptr,
-                           std::string* ext_detail_message_out = nullptr)
+auto call_capability_async(
+    CapabilityCall call, UserContext ctx,
+    std::string* ext_detail_code_out = nullptr,
+    std::string* ext_detail_message_out = nullptr,
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted = nullptr)
     -> drogon::Task<ResolveResult>;
 
 // Full Tier 2 cache resync from plinth.capabilities. Builds a complete

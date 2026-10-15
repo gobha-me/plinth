@@ -34,11 +34,16 @@
 #include "kernel/js/db_search_path.hpp"
 #include "kernel/js/db_silent_audit.hpp"
 #include "kernel/js/eval_guard.hpp"
+#include "kernel/js/execution_lifetime.hpp"
 #include "kernel/js/extension_database.hpp"
+#include "kernel/js/native_rollback_owner.hpp"
+#include "kernel/js/native_setup_failure.hpp"
+#include "kernel/js/owned_database_awaiters.hpp"
 #include "kernel/js/stdlib/cap_bindings.hpp"
 #include "kernel/js/stdlib/db_error_map.hpp"
 #include "kernel/js/stdlib/db_result_to_json.hpp"
 #include "kernel/js/stdlib_inject.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/realtime/broker.hpp"
 #include "kernel/realtime/coalescer.hpp"
@@ -83,8 +88,25 @@ using std::chrono::steady_clock;
 // path allocation-free (matches 0.3.0.1 kernel convention).
 using OpOutcome = std::expected<Json::Value, PromiseRejection>;
 
+struct OwnedJsValue {
+  OwnedJsValue(JSContext* context_in, JSValue value_in)
+      : context(context_in), value(value_in) {}
+  OwnedJsValue(const OwnedJsValue&) = delete;
+  auto operator=(const OwnedJsValue&) -> OwnedJsValue& = delete;
+  OwnedJsValue(OwnedJsValue&&) = delete;
+  auto operator=(OwnedJsValue&&) -> OwnedJsValue& = delete;
+  JSContext* context;
+  JSValue value;
+  ~OwnedJsValue() { JS_FreeValue(context, value); }
+  auto reset() -> void {
+    JS_FreeValue(context, std::exchange(value, JS_UNDEFINED));
+  }
+  auto take() -> JSValue { return std::exchange(value, JS_UNDEFINED); }
+};
+
 // Forward declarations.
-auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start)
+auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start,
+                              std::optional<EvalError> original = std::nullopt)
     -> drogon::Task<EvalResult>;
 
 // Drive the JS job queue (resolved promises' .then handlers, etc.)
@@ -119,8 +141,8 @@ auto drive_jobs(BridgeContext& bc) -> std::optional<EvalError> {
 // Frees `result` regardless of outcome.
 auto convert_top_level(BridgeContext& bc, JSValue result)
     -> std::expected<Json::Value, EvalError> {
+  OwnedJsValue owned_result{bc.ctx, result};
   if (JS_IsException(result)) {
-    JS_FreeValue(bc.ctx, result);
     return std::unexpected(detail::extract_error(bc.ctx, bc));
   }
 
@@ -131,7 +153,6 @@ auto convert_top_level(BridgeContext& bc, JSValue result)
       // Should not happen at finalize time — the loop continues
       // until the top-level Promise (if any) settles. Treat as
       // an internal invariant violation.
-      JS_FreeValue(bc.ctx, result);
       return std::unexpected(
           EvalError{.kind = EvalErrorKind::INTERNAL_ASYNC,
                     .message = "top-level promise still pending at finalize",
@@ -139,7 +160,7 @@ auto convert_top_level(BridgeContext& bc, JSValue result)
                     .column = 0});
     }
     JSValue inner = JS_PromiseResult(bc.ctx, result);
-    JS_FreeValue(bc.ctx, result);
+    OwnedJsValue owned_inner{bc.ctx, inner};
     if (state == JS_PROMISE_REJECTED) {
       // Route through the shared classifier so async-IIFE-wrapped
       // OOM / CPU / wall-clock / cancel trips surface with the
@@ -147,18 +168,15 @@ auto convert_top_level(BridgeContext& bc, JSValue result)
       // that doesn't match any known trigger falls through to
       // PROMISE_REJECTED_UNHANDLED with the stringified reason.
       auto err = detail::classify_rejection(bc.ctx, inner, bc);
-      JS_FreeValue(bc.ctx, inner);
       return std::unexpected(std::move(err));
     }
     // Fulfilled — convert the resolved value.
     auto out = detail::js_to_json(bc.ctx, inner);
-    JS_FreeValue(bc.ctx, inner);
     return out;
   }
 
   // Not a promise — convert directly.
   auto out = detail::js_to_json(bc.ctx, result);
-  JS_FreeValue(bc.ctx, result);
   return out;
 }
 
@@ -290,9 +308,9 @@ auto db_connection_unavailable(BridgeContext& bc, int id) -> void {
                                  .sqlstate = std::nullopt});
 }
 
-// SqlBinderAwaiter — non-blocking awaiter for the runtime-sized param
-// path. Replaces the `std::promise/future` bridge retired in 0.3.3.1
-// per docs/DEFERRED.md "runtime-sized param binding loop blocking".
+// SqlBinderAwaiter owns the accepted process lease in both driver callbacks,
+// including empty-parameter SQL. This keeps callback-stack cleanup counted
+// after coroutine resumption has destroyed the native worker's frame.
 //
 // Inherits Drogon's CallbackAwaiter<Result> for result / exception
 // storage + await_resume. await_suspend sets up the SqlBinder,
@@ -301,28 +319,44 @@ auto db_connection_unavailable(BridgeContext& bc, int id) -> void {
 // of await_suspend's scope) triggers exec; callbacks fire async on
 // Drogon's IO thread and resume the coroutine there. The awaiter
 // lives in the coroutine frame, so `this` outlives the binder.
-struct SqlBinderAwaiter : public drogon::CallbackAwaiter<drogon::orm::Result> {
-  SqlBinderAwaiter(std::shared_ptr<drogon::orm::DbClient> db_in,
-                   std::string sql_in, std::vector<Json::Value> params_in)
-      : db(std::move(db_in)), sql(std::move(sql_in)),
+struct SqlBinderAwaiter {
+  SqlBinderAwaiter(
+      std::shared_ptr<drogon::orm::DbClient> db_in, std::string sql_in,
+      std::vector<Json::Value> params_in,
+      std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted_in)
+      : completion(
+            std::make_shared<OwnedSqlCompletion>(std::move(accepted_in))),
+        db(std::move(db_in)), sql(std::move(sql_in)),
         params(std::move(params_in)) {}
 
+  ~SqlBinderAwaiter() { completion->revoke(); }
+  [[nodiscard]] auto await_ready() const noexcept -> bool { return false; }
+  auto await_resume() -> drogon::orm::Result {
+    return completion->take_result();
+  }
+
   auto await_suspend(std::coroutine_handle<> handle) -> void {
-    auto binder = *db << sql;
-    for (const auto& p : params) {
-      bind_param(binder, p);
+    auto state = completion;
+    auto database = db;
+    state->arm(handle);
+    try {
+      auto binder = *database << sql;
+      SqlBinderSetupGuard setup{binder};
+      for (const auto& p : params) {
+        bind_param(binder, p);
+      }
+      binder >>
+          [state](const drogon::orm::Result& res) { state->succeed(res); };
+      binder >> [state](const std::exception_ptr& ep) { state->fail(ep); };
+      binder.exec();
+    } catch (...) {
+      state->revoke();
+      throw;
     }
-    binder >> [this, handle](const drogon::orm::Result& res) {
-      setValue(res);
-      handle.resume();
-    };
-    binder >> [this, handle](const std::exception_ptr& ep) {
-      setException(ep);
-      handle.resume();
-    };
-  } // binder dtor here → exec queued; callbacks fire later
+  }
 
  private:
+  std::shared_ptr<OwnedSqlCompletion> completion;
   std::shared_ptr<drogon::orm::DbClient> db;
   std::string sql;
   std::vector<Json::Value> params;
@@ -335,7 +369,33 @@ struct SqlBinderAwaiter : public drogon::CallbackAwaiter<drogon::orm::Result> {
 // canonical destructor-driven commit so the async operation owns the
 // transaction through PostgreSQL's acknowledgement.
 struct TransactionCommitAwaiter {
+  // Constructed without allocation BEFORE completion state or callback setup.
+  // Until the driver's completion callback has been installed, destroying
+  // this awaiter must request rollback, not destructor-driven auto-COMMIT.
+  struct UnissuedCommitOwner {
+    UnissuedCommitOwner(
+        std::shared_ptr<drogon::orm::Transaction> transaction_in,
+        std::shared_ptr<NativeRollbackOwner> rollback_owner_in,
+        std::shared_ptr<ExtensionDatabaseClients> domain_in) noexcept
+        : transaction(std::move(transaction_in)),
+          rollback_owner(std::move(rollback_owner_in)),
+          database_owner(std::move(domain_in)) {}
+
+    ~UnissuedCommitOwner() {
+      if (transaction) {
+        rollback_owner->request(transaction, database_owner);
+      }
+    }
+
+    std::shared_ptr<drogon::orm::Transaction> transaction;
+    std::shared_ptr<NativeRollbackOwner> rollback_owner;
+    std::shared_ptr<ExtensionDatabaseClients> database_owner;
+  };
+
   struct CompletionState {
+    // Last field destroyed: real commit callback + deferred resume remain
+    // owned even after the JS generation no longer exists.
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted;
     std::atomic<bool> resume_queued{false};
     std::recursive_mutex lifecycle;
     std::coroutine_handle<> suspended{};
@@ -344,10 +404,21 @@ struct TransactionCommitAwaiter {
     bool active{true};
   };
 
+  static auto make_completion() -> std::shared_ptr<CompletionState> {
+    maybe_fail_native_setup(
+        NativeSetupFailurePoint::commit_completion_allocation);
+    return std::make_shared<CompletionState>();
+  }
+
   explicit TransactionCommitAwaiter(
-      std::shared_ptr<drogon::orm::Transaction> transaction_in)
-      : transaction(std::move(transaction_in)),
-        completion(std::make_shared<CompletionState>()) {
+      std::shared_ptr<drogon::orm::Transaction> transaction_in,
+      std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+      std::shared_ptr<NativeRollbackOwner> rollback_owner_in,
+      std::shared_ptr<ExtensionDatabaseClients> domain_in)
+      : unissued(std::move(transaction_in), std::move(rollback_owner_in),
+                 std::move(domain_in)),
+        completion(make_completion()) {
+    completion->accepted = std::move(accepted);
     completion->owner_loop = trantor::EventLoop::getEventLoopOfCurrentThread();
     if (completion->owner_loop == nullptr) {
       completion->owner_loop = drogon::app().getLoop();
@@ -375,42 +446,47 @@ struct TransactionCommitAwaiter {
       // its coroutine. Mark it for rollback before releasing the final owner;
       // otherwise Drogon's destructor-driven transaction completion would
       // commit even though await_resume() reports failure.
-      transaction->rollback();
-      transaction.reset();
+      unissued.rollback_owner->request(unissued.transaction,
+                                       unissued.database_owner);
+      unissued.transaction.reset();
       return false;
     }
     {
       std::lock_guard<std::recursive_mutex> guard{completion->lifecycle};
       completion->suspended = handle;
     }
-    transaction->setCommitCallback([state = completion](bool committed) {
-      // TransactionImpl invokes this callback from inside its DB completion
-      // stack. Resuming there is re-entrant: the continuation destroys this
-      // awaiter while Drogon still owns callback copies, which Release builds
-      // can surface as an unreachable/cold-path trap. Keep all callback state
-      // independently alive and defer one resume onto the coroutine's owning
-      // event loop.
-      if (state->resume_queued.exchange(true, std::memory_order_acq_rel)) {
-        return;
-      }
-      state->owner_loop->queueInLoop([state, committed]() mutable {
-        // Serialize cancellation/frame destruction with resumption. A
-        // recursive mutex is intentional: suspended.resume() destroys this
-        // awaiter on the same thread before it returns, and the destructor
-        // must be able to revoke the handle while this guard is held.
-        std::lock_guard<std::recursive_mutex> guard{state->lifecycle};
-        if (!state->active) {
-          state->suspended = {};
-          return;
-        }
-        state->committed = committed;
-        auto suspended = std::exchange(state->suspended, {});
-        if (suspended) {
-          suspended.resume();
-        }
-      });
-    });
-    transaction.reset();
+    maybe_fail_native_setup(NativeSetupFailurePoint::commit_callback_install);
+    unissued.transaction->setCommitCallback(
+        [state = completion](bool committed) {
+          // TransactionImpl invokes this callback from inside its DB completion
+          // stack. Resuming there is re-entrant: the continuation destroys this
+          // awaiter while Drogon still owns callback copies, which Release
+          // builds can surface as an unreachable/cold-path trap. Keep all
+          // callback state independently alive and defer one resume onto the
+          // coroutine's owning event loop.
+          if (state->resume_queued.exchange(true, std::memory_order_acq_rel)) {
+            return;
+          }
+          state->owner_loop->queueInLoop([state, committed]() mutable {
+            // Serialize cancellation/frame destruction with resumption. A
+            // recursive mutex is intentional: suspended.resume() destroys this
+            // awaiter on the same thread before it returns, and the destructor
+            // must be able to revoke the handle while this guard is held.
+            std::lock_guard<std::recursive_mutex> guard{state->lifecycle};
+            if (!state->active) {
+              state->suspended = {};
+              return;
+            }
+            state->committed = committed;
+            auto suspended = std::exchange(state->suspended, {});
+            if (suspended) {
+              suspended.resume();
+            }
+          });
+        });
+    // This is the actual handoff point. Callback installation above may
+    // throw; before this reset the guard still owns rollback responsibility.
+    unissued.transaction.reset();
     return true;
   }
 
@@ -419,17 +495,21 @@ struct TransactionCommitAwaiter {
   }
 
  private:
-  std::shared_ptr<drogon::orm::Transaction> transaction;
+  UnissuedCommitOwner unissued;
   std::shared_ptr<CompletionState> completion;
 };
 
-auto commit_transaction(std::shared_ptr<drogon::orm::Transaction> transaction)
-    -> drogon::Task<> {
+auto commit_transaction(
+    std::shared_ptr<drogon::orm::Transaction> transaction,
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+    std::shared_ptr<NativeRollbackOwner> rollback_owner,
+    std::shared_ptr<ExtensionDatabaseClients> domain) -> drogon::Task<> {
   // Keep the co_await outside the conditional. GCC 12 miscomputes the
   // coroutine frame layout for `if (co_await ...)` (GCC PR 106713), causing
   // the resumed actor to read its state from the wrong offset and trap.
-  const bool committed =
-      co_await TransactionCommitAwaiter{std::move(transaction)};
+  const bool committed = co_await TransactionCommitAwaiter{
+      std::move(transaction), std::move(accepted), std::move(rollback_owner),
+      std::move(domain)};
   if (!committed) {
     throw std::runtime_error("database transaction commit failed");
   }
@@ -449,7 +529,19 @@ auto commit_transaction(std::shared_ptr<drogon::orm::Transaction> transaction)
 // populated (or both empty, meaning kernel-scope bypass / enforce
 // disabled → run raw).
 struct SearchPathWrap {
+  SearchPathWrap() = default;
+  SearchPathWrap(const SearchPathWrap&) = delete;
+  auto operator=(const SearchPathWrap&) -> SearchPathWrap& = delete;
+  SearchPathWrap(SearchPathWrap&&) noexcept = default;
+  auto operator=(SearchPathWrap&&) noexcept -> SearchPathWrap& = default;
+  ~SearchPathWrap() {
+    if (tx) {
+      rollback_owner->request(tx, domain);
+    }
+  }
   std::shared_ptr<drogon::orm::Transaction> tx;
+  std::shared_ptr<NativeRollbackOwner> rollback_owner;
+  std::shared_ptr<ExtensionDatabaseClients> domain;
   std::optional<PromiseRejection> early_reject;
 };
 
@@ -459,8 +551,10 @@ struct SearchPathWrap {
 // no reference parameters (the coroutine-frame capture of references
 // to caller locals is unsafe per
 // cppcoreguidelines-avoid-reference-coroutine-parameters).
-auto prepare_search_path_wrapper(std::shared_ptr<drogon::orm::DbClient> db,
-                                 std::string extension_name)
+auto prepare_search_path_wrapper(
+    std::shared_ptr<drogon::orm::DbClient> db, std::string extension_name,
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+    std::shared_ptr<ExtensionDatabaseClients> domain)
     -> drogon::Task<SearchPathWrap> {
   SearchPathWrap out;
   if (!plinth::js::db::search_path_enforced() || extension_name.empty()) {
@@ -475,15 +569,25 @@ auto prepare_search_path_wrapper(std::shared_ptr<drogon::orm::DbClient> db,
     co_return out;
   }
   try {
-    out.tx = co_await db->newTransactionCoro();
-    co_await out.tx->execSqlCoro("SET LOCAL search_path TO ext_" +
-                                 extension_name + ", plinth");
+    out.rollback_owner = std::make_shared<NativeRollbackOwner>(accepted);
+    out.domain = std::move(domain);
+    out.tx = co_await OwnedTransactionAwaiter{db, accepted, out.rollback_owner,
+                                              out.domain};
+    out.rollback_owner->attach(out.tx);
+    co_await SqlBinderAwaiter{out.tx,
+                              "SET LOCAL search_path TO ext_" + extension_name +
+                                  ", plinth",
+                              {},
+                              accepted};
   } catch (const drogon::orm::DrogonDbException& e) {
     auto rej = pg_exception_to_rejection(e);
     plinth::js::db::audit_search_path_set_failed(extension_name,
                                                  rej.sqlstate.value_or(""));
     rej.code = "db.search_path.set_failed";
     out.early_reject = rej;
+    if (out.tx) {
+      out.rollback_owner->request(out.tx, out.domain);
+    }
     out.tx.reset();
   }
   co_return out;
@@ -491,7 +595,8 @@ auto prepare_search_path_wrapper(std::shared_ptr<drogon::orm::DbClient> db,
 
 auto database_for_operation(
     std::string extension_name,
-    std::shared_ptr<ExtensionDatabaseClients> extension_clients)
+    std::shared_ptr<ExtensionDatabaseClients> extension_clients,
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
     -> drogon::Task<std::shared_ptr<drogon::orm::DbClient>> {
   if (extension_name.empty()) {
     co_return drogon::app().getDbClient();
@@ -499,10 +604,13 @@ auto database_for_operation(
   if (!extension_clients) {
     throw std::runtime_error("extension database owner is unavailable");
   }
-  co_return co_await extension_clients->get(std::move(extension_name));
+  co_return co_await extension_clients->get(std::move(extension_name),
+                                            std::move(accepted));
 }
 
-auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
+auto run_db_query_outcome(
+    AsyncOp op, std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
+    -> drogon::Task<OpOutcome> {
   try {
     if (!op.bc_extension_name.empty() &&
         (!db::is_valid_extension_name(op.bc_extension_name) ||
@@ -513,8 +621,8 @@ auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
                            .message = "invalid extension database identity",
                            .sqlstate = std::nullopt});
     }
-    auto db = co_await database_for_operation(op.bc_extension_name,
-                                              op.extension_database_clients);
+    auto db = co_await database_for_operation(
+        op.bc_extension_name, op.extension_database_clients, accepted);
     if (!db) {
       co_return std::unexpected(
           PromiseRejection{.code = "db.connection_error",
@@ -531,7 +639,8 @@ auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
     if (op.batch_pinned_conn) {
       exec_target = op.batch_pinned_conn;
     } else {
-      wrap = co_await prepare_search_path_wrapper(db, op.bc_extension_name);
+      wrap = co_await prepare_search_path_wrapper(
+          db, op.bc_extension_name, accepted, op.extension_database_clients);
       if (wrap.early_reject.has_value()) {
         co_return std::unexpected(*std::move(wrap.early_reject));
       }
@@ -541,17 +650,20 @@ auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
     }
 
     drogon::orm::Result r{nullptr};
-    if (op.sql_params.empty()) {
-      r = co_await exec_target->execSqlCoro(op.sql);
-    } else {
-      r = co_await SqlBinderAwaiter{exec_target, op.sql, op.sql_params};
-    }
+    r = co_await SqlBinderAwaiter{exec_target, op.sql, op.sql_params, accepted};
     // Release the execution-target copy before moving the sole remaining
     // transaction owner into the canonical commit awaiter. Batch ops skip
     // this — DB_BATCH_COMMIT owns the single commit at batch end.
     if (wrap.tx) {
       exec_target.reset();
-      co_await commit_transaction(std::move(wrap.tx));
+      // Keep the rollback-guarded wrapper pin until coroutine allocation has
+      // succeeded. Moving the last pin into a failed Task allocation would
+      // auto-COMMIT before TransactionCommitAwaiter's guard can exist.
+      maybe_fail_native_setup(NativeSetupFailurePoint::wrapper_commit_task);
+      auto commit = commit_transaction(wrap.tx, accepted, wrap.rollback_owner,
+                                       wrap.domain);
+      wrap.tx.reset();
+      co_await commit;
     }
     co_return db::result_to_json(r);
   } catch (const drogon::orm::DrogonDbException& e) {
@@ -563,7 +675,9 @@ auto run_db_query_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
   }
 }
 
-auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
+auto run_db_exec_outcome(
+    AsyncOp op, std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
+    -> drogon::Task<OpOutcome> {
   try {
     if (!op.bc_extension_name.empty() &&
         (!db::is_valid_extension_name(op.bc_extension_name) ||
@@ -574,8 +688,8 @@ auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
                            .message = "invalid extension database identity",
                            .sqlstate = std::nullopt});
     }
-    auto db = co_await database_for_operation(op.bc_extension_name,
-                                              op.extension_database_clients);
+    auto db = co_await database_for_operation(
+        op.bc_extension_name, op.extension_database_clients, accepted);
     if (!db) {
       co_return std::unexpected(
           PromiseRejection{.code = "db.connection_error",
@@ -589,7 +703,8 @@ auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
     if (op.batch_pinned_conn) {
       exec_target = op.batch_pinned_conn;
     } else {
-      wrap = co_await prepare_search_path_wrapper(db, op.bc_extension_name);
+      wrap = co_await prepare_search_path_wrapper(
+          db, op.bc_extension_name, accepted, op.extension_database_clients);
       if (wrap.early_reject.has_value()) {
         co_return std::unexpected(*std::move(wrap.early_reject));
       }
@@ -599,17 +714,17 @@ auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
     }
 
     drogon::orm::Result r{nullptr};
-    if (op.sql_params.empty()) {
-      r = co_await exec_target->execSqlCoro(op.sql);
-    } else {
-      r = co_await SqlBinderAwaiter{exec_target, op.sql, op.sql_params};
-    }
+    r = co_await SqlBinderAwaiter{exec_target, op.sql, op.sql_params, accepted};
     // Release the execution-target copy before moving the sole remaining
     // transaction owner into the canonical commit awaiter. In-batch ops skip
     // this — DB_BATCH_COMMIT owns the batch-scope commit.
     if (wrap.tx) {
       exec_target.reset();
-      co_await commit_transaction(std::move(wrap.tx));
+      maybe_fail_native_setup(NativeSetupFailurePoint::wrapper_commit_task);
+      auto commit = commit_transaction(wrap.tx, accepted, wrap.rollback_owner,
+                                       wrap.domain);
+      wrap.tx.reset();
+      co_await commit;
     }
     Json::Value out{Json::objectValue};
     out["row_count"] = static_cast<Json::Int>(r.affectedRows());
@@ -657,7 +772,9 @@ auto run_db_exec_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
 // `op.cap_call_depth`. Reading those off the op value inside this
 // detached coroutine is free of cross-thread races — the op is moved
 // into this function and owned here.
-auto run_cap_call_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
+auto run_cap_call_outcome(
+    AsyncOp op, std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
+    -> drogon::Task<OpOutcome> {
   plinth::capabilities::CapabilityCall cc{.signature = op.cap_signature,
                                           .args = op.cap_args,
                                           .call_depth = op.cap_call_depth};
@@ -670,7 +787,7 @@ auto run_cap_call_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
   std::string ext_detail_message;
   auto res = co_await plinth::capabilities::call_capability_async(
       std::move(cc), std::move(op.cap_user), &ext_detail_code,
-      &ext_detail_message);
+      &ext_detail_message, std::move(accepted));
   if (res.has_value()) {
     co_return res->data;
   }
@@ -691,17 +808,16 @@ auto run_cap_call_outcome(AsyncOp op) -> drogon::Task<OpOutcome> {
 // stripped — FastWriter is the project-wide primitive for this
 // measurement (see logging.cpp), and the per-op overhead of scanning
 // for the trailing byte would outweigh the informational benefit.
-auto check_result_size(const BridgeContext& bc, const Json::Value& v)
+auto check_result_size(std::size_t limit, const Json::Value& v)
     -> std::optional<PromiseRejection> {
   auto serialized = Json::FastWriter{}.write(v);
   const std::size_t SIZE = serialized.size();
-  if (SIZE > bc.async_result_size_limit_bytes) {
-    return PromiseRejection{
-        .code = "async.result_size_exceeded",
-        .message = "result size " + std::to_string(SIZE) +
-                   " bytes exceeds limit " +
-                   std::to_string(bc.async_result_size_limit_bytes) + " bytes",
-        .sqlstate = std::nullopt};
+  if (SIZE > limit) {
+    return PromiseRejection{.code = "async.result_size_exceeded",
+                            .message = "result size " + std::to_string(SIZE) +
+                                       " bytes exceeds limit " +
+                                       std::to_string(limit) + " bytes",
+                            .sqlstate = std::nullopt};
   }
   return std::nullopt;
 }
@@ -807,13 +923,36 @@ auto run_audit_write_outcome(const AsyncOp& op) -> OpOutcome {
 //              outer promise's rejection path fires via JS-side
 //              `throw e` after rollback resolves).
 
-auto finalize_batch(BridgeContext& bc, AsyncOp::Type type, AsyncOp op,
+auto finalize_batch(std::shared_ptr<ExecutionLifetime> lifetime,
+                    AsyncOp::Type type, const AsyncOp& op,
                     trantor::EventLoop* main_loop,
                     std::shared_ptr<drogon::orm::Transaction> tx,
-                    std::optional<PromiseRejection> err) -> void {
+                    std::optional<PromiseRejection> err,
+                    bool native_commit_acknowledged = false) -> void {
+  // Borrow op synchronously only. Its snapshots below enter the queue by value;
+  // a setup exception leaves caller metadata intact for the failure finalizer.
+  // Keep an explicit rollback-guarded copy across metadata/callback allocation.
+  // Moving the sole BEGIN pin into a failed queue closure must not auto-COMMIT.
+  // COMMIT has already been issued and supplies no tx here; it is not undone.
+  SearchPathWrap pending_handoff;
+  pending_handoff.tx = tx;
+  pending_handoff.rollback_owner = op.batch_rollback_owner;
+  pending_handoff.domain =
+      op.bc_extension_name.empty() ? nullptr : op.extension_database_clients;
+  if (type == AsyncOp::Type::DB_BATCH_BEGIN && tx) {
+    maybe_fail_native_setup(NativeSetupFailurePoint::batch_begin_metadata);
+  }
+  if (type == AsyncOp::Type::DB_BATCH_COMMIT && native_commit_acknowledged) {
+    maybe_fail_native_setup(NativeSetupFailurePoint::batch_commit_metadata);
+  }
   int cb_id = op.callback_id;
   std::uint64_t scope_id = op.batch_scope_id;
+  const auto operation_count = op.batch_operation_count;
   std::string ext_name = op.bc_extension_name;
+  auto rollback_owner = op.batch_rollback_owner;
+  auto rollback_domain =
+      ext_name.empty() ? nullptr : op.extension_database_clients;
+  const bool rollback_request_pending = op.rollback_request_pending;
   std::string rollback_reason = "db_error";
   std::string rollback_code;
   if (op.rollback_error.isObject() && op.rollback_error.isMember("code")) {
@@ -831,84 +970,137 @@ auto finalize_batch(BridgeContext& bc, AsyncOp::Type type, AsyncOp op,
   // `tx` is moved into the queueInLoop lambda so the main-loop
   // callback owns the sole reference; this avoids a shared_ptr
   // copy (and satisfies performance-unnecessary-value-param).
-  main_loop->queueInLoop([&bc, cb_id, type, scope_id, ext_name, rollback_reason,
-                          rollback_code, main_loop, tx = std::move(tx),
-                          err = std::move(err)]() mutable {
-    if (err.has_value()) {
-      // BEGIN failure never enters the registry; COMMIT /
-      // ROLLBACK failure already ran through the arm, so
-      // clean up the registry defensively in either case.
+  if (type == AsyncOp::Type::DB_BATCH_BEGIN && tx) {
+    maybe_fail_native_setup(NativeSetupFailurePoint::batch_begin_queue);
+  }
+  main_loop->queueInLoop([lifetime, rollback_owner, rollback_domain,
+                          native_commit_acknowledged, rollback_request_pending,
+                          cb_id, type, scope_id, operation_count, ext_name,
+                          rollback_reason, rollback_code, main_loop,
+                          tx = std::move(tx), err = std::move(err)]() mutable {
+    if (type == AsyncOp::Type::DB_BATCH_COMMIT) {
+      plinth::js::clear_batch_timer(scope_id);
+      tx.reset();
       plinth::js::unregister_in_flight_batch(scope_id);
-      bc.reject(cb_id, *err);
-    } else {
-      switch (type) {
-        case AsyncOp::Type::DB_BATCH_BEGIN: {
-          bc.batch_state.pinned_conn = tx;
-          plinth::js::register_in_flight_batch(scope_id, ext_name);
-          // ICD-0.5.3 §B.06 — arm the wall-clock
-          // deadline now that BEGIN succeeded.
-          // Lambda captures `&bc` + `scope_id` by
-          // value; the scope-id match check ensures a
-          // stale fire after a fast COMMIT/ROLLBACK +
-          // re-batch on the same bc no-ops. Discard
-          // paths (`discard_batches_for_extension`,
-          // `discard_all_batches`) invalidate this
-          // timer synchronously, so a destroyed bc can
-          // never see a late fire.
-          std::size_t to_ms = plinth::js::batch_timeout_ms();
-          trantor::TimerId tid = main_loop->runAfter(
-              static_cast<double>(to_ms) / 1000.0, [&bc, scope_id]() {
-                if (bc.batch_state.scope_id == scope_id) {
-                  bc.batch_state.timed_out = true;
-                }
-              });
-          bc.batch_state.timer_id = tid;
-          bc.batch_state.timer_loop = main_loop;
-          plinth::js::set_batch_timer(scope_id, tid, main_loop);
-          bc.resolve(cb_id, Json::Value{});
-          break;
-        }
-        case AsyncOp::Type::DB_BATCH_COMMIT: {
-          std::size_t ops = bc.batch_state.ops_in_batch;
-          plinth::js::clear_batch_timer(scope_id);
-          bc.batch_state = BridgeContext::BatchState{};
-          // COMMIT completed. Return the pinned connection before the
-          // coalescer requests a pool connection for its notification flush.
-          tx.reset();
-          plinth::js::unregister_in_flight_batch(scope_id);
-          plinth::realtime::CoalescerRegistry::instance().flush_batch_scope(
-              scope_id);
-          plinth::js::audit_batch_committed(ext_name, ops);
-          bc.resolve(cb_id, Json::Value{});
-          break;
-        }
-        case AsyncOp::Type::DB_BATCH_ROLLBACK:
-          plinth::js::clear_batch_timer(scope_id);
-          bc.batch_state = BridgeContext::BatchState{};
-          plinth::js::unregister_in_flight_batch(scope_id);
-          plinth::realtime::CoalescerRegistry::instance().discard_batch_scope(
-              scope_id);
-          plinth::js::audit_batch_rolled_back(ext_name, rollback_reason,
-                                              rollback_code);
-          bc.resolve(cb_id, Json::Value{});
-          break;
-        default: break;
+      if (native_commit_acknowledged) {
+        plinth::realtime::CoalescerRegistry::instance().flush_batch_scope(
+            scope_id);
+        plinth::js::audit_batch_committed(ext_name, operation_count);
+      } else {
+        plinth::realtime::CoalescerRegistry::instance().discard_batch_scope(
+            scope_id);
+      }
+      lifetime->finish_commit(scope_id);
+    }
+    if (type == AsyncOp::Type::DB_BATCH_ROLLBACK) {
+      plinth::js::clear_batch_timer(scope_id);
+      plinth::js::unregister_in_flight_batch(scope_id);
+      plinth::realtime::CoalescerRegistry::instance().discard_batch_scope(
+          scope_id);
+      if (!err && !rollback_request_pending) {
+        // Preserve the existing rollback-request audit, not an invented ACK.
+        plinth::js::audit_batch_rolled_back(ext_name, rollback_reason,
+                                            rollback_code);
       }
     }
-    bc.inflight_detached.fetch_sub(1, std::memory_order_acq_rel);
-    bc.signal_completion();
+    const bool delivered = lifetime->visit([&](BridgeContext& bc) {
+      if (err.has_value()) {
+        // BEGIN failure never enters the registry; COMMIT /
+        // ROLLBACK failure already ran through the arm, so
+        // clean up the registry defensively in either case.
+        plinth::js::unregister_in_flight_batch(scope_id);
+        bc.reject(cb_id, *err);
+      } else {
+        switch (type) {
+          case AsyncOp::Type::DB_BATCH_BEGIN: {
+            if (bc.cancelled.load(std::memory_order_acquire) ||
+                bc.batch_state.scope_id != scope_id) {
+              rollback_owner->request(tx, rollback_domain);
+              plinth::js::unregister_in_flight_batch(scope_id);
+              plinth::realtime::CoalescerRegistry::instance()
+                  .discard_batch_scope(scope_id);
+              bc.reject(cb_id,
+                        PromiseRejection{.code = "db.cancelled",
+                                         .message = "execution cancelled",
+                                         .sqlstate = std::nullopt});
+              break;
+            }
+            bc.batch_state.pinned_conn = tx;
+            bc.batch_state.rollback_owner = rollback_owner;
+            plinth::js::register_in_flight_batch(scope_id, ext_name);
+            // ICD-0.5.3 §B.06 — arm the wall-clock
+            // deadline now that BEGIN succeeded.
+            // Weak generation and exact scope fence stale fires after context
+            // retirement/reuse, in addition to registry-owned timer
+            // invalidation.
+            std::size_t to_ms = plinth::js::batch_timeout_ms();
+            trantor::TimerId tid = main_loop->runAfter(
+                static_cast<double>(to_ms) / 1000.0,
+                [weak = std::weak_ptr<ExecutionLifetime>{lifetime},
+                 scope_id]() {
+                  if (auto owner = weak.lock()) {
+                    owner->visit([scope_id](BridgeContext& current) {
+                      if (current.batch_state.scope_id == scope_id) {
+                        current.batch_state.timed_out = true;
+                      }
+                    });
+                  }
+                });
+            bc.batch_state.timer_id = tid;
+            bc.batch_state.timer_loop = main_loop;
+            plinth::js::set_batch_timer(scope_id, tid, main_loop);
+            bc.resolve(cb_id, Json::Value{});
+            break;
+          }
+          case AsyncOp::Type::DB_BATCH_COMMIT: {
+            bc.batch_state = BridgeContext::BatchState{};
+            bc.resolve(cb_id, Json::Value{});
+            break;
+          }
+          case AsyncOp::Type::DB_BATCH_ROLLBACK:
+            bc.batch_state = BridgeContext::BatchState{};
+            bc.resolve(cb_id, Json::Value{});
+            break;
+          default: break;
+        }
+      }
+      bc.inflight_detached.fetch_sub(1, std::memory_order_acq_rel);
+      bc.signal_completion();
+    });
+    if (!delivered) {
+      if (type == AsyncOp::Type::DB_BATCH_COMMIT ||
+          type == AsyncOp::Type::DB_BATCH_ROLLBACK) {
+        // Terminal native bookkeeping already completed above.
+        return;
+      }
+      // No late BC/JS access. A late BEGIN still owns a transaction and must
+      // not auto-commit on final release. This requests rollback; it does not
+      // invent a PostgreSQL acknowledgement or reverse an already committed op.
+      if (tx) {
+        rollback_owner->request(tx, rollback_domain);
+      }
+      plinth::js::clear_batch_timer(scope_id);
+      plinth::js::unregister_in_flight_batch(scope_id);
+      plinth::realtime::CoalescerRegistry::instance().discard_batch_scope(
+          scope_id);
+    }
   });
+  // The accepted queue closure now owns native completion/BEGIN delivery.
+  pending_handoff.tx.reset();
 }
 
 // outlives the coroutine.
-auto handle_db_batch_begin(BridgeContext& bc, AsyncOp op,
-                           trantor::EventLoop* main_loop) -> drogon::Task<> {
+auto handle_db_batch_begin(std::shared_ptr<ExecutionLifetime> lifetime,
+                           AsyncOp op, trantor::EventLoop* main_loop)
+    -> drogon::Task<> {
+  std::shared_ptr<drogon::orm::Transaction> tx;
   try {
     auto db = co_await database_for_operation(op.bc_extension_name,
-                                              op.extension_database_clients);
+                                              op.extension_database_clients,
+                                              lifetime->accepted_lease());
     if (!db) {
-      finalize_batch(bc, AsyncOp::Type::DB_BATCH_BEGIN, std::move(op),
-                     main_loop, nullptr,
+      finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_BEGIN, op, main_loop,
+                     nullptr,
                      PromiseRejection{.code = "db.connection_error",
                                       .message = "no DbClient configured",
                                       .sqlstate = std::nullopt});
@@ -921,27 +1113,50 @@ auto handle_db_batch_begin(BridgeContext& bc, AsyncOp op,
     if (!op.bc_extension_name.empty() &&
         !plinth::js::db::is_valid_extension_name(op.bc_extension_name)) {
       plinth::js::db::audit_search_path_set_failed(op.bc_extension_name, "");
-      finalize_batch(bc, AsyncOp::Type::DB_BATCH_BEGIN, std::move(op),
-                     main_loop, nullptr,
+      finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_BEGIN, op, main_loop,
+                     nullptr,
                      PromiseRejection{
                          .code = "db.search_path.set_failed",
                          .message = "invalid extension identity for SET LOCAL",
                          .sqlstate = std::nullopt});
       co_return;
     }
-    auto tx = co_await db->newTransactionCoro();
+    op.batch_rollback_owner =
+        std::make_shared<NativeRollbackOwner>(lifetime->accepted_lease());
+    auto rollback_domain =
+        op.bc_extension_name.empty() ? nullptr : op.extension_database_clients;
+    {
+      OwnedTransactionAwaiter acquisition{db, lifetime->accepted_lease(),
+                                          op.batch_rollback_owner,
+                                          rollback_domain};
+      tx = co_await acquisition;
+    }
+    op.batch_rollback_owner->attach(tx);
     if (!op.bc_extension_name.empty() &&
         plinth::js::db::search_path_enforced()) {
-      co_await tx->execSqlCoro("SET LOCAL search_path TO ext_" +
-                               op.bc_extension_name + ", plinth");
+      co_await SqlBinderAwaiter{tx,
+                                "SET LOCAL search_path TO ext_" +
+                                    op.bc_extension_name + ", plinth",
+                                {},
+                                lifetime->accepted_lease()};
     }
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_BEGIN, std::move(op), main_loop,
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_BEGIN, op, main_loop,
                    std::move(tx), std::nullopt);
   } catch (const drogon::orm::DrogonDbException& e) {
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_BEGIN, std::move(op), main_loop,
+    if (tx) {
+      op.batch_rollback_owner->request(tx, op.bc_extension_name.empty()
+                                               ? nullptr
+                                               : op.extension_database_clients);
+    }
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_BEGIN, op, main_loop,
                    nullptr, pg_exception_to_rejection(e));
   } catch (const std::exception& e) {
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_BEGIN, std::move(op), main_loop,
+    if (tx) {
+      op.batch_rollback_owner->request(tx, op.bc_extension_name.empty()
+                                               ? nullptr
+                                               : op.extension_database_clients);
+    }
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_BEGIN, op, main_loop,
                    nullptr,
                    PromiseRejection{.code = "db.internal",
                                     .message = std::string{e.what()},
@@ -949,43 +1164,56 @@ auto handle_db_batch_begin(BridgeContext& bc, AsyncOp op,
   }
 }
 
-auto handle_db_batch_commit(BridgeContext& bc, AsyncOp op,
-                            trantor::EventLoop* main_loop) -> drogon::Task<> {
+auto handle_db_batch_commit(std::shared_ptr<ExecutionLifetime> lifetime,
+                            AsyncOp op, trantor::EventLoop* main_loop)
+    -> drogon::Task<> {
+  bool native_commit_acknowledged = false;
   try {
     auto tx = std::move(op.batch_pinned_conn);
     if (!tx) {
       finalize_batch(
-          bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop, nullptr,
+          lifetime, AsyncOp::Type::DB_BATCH_COMMIT, op, main_loop, nullptr,
           PromiseRejection{.code = "db.batch.no_pinned_conn",
                            .message = "batch commit without a pinned conn",
                            .sqlstate = std::nullopt});
       co_return;
     }
-    bool committed = co_await TransactionCommitAwaiter{std::move(tx)};
+    auto rollback_domain =
+        op.bc_extension_name.empty() ? nullptr : op.extension_database_clients;
+    bool committed = false;
+    {
+      TransactionCommitAwaiter commit{std::move(tx), lifetime->accepted_lease(),
+                                      op.batch_rollback_owner, rollback_domain};
+      committed = co_await commit;
+    }
     if (!committed) {
       finalize_batch(
-          bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop, nullptr,
+          lifetime, AsyncOp::Type::DB_BATCH_COMMIT, op, main_loop, nullptr,
           PromiseRejection{.code = "db.internal",
                            .message = "database transaction commit failed",
                            .sqlstate = std::nullopt});
       co_return;
     }
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
-                   nullptr, std::nullopt);
+    native_commit_acknowledged = true;
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_COMMIT, op, main_loop,
+                   nullptr, std::nullopt, native_commit_acknowledged);
   } catch (const drogon::orm::DrogonDbException& e) {
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
-                   nullptr, pg_exception_to_rejection(e));
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_COMMIT, op, main_loop,
+                   nullptr, pg_exception_to_rejection(e),
+                   native_commit_acknowledged);
   } catch (const std::exception& e) {
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_COMMIT, std::move(op), main_loop,
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_COMMIT, op, main_loop,
                    nullptr,
                    PromiseRejection{.code = "db.internal",
                                     .message = std::string{e.what()},
-                                    .sqlstate = std::nullopt});
+                                    .sqlstate = std::nullopt},
+                   native_commit_acknowledged);
   }
 }
 
-auto handle_db_batch_rollback(BridgeContext& bc, AsyncOp op,
-                              trantor::EventLoop* main_loop) -> drogon::Task<> {
+auto handle_db_batch_rollback(std::shared_ptr<ExecutionLifetime> lifetime,
+                              AsyncOp op, trantor::EventLoop* main_loop)
+    -> drogon::Task<> {
   try {
     auto tx = std::move(op.batch_pinned_conn);
     if (tx) {
@@ -993,16 +1221,18 @@ auto handle_db_batch_rollback(BridgeContext& bc, AsyncOp op,
       // auto-commit otherwise (see phase 3 note). The rollback()
       // method flips isCommitedOrRolledback_ so the destructor
       // skips its commit.
-      tx->rollback();
+      op.rollback_request_pending = !op.batch_rollback_owner->request(
+          tx, op.bc_extension_name.empty() ? nullptr
+                                           : op.extension_database_clients);
     }
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_ROLLBACK, std::move(op),
-                   main_loop, tx, std::nullopt);
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_ROLLBACK, op, main_loop,
+                   tx, std::nullopt);
   } catch (const std::exception& e) {
-    // Rollback is best-effort — swallow exceptions and still
-    // resolve the orchestrator promise so the chain proceeds to
-    // reject with the user's original error.
-    finalize_batch(bc, AsyncOp::Type::DB_BATCH_ROLLBACK, std::move(op),
-                   main_loop, nullptr,
+    // Native rollback request failures are retained by their cleanup owner.
+    // Delivery/setup errors here still preserve the user's primary rejection;
+    // they do not release or report successful native cleanup.
+    finalize_batch(lifetime, AsyncOp::Type::DB_BATCH_ROLLBACK, op, main_loop,
+                   nullptr,
                    PromiseRejection{.code = "db.internal",
                                     .message = std::string{e.what()},
                                     .sqlstate = std::nullopt});
@@ -1016,26 +1246,23 @@ auto handle_db_batch_rollback(BridgeContext& bc, AsyncOp op,
 // `bc.resolve` / `bc.reject`, decrement `inflight_detached`, and fire
 // `signal_completion` to wake the outer coroutine.
 //
-// The capture of `bc` is by reference — safe because
-// `run_on_context`'s normal path loops while `inflight_detached > 0`
-// and the cancellation cascade drains inflight with a bounded ceiling
-// before returning. The `BridgeContext` outlives every spawned detached
-// task; see DEFERRED.md "runtime-binder" / "parallel-fanout" entries
-// resolved in 0.3.3.1.
-// outlives the coroutine.
-auto dispatch_async_op_detached(BridgeContext& bc, AsyncOp op,
-                                trantor::EventLoop* main_loop)
+// No worker or queued callback owns a raw BC reference. Native work retains
+// independently owned immutable snapshots and accepted process ownership;
+// owner-loop visit() admits JS delivery only while its generation is current.
+auto dispatch_async_op_detached(std::shared_ptr<ExecutionLifetime> lifetime,
+                                AsyncOp op, trantor::EventLoop* main_loop)
     -> drogon::Task<> {
   // Capture callback id before the switch — the CAP_CALL case
   // std::move's `op` into run_cap_call_outcome.
   int cb_id = op.callback_id;
+  const auto batch_scope_id = op.batch_scope_id;
   OpOutcome outcome;
   switch (op.type) {
     case AsyncOp::Type::DB_QUERY:
-      outcome = co_await run_db_query_outcome(op);
+      outcome = co_await run_db_query_outcome(op, lifetime->accepted_lease());
       break;
     case AsyncOp::Type::DB_EXEC:
-      outcome = co_await run_db_exec_outcome(op);
+      outcome = co_await run_db_exec_outcome(op, lifetime->accepted_lease());
       break;
     case AsyncOp::Type::AUDIT_WRITE:
       outcome = run_audit_write_outcome(op);
@@ -1044,7 +1271,8 @@ auto dispatch_async_op_detached(BridgeContext& bc, AsyncOp op,
       // Identity + call_depth live on the op (captured on the
       // main loop at cap.call enqueue time). No bc.user /
       // bc.call_depth read inside this detached coroutine arm.
-      outcome = co_await run_cap_call_outcome(std::move(op));
+      outcome = co_await run_cap_call_outcome(std::move(op),
+                                              lifetime->accepted_lease());
       break;
     case AsyncOp::Type::PUBSUB_PUBLISH:
       outcome = co_await run_pubsub_publish_outcome(std::move(op));
@@ -1068,16 +1296,51 @@ auto dispatch_async_op_detached(BridgeContext& bc, AsyncOp op,
           .sqlstate = std::nullopt});
       break;
     case AsyncOp::Type::DB_BATCH_BEGIN:
-      // Batch arms manage their own queueInLoop + bc mutation
-      // via finalize_batch — short-circuit the common tail.
-      co_await handle_db_batch_begin(bc, std::move(op), main_loop);
-      co_return;
     case AsyncOp::Type::DB_BATCH_COMMIT:
-      co_await handle_db_batch_commit(bc, std::move(op), main_loop);
+    case AsyncOp::Type::DB_BATCH_ROLLBACK: {
+      // Retain the dispatcher's pin while copying/allocating the child Task.
+      // Its frame must exist before the dispatcher relinquishes cleanup.
+      auto rollback_unhanded = [&op] {
+        if (op.batch_pinned_conn) {
+          op.batch_rollback_owner->request(op.batch_pinned_conn,
+                                           op.bc_extension_name.empty()
+                                               ? nullptr
+                                               : op.extension_database_clients);
+          op.batch_pinned_conn.reset();
+        }
+      };
+      std::optional<PromiseRejection> failure;
+      try {
+        if (op.type == AsyncOp::Type::DB_BATCH_COMMIT) {
+          maybe_fail_native_setup(NativeSetupFailurePoint::batch_commit_task);
+        }
+        auto child = [&]() -> drogon::Task<> {
+          switch (op.type) {
+            case AsyncOp::Type::DB_BATCH_BEGIN:
+              return handle_db_batch_begin(lifetime, op, main_loop);
+            case AsyncOp::Type::DB_BATCH_COMMIT:
+              return handle_db_batch_commit(lifetime, op, main_loop);
+            default: return handle_db_batch_rollback(lifetime, op, main_loop);
+          }
+        }();
+        op.batch_pinned_conn.reset();
+        co_await child;
+      } catch (const drogon::orm::DrogonDbException& e) {
+        rollback_unhanded();
+        failure = pg_exception_to_rejection(e);
+      } catch (const std::exception& e) {
+        rollback_unhanded();
+        failure = PromiseRejection{.code = "db.internal",
+                                   .message = std::string{e.what()},
+                                   .sqlstate = std::nullopt};
+      }
+      if (failure) {
+        const auto type = op.type;
+        finalize_batch(lifetime, type, op, main_loop, nullptr,
+                       std::move(failure));
+      }
       co_return;
-    case AsyncOp::Type::DB_BATCH_ROLLBACK:
-      co_await handle_db_batch_rollback(bc, std::move(op), main_loop);
-      co_return;
+    }
   }
 
   // 0.3.5 result-size check — success outcomes only. Failure paths
@@ -1085,56 +1348,94 @@ auto dispatch_async_op_detached(BridgeContext& bc, AsyncOp op,
   // converted to a rejection here before crossing back to the main
   // loop.
   if (outcome.has_value()) {
-    auto rej = check_result_size(bc, outcome.value());
+    auto rej = check_result_size(lifetime->result_size_limit, outcome.value());
     if (rej.has_value()) {
       outcome = std::unexpected(std::move(*rej));
     }
   }
 
-  main_loop->queueInLoop([&bc, cb_id, outcome = std::move(outcome)]() mutable {
-    if (outcome.has_value()) {
-      bc.resolve(cb_id, outcome.value());
-    } else {
-      bc.reject(cb_id, outcome.error());
+  main_loop->queueInLoop([lifetime, cb_id, batch_scope_id,
+                          outcome = std::move(outcome)]() mutable {
+    bool cancelled = false;
+    const bool delivered = lifetime->visit([&](BridgeContext& bc) {
+      cancelled = bc.cancelled.load(std::memory_order_acquire);
+      if (outcome.has_value()) {
+        bc.resolve(cb_id, outcome.value());
+      } else {
+        bc.reject(cb_id, outcome.error());
+      }
+      bc.inflight_detached.fetch_sub(1, std::memory_order_acq_rel);
+      bc.signal_completion();
+    });
+    if ((!delivered || cancelled) && batch_scope_id != 0 &&
+        !lifetime->commit_pending(batch_scope_id)) {
+      plinth::realtime::CoalescerRegistry::instance().discard_batch_scope(
+          batch_scope_id);
     }
-    bc.inflight_detached.fetch_sub(1, std::memory_order_acq_rel);
-    bc.signal_completion();
   });
 }
 
 // AnyCompletionAwaiter — suspends the outer run_on_context coroutine
 // until any detached task completes (i.e. its queueInLoop callback
-// calls `bc.signal_completion()`). Accumulated signals (wake_count)
+// calls `bc.signal_completion()`). A retained generation wake
 // short-circuit the suspend so a completion that lands between a prior
-// await and the next await isn't lost. The mutex inside BridgeContext
+// await and the next await isn't lost. The execution-state mutex
 // makes the state-transition atomic between the waiter and signaler.
 struct AnyCompletionAwaiter {
-  // is a short-lived stack object co_awaited once; pointer semantics are
-  // equivalent but noisier here.
-  BridgeContext& bc;
+  explicit AnyCompletionAwaiter(std::shared_ptr<ExecutionLifetime> lifetime_in)
+      : lifetime(std::move(lifetime_in)) {}
+  AnyCompletionAwaiter(const AnyCompletionAwaiter&) = delete;
+  auto operator=(const AnyCompletionAwaiter&) -> AnyCompletionAwaiter& = delete;
+  AnyCompletionAwaiter(AnyCompletionAwaiter&&) = delete;
+  auto operator=(AnyCompletionAwaiter&&) -> AnyCompletionAwaiter& = delete;
+  std::shared_ptr<ExecutionLifetime> lifetime;
+  std::size_t lease = 0;
 
-  auto await_ready() noexcept -> bool {
-    std::lock_guard<std::mutex> g{bc.wake_mu};
-    if (bc.wake_count > 0) {
-      bc.wake_count = 0;
-      return true;
-    }
-    return false;
-  }
+  ~AnyCompletionAwaiter() { lifetime->clear_waiter(lease); }
+
+  auto await_ready() noexcept -> bool { return lifetime->consume_wake(); }
 
   auto await_suspend(std::coroutine_handle<> h) noexcept -> bool {
-    std::lock_guard<std::mutex> g{bc.wake_mu};
-    // Late signal — completed between await_ready and await_suspend.
-    if (bc.wake_count > 0) {
-      bc.wake_count = 0;
-      return false; // don't suspend
-    }
-    bc.waiter_handle = h;
-    return true; // suspend
+    return lifetime->suspend(h, lease);
   }
 
   auto await_resume() noexcept -> void {}
 };
+
+// Request, not acknowledgment. Driver-held transaction callbacks retain their
+// accepted lease until native cleanup. Failed requests transfer tx ownership
+// into the process registry; BC can retire without leaving a poisoned pool.
+auto retire_batch_owners(BridgeContext& bc,
+                         const std::shared_ptr<ExecutionLifetime>& lifetime)
+    -> void {
+  auto rollback = [&](const auto& transaction, const auto& owner,
+                      const auto& extension_name) {
+    if (!transaction) {
+      return;
+    }
+    owner->request(transaction,
+                   extension_name.empty() ? nullptr : lifetime->database_owner);
+  };
+  for (const auto& operation : bc.pending_ops) {
+    rollback(operation.batch_pinned_conn, operation.batch_rollback_owner,
+             operation.bc_extension_name);
+  }
+  for (const auto& operation : bc.retired_pending_ops) {
+    rollback(operation.batch_pinned_conn, operation.batch_rollback_owner,
+             operation.bc_extension_name);
+  }
+  rollback(bc.batch_state.pinned_conn, bc.batch_state.rollback_owner,
+           bc.extension_name);
+  const auto scope = bc.batch_state.scope_id;
+  plinth::js::clear_batch_timer(scope);
+  if (!lifetime->commit_pending(scope)) {
+    plinth::js::unregister_in_flight_batch(scope);
+    plinth::realtime::CoalescerRegistry::instance().discard_batch_scope(scope);
+  }
+  bc.batch_state = BridgeContext::BatchState{};
+  bc.pending_ops.clear();
+  bc.retired_pending_ops.clear();
+}
 
 // Cancellation cascade (ICD §Cancellation Cascade): drain in-flight
 // detached tasks up to a 5-second ceiling, then reject every
@@ -1143,20 +1444,28 @@ struct AnyCompletionAwaiter {
 // required to route the returned BridgeContext to
 // RuntimePool::destroy(), not release().
 //
-// 0.3.3.1 upgrade: drain is now "wait for AnyCompletionAwaiter until
-// inflight_detached reaches 0 OR 5 s elapses", not a blind 5 s sleep.
-// This closes the BridgeContext-UAF window that parallel fan-out
-// would otherwise open (outer returns while detached tasks still
-// hold `&bc`). The 5 s ceiling is retained — matches the upper bound
-// 0.3.3 already documented; longer waits risk deadlock if a detached
-// task is stuck inside a PG operation that libpq-level cancel can't
-// preempt. After the ceiling, we bail anyway — same accepted-risk
-// posture as 0.3.3.
-// outlives the coroutine.
-auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start)
+// The original five-second ceiling is driven by an owned timer, not dependent
+// on the first SQL completion. At retirement native work remains process-owned
+// but loses BC/JS access. This does not claim to preempt already dispatched
+// SQL.
+auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start,
+                              std::optional<EvalError> original)
     -> drogon::Task<EvalResult> {
-  auto* loop = trantor::EventLoop::getEventLoopOfCurrentThread();
   auto cancel_deadline = steady_clock::now() + std::chrono::seconds(5);
+  if (!original) {
+    original = EvalError{
+        .kind = bc.wall_clock_exceeded() ? EvalErrorKind::WALL_CLOCK_EXCEEDED
+                                         : EvalErrorKind::CANCELLED,
+        .message = "execution cancelled after 5s abandon window",
+        .line = 0,
+        .column = 0};
+  }
+  // Preserve the captured error; cancellation flags now forbid new host
+  // admission from promise cleanup. This does not cancel already-issued SQL.
+  bc.cancelled.store(true, std::memory_order_release);
+  auto lifetime = bc.execution_lifetime.load(std::memory_order_acquire);
+  retire_batch_owners(bc, lifetime);
+  lifetime->arm_wake(cancel_deadline);
 
   // Step 3: drain detached tasks. Wake-driven — signal_completion
   // decrements inflight_detached and fires the AnyCompletionAwaiter.
@@ -1166,7 +1475,7 @@ auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start)
     if (steady_clock::now() >= cancel_deadline) {
       break;
     }
-    co_await AnyCompletionAwaiter{bc};
+    co_await AnyCompletionAwaiter{lifetime};
   }
 
   // Step 4: reject every outstanding promise so QuickJS releases its
@@ -1191,33 +1500,40 @@ auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start)
                                    .message = "execution cancelled",
                                    .sqlstate = std::nullopt});
   }
-  bc.pending_ops.clear();
+  retire_batch_owners(bc, lifetime);
 
   // Drive the job queue so QuickJS processes the rejections.
   bc.resume_cpu_timer();
-  while (JS_IsJobPending(bc.rt)) {
+  constexpr int JOB_DRAIN_MAX = 4096; // existing RuntimePool teardown bound
+  for (int count = 0; count < JOB_DRAIN_MAX && JS_IsJobPending(bc.rt);
+       ++count) {
     JSContext* pctx = bc.ctx;
     // Best-effort: a reject's .then(undefined, handler) might throw,
     // but at this point we just need to drain the queue.
-    JS_ExecutePendingJob(bc.rt, &pctx);
+    if (JS_ExecutePendingJob(bc.rt, &pctx) < 0) {
+      JSValue exception = JS_GetException(pctx);
+      JS_FreeValue(pctx, exception);
+    }
   }
   bc.pause_cpu_timer();
 
-  // Suppress the unused-variable warning when `loop` was only needed
-  // for a since-removed sleepCoro call on gcc older tidies.
-  (void)loop;
-
-  auto kind = bc.wall_clock_exceeded() ? EvalErrorKind::WALL_CLOCK_EXCEEDED
-                                       : EvalErrorKind::CANCELLED;
+  // A cleanup callback may enqueue bookkeeping (e.g. an unsubscribe). Never
+  // dispatch it, and free its capability owners before the runtime is freed.
+  retire_batch_owners(bc, lifetime);
+  for (auto& [id, callbacks] : bc.callbacks) {
+    (void)id;
+    JS_FreeValue(bc.ctx, callbacks.resolve);
+    JS_FreeValue(bc.ctx, callbacks.reject);
+  }
+  bc.callbacks.clear();
+  if (JS_IsJobPending(bc.rt)) {
+    plinth::log::error(
+        "cancelled execution exceeded existing job cleanup bound");
+  }
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
       steady_clock::now() - start);
-  co_return EvalResult{
-      .value = std::unexpected(
-          EvalError{.kind = kind,
-                    .message = "execution cancelled after 5s abandon window",
-                    .line = 0,
-                    .column = 0}),
-      .duration = duration};
+  co_return EvalResult{.value = std::unexpected(std::move(*original)),
+                       .duration = duration};
 }
 
 // Return true iff the top-level `result` is a pending promise.
@@ -1316,51 +1632,157 @@ auto dispatch_pubsub_unsub_inline(BridgeContext& bc, const AsyncOp& op)
 auto dispatch_ops_batch_fanout(BridgeContext& bc, std::vector<AsyncOp> ops,
                                trantor::EventLoop* main_loop) -> std::size_t {
   std::size_t i = 0;
-  for (; i < ops.size(); ++i) {
-    // Synchronous broker ops — run inline on the main loop (JSValue
-    // construction + broker registry mutation are both trivial and
-    // don't need drogon::async_run). Resolved before the loop
-    // re-enters JS, preserving FIFO semantics with adjacent ops.
-    if (ops[i].type == AsyncOp::Type::PUBSUB_SUBSCRIBE) {
-      dispatch_pubsub_sub_inline(bc, ops[i]);
-      continue;
-    }
-    if (ops[i].type == AsyncOp::Type::PUBSUB_UNSUBSCRIBE) {
-      dispatch_pubsub_unsub_inline(bc, ops[i]);
-      continue;
-    }
-    if (bc.max_concurrent_async_ops == 0) {
-      bc.reject(ops[i].callback_id,
-                PromiseRejection{.code = "async.concurrency_limit",
-                                 .message = "max_concurrent_async_ops is 0",
-                                 .sqlstate = std::nullopt});
-      continue;
-    }
-    if (bc.concurrent_async_ops >= bc.max_concurrent_async_ops) {
-      break;
-    }
-    ++bc.concurrent_async_ops;
-    bc.inflight_detached.fetch_add(1, std::memory_order_acq_rel);
-    drogon::async_run(
-        // `bc` lifetime guarded by cancellation cascade's inflight-drain; `op`
-        // moved into lambda; `main_loop` pointer-stable.
-        [&bc, op = std::move(ops[i]), main_loop]() mutable -> drogon::Task<> {
-          co_await dispatch_async_op_detached(bc, std::move(op), main_loop);
+  try {
+    for (; i < ops.size(); ++i) {
+      // Synchronous broker ops — run inline on the main loop (JSValue
+      // construction + broker registry mutation are both trivial and
+      // don't need drogon::async_run). Resolved before the loop
+      // re-enters JS, preserving FIFO semantics with adjacent ops.
+      if (ops[i].type == AsyncOp::Type::PUBSUB_SUBSCRIBE) {
+        dispatch_pubsub_sub_inline(bc, ops[i]);
+        continue;
+      }
+      if (ops[i].type == AsyncOp::Type::PUBSUB_UNSUBSCRIBE) {
+        dispatch_pubsub_unsub_inline(bc, ops[i]);
+        continue;
+      }
+      if (bc.max_concurrent_async_ops == 0) {
+        if (ops[i].batch_pinned_conn) {
+          ops[i].batch_rollback_owner->request(
+              ops[i].batch_pinned_conn,
+              ops[i].bc_extension_name.empty()
+                  ? nullptr
+                  : ops[i].extension_database_clients);
+          ops[i].batch_pinned_conn.reset();
+        }
+        bc.reject(ops[i].callback_id,
+                  PromiseRejection{.code = "async.concurrency_limit",
+                                   .message = "max_concurrent_async_ops is 0",
+                                   .sqlstate = std::nullopt});
+        continue;
+      }
+      if (bc.concurrent_async_ops >= bc.max_concurrent_async_ops) {
+        break;
+      }
+      auto lifetime = bc.execution_lifetime.load(std::memory_order_acquire);
+      const auto scope = ops[i].batch_scope_id;
+      bool counted = false;
+      bool commit_registered = false;
+      try {
+        // Retain the source operation until handoff succeeds. If allocating the
+        // launch closure fails, its moved copy must not become the last tx
+        // owner.
+        auto operation = std::make_shared<AsyncOp>(ops[i]);
+        if (operation->type == AsyncOp::Type::DB_BATCH_COMMIT) {
+          maybe_fail_native_setup(
+              NativeSetupFailurePoint::dispatcher_commit_task);
+        }
+        // Pre-create this Task before entering Drogon's AsyncTask wrapper.
+        // Otherwise its allocation exception is caught by AsyncTask's fatal
+        // unhandled_exception, rather than this owned fanout failure path.
+        auto dispatch =
+            dispatch_async_op_detached(lifetime, *operation, main_loop);
+        if (operation->type == AsyncOp::Type::DB_BATCH_COMMIT) {
+          lifetime->begin_commit(scope);
+          commit_registered = true;
+        }
+        ++bc.concurrent_async_ops;
+        bc.inflight_detached.fetch_add(1, std::memory_order_acq_rel);
+        counted = true;
+        if (operation->type == AsyncOp::Type::DB_BATCH_COMMIT) {
+          maybe_fail_native_setup(
+              NativeSetupFailurePoint::launcher_commit_task);
+        }
+        drogon::async_run([dispatch = std::move(
+                               dispatch)]() mutable noexcept -> drogon::Task<> {
+          return std::move(dispatch);
         });
+        // Native child now owns this pin. Failure cleanup must never roll back
+        // a dispatched COMMIT by revisiting the source operation copy.
+        ops[i].batch_pinned_conn.reset();
+      } catch (...) {
+        if (counted) {
+          --bc.concurrent_async_ops;
+          bc.inflight_detached.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        if (commit_registered) {
+          lifetime->finish_commit(scope);
+        }
+        throw;
+      }
+    }
+    // Requeue unprocessed ops[i..] before returning.
+    if (i < ops.size()) {
+      requeue_remainder(bc, ops, i);
+    }
+    return i;
+  } catch (...) {
+    // std::vector's standard allocator move assignment does not allocate.
+    // Keep every unlaunched pin owned even if requeue allocation itself fails.
+    bc.retired_pending_ops = std::move(ops);
+    throw;
   }
-  // Requeue unprocessed ops[i..] before returning.
-  if (i < ops.size()) {
-    requeue_remainder(bc, ops, i);
-  }
-  return i;
 }
 
 } // namespace
 
+// No async work in this guard: all remaining pinned/undispatched transaction
+// owners receive rollback requests before generation access is revoked.
+struct ExecutionExit {
+  ExecutionExit(BridgeContext& context,
+                std::shared_ptr<ExecutionLifetime> lifetime_in)
+      : bc(context), lifetime(std::move(lifetime_in)) {}
+  ExecutionExit(const ExecutionExit&) = delete;
+  auto operator=(const ExecutionExit&) -> ExecutionExit& = delete;
+  ExecutionExit(ExecutionExit&&) = delete;
+  auto operator=(ExecutionExit&&) -> ExecutionExit& = delete;
+  BridgeContext& bc;
+  std::shared_ptr<ExecutionLifetime> lifetime;
+  ~ExecutionExit() {
+    retire_batch_owners(bc, lifetime);
+    lifetime->retire([this] {
+      bc.execution_lifetime.store(nullptr, std::memory_order_release);
+    });
+  }
+};
+
 // header: bc outlives the coroutine (owned by RuntimePool).
-auto run_on_context(BridgeContext& bc, std::string_view source)
+auto run_on_context(BridgeContext& bc, std::string_view source,
+                    std::shared_ptr<lifecycle::AsyncTaskLease> accepted)
     -> drogon::Task<EvalResult> {
   auto start = steady_clock::now();
+  // Admission occurs before any owner-loop scheduling hop. An explicitly
+  // inherited lease authorizes descendants of an already accepted request.
+  auto admitted = accepted ? std::move(accepted)
+                           : plinth::lifecycle::async_tasks().try_acquire();
+  if (!admitted) {
+    co_return EvalResult{
+        .value = std::unexpected(EvalError{.kind = EvalErrorKind::CANCELLED,
+                                           .message = "server is shutting down",
+                                           .line = 0,
+                                           .column = 0}),
+        .duration = std::chrono::milliseconds{0}};
+  }
+  auto* main_loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+  if (main_loop == nullptr) {
+    main_loop = drogon::app().getLoop();
+  }
+  auto lifetime =
+      std::make_shared<ExecutionLifetime>(bc, *main_loop, std::move(admitted));
+  std::shared_ptr<ExecutionLifetime> previous;
+  if (!bc.execution_lifetime.compare_exchange_strong(
+          previous, lifetime, std::memory_order_acq_rel)) {
+    co_return EvalResult{
+        .value = std::unexpected(
+            EvalError{.kind = EvalErrorKind::INTERNAL_ASYNC,
+                      .message = "context already has an execution owner",
+                      .line = 0,
+                      .column = 0}),
+        .duration = std::chrono::milliseconds{0}};
+  }
+  // Publish ownership before the scheduling hop: defensive pool calls cannot
+  // destroy a context while this coroutine is queued on its owner loop.
+  ExecutionExit exit{bc, lifetime};
   bc.execution_start = start;
   bc.cpu_time_accumulated = std::chrono::nanoseconds{0};
   bc.cpu_timer_start = {};
@@ -1379,10 +1801,6 @@ auto run_on_context(BridgeContext& bc, std::string_view source)
   // must be stable for the lifetime of run_on_context. We fall back
   // to drogon::app().getLoop() if we're not on a Drogon loop yet
   // (e.g. drogon::sync_wait on a test thread).
-  auto* main_loop = trantor::EventLoop::getEventLoopOfCurrentThread();
-  if (main_loop == nullptr) {
-    main_loop = drogon::app().getLoop();
-  }
 
   // 0.5.5.2 — Pin every JSValue / JSContext touch to `main_loop`.
   // The kernel-loop invariant (run_on_context.cpp:9-12) is "QuickJS
@@ -1410,102 +1828,125 @@ auto run_on_context(BridgeContext& bc, std::string_view source)
   if (!main_loop->isInLoopThread()) {
     co_await drogon::switchThreadCoro(main_loop);
   }
+  OwnedJsValue owned_result{bc.ctx, JS_UNDEFINED};
+  auto& result = owned_result.value;
+  std::optional<EvalError> unexpected_failure;
+  try {
+    lifetime->arm_wake(start + bc.wall_clock_limit);
 
-  // QuickJS uses a thread-local stack base for stack-overflow
-  // detection. The runtime was likely created on a different thread
-  // (RuntimePool ctor / acquire site) than the one this coroutine
-  // resumes on (Drogon event-loop thread), so we re-anchor the
-  // stack base here. Without this, JS_Eval misclassifies any work
-  // as STACK_OVERFLOW.
-  JS_UpdateStackTop(bc.rt);
+    // QuickJS uses a thread-local stack base for stack-overflow
+    // detection. The runtime was likely created on a different thread
+    // (RuntimePool ctor / acquire site) than the one this coroutine
+    // resumes on (Drogon event-loop thread), so we re-anchor the
+    // stack base here. Without this, JS_Eval misclassifies any work
+    // as STACK_OVERFLOW.
+    JS_UpdateStackTop(bc.rt);
 
-  // ICD-0.4.1 Layer 2 — pre-`JS_Eval` GlassWorm gate. Runs before
-  // the CPU-timer bracket per ICD §Layer 2 / Pass ordering. Wraps
-  // the EvalError into the EvalResult shape this coroutine returns.
-  if (auto err = pre_eval_scan(source, "<async>"); err.has_value()) {
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        steady_clock::now() - start);
-    co_return EvalResult{.value = std::unexpected(std::move(*err)),
-                         .duration = duration};
-  }
-
-  bc.resume_cpu_timer();
-  JSValue result = JS_Eval(bc.ctx, source.data(), source.size(), "<extension>",
-                           JS_EVAL_TYPE_GLOBAL);
-  bc.pause_cpu_timer();
-  // 0.5.5.2: latch the memory peak immediately after JS_Eval so a
-  // synchronous OOM (e.g. tight `new Promise(()=>{})` allocation
-  // loop) classifies as MEMORY_LIMIT instead of falling through to
-  // RUNTIME_ERROR. Pre-0.5.5.2 the latch was only updated from
-  // `drive_jobs` (between JS jobs); for a synchronous IIFE that
-  // exhausts the heap inside `JS_Eval` the latch never sets, the
-  // post-OOM classifier reads an empty `name`/`message` (the
-  // property-read path itself OOMs), and `is_runtime_near_memory_
-  // limit` may return false because QuickJS has already reclaimed
-  // the failed allocation by the time we sample. Sampling here
-  // captures the pre-reclaim peak.
-  detail::sample_memory_peak(bc);
-
-  // If JS_Eval threw (and we have nothing to drive), short-circuit.
-  if (JS_IsException(result) && !bc.has_pending_ops() &&
-      !JS_IsJobPending(bc.rt)) {
-    co_return finalize(bc, result, start);
-  }
-
-  // Loop: dispatch pending AsyncOps, drive JS job queue, check
-  // cancellation. Continues until JS execution stalls (no pending
-  // ops, no in-flight detached tasks, no jobs, top-level value
-  // either ready or settled-promise).
-  while (bc.has_pending_ops() || JS_IsJobPending(bc.rt) ||
-         top_result_pending(bc, result) ||
-         bc.inflight_detached.load(std::memory_order_acquire) > 0) {
-    // 1. Fire-and-forget dispatch of any newly queued async ops
-    //    (respecting back-pressure).
-    dispatch_ops_batch_fanout(bc, bc.take_pending_ops(), main_loop);
-
-    // 2. If there are detached tasks in flight and nothing else
-    //    to drive right now, suspend on the completion awaiter so
-    //    detached-task `queueInLoop` resolves can wake us.
-    //
-    //    0.5.5.2: also suspend when pending_ops are blocked by
-    //    back-pressure (concurrent_async_ops at cap). Without this,
-    //    the loop spins on `dispatch_ops_batch_fanout`-no-progress
-    //    + `drive_jobs`-no-jobs while waiting for an inflight to
-    //    free a slot. The original `!has_pending_ops` guard only
-    //    held when the dispatch loop ran on a different thread than
-    //    main_loop (the test fixture's `drogon::sync_wait` spawned a
-    //    worker thread for the dispatch prefix, so main_loop stayed
-    //    free to fire completions). When the dispatcher and
-    //    main_loop share a thread (production HTTP handler path,
-    //    or the test fixture's main-loop-driven path that 0.5.5.2
-    //    moves all tests to), the spin starves completions and
-    //    deadlocks. The back-pressure check here closes that gap.
-    bool back_pressured =
-        bc.has_pending_ops() &&
-        bc.concurrent_async_ops >= bc.max_concurrent_async_ops;
-    if (bc.inflight_detached.load(std::memory_order_acquire) > 0 &&
-        !JS_IsJobPending(bc.rt) && (!bc.has_pending_ops() || back_pressured)) {
-      co_await AnyCompletionAwaiter{bc};
-    }
-
-    // 3. Resume JS to process resolved promises (.then handlers).
-    if (auto err = drive_jobs(bc); err.has_value()) {
-      JS_FreeValue(bc.ctx, result);
+    // ICD-0.4.1 Layer 2 — pre-`JS_Eval` GlassWorm gate. Runs before
+    // the CPU-timer bracket per ICD §Layer 2 / Pass ordering. Wraps
+    // the EvalError into the EvalResult shape this coroutine returns.
+    if (auto err = pre_eval_scan(source, "<async>"); err.has_value()) {
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
           steady_clock::now() - start);
-      co_return EvalResult{.value = std::unexpected(*err),
+      co_return EvalResult{.value = std::unexpected(std::move(*err)),
                            .duration = duration};
     }
 
-    // 4. Cancellation / wall-clock check.
-    if (bc.cancelled.load(std::memory_order_acquire) ||
-        bc.wall_clock_exceeded()) {
-      JS_FreeValue(bc.ctx, result);
-      co_return co_await run_cancellation_cascade(bc, start);
-    }
-  }
+    bc.resume_cpu_timer();
+    result = JS_Eval(bc.ctx, source.data(), source.size(), "<extension>",
+                     JS_EVAL_TYPE_GLOBAL);
+    bc.pause_cpu_timer();
+    // 0.5.5.2: latch the memory peak immediately after JS_Eval so a
+    // synchronous OOM (e.g. tight `new Promise(()=>{})` allocation
+    // loop) classifies as MEMORY_LIMIT instead of falling through to
+    // RUNTIME_ERROR. Pre-0.5.5.2 the latch was only updated from
+    // `drive_jobs` (between JS jobs); for a synchronous IIFE that
+    // exhausts the heap inside `JS_Eval` the latch never sets, the
+    // post-OOM classifier reads an empty `name`/`message` (the
+    // property-read path itself OOMs), and `is_runtime_near_memory_
+    // limit` may return false because QuickJS has already reclaimed
+    // the failed allocation by the time we sample. Sampling here
+    // captures the pre-reclaim peak.
+    detail::sample_memory_peak(bc);
 
-  co_return finalize(bc, result, start);
+    // If JS_Eval threw (and we have nothing to drive), short-circuit.
+    if (JS_IsException(result) && !bc.has_pending_ops() &&
+        !JS_IsJobPending(bc.rt)) {
+      co_return finalize(bc, owned_result.take(), start);
+    }
+
+    // Loop: dispatch pending AsyncOps, drive JS job queue, check
+    // cancellation. Continues until JS execution stalls (no pending
+    // ops, no in-flight detached tasks, no jobs, top-level value
+    // either ready or settled-promise).
+    while (bc.has_pending_ops() || JS_IsJobPending(bc.rt) ||
+           top_result_pending(bc, result) ||
+           bc.inflight_detached.load(std::memory_order_acquire) > 0) {
+      if (bc.cancelled.load(std::memory_order_acquire) ||
+          bc.wall_clock_exceeded()) {
+        owned_result.reset();
+        co_return co_await run_cancellation_cascade(bc, start);
+      }
+      // 1. Fire-and-forget dispatch of any newly queued async ops
+      //    (respecting back-pressure).
+      dispatch_ops_batch_fanout(bc, bc.take_pending_ops(), main_loop);
+
+      // 2. If there are detached tasks in flight and nothing else
+      //    to drive right now, suspend on the completion awaiter so
+      //    detached-task `queueInLoop` resolves can wake us.
+      //
+      //    0.5.5.2: also suspend when pending_ops are blocked by
+      //    back-pressure (concurrent_async_ops at cap). Without this,
+      //    the loop spins on `dispatch_ops_batch_fanout`-no-progress
+      //    + `drive_jobs`-no-jobs while waiting for an inflight to
+      //    free a slot. The original `!has_pending_ops` guard only
+      //    held when the dispatch loop ran on a different thread than
+      //    main_loop (the test fixture's `drogon::sync_wait` spawned a
+      //    worker thread for the dispatch prefix, so main_loop stayed
+      //    free to fire completions). When the dispatcher and
+      //    main_loop share a thread (production HTTP handler path,
+      //    or the test fixture's main-loop-driven path that 0.5.5.2
+      //    moves all tests to), the spin starves completions and
+      //    deadlocks. The back-pressure check here closes that gap.
+      bool back_pressured =
+          bc.has_pending_ops() &&
+          bc.concurrent_async_ops >= bc.max_concurrent_async_ops;
+      if ((bc.inflight_detached.load(std::memory_order_acquire) > 0 ||
+           top_result_pending(bc, result)) &&
+          !JS_IsJobPending(bc.rt) &&
+          (!bc.has_pending_ops() || back_pressured)) {
+        co_await AnyCompletionAwaiter{lifetime};
+      }
+
+      // 3. Resume JS to process resolved promises (.then handlers).
+      if (auto err = drive_jobs(bc); err.has_value()) {
+        owned_result.reset();
+        co_return co_await run_cancellation_cascade(bc, start, std::move(err));
+      }
+
+      // 4. Cancellation / wall-clock check.
+      if (bc.cancelled.load(std::memory_order_acquire) ||
+          bc.wall_clock_exceeded()) {
+        owned_result.reset();
+        co_return co_await run_cancellation_cascade(bc, start);
+      }
+    }
+
+    co_return finalize(bc, owned_result.take(), start);
+  } catch (const std::exception& error) {
+    unexpected_failure = EvalError{.kind = EvalErrorKind::RUNTIME_ERROR,
+                                   .message = error.what(),
+                                   .line = 0,
+                                   .column = 0};
+  } catch (...) {
+    unexpected_failure = EvalError{.kind = EvalErrorKind::RUNTIME_ERROR,
+                                   .message = "native execution failed",
+                                   .line = 0,
+                                   .column = 0};
+  }
+  owned_result.reset();
+  co_return co_await run_cancellation_cascade(bc, start,
+                                              std::move(unexpected_failure));
 }
 
 } // namespace plinth::js

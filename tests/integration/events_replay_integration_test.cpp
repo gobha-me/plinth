@@ -117,7 +117,9 @@ TEST_CASE("I.01: full chain — listener -> writer -> cursor -> WS client",
   auth["type"] = "auth";
   auth["token"] = token;
   client.send_json(auth);
-  REQUIRE(client.receive_json(3s).has_value()); // connected
+  const auto connected = client.receive_json(3s);
+  REQUIRE(connected.has_value());
+  REQUIRE((*connected)["type"].asString() == "connected");
 
   Json::Value sub;
   sub["type"] = "subscribe";
@@ -125,7 +127,9 @@ TEST_CASE("I.01: full chain — listener -> writer -> cursor -> WS client",
   arr.append("plinth:data:ext_i01.t");
   sub["channels"] = arr;
   client.send_json(sub);
-  REQUIRE(client.receive_json(3s).has_value()); // subscribed ack
+  const auto subscribed = client.receive_json(3s);
+  REQUIRE(subscribed.has_value());
+  REQUIRE((*subscribed)["type"].asString() == "subscribed");
 
   // Drive ONE envelope through the listener's dispatch chain. The
   // listener iterates registered handlers in registration order:
