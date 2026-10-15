@@ -608,6 +608,12 @@ constexpr const char* DB_BATCH_ORCHESTRATOR_SRC = R"JS(
 (function () {
   globalThis.__db_batch_orchestrator__ = function (scope_id, fn) {
     return __db_batch_begin__(scope_id).then(function () {
+      function rollback(e) {
+        return __db_batch_rollback__(scope_id, e).then(
+          function () { throw e; },
+          function () { throw e; }
+        );
+      }
       var body;
       try {
         body = fn();
@@ -616,16 +622,19 @@ constexpr const char* DB_BATCH_ORCHESTRATOR_SRC = R"JS(
       }
       return Promise.resolve(body).then(
         function (v) {
-          return __db_batch_commit__(scope_id).then(function () {
-            return v;
-          });
-        },
-        function (e) {
-          return __db_batch_rollback__(scope_id, e).then(
-            function () { throw e; },
-            function () { throw e; }
+          return __db_batch_commit__(scope_id).then(
+            function () { return v; },
+            function (e) {
+              // Only inline deadline rejection retains the transaction.
+              // Native COMMIT outcomes use other mapped error codes.
+              if (e && e.code === 'db.batch.timeout') {
+                return rollback(e);
+              }
+              throw e;
+            }
           );
-        }
+        },
+        rollback
       );
     });
   };
