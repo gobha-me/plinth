@@ -25,8 +25,8 @@ namespace {
 
 constexpr std::size_t ID_MAX_LEN = 64;
 constexpr std::size_t TITLE_MAX_LEN = 256;
-constexpr std::size_t TYPED_MANIFEST_MAX_BYTES = 256 * 1024;
-constexpr std::size_t TYPED_DECLARATION_MAX_BYTES = 16 * 1024;
+constexpr std::size_t TYPED_MANIFEST_MAX_BYTES = std::size_t{256} * 1024;
+constexpr std::size_t TYPED_DECLARATION_MAX_BYTES = std::size_t{16} * 1024;
 
 constexpr std::array<std::string_view, 6> KNOWN_PANEL_FIELDS{
     "id", "client_path", "title", "icon", "rbac_rule", "order",

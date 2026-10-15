@@ -158,8 +158,11 @@ auto finalize_panel_install_order(PGconn& conn, std::string_view package_id)
     }
     std::optional<std::uint64_t> inherited;
     if (PQgetisnull(panels.get(), row, 3) == 0) {
-      if (PQgetisnull(panels.get(), row, 2) != 0 ||
-          !(inherited = parse_order(PQgetvalue(panels.get(), row, 2)))) {
+      if (PQgetisnull(panels.get(), row, 2) != 0) {
+        return std::unexpected("predecessor typed float is missing its order");
+      }
+      inherited = parse_order(PQgetvalue(panels.get(), row, 2));
+      if (!inherited) {
         return std::unexpected("predecessor typed float is missing its order");
       }
       greatest_existing = std::max(greatest_existing, *inherited);

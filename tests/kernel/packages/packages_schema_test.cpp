@@ -558,6 +558,11 @@ TEST_CASE("typed float order allocation follows committed installation order",
   REQUIRE(PQstatus(worker_connection->conn) == CONNECTION_OK);
   const auto worker_pid = std::to_string(PQbackendPID(worker_connection->conn));
   const auto owner_pid = std::to_string(PQbackendPID(s.pg->conn));
+  std::string blocking_query{"SELECT "};
+  blocking_query += owner_pid;
+  blocking_query += "=ANY(pg_blocking_pids(";
+  blocking_query += worker_pid;
+  blocking_query += "))";
   plinth::ws_test::TestPg observer{s.db};
   REQUIRE(PQstatus(observer.conn) == CONNECTION_OK);
   s.command("BEGIN");
@@ -567,8 +572,7 @@ TEST_CASE("typed float order allocation follows committed installation order",
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds{3};
   while (std::chrono::steady_clock::now() < deadline) {
-    auto lock = observer.exec("SELECT " + owner_pid + "=ANY(pg_blocking_pids(" +
-                              worker_pid + "))");
+    auto lock = observer.exec(blocking_query);
     REQUIRE(PQresultStatus(lock.get()) == PGRES_TUPLES_OK);
     if (std::string_view{PQgetvalue(lock.get(), 0, 0)} == "t") {
       blocked = true;

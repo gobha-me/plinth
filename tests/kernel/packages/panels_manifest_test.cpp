@@ -615,8 +615,8 @@ TEST_CASE(
 TEST_CASE(
     "typed surfaces: compact normalized byte and entry limits include defaults",
     "[packages][panels][typed-surfaces]") {
-  constexpr std::size_t declaration_limit = 16 * 1024;
-  constexpr std::size_t manifest_limit = 256 * 1024;
+  constexpr std::size_t declaration_limit = std::size_t{16} * 1024;
+  constexpr std::size_t manifest_limit = std::size_t{256} * 1024;
   auto document = surface_document(surface("primary"));
   document["panels"][0]["padding"] = "";
   auto initial = PanelsManifest::parse(document.dump(), "panels.json");
