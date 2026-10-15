@@ -40,7 +40,7 @@ class HttpTestFixture {
   // is running. Throws if PG is unavailable — call
   // `plinth::ws_test::pg_available()` and SKIP first.
   HttpTestFixture();
-  ~HttpTestFixture() = default;
+  ~HttpTestFixture();
 
   HttpTestFixture(const HttpTestFixture&) = delete;
   auto operator=(const HttpTestFixture&) -> HttpTestFixture& = delete;

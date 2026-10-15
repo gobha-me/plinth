@@ -2,6 +2,7 @@
 //
 // ICD-0.6.1/0.6.2/0.6.3 deferred JS-dispatch contract backfill.
 
+#include "../ws/ws_test_fixture.hpp"
 #include "kernel/auth/middleware.hpp"
 #include "kernel/cap/api_cap.hpp"
 #include "kernel/capabilities/resolution.hpp"
@@ -105,6 +106,7 @@ class ShellDispatchFixture {
   explicit ShellDispatchFixture(std::string_view test_name) {
     plinth::async_bridge_test::ensure_drogon_with_db_running();
     cfg = plinth::async_bridge_test::test_config();
+    plinth::ws_test::settle_fixture_work();
 
     auto suffix = std::to_string(::getpid()) + "_" +
                   std::to_string(scratch_counter.fetch_add(1));
@@ -134,6 +136,8 @@ class ShellDispatchFixture {
     REQUIRE(plinth::packages::rbac_test::start_async_workers());
     REQUIRE(plinth::shell::ensure_bundled_shell_installed(cfg, installer)
                 .has_value());
+    plinth::ws_test::settle_fixture_work();
+    REQUIRE(plinth::packages::rbac_test::start_async_workers());
 
     username = std::string{test_name};
     user_id = add_user(username);
@@ -143,13 +147,12 @@ class ShellDispatchFixture {
     for (const auto& key : successful_set_keys) {
       (void)wait_for_audit(key, 2s);
     }
-    static_cast<void>(plinth::packages::rbac_test::shutdown_async_workers());
+    plinth::ws_test::settle_fixture_work_or_exit();
     plinth::packages::asset_server::cancel_all_registrations();
     static_cast<void>(plinth::extensions::shutdown_registry());
     plinth::capabilities::clear_resolver_for_test();
     std::error_code ec;
     fs::remove_all(root, ec);
-    static_cast<void>(plinth::packages::rbac_test::start_async_workers());
   }
 
   ShellDispatchFixture(const ShellDispatchFixture&) = delete;

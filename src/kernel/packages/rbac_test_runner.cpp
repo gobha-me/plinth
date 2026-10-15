@@ -53,8 +53,9 @@ struct Worker {
 class WorkerRegistry {
  public:
   auto start() -> bool {
+    std::vector<Worker> retired;
     std::lock_guard lock(mu);
-    reap_finished_locked();
+    retired = take_finished_locked();
     if (active != 0) {
       return false;
     }
@@ -64,8 +65,9 @@ class WorkerRegistry {
   }
 
   auto schedule(std::function<void(std::stop_token)> task) -> bool {
+    std::vector<Worker> retired;
     std::lock_guard lock(mu);
-    reap_finished_locked();
+    retired = take_finished_locked();
     if (!accepting) {
       return false;
     }
@@ -76,15 +78,22 @@ class WorkerRegistry {
     try {
       workers.back().thread = std::jthread(
           [this, state, task = std::move(task)](std::stop_token stop) mutable {
-            plinth::db::OperationScope database_operations{stop};
-            try {
-              task(stop);
-            } catch (const std::exception& e) {
-              spdlog::error("rbac_test worker: exception: {}", e.what());
-            } catch (...) {
-              spdlog::error("rbac_test worker: unknown exception");
+            bool clean = true;
+            {
+              plinth::db::OperationScope database_operations{stop};
+              try {
+                task(stop);
+              } catch (const std::exception& e) {
+                spdlog::error("rbac_test worker: exception: {}", e.what());
+              } catch (...) {
+                spdlog::error("rbac_test worker: unknown exception");
+              }
+              // Retire captured owners before publishing completion. A waiter
+              // must not confuse the last SQL statement with the worker tail.
+              task = {};
+              clean = !database_operations.cancellation_failed();
             }
-            finish(state, !database_operations.cancellation_failed());
+            finish(state, clean);
           });
     } catch (...) {
       --active;
@@ -95,6 +104,7 @@ class WorkerRegistry {
   }
 
   auto shutdown(std::chrono::milliseconds timeout) -> bool {
+    std::vector<Worker> retired;
     std::unique_lock lock(mu);
     accepting = false;
     for (auto& worker : workers) {
@@ -103,7 +113,22 @@ class WorkerRegistry {
     bool drained =
         drained_cv.wait_for(lock, timeout, [this] { return active == 0; });
     if (drained) {
-      reap_finished_locked();
+      retired = take_finished_locked();
+    }
+    return drained && cancellation_clean;
+  }
+
+  auto quiesce(std::chrono::milliseconds timeout) -> bool {
+    std::vector<Worker> retired;
+    std::unique_lock lock(mu);
+    // Current workers can enqueue nested timed capability calls. Let those
+    // finish normally, then seal admission atomically with observing zero.
+    // The caller must first stop external producers (e.g. serialized fixtures).
+    bool drained =
+        drained_cv.wait_for(lock, timeout, [this] { return active == 0; });
+    accepting = false; // Failure also stays sealed until an explicit recovery.
+    if (drained) {
+      retired = take_finished_locked();
     }
     return drained && cancellation_clean;
   }
@@ -124,15 +149,20 @@ class WorkerRegistry {
     drained_cv.notify_all();
   }
 
-  auto reap_finished_locked() -> void {
+  // Return retired owners to the caller's outer scope: jthread destruction must
+  // happen AFTER releasing mu, never while another thread may need the lock.
+  auto take_finished_locked() -> std::vector<Worker> {
+    std::vector<Worker> retired;
     auto it = workers.begin();
     while (it != workers.end()) {
       if (it->state->finished) {
+        retired.push_back(std::move(*it));
         it = workers.erase(it);
       } else {
         ++it;
       }
     }
+    return retired;
   }
 
   mutable std::mutex mu;
@@ -1007,6 +1037,15 @@ auto shutdown_async_workers(std::chrono::milliseconds timeout) -> bool {
                   worker_registry().active_count());
   }
   return drained;
+}
+
+auto quiesce_async_workers(std::chrono::milliseconds timeout) -> bool {
+  return worker_registry().quiesce(timeout);
+}
+
+auto test_seam::schedule_worker(std::function<void(std::stop_token)> task)
+    -> bool {
+  return worker_registry().schedule(std::move(task));
 }
 
 auto active_async_worker_count_for_test() -> std::size_t {

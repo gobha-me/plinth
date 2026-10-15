@@ -102,7 +102,7 @@ struct AssertPg {
   }
 };
 
-// Install/enable/upgrade fires a detached RBAC test run that holds the
+// Install/enable/upgrade fires an owned RBAC test run that holds the
 // per-name `pg_try_advisory_lock('plinth.packages.<name>')` lock for a
 // few ms (ICD-0.4.7 slice B). A subsequent upgrade POST issued before
 // the RBAC test settles loses the lock race and 409s with
@@ -436,8 +436,8 @@ TEST_CASE("X.13: two concurrent POSTs same name different versions → one 201 +
       // name-already-installed wins if the first ran fully serial.
       // upgrade-version-not-newer can NOT fire here because both
       // candidates are strictly > 1.2.3.
-      REQUIRE(
-          (kind == "advisory-lock-held" || kind == "name-already-installed"));
+      REQUIRE((kind == "advisory-lock-held" || kind == "in-flight-operation" ||
+               kind == "name-already-installed"));
       ++count_409;
     } else if (code == 400) {
       // The broken-migration POST may serialise after the v2
@@ -455,6 +455,35 @@ TEST_CASE("X.13: two concurrent POSTs same name different versions → one 201 +
   }
   REQUIRE(count_201 == 1);
   REQUIRE((count_409 + count_400_mig) == 1);
+}
+
+TEST_CASE("package upload maps delegated upgrade contention to HTTP 409",
+          "[packages][http-status]") {
+  using plinth::packages::InstallStage;
+  using plinth::packages::test_seam::install_failure_status;
+  for (const auto* kind :
+       {"in-flight-operation", "advisory-lock-held", "name-already-installed",
+        "disabled-version-present", "upgrade-version-not-newer",
+        "upgrade-not-yet-implemented"}) {
+    CAPTURE(kind);
+    REQUIRE(install_failure_status(InstallStage::UPLOADING, kind) ==
+            drogon::k409Conflict);
+  }
+  REQUIRE(install_failure_status(InstallStage::UPLOADING,
+                                 "upgrade-migration-failed") ==
+          drogon::k400BadRequest);
+  REQUIRE(install_failure_status(InstallStage::UPLOADING, "unknown") ==
+          drogon::k400BadRequest);
+  REQUIRE(install_failure_status(InstallStage::UPLOADING, "upload-too-large") ==
+          drogon::k413RequestEntityTooLarge);
+  REQUIRE(
+      install_failure_status(InstallStage::VALIDATING, "in-flight-operation") ==
+      drogon::k422UnprocessableEntity);
+  REQUIRE(
+      install_failure_status(InstallStage::MIGRATING, "in-flight-operation") ==
+      drogon::k422UnprocessableEntity);
+  REQUIRE(install_failure_status(InstallStage::ACTIVE, "in-flight-operation") ==
+          drogon::k500InternalServerError);
 }
 
 // ─── 0.6.0.N session 9 — X.07 missing/changed + X.08 + X.09 ───────────

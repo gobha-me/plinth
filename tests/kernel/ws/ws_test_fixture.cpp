@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <drogon/drogon.h>
 #include <filesystem>
@@ -140,18 +141,46 @@ auto test_config() -> plinth::Config {
   return cfg;
 }
 
-auto reset_schema(const plinth::Config::Database& db) -> void {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds{5};
-  if (!plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}) ||
-      !plinth::log::wait_for_audits(
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              deadline - std::chrono::steady_clock::now()))) {
-    throw std::runtime_error("schema reset requires settled native audits");
+auto settle_fixture_work(std::chrono::milliseconds timeout) -> void {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  auto remaining = [&] {
+    return std::max(std::chrono::milliseconds{0},
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        deadline - std::chrono::steady_clock::now()));
+  };
+  if (!plinth::packages::rbac_test::quiesce_async_workers(remaining()) ||
+      !plinth::lifecycle::async_tasks().drain(remaining()) ||
+      !plinth::log::wait_for_audits(remaining())) {
+    throw std::runtime_error(
+        "fixture reset requires settled workers and audits");
   }
+}
+
+auto settle_fixture_work_or_exit() noexcept -> void {
+  try {
+    settle_fixture_work();
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "fixture cleanup failed: %s\n", error.what());
+    std::_Exit(EXIT_FAILURE);
+  } catch (...) {
+    std::fputs("fixture cleanup failed: unknown drain error\n", stderr);
+    std::_Exit(EXIT_FAILURE);
+  }
+}
+
+auto reset_schema(const plinth::Config::Database& db,
+                  std::chrono::milliseconds timeout,
+                  const std::function<void()>& after_reset) -> void {
+  settle_fixture_work(timeout);
   auto migrations_dir = std::string{CMAKE_SOURCE_DIR} + "/migrations";
   plinth::db::bootstrap_schema(db, migrations_dir, /*dev_mode=*/true);
   plinth::groups::bootstrap_groups(db);
+  if (after_reset) {
+    after_reset();
+  }
+  if (!plinth::packages::rbac_test::start_async_workers()) {
+    throw std::runtime_error("fixture reset could not reopen RBAC admission");
+  }
 }
 
 // ── TestPg ──────────────────────────────────────────────────────

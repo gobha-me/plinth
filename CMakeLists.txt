@@ -1236,6 +1236,33 @@ set_tests_properties(plinth_tests_ws
              LABELS "needs_pg"
              TIMEOUT 180)
 
+# Independent strict oracles keep mapping/worker cleanup and the real HTTP
+# contention journey visible even when grouped Catch output is noisy.
+set(PLINTH_PACKAGE_STATUS_CASE
+  "package upload maps delegated upgrade contention to HTTP 409")
+set(PLINTH_RBAC_QUIESCENCE_CASE
+  "schema reset settles real RBAC workers and refuses unsafe DDL")
+set(PLINTH_RBAC_TAIL_CASE
+  "RBAC quiescence includes capture retirement and reentrant tails")
+set(PLINTH_PACKAGE_CONTENTION_CASE
+  "X.13: two concurrent POSTs same name different versions → one 201 + one 409")
+function(add_plinth_package_boundary_case name selector)
+  add_test(NAME plinth_tests_package_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}" --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_package_${name} PROPERTIES TIMEOUT 70)
+endfunction()
+add_plinth_package_boundary_case(status "${PLINTH_PACKAGE_STATUS_CASE}")
+add_plinth_package_boundary_case(rbac_quiescence "${PLINTH_RBAC_QUIESCENCE_CASE}")
+add_plinth_package_boundary_case(rbac_tail "${PLINTH_RBAC_TAIL_CASE}")
+add_plinth_package_boundary_case(contention "${PLINTH_PACKAGE_CONTENTION_CASE}")
+set_tests_properties(plinth_tests_package_rbac_quiescence
+  plinth_tests_package_contention PROPERTIES
+  RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099" LABELS "needs_pg")
+
 # The Drogon singleton must be untouched before the controlled first-start
 # regression. Exclude only its isolated tag from the shared WS process.
 add_test(NAME plinth_tests_ws_listener_readiness
@@ -1329,6 +1356,9 @@ if(PLINTH_TSAN)
     "production shutdown persists and replays the last extension write" 480)
   add_plinth_tsan_case(production_partial_startup
     "partial startup uses bounded coordinator teardown" 180)
+  add_plinth_tsan_case(rbac_quiescence "${PLINTH_RBAC_QUIESCENCE_CASE}" 60)
+  add_plinth_tsan_case(rbac_tail "${PLINTH_RBAC_TAIL_CASE}" 60)
+  add_plinth_tsan_case(package_contention "${PLINTH_PACKAGE_CONTENTION_CASE}" 60)
 
   # Real EventLoopThread scheduling with a fake connection: no database or
   # process-lifetime Drogon fixture is needed for this owner-affinity oracle.

@@ -88,7 +88,7 @@ auto failure_to_status(InstallStage stage, std::string_view kind)
       return drogon::k413RequestEntityTooLarge;
     }
     if (kind == "name-already-installed" || kind == "advisory-lock-held" ||
-        kind == "disabled-version-present" ||
+        kind == "in-flight-operation" || kind == "disabled-version-present" ||
         kind == "upgrade-version-not-newer" ||
         kind == "upgrade-not-yet-implemented") {
       return drogon::k409Conflict;
@@ -588,6 +588,11 @@ auto register_package_routes(const PackageRoutesConfig& cfg) -> void {
 }
 
 namespace test_seam {
+
+auto install_failure_status(InstallStage stage, std::string_view kind)
+    -> drogon::HttpStatusCode {
+  return failure_to_status(stage, kind);
+}
 
 auto dispatch_post(const drogon::HttpRequestPtr& req,
                    std::function<void(const drogon::HttpResponsePtr&)> cb,
