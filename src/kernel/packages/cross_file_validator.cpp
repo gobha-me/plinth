@@ -254,6 +254,47 @@ auto cf3_panel_rbac_rules(const ParsedPackage& pkg, Reporter& r) -> void {
   }
 }
 
+// Typed float declarations refer to capabilities provided by this exact
+// package. This linkage grants nothing: panel and capability permissions
+// remain independent runtime checks. Legacy metadata is deliberately inert.
+auto cf3_typed_float_capabilities(const ParsedPackage& pkg, Reporter& r)
+    -> void {
+  if (!pkg.panels || pkg.panels->format_version != 2) {
+    return;
+  }
+  for (std::size_t i = 0; i < pkg.panels->panels.size(); ++i) {
+    const auto& panel = pkg.panels->panels[i];
+    if (panel.type != PanelType::FLOAT) {
+      continue;
+    }
+    bool provided = false;
+    if (panel.capability && pkg.manifest && pkg.capabilities) {
+      auto parsed = plinth::capabilities::parse_signature(*panel.capability);
+      if (const auto* signature =
+              std::get_if<plinth::capabilities::ParsedSignature>(&parsed)) {
+        provided =
+            signature->namespace_ == pkg.manifest->name &&
+            std::ranges::any_of(
+                pkg.capabilities->provides, [&](const auto& capability) {
+                  return capability.namespace_ == signature->namespace_ &&
+                         capability.version == signature->version &&
+                         capability.function == signature->function;
+                });
+      }
+    }
+    if (!provided) {
+      r.error(
+          "panel-capability-not-provided",
+          "typed float panels[" + std::to_string(i) +
+              "] must reference an exact capability provided by its package",
+          "panels.json",
+          "declare the package-owned capability in capabilities.json or "
+          "correct the panel capability",
+          Phase::CROSS_FILE);
+    }
+  }
+}
+
 // ─── CF4 — handler file exists for every provided capability ─────────
 
 auto cf4_handler_files(const ParsedPackage& pkg, const fs::path& package_root,
@@ -516,6 +557,7 @@ auto run_cross_file_validation(const ParsedPackage& pkg,
   cf2_rbac_test_call(pkg, r);
   cf3_panel_client_files(pkg, package_root, r);
   cf3_panel_rbac_rules(pkg, r);
+  cf3_typed_float_capabilities(pkg, r);
   cf4_handler_files(pkg, package_root, r);
   cf5_frontend_mount_reserved(pkg, r);
   cf6_name_reserved(pkg, r);

@@ -3,10 +3,11 @@
 **Specification owner:** [#45](https://github.com/gobha-me/plinth/issues/45).
 **Implementation owner:** [#46](https://github.com/gobha-me/plinth/issues/46).
 **Source baseline:** `f677f8d16bc35db2821e11859aa5dce13d37f53c`.
-**Status:** Reviewed delivery specification, not shipped behavior, API
-ratification or a release promise. Concrete engineering proposals below require
-#46's architecture/source review before implementation. Approved product choices
-are distinguished explicitly; no production code changes accompany this paper.
+**Status:** Reviewed delivery specification with the bounded typed-install
+foundation recorded in section 1.1. The remaining catalog, resolver, persistence,
+tray and navigation proposals are not shipped behavior, API ratification or a
+release promise. Concrete engineering proposals require #46's architecture/source
+review. Approved product choices remain distinguished explicitly.
 
 ## 1. Authority, current behavior and sequencing
 
@@ -22,11 +23,13 @@ Current behavior remains separate:
 
 - [Primary discovery and launcher](ICD-application-discovery-launcher.md)
   owns shipped Home/app/tab navigation, retained primaries and generation
-  replacement. Registration uses `PanelType::PRIMARY`; discovery explicitly
-  selects primary rows. That catalog does not authorize floats or trays.
-- `panels_manifest.cpp` recognizes `id`, `client_path`, `title`, `icon`,
-  `rbac_rule`, `order` and the `panels` root. Unknown metadata is inert; database
-  enum support for float/tray is not typed validation or admission.
+  replacement. Legacy registration remains primary; explicitly validated v2
+  registration uses its declared type. Discovery still explicitly selects
+  primary rows. That catalog does not authorize floats or trays.
+- Legacy `panels_manifest.cpp` parsing recognizes `id`, `client_path`, `title`,
+  `icon`, `rbac_rule`, `order` and the `panels` root. Its unknown metadata remains
+  inert. Explicit v2 parsing/registration is the narrower foundation in 1.1,
+  not production typed discovery or permission admission.
 - `panel_api.js` returns the original initial context reference (default `{}`).
   `navigate`, `openFloat`, `requestFocus`, `setTrayState` and `setTrayBadge`
   remain unsupported stubs. `onNavigationIntent` registers an ordered chain,
@@ -64,10 +67,90 @@ an internally resolved target is not working extension `openFloat`. #46 remains
 open until its whole acceptance matrix passes. Notification data is #81; a
 health/performance tray is #55; broader user-deletion protocols remain #97.
 
-Non-goals: implementation here; new SDK methods, grants or settings panels;
+Non-goals beyond the bounded foundation: new SDK methods, grants or settings panels;
 primary catalog/cache changes; arbitrary component/dirty-memory persistence;
 notification APIs; new sequence/replay guarantees; releases, bundling changes,
 repository settings or approval services.
+
+### 1.1 Typed-install foundation and remaining delivery
+
+The first #46 implementation slice is reviewed against public source baseline
+`a4f363418dc8bfdbe950efbe94b1729296d8d079`. It implements explicit format-v2
+declaration parsing/cross-file validation, trusted install provenance, actual
+primary/float/tray registration, typed lifecycle/readiness and durable logical
+handler order. It does **not** implement the prospective surfaces/admission
+resources, default storage/resolution, protected restore policy, persistence,
+SDK adapters, tray chrome or navigation. #46 and the dependent real installed
+float/browser/persistent-descriptor acceptance remain open. The rest of this
+document specifies that remaining delivery, not execution evidence for it.
+
+Existing rows acquire kernel-owned `validated_format_version=0` without inspecting
+their declaration JSON. Only explicit successfully validated v2 install/upgrade
+writes provenance 2. A stored unknown `type`, version or persistence-looking
+field cannot self-certify typed authority on enable, recovery or restart. The
+absence of such markers in repository fixtures does not certify deployed
+packages free of collisions; new explicit installs/upgrades must meet the v2
+contract rather than silently falling back. Legacy six-field rules and inert
+unknown-field round trips are retained.
+
+V2 keeps the existing common field grammar, including the 256-Unicode-scalar
+title rule, with its additional 1,024-byte metadata ceiling. State names use the
+existing bounded icon-token grammar. MIME normalization case-folds ASCII only;
+it does not trim, infer parameters or accept wildcards. Each type/subtype starts
+with an ASCII letter/digit and then uses letters/digits or `!#$&^_.+-`, with one
+slash and the reviewed 128-byte total ceiling. The at-most-32 list may
+be empty (then it handles no content type); an initial tray state necessarily
+requires a nonempty declared map. An optional validated context schema on a
+non-opted-in primary or tray does not activate navigation or persistence.
+Manifest/declaration byte bounds apply to compact normalized JSON, including
+inserted defaults. Duplicate raw keys in an explicit v2 document are refused
+before DOM erasure; ambiguous duplicate root version markers cannot select
+legacy parsing. This is not a generic HTTP/request JSON parser change.
+Structural parsing does not certify native storage success: existing valid-UTF-8
+title semantics are not silently tightened, and PostgreSQL JSONB independently
+refuses escaped NUL in stored metadata. Installation reports that native failure
+rather than rewriting/truncating the value or granting typed readiness.
+
+Each generation's typed float row carries its own nullable-at-registration
+`logical_install_order`. Allocate/inherit it in the transaction that first
+commits that generation ACTIVE: first-install activation or upgrade's T3
+ACTIVE/SUPERSEDED swap, **not** REGISTERING or later runtime-ready publication.
+A committed upgrade whose runtime later fails retains its rank while unready
+and fenced. A singleton kernel-owned NUMERIC(20,0) high-water row allocates exact
+positive uint64 values, holding its row lock through COMMIT so unrelated new
+installs have a durable order. New handlers within one transaction are ordered
+by bytewise panel ID. Exhaustion refuses the transaction; no reset, wrapping,
+gapless numbering or caller-selected rank is promised. No public rank API is
+introduced in this slice.
+
+The new cross-package singleton lock acquisition uses a transaction-local
+`lock_timeout` of at most 10,000 ms, retaining any shorter configured nonzero
+limit and leaving `statement_timeout` and existing cancellation unchanged.
+Restore the caller's prior setting immediately after successful acquisition;
+the acquired row lock still lasts through COMMIT. A failed acquisition/restoration
+returns to the transaction owner's rollback/fence path without retry. This is
+a bound on that one new server-side lock wait, not a whole-helper, runtime
+socket or broader legacy transport deadline.
+
+Copy a rank only from the immediate explicitly validated float predecessor
+with the same application/panel identity. A new or removed-then-reintroduced
+handler, non-float-to-float transition or uninstall/reinstall receives a new
+rank; capability metadata changes alone do not change that logical identity.
+Current copies survive predecessor garbage collection. Enable/restart reuse
+committed ranks, never fill a missing rank on an already installed generation.
+Recovery performing the first ACTIVE transition uses the same transaction
+protocol. A lost COMMIT acknowledgement retains the existing uncertainty/fence
+semantics, not an automatic reallocation. Verified rollback means the existing
+matched database-and-claim restore, which restores provenance/ranks/allocator
+together; it does not add downgrade or historical-generation reactivation APIs.
+
+Typed readiness covers all explicit typed members and their actual assets,
+stored types/provenance, package-owned rule/capability metadata and required
+float ranks, while retaining active-pointer/state/pool/cache/fence checks.
+Primary discovery remains schema 1 and primary-only. A declaration, ready bit,
+essential-looking flag or `persist_keys` request grants neither access nor
+reviewed safe persistence. Later delivery must still freshly authorize each
+catalog/admission/presentation and prove the full acceptance matrix below.
 
 ## 2. Typed declarations and context proposals
 

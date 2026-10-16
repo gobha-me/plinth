@@ -1,3 +1,4 @@
+#include "../ws/ws_test_fixture.hpp"
 #include "kernel/auth/middleware.hpp"
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/config.hpp"
@@ -164,6 +165,73 @@ auto seed_panel(const plinth::Config::Database& db, std::string_view package,
 }
 
 } // namespace
+
+TEST_CASE("primary discovery excludes validated float and tray registrations",
+          "[typed-surface-foundation][frontend][applications][integration]") {
+  REQUIRE(pg_available());
+  const auto db = pg_config();
+  plinth::ws_test::reset_schema(db);
+  struct FixtureBarrier {
+    ~FixtureBarrier() { plinth::ws_test::settle_fixture_work_or_exit(); }
+  } barrier;
+  seed_user(db);
+  seed_rule(db, "typed.read", "typed", "everyone");
+  seed_rule(db, "floatonly.read", "floatonly", "everyone");
+  seed_rule(db, "trayonly.read", "trayonly", "everyone");
+  seed_package(db, "typed", "1.0.0", "ACTIVE", true,
+               R"({"name":"typed","version":"1.0.0"})");
+  seed_package(db, "floatonly", "1.0.0", "ACTIVE", true,
+               R"({"name":"floatonly","version":"1.0.0"})");
+  seed_package(db, "trayonly", "1.0.0", "ACTIVE", true,
+               R"({"name":"trayonly","version":"1.0.0"})");
+  seed_panel(db, "typed", "main",
+             R"({"client_path":"main.js","rbac_rule":"typed.read"})");
+  execute(db, "UPDATE plinth.panels SET validated_format_version=2");
+  execute(
+      db,
+      "INSERT INTO plinth.panels(package_id,panel_id,panel_type,declaration,"
+      "validated_format_version,logical_install_order) "
+      "SELECT id,'preview','float','{\"client_path\":\"preview.js\","
+      "\"rbac_rule\":\"typed.read\",\"title\":\"FLOAT-MUST-NOT-LEAK\"}',2,1 "
+      "FROM plinth.packages WHERE name='typed'");
+  execute(
+      db,
+      "INSERT INTO plinth.panels(package_id,panel_id,panel_type,declaration,"
+      "validated_format_version) "
+      "SELECT id,'status','tray','{\"client_path\":\"status.js\","
+      "\"rbac_rule\":\"typed.read\",\"title\":\"TRAY-MUST-NOT-LEAK\"}',2 "
+      "FROM plinth.packages WHERE name='typed'");
+  execute(
+      db,
+      "INSERT INTO plinth.panels(package_id,panel_id,panel_type,declaration,"
+      "validated_format_version,logical_install_order) "
+      "SELECT id,'only','float','{\"client_path\":\"only.js\","
+      "\"rbac_rule\":\"floatonly.read\"}',2,2 FROM plinth.packages "
+      "WHERE name='floatonly'");
+  execute(
+      db,
+      "INSERT INTO plinth.panels(package_id,panel_id,panel_type,declaration,"
+      "validated_format_version) "
+      "SELECT id,'only','tray','{\"client_path\":\"only.js\","
+      "\"rbac_rule\":\"trayonly.read\"}',2 FROM plinth.packages "
+      "WHERE name='trayonly'");
+  execute(db, "UPDATE plinth.handler_install_order_allocator SET last_value=2");
+  const auto response = dispatch(db, request_for());
+  REQUIRE(response.status == drogon::k200OK);
+  const auto body = nlohmann::json::parse(response.body);
+  REQUIRE(body["schema_version"] == 1);
+  REQUIRE(body["applications"].size() == 1);
+  REQUIRE(body["applications"][0]["id"] == "typed");
+  REQUIRE(body["applications"][0]["panels"].size() == 1);
+  REQUIRE(body["applications"][0]["panels"][0]["id"] == "main");
+  REQUIRE(response.body.find("MUST-NOT-LEAK") == std::string::npos);
+  REQUIRE(response.body.find("floatonly") == std::string::npos);
+  REQUIRE(response.body.find("trayonly") == std::string::npos);
+  REQUIRE(response.body.find("logical_install_order") == std::string::npos);
+  REQUIRE(response.body.find("validated_format_version") == std::string::npos);
+  REQUIRE(response.cache_control == "no-store");
+  REQUIRE(response.vary == "Cookie, Authorization");
+}
 
 TEST_CASE("application discovery rejects a missing authentication context",
           "[frontend][applications][integration]") {

@@ -152,6 +152,132 @@ auto reset_development_schemas(const PgConnection& pg) -> void {
   }
 }
 
+auto ensure_typed_panel_schema(const PgConnection& pg) -> void {
+  // Existing declaration JSON is never evidence of validation. The additive
+  // marker defaults to legacy and no migration interprets old metadata.
+  const bool marker_existed =
+      pg.has_rows("SELECT 1 FROM information_schema.columns WHERE "
+                  "table_schema='plinth' AND table_name='panels' AND "
+                  "column_name='validated_format_version'");
+  const bool allocator_existed = pg.has_rows(
+      "SELECT 1 WHERE to_regclass('plinth.handler_install_order_allocator') "
+      "IS NOT NULL");
+  if (marker_existed && !allocator_existed) {
+    throw std::runtime_error("retained handler order allocator is missing");
+  }
+  pg.exec("BEGIN");
+  pg.exec("ALTER TABLE plinth.panels ADD COLUMN IF NOT EXISTS "
+          "validated_format_version SMALLINT NOT NULL DEFAULT 0");
+  pg.exec("ALTER TABLE plinth.panels ADD COLUMN IF NOT EXISTS "
+          "logical_install_order NUMERIC(20,0)");
+  pg.exec("DO $upgrade$ BEGIN "
+          "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+          "WHERE conrelid='plinth.panels'::regclass AND "
+          "conname='chk_panels_validated_format_version') THEN "
+          "ALTER TABLE plinth.panels ADD CONSTRAINT "
+          "chk_panels_validated_format_version CHECK "
+          "(validated_format_version IN (0,2)); END IF; "
+          "IF NOT EXISTS (SELECT 1 FROM pg_constraint "
+          "WHERE conrelid='plinth.panels'::regclass AND "
+          "conname='chk_panels_logical_install_order') THEN "
+          "ALTER TABLE plinth.panels ADD CONSTRAINT "
+          "chk_panels_logical_install_order CHECK "
+          "(logical_install_order IS NULL OR "
+          "(validated_format_version=2 AND panel_type='float' AND "
+          "logical_install_order>=1 AND "
+          "logical_install_order<=18446744073709551615)); "
+          "END IF; END $upgrade$");
+  pg.exec("CREATE TABLE IF NOT EXISTS "
+          "plinth.handler_install_order_allocator ("
+          "id SMALLINT PRIMARY KEY DEFAULT 1, "
+          "last_value NUMERIC(20,0) NOT NULL DEFAULT 0, "
+          "CONSTRAINT chk_handler_install_order_allocator_id CHECK(id=1), "
+          "CONSTRAINT chk_handler_install_order_allocator_value CHECK "
+          "(last_value>=0 AND last_value<=18446744073709551615))");
+
+  const auto ordinary_column =
+      " AND NOT a.attisdropped AND a.attgenerated='' AND a.attidentity='' ";
+  const auto column_query =
+      "SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d "
+      "ON d.adrelid=a.attrelid AND d.adnum=a.attnum WHERE ";
+  if (!pg.has_rows(std::string{column_query} +
+                   "a.attrelid='plinth.panels'::regclass "
+                   "AND a.attname='validated_format_version' " +
+                   ordinary_column +
+                   "AND a.atttypid='smallint'::regtype AND a.attnotnull "
+                   "AND pg_get_expr(d.adbin,d.adrelid)='0'") ||
+      !pg.has_rows(std::string{column_query} +
+                   "a.attrelid='plinth.panels'::regclass "
+                   "AND a.attname='logical_install_order' " +
+                   ordinary_column +
+                   "AND format_type(a.atttypid,a.atttypmod)='numeric(20,0)' "
+                   "AND NOT a.attnotnull AND d.oid IS NULL") ||
+      !pg.has_rows(
+          std::string{column_query} +
+          "a.attrelid='plinth.handler_install_order_allocator'::regclass "
+          "AND a.attname='id' " +
+          ordinary_column +
+          "AND a.atttypid='smallint'::regtype AND a.attnotnull "
+          "AND pg_get_expr(d.adbin,d.adrelid)='1'") ||
+      !pg.has_rows(
+          std::string{column_query} +
+          "a.attrelid='plinth.handler_install_order_allocator'::regclass "
+          "AND a.attname='last_value' " +
+          ordinary_column +
+          "AND format_type(a.atttypid,a.atttypmod)='numeric(20,0)' "
+          "AND a.attnotnull AND pg_get_expr(d.adbin,d.adrelid)='0'")) {
+    throw std::runtime_error("incompatible typed panel storage columns");
+  }
+  // Compare the actual validated expressions, not only constraint names.
+  // PostgreSQL adds formatting parentheses and implicit numeric/text casts.
+  const auto constraint_query =
+      "SELECT 1 FROM pg_constraint c WHERE c.contype='c' AND c.convalidated "
+      "AND regexp_replace(replace(pg_get_expr(c.conbin,c.conrelid), "
+      "chr(39),''),'[[:space:]()]|::numeric|::text','','g')=";
+  if (!pg.has_rows(std::string{constraint_query} +
+                   "'validated_format_version=ANYARRAY[0,2]' "
+                   "AND c.conrelid='plinth.panels'::regclass "
+                   "AND c.conname='chk_panels_validated_format_version'") ||
+      !pg.has_rows(std::string{constraint_query} +
+                   "'logical_install_orderISNULLORvalidated_format_version=2AND"
+                   "panel_type=floatANDlogical_install_order>=1AND"
+                   "logical_install_order<=18446744073709551615' "
+                   "AND c.conrelid='plinth.panels'::regclass "
+                   "AND c.conname='chk_panels_logical_install_order'") ||
+      !pg.has_rows(std::string{constraint_query} +
+                   "'id=1' AND c.conrelid="
+                   "'plinth.handler_install_order_allocator'::regclass "
+                   "AND c.conname='chk_handler_install_order_allocator_id'") ||
+      !pg.has_rows(
+          std::string{constraint_query} +
+          "'last_value>=0ANDlast_value<=18446744073709551615' "
+          "AND c.conrelid='plinth.handler_install_order_allocator'::regclass "
+          "AND c.conname='chk_handler_install_order_allocator_value'")) {
+    throw std::runtime_error("incompatible typed panel storage constraints");
+  }
+  if (!pg.has_rows(
+          "SELECT 1 FROM pg_constraint c JOIN pg_attribute a "
+          "ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1] "
+          "WHERE c.conrelid='plinth.handler_install_order_allocator'::regclass "
+          "AND c.contype='p' AND cardinality(c.conkey)=1 AND a.attname='id'")) {
+    throw std::runtime_error("incompatible handler order allocator identity");
+  }
+  // Only a truly new migration seeds zero. A missing retained singleton cannot
+  // be repaired from surviving ranks: GC may have removed the highest one.
+  if (!allocator_existed) {
+    pg.exec(
+        "INSERT INTO plinth.handler_install_order_allocator (id,last_value) "
+        "VALUES (1,0)");
+  }
+  if (!pg.has_rows("SELECT 1 WHERE (SELECT count(*) FROM "
+                   "plinth.handler_install_order_allocator)=1 AND EXISTS "
+                   "(SELECT 1 FROM plinth.handler_install_order_allocator "
+                   "WHERE id=1)")) {
+    throw std::runtime_error("retained handler order allocator is missing");
+  }
+  pg.exec("COMMIT");
+}
+
 } // namespace
 
 auto load_schema_sql(const std::string& migrations_dir) -> std::string {
@@ -261,6 +387,8 @@ auto bootstrap_schema(const Config::Database& db_cfg,
             "('ACTIVE','ACTIVE_FLAGGED')); END IF; END $upgrade$");
     pg.exec("COMMIT");
   }
+
+  ensure_typed_panel_schema(pg);
 
   // Kernel-owned, idempotent upgrade for #37 invite registration. Existing
   // retained installations skip schema.sql, so create the digest-only invite

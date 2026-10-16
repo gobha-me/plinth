@@ -168,7 +168,7 @@ auto emit_applications_changed(PGconn* conn)
   return {};
 }
 
-auto has_primary_panels(PGconn* conn, std::string_view package_id)
+auto has_registered_surfaces(PGconn* conn, std::string_view package_id)
     -> std::expected<bool, std::string> {
   std::string id{package_id};
   std::array<const char*, 1> values{id.c_str()};
@@ -176,7 +176,8 @@ auto has_primary_panels(PGconn* conn, std::string_view package_id)
       plinth::db::exec_params(
           conn,
           "SELECT EXISTS(SELECT 1 FROM plinth.panels "
-          "WHERE package_id = $1::uuid AND panel_type = 'primary')",
+          "WHERE package_id = $1::uuid AND (panel_type = 'primary' OR "
+          "(validated_format_version=2 AND panel_type IN ('float','tray'))))",
           1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(result.get()) != PGRES_TUPLES_OK ||
@@ -194,8 +195,20 @@ auto registered_panel_assets_ready(PGconn* conn, std::string_view package_id,
   PgResultPtr result(
       plinth::db::exec_params(
           conn,
-          "SELECT declaration->>'client_path' FROM plinth.panels "
-          "WHERE package_id = $1::uuid AND panel_type = 'primary'",
+          "SELECT pn.declaration->>'client_path', pn.panel_type, "
+          "pn.validated_format_version, pn.logical_install_order::text, "
+          "pn.declaration::text, EXISTS (SELECT 1 FROM plinth.rbac_rules r "
+          "WHERE r.rule=pn.declaration->>'rbac_rule' "
+          "AND r.extension_name=p.name AND r.orphaned_at IS NULL), "
+          "EXISTS (SELECT 1 FROM plinth.capabilities c "
+          "JOIN plinth.rbac_rules r ON r.rule=c.rbac_rule "
+          "AND r.extension_name=p.name AND r.orphaned_at IS NULL "
+          "WHERE c.signature=pn.declaration->>'capability' "
+          "AND c.extension_name=p.name AND c.namespace=p.name "
+          "AND c.provider_type='extension' AND c.enabled), pn.panel_id "
+          "FROM plinth.panels pn JOIN plinth.packages p ON p.id=pn.package_id "
+          "WHERE pn.package_id=$1::uuid AND "
+          "(pn.panel_type='primary' OR pn.validated_format_version=2)",
           1, nullptr, values.data(), nullptr, nullptr, 0),
       PQclear);
   if (PQresultStatus(result.get()) != PGRES_TUPLES_OK) {
@@ -212,6 +225,32 @@ auto registered_panel_assets_ready(PGconn* conn, std::string_view package_id,
     return false;
   }
   for (int row = 0; row < PQntuples(result.get()); ++row) {
+    if (std::string_view{PQgetvalue(result.get(), row, 2)} == "2") {
+      // Only the kernel-owned marker selects typed decoding. Old unknown JSON
+      // never becomes a typed declaration during enable or startup.
+      auto declaration = nlohmann::json::parse(PQgetvalue(result.get(), row, 4),
+                                               nullptr, false);
+      if (declaration.is_discarded()) {
+        return false;
+      }
+      auto parsed = PanelsManifest::parse(
+          nlohmann::json{{"format_version", 2},
+                         {"panels", nlohmann::json::array({declaration})}}
+              .dump(),
+          "registered typed panel");
+      if (!parsed.value || parsed.value->panels.size() != 1 ||
+          parsed.value->panels.front().id != PQgetvalue(result.get(), row, 7) ||
+          panel_type_to_string(parsed.value->panels.front().type) !=
+              PQgetvalue(result.get(), row, 1) ||
+          std::string_view{PQgetvalue(result.get(), row, 5)} != "t") {
+        return false;
+      }
+      if (parsed.value->panels.front().type == PanelType::FLOAT &&
+          (PQgetisnull(result.get(), row, 3) != 0 ||
+           std::string_view{PQgetvalue(result.get(), row, 6)} != "t")) {
+        return false;
+      }
+    }
     if (PQgetisnull(result.get(), row, 0) != 0) {
       return false;
     }
@@ -1136,9 +1175,11 @@ auto run_stage_registering_upgrade(PGconn* admin, std::string_view new_id,
       PanelRegistration preg{
           .package_id = std::string{new_id},
           .panel_id = p.id,
-          .panel_type = PanelType::PRIMARY,
+          .panel_type =
+              panels->format_version == 2 ? p.type : PanelType::PRIMARY,
           .slot_type = std::nullopt,
           .declaration = p.declaration(),
+          .validated_format_version = panels->format_version.value_or(0),
       };
       auto rp = register_panel(*admin, preg);
       if (!rp.has_value()) {
@@ -1226,11 +1267,11 @@ auto run_stage_registering(PGconn* admin, std::string_view id,
       PanelRegistration preg{
           .package_id = std::string{id},
           .panel_id = p.id,
-          .panel_type = PanelType::PRIMARY, // 0.4.4 default; future
-                                            // panels_manifest carries
-                                            // a typed field.
+          .panel_type =
+              panels->format_version == 2 ? p.type : PanelType::PRIMARY,
           .slot_type = std::nullopt,
           .declaration = p.declaration(),
+          .validated_format_version = panels->format_version.value_or(0),
       };
       auto rp = register_panel(*admin, preg);
       if (!rp.has_value()) {
@@ -1967,22 +2008,37 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
     });
   }
   std::string activation_error;
-  std::array<const char*, 2> activation_values{
-      install_uuid.c_str(), application_ready ? "true" : "false"};
-  PgResultPtr activated(
-      plinth::db::exec_params(
-          pg.conn,
-          "UPDATE plinth.packages SET state = 'ACTIVE', "
-          "application_ready = $2::boolean WHERE id = $1::uuid",
-          2, nullptr, activation_values.data(), nullptr, nullptr, 0),
-      PQclear);
-  if (PQresultStatus(activated.get()) != PGRES_COMMAND_OK ||
-      std::string_view{PQcmdTuples(activated.get())} != "1") {
-    activation_error = "application activation update failed";
-  } else if (application_ready) {
-    auto notified = emit_applications_changed(pg.conn);
-    if (!notified.has_value()) {
-      activation_error = notified.error();
+  if (auto ordered = finalize_panel_install_order(*pg.conn, install_uuid);
+      !ordered) {
+    activation_error = ordered.error();
+  }
+  if (activation_error.empty() && panels_opt &&
+      panels_opt->format_version == 2 && application_ready) {
+    auto ready =
+        registered_panel_assets_ready(pg.conn, install_uuid, dest_root);
+    if (!ready || !*ready) {
+      activation_error =
+          ready ? "typed surface readiness verification failed" : ready.error();
+    }
+  }
+  if (activation_error.empty()) {
+    std::array<const char*, 2> activation_values{
+        install_uuid.c_str(), application_ready ? "true" : "false"};
+    PgResultPtr activated(
+        plinth::db::exec_params(
+            pg.conn,
+            "UPDATE plinth.packages SET state = 'ACTIVE', "
+            "application_ready = $2::boolean WHERE id = $1::uuid",
+            2, nullptr, activation_values.data(), nullptr, nullptr, 0),
+        PQclear);
+    if (PQresultStatus(activated.get()) != PGRES_COMMAND_OK ||
+        std::string_view{PQcmdTuples(activated.get())} != "1") {
+      activation_error = "application activation update failed";
+    } else if (application_ready) {
+      auto notified = emit_applications_changed(pg.conn);
+      if (!notified.has_value()) {
+        activation_error = notified.error();
+      }
     }
   }
   bool activation_commit_uncertain = false;
@@ -1994,6 +2050,12 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
     }
   }
   if (!activation_error.empty()) {
+    if (panels_opt && panels_opt->format_version == 2) {
+      // Typed registration is already durable. A failed rank allocation or
+      // readiness check must remain fenced until explicit reconciliation;
+      // rolling back activation alone does not certify typed admission.
+      install_fence.preserve();
+    }
     if (activation_commit_uncertain) {
       // A lost COMMIT acknowledgement may still mean ACTIVE+ready is durable.
       // Retain the verified route/runtime but keep both capability ingress and
@@ -2508,7 +2570,7 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
         TransitionKind::ENABLE, package_id, "db-error", cleared.error()));
   }
 
-  auto panel_presence = has_primary_panels(pg.conn, package_id);
+  auto panel_presence = has_registered_surfaces(pg.conn, package_id);
   if (!panel_presence.has_value()) {
     return std::unexpected(transition_failure(TransitionKind::ENABLE,
                                               package_id, "db-error",
@@ -2976,6 +3038,12 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
       return std::unexpected(begin.error());
     }
     auto rollback = [&]() { static_cast<void>(pg_exec(pg.conn, "ROLLBACK")); };
+    if (state == "ACTIVE") {
+      if (auto ordered = finalize_panel_install_order(*pg.conn, id); !ordered) {
+        rollback();
+        return ordered;
+      }
+    }
     if (auto updated = update_packages_state(pg.conn, id, state);
         !updated.has_value()) {
       rollback();
@@ -3610,7 +3678,9 @@ auto reconcile_application_readiness(const InstallerContext& ctx)
             " JOIN plinth.rbac_rules r "
             "   ON r.rule = pn.declaration->>'rbac_rule' "
             "  AND r.extension_name = p.name AND r.orphaned_at IS NULL "
-            " WHERE pn.package_id = p.id AND pn.panel_type = 'primary' "
+            " WHERE pn.package_id = p.id AND (pn.panel_type = 'primary' OR "
+            " (pn.validated_format_version=2 AND "
+            " pn.panel_type IN ('float','tray'))) "
             "   AND jsonb_typeof(pn.declaration->'client_path') = 'string' "
             "   AND pn.declaration->>'client_path' <> ''"
             "), NOT EXISTS ("
@@ -4285,6 +4355,11 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   };
   {
     RollbackGuard rg{swap_rollback};
+    if (auto ordered = finalize_panel_install_order(*pg.conn, new_id);
+        !ordered) {
+      return std::unexpected(
+          fail_and_mark("upgrade-swap-failed", ordered.error()));
+    }
     std::string old_id_s = existing.id;
     std::array<const char*, 1> old_v = {old_id_s.c_str()};
     PgResultPtr r1(plinth::db::exec_params(
@@ -4460,6 +4535,16 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
 
   const bool new_application_ready =
       panels.has_value() && !panels->panels.empty();
+  if (new_application_ready && panels->format_version == 2) {
+    auto ready =
+        registered_panel_assets_ready(pg.conn, new_id, new_version_dir);
+    if (!ready || !*ready) {
+      return std::unexpected(
+          upgrade_failure(new_id, "readiness-verification-failed",
+                          ready ? "typed surface readiness verification failed"
+                                : ready.error()));
+    }
+  }
   if (new_application_ready) {
     if (auto begin = pg_exec(pg.conn, "BEGIN"); !begin.has_value()) {
       return std::unexpected(

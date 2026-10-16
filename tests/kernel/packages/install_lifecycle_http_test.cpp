@@ -29,6 +29,7 @@
 
 #include "../ws/ws_test_fixture.hpp"
 #include "http_test_fixture.hpp"
+#include "typed_surface_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <drogon/HttpResponse.h>
@@ -58,6 +59,66 @@ auto parse_json_body(const drogon::HttpResponsePtr& resp) -> Json::Value {
 }
 
 } // namespace
+
+TEST_CASE("typed package API registration preserves surface types",
+          "[typed-surface-foundation][integration][packages][http][ws]") {
+  REQUIRE(plinth::ws_test::pg_available());
+  namespace fixture = plinth::typed_surface_test;
+  nlohmann::json declarations;
+  std::string expected;
+  std::string primary_count;
+  SECTION("float only") {
+    declarations = fixture::panels({fixture::floating()});
+    expected = "preview:float:2:1";
+    primary_count = "0";
+  }
+  SECTION("tray only") {
+    declarations = fixture::panels({fixture::tray()});
+    expected = "status:tray:2:NULL";
+    primary_count = "0";
+  }
+  SECTION("mixed") {
+    declarations = fixture::panels(
+        {fixture::primary(), fixture::floating(), fixture::tray()});
+    expected = "editor:primary:2:NULL,preview:float:2:1,status:tray:2:NULL";
+    primary_count = "1";
+  }
+  SECTION("legacy unknown type remains primary") {
+    declarations = {{"panels", {fixture::floating()}}};
+    expected = "preview:primary:0:NULL";
+    primary_count = "1";
+  }
+  plinth::http_test::HttpTestFixture api;
+  fixture::NotesFenceCleanup fence_cleanup;
+  const auto token = api.seed_admin();
+  const auto bytes = fixture::package(declarations);
+  const auto response = api.dispatch(api.build_post(bytes, token));
+  INFO(response->getBody());
+  REQUIRE(response->statusCode() == drogon::k201Created);
+  const auto body = parse_json_body(response);
+  REQUIRE(body["name"].asString() == "notes");
+  REQUIRE(body["version"].asString() == "1.2.3");
+  REQUIRE(body["state"].asString() == "ACTIVE");
+  plinth::ws_test::settle_fixture_work();
+  plinth::ws_test::TestPg observer{plinth::ws_test::test_config().db};
+  const auto rows = observer.exec(
+      "SELECT string_agg(panel_id||':'||panel_type||':'||"
+      "validated_format_version::text||':'||"
+      "COALESCE(logical_install_order::text,'NULL'),',' ORDER BY panel_id "
+      "COLLATE \"C\") FROM plinth.panels");
+  REQUIRE(PQresultStatus(rows.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(rows.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(rows.get(), 0, 0)} == expected);
+  const auto primary = observer.exec("SELECT count(*) FROM plinth.panels "
+                                     "WHERE panel_type='primary'");
+  REQUIRE(PQresultStatus(primary.get()) == PGRES_TUPLES_OK);
+  REQUIRE(std::string{PQgetvalue(primary.get(), 0, 0)} == primary_count);
+  const auto ready = observer.exec("SELECT application_ready::text FROM "
+                                   "plinth.packages WHERE name='notes'");
+  REQUIRE(PQresultStatus(ready.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(ready.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(ready.get(), 0, 0)} == "true");
+}
 
 TEST_CASE("cookie package POST rejects a missing CSRF header before mutation",
           "[integration][packages][http][ws][csrf]") {

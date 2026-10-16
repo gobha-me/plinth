@@ -229,6 +229,14 @@ The existing `id` validation remains unchanged. The launcher adds these rules:
 - entries continue to register as `primary`; #31 does not activate historical
   `type`, `slot_type`, float, settings, or tray declarations.
 
+**Later scoped addition (#46):** This remains the legacy/no-version behavior
+and the historical #31 delivery boundary. Explicit format-v2 installation now
+uses the [typed-install foundation](ICD-shell-trays-resolution-navigation.md#11-typed-install-foundation-and-remaining-delivery)
+for validated primary/float/tray registration, trusted provenance, lifecycle
+readiness and committed logical handler order. Existing stored unknown fields
+are never reinterpreted. This does not expand the schema-1 primary catalog,
+authorize float/tray targets or implement resolver/navigation SDK adapters.
+
 The canonical complete entry, including recognized and forward-compatible
 unknown fields, is stored in `plinth.panels.declaration`. Registration must no
 longer reconstruct a lossy three-field object. `order` remains in the JSON

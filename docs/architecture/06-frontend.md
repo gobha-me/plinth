@@ -26,8 +26,9 @@ alternative frontends.
   specification; #44 mechanism and separately reviewed #45/#46 adapters,
   not shipped behavior or a ratified current subsystem contract).
 - [Trays, resolution and navigation specification](../icd/ICD-shell-trays-resolution-navigation.md)
-  (#45 delivery paper; prospective #46 typed authority, defaults and adapters,
-  not currently available endpoints or a production/API ratification).
+  (#45 delivery specification with #46's bounded typed-install foundation;
+  typed authority endpoints, defaults and adapters remain prospective, not
+  currently available APIs or a production/API ratification).
 - `DESIGN-shell-v06x.md` (the 0.6.x shell arc: bootstrap, schema, the
   panel SDK, the tab/launcher model, floating panels, the system
   tray, content-type negotiation, and intents).
@@ -318,6 +319,18 @@ implements resolver/navigation/floats.
 Extensions register UI panels via `panels.json`. The active frontend design
 provides:
 
+- **Typed-install foundation (#46).** Explicit format-v2 manifests validate
+  primary/float/tray declarations and package-owned float capability linkage.
+  Kernel-owned persisted validation provenance defaults old rows to legacy;
+  stored unknown metadata never activates on restart or enable. Typed readiness
+  retains all lifecycle/asset/runtime/authority prerequisites. Float handler
+  order is allocated transactionally at the first committed ACTIVE generation
+  and inherited only from the immediate same-identity typed predecessor;
+  current rank copies survive predecessor collection. This is metadata/install
+  support, not a typed catalog, permission grant, working SDK adapter or safe
+  persistence approval. The linked specification's section 1.1 records exact
+  bounds, commit/rollback semantics and remaining acceptance. Existing primary
+  discovery remains schema 1 and primary-only.
 - **Primary panel container.** Topbar navigation, content area,
   primary-panel tab strip, and launcher, bounded by
   `ICD-application-discovery-launcher.md`.

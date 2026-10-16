@@ -32,6 +32,8 @@ struct PanelRegistration {
   PanelType panel_type;
   std::optional<SlotType> slot_type;
   nlohmann::json declaration; // arbitrary per-panel JSON from panels.json
+  std::uint32_t validated_format_version = 0;
+  std::optional<std::string> logical_install_order;
 };
 
 // Map enum → DB-CHECK string token.
@@ -41,6 +43,13 @@ struct PanelRegistration {
 // INSERT one (package_id, panel_id, ...) row. Returns an error string
 // on PG failure (including PRIMARY KEY violation).
 auto register_panel(PGconn& conn, const PanelRegistration& reg)
+    -> std::expected<void, std::string>;
+
+// Caller owns the first ACTIVE transaction and package-name admission lock.
+// Inherit only the immediate typed-float predecessor's logical identity; new
+// handlers allocate exact uint64 ranks under a singleton row lock until COMMIT.
+// Already-installed generations with missing ranks fail closed, never backfill.
+auto finalize_panel_install_order(PGconn& conn, std::string_view package_id)
     -> std::expected<void, std::string>;
 
 } // namespace plinth::packages
