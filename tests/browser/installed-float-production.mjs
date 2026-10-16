@@ -6,8 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
-import { installFailureSummary, emitJourneyFailure } from './installed-float-diagnostics.mjs';
-import { boundedStep, observeReadLane, withFrozenReadLane } from './installed-float-coordination.mjs';
+import { installFailureSummary, emitJourneyFailure, createJourneyFailureSteps } from './installed-float-diagnostics.mjs';
+import { boundedStep, createResponseBodyRegistry, observeReadLane, withFrozenReadLane } from './installed-float-coordination.mjs';
 
 const phase = process.argv[2];
 assert(['install', 'verify'].includes(phase), 'owned supervisor phase required');
@@ -31,11 +31,13 @@ const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const fixtureRules = ['floatcaller.panel', 'floatprovider.panel', 'floatprovider.preview'];
 const contexts = [];
 const readLanes = new Map();
+const responseBodies = createResponseBodyRegistry();
 let browser;
 let state;
 let failure;
 const cleanupFailures = [];
 const completed = [];
+const failureSteps = createJourneyFailureSteps();
 
 async function publicPost(path, payload) {
     const response = await fetch(base + path, { method: 'POST',
@@ -193,18 +195,18 @@ function expectedWatch(nativeRequest, targets) {
 }
 function observeFreshResponse(page, select, barrier, deadline) {
     const requests = new Map(), diagnostics = { requests: 0, responses: [] };
-    let resolve, reject, settled = false, closed = false, outcome = null;
+    let resolve, reject, selectedFresh = false, settled = false, closed = false, outcome = null;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     // A click can fail before its observer is awaited; retain a handled promise.
     promise.catch(() => {});
-    const fail = () => {
+    const fail = (error = new Error('native request identity/timing observation failed: ' + JSON.stringify(diagnostics))) => {
         if (settled || closed) return;
         settled = true;
-        outcome = { error: true };
-        reject(new Error('native request identity/timing observation failed: ' + JSON.stringify(diagnostics)));
+        outcome = { error: true, cause: error };
+        reject(error);
     };
     const onRequest = nativeRequest => {
-        if (closed || settled) return;
+        if (closed || settled || selectedFresh) return;
         const selected = select(nativeRequest);
         if (!selected) return;
         if (diagnostics.requests === 64) { fail(); return; }
@@ -212,7 +214,7 @@ function observeFreshResponse(page, select, barrier, deadline) {
         requests.set(nativeRequest, selected);
     };
     const onResponse = response => {
-        if (closed || settled) return;
+        if (closed || settled || selectedFresh) return;
         const nativeRequest = response.request(), selected = requests.get(nativeRequest);
         if (!selected) return;
         requests.delete(nativeRequest);
@@ -224,9 +226,17 @@ function observeFreshResponse(page, select, barrier, deadline) {
             relation, status: response.status(), panels: selected.map(item => item.panel_id) });
         if (relation === 'missing') { fail(); return; }
         if (relation !== 'fresh') return;
-        settled = true;
-        outcome = { response, selected };
-        resolve(outcome);
+        let body;
+        try { body = responseBodies.capture(response); }
+        catch (error) { fail(error); return; }
+        selectedFresh = true;
+        outcome = { response, selected, body };
+        body.settlement.then(result => {
+            if (closed || settled) return;
+            if (!result.ok) { fail(result.error); return; }
+            settled = true;
+            resolve(outcome);
+        }).catch(fail);
     };
     const timer = setTimeout(fail, remaining(deadline));
     page.on('request', onRequest);
@@ -285,7 +295,7 @@ async function observedDefaultOpen(page, record, target, branch) {
         if (logical) {
             const observed = await logical.promise;
             assert.equal(observed.response.status(), 200, 'fresh logical default admission HTTP status');
-            assert.deepEqual(await withinDeadline(observed.response.json(), deadline), {
+            assert.deepEqual(await withinDeadline(observed.body.json(), deadline), {
                 schema_version: 1, results: [{ index: 0, status: 'available', target }],
             }, 'actual default tier resolves the exact authorized installed preview');
         }
@@ -293,7 +303,7 @@ async function observedDefaultOpen(page, record, target, branch) {
             assert.equal(catalogRequests.length, 1, 'ordinary default resolution makes one catalog request');
             const observed = await catalog.promise;
             assert.equal(observed.response.status(), 200, 'fresh automatic resolver catalog HTTP status');
-            const value = await withinDeadline(observed.response.json(), deadline);
+            const value = await withinDeadline(observed.body.json(), deadline);
             assert.deepEqual(value, { schema_version: 1, kind: 'float', targets: [target], next_cursor: null,
                 admin_default_candidate: branch === 'admin'
                     ? { application_id: target.application_id, panel_id: target.panel_id, generation: target.generation } : null },
@@ -326,7 +336,7 @@ function requireUnavailableValue(value, count, diagnostics) {
 }
 async function requireUnavailable(observed, deadline, diagnostics) {
     assert.equal(observed.response.status(), 200, 'fresh native admission HTTP status');
-    requireUnavailableValue(await withinDeadline(observed.response.json(), deadline), observed.selected.length, diagnostics);
+    requireUnavailableValue(await withinDeadline(observed.body.json(), deadline), observed.selected.length, diagnostics);
 }
 function targetArtifactDigest(target) {
     // The closed thirteen-key target has no top-level digest field. The
@@ -350,7 +360,7 @@ async function refusedOpen(page, record, deadline = performance.now() + 15000) {
         await page.locator('#installed-float-open').click({ timeout: remaining(deadline) });
         const observed = await observer.promise;
         assert.equal(observed.response.status(), 200, 'fresh SDK resolver catalog HTTP status');
-        const catalog = await withinDeadline(observed.response.json(), deadline);
+        const catalog = await withinDeadline(observed.body.json(), deadline);
         assert(catalog?.schema_version === 1 && catalog.kind === 'float' &&
             Object.keys(catalog).sort().join(',') === 'admin_default_candidate,kind,next_cursor,schema_version,targets' &&
             Array.isArray(catalog.targets) && catalog.targets.length === 0 &&
@@ -391,7 +401,7 @@ async function revalidateFromUI(page, record, refusedRecord, expectedTargets) {
             const outcome = await Promise.race([observer.promise, retired]);
             assert(!outcome.expired, 'native owner retirement deadline expired');
             const observed = outcome.response ? outcome : observer.peek();
-            if (observed?.error) throw new Error('native request observation failed');
+            if (observed?.error) throw observed.cause;
             if (observed?.response) await requireUnavailable(observed, deadline, observer.diagnostics);
             else fallback = true;
         }
@@ -399,7 +409,7 @@ async function revalidateFromUI(page, record, refusedRecord, expectedTargets) {
             // No forced click or synthetic hint: a genuinely retired owner uses
             // one explicit ordinary SDK intent, with its own fresh Request.
             const observed = observer.peek();
-            if (observed?.error) throw new Error('native request observation failed');
+            if (observed?.error) throw observed.cause;
             if (observed?.response) await requireUnavailable(observed, deadline, observer.diagnostics);
             observer.stop();
             await refusedOpen(page, refusedRecord, deadline);
@@ -510,55 +520,74 @@ try {
         assert.equal(live.persistence_contract, null, 'required unapproved reopen field is live-only');
         assert.deepEqual(await surfaces(denied), [], 'authorization filters before exposure');
         completed.push('real protected policy, captured profile, authorized/denied surface filtering');
-        await openCaller(a);
+        await failureSteps.run('initial-caller', () => openCaller(a));
         const personalWhere = `user_id=${literal(state.accounts.a.id)} AND key='shell.handler_defaults'`;
         const adminWhere = `content_type=${literal(fixtureContentType)}`;
-        assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE ${personalWhere}`), '0');
-        assert.equal(sql(`SELECT count(*) FROM ext_shell.default_apps WHERE ${adminWhere}`), '0');
+        failureSteps.run('default-state', () => {
+            assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE ${personalWhere}`), '0');
+            assert.equal(sql(`SELECT count(*) FROM ext_shell.default_apps WHERE ${adminWhere}`), '0');
+        });
         const personalDefault = { version: 1, choices: [{ content_type: fixtureContentType,
             application_id: 'floatprovider', panel_id: 'preview' }] };
-        const personalSaved = await request(a, '/api/cap/shell.preferences.set', 'POST', {
-            args: { key: 'shell.handler_defaults', value: personalDefault },
+        await failureSteps.run('personal-write', async () => {
+            const personalSaved = await request(a, '/api/cap/shell.preferences.set', 'POST', {
+                args: { key: 'shell.handler_defaults', value: personalDefault },
+            });
+            assert.equal(personalSaved.status, 200);
+            assert.equal(personalSaved.value.ok, true);
+            assert.deepEqual(personalSaved.value.value, { ok: true });
         });
-        assert.equal(personalSaved.status, 200);
-        assert.equal(personalSaved.value.ok, true);
-        assert.deepEqual(personalSaved.value.value, { ok: true });
         try {
-            assert.deepEqual(jsonSql(`SELECT value::text FROM ext_shell.user_preferences WHERE ${personalWhere}`), personalDefault);
-            assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE user_id=${literal(state.accounts.b.id)}
-                AND key='shell.handler_defaults'`), '0', 'personal preference is owned by A only');
-            await closeDefaultFixture(a, await observedDefaultOpen(a, 'fixture-personal-default', preview, 'personal'));
+            failureSteps.run('personal-write', () => {
+                assert.deepEqual(jsonSql(`SELECT value::text FROM ext_shell.user_preferences WHERE ${personalWhere}`), personalDefault);
+                assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE user_id=${literal(state.accounts.b.id)}
+                    AND key='shell.handler_defaults'`), '0', 'personal preference is owned by A only');
+            });
+            const opened = await failureSteps.run('personal-open', () => observedDefaultOpen(a, 'fixture-personal-default', preview, 'personal'));
+            await failureSteps.run('personal-close', () => closeDefaultFixture(a, opened));
         } finally {
-            const deleted = await request(a, '/api/cap/shell.preferences.set', 'POST', { args: { key: 'shell.handler_defaults' } });
-            assert.equal(deleted.status, 200);
-            assert.equal(deleted.value.ok, true);
-            assert.deepEqual(deleted.value.value, { ok: true, deleted: true });
-            assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE ${personalWhere}`), '0');
+            await failureSteps.run('personal-delete', async () => {
+                const deleted = await request(a, '/api/cap/shell.preferences.set', 'POST', { args: { key: 'shell.handler_defaults' } });
+                assert.equal(deleted.status, 200);
+                assert.equal(deleted.value.ok, true);
+                assert.deepEqual(deleted.value.value, { ok: true, deleted: true });
+                assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE ${personalWhere}`), '0');
+            });
         }
         // The administrator manager UI/API is not implemented. Seed exactly
         // this owned preference row, not a grant or a claimed HTTP admin write.
-        assert.equal(sql(`WITH inserted AS (INSERT INTO ext_shell.default_apps(content_type,application_id,panel_id)
-            VALUES (${literal(fixtureContentType)},'floatprovider','preview') RETURNING 1)
-            SELECT count(*) FROM inserted`), '1');
+        failureSteps.run('admin-seed', () => {
+            assert.equal(sql(`WITH inserted AS (INSERT INTO ext_shell.default_apps(content_type,application_id,panel_id)
+                VALUES (${literal(fixtureContentType)},'floatprovider','preview') RETURNING 1)
+                SELECT count(*) FROM inserted`), '1');
+        });
         try {
-            await closeDefaultFixture(a, await observedDefaultOpen(a, 'fixture-admin-default', preview, 'admin'));
+            const opened = await failureSteps.run('admin-open', () => observedDefaultOpen(a, 'fixture-admin-default', preview, 'admin'));
+            await failureSteps.run('admin-close', () => closeDefaultFixture(a, opened));
         } finally {
-            assert.equal(sql(`WITH removed AS (DELETE FROM ext_shell.default_apps WHERE ${adminWhere}
-                AND application_id='floatprovider' AND panel_id='preview' RETURNING 1)
-                SELECT count(*) FROM removed`), '1');
-            assert.equal(sql(`SELECT count(*) FROM ext_shell.default_apps WHERE ${adminWhere}`), '0');
+            failureSteps.run('admin-delete', () => {
+                assert.equal(sql(`WITH removed AS (DELETE FROM ext_shell.default_apps WHERE ${adminWhere}
+                    AND application_id='floatprovider' AND panel_id='preview' RETURNING 1)
+                    SELECT count(*) FROM removed`), '1');
+                assert.equal(sql(`SELECT count(*) FROM ext_shell.default_apps WHERE ${adminWhere}`), '0');
+            });
         }
-        const first = await observedDefaultOpen(a, 'fixture-record-A', preview, 'fallback');
-        const instance = await first.provider.getAttribute('data-instance');
-        assert.match(instance, uuid);
-        await first.provider.locator('.installed-float-unsaved').fill('fake unsaved text must never persist');
-        await first.provider.getByRole('button', { name: 'Request fixture focus', exact: true }).click();
-        const singleton = await a.evaluate(() => ({ sdk: __plinthInstalledFloats.sdk.size,
-            preact: __plinthInstalledFloats.preact.size, hooks: __plinthInstalledFloats.hooks.size }));
-        assert.deepEqual(singleton, { sdk: 1, preact: 1, hooks: 1 });
-        const modules = await a.evaluate(() => performance.getEntriesByType('resource').map(item => item.name).filter(name => name.includes('/_plinth/typed/')));
-        const prefix = new URL(preview.module_url, base).pathname.replace(/[^/]+$/, '');
-        for (const filename of ['preview.js', 'label.js', 'detail.js']) assert(modules.some(name => new URL(name).pathname === prefix + filename), 'actual native captured module graph');
+        const first = await failureSteps.run('fallback-open', () => observedDefaultOpen(a, 'fixture-record-A', preview, 'fallback'));
+        const instance = await failureSteps.run('fallback-focus', async () => {
+            const value = await first.provider.getAttribute('data-instance');
+            assert.match(value, uuid);
+            await first.provider.locator('.installed-float-unsaved').fill('fake unsaved text must never persist');
+            await first.provider.getByRole('button', { name: 'Request fixture focus', exact: true }).click();
+            return value;
+        });
+        await failureSteps.run('fallback-modules', async () => {
+            const singleton = await a.evaluate(() => ({ sdk: __plinthInstalledFloats.sdk.size,
+                preact: __plinthInstalledFloats.preact.size, hooks: __plinthInstalledFloats.hooks.size }));
+            assert.deepEqual(singleton, { sdk: 1, preact: 1, hooks: 1 });
+            const modules = await a.evaluate(() => performance.getEntriesByType('resource').map(item => item.name).filter(name => name.includes('/_plinth/typed/')));
+            const prefix = new URL(preview.module_url, base).pathname.replace(/[^/]+$/, '');
+            for (const filename of ['preview.js', 'label.js', 'detail.js']) assert(modules.some(name => new URL(name).pathname === prefix + filename), 'actual native captured module graph');
+        });
         completed.push('ordinary caller SDK openFloat, ready ID, native relative/dynamic imports, shared modules');
         await save(a, state.accounts.a, ['fixture-record-A']);
         assert.equal(saved(state.accounts.b), null, 'no cross-user descriptor');
@@ -809,6 +838,11 @@ finally {
     readLanes.clear();
     for (const context of contexts) { try { await context.close(); } catch (error) { cleanupFailures.push(error); } }
     if (browser) { try { await browser.close(); } catch (error) { cleanupFailures.push(error); } }
+    try {
+        for (const error of await responseBodies.drain(performance.now() + 2000)) {
+            if (error !== failure && !cleanupFailures.includes(error)) cleanupFailures.push(error);
+        }
+    } catch (error) { cleanupFailures.push(error); }
 }
 // The supervisor drops the exact disposable database and owned filesystem even
 // when install or verify fails. Normal package uninstall is separately required
@@ -849,7 +883,7 @@ if (phase === 'verify' && state && !failure && !cleanupFailures.length) {
     finally { if (browser) { try { await browser.close(); } catch (error) { cleanupFailures.push(error); } } }
 }
 if (failure || cleanupFailures.length) {
-    emitJourneyFailure(phase, completed, failure ?? cleanupFailures[0]);
+    emitJourneyFailure(phase, completed, failure ?? cleanupFailures[0], undefined, failureSteps.failed());
     throw new AggregateError([...(failure ? [failure] : []), ...cleanupFailures], 'installed float journey/cleanup failed');
 }
 if (phase === 'verify') {

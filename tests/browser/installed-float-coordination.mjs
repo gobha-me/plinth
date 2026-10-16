@@ -13,6 +13,45 @@ export async function boundedStep(run, deadline) {
     } finally { clearTimeout(timer); }
 }
 
+export function createResponseBodyRegistry() {
+    const entries = new Set();
+    let closed = false;
+    return Object.freeze({
+        capture(response) {
+            if (closed || entries.size === 64) throw failure();
+            const entry = { observed: false, outcome: null };
+            entries.add(entry);
+            // Invoke immediately: retaining Response alone does not retain its
+            // lazy CDP body after navigation. Attach both handlers immediately.
+            let pending;
+            try { pending = Promise.resolve(response.body()); }
+            catch (error) { pending = Promise.reject(error); }
+            entry.settlement = pending.then(value => {
+                entry.outcome = { ok: true, value }; return entry.outcome;
+            }, error => {
+                entry.outcome = { ok: false, error }; return entry.outcome;
+            });
+            return Object.freeze({ settlement: entry.settlement, async json() {
+                entry.observed = true;
+                const outcome = await entry.settlement;
+                if (!outcome.ok) throw outcome.error;
+                // Match Playwright Response.json without another CDP lookup.
+                return JSON.parse(outcome.value.toString('utf8'));
+            } });
+        },
+        async drain(deadline) {
+            closed = true;
+            // The journey closes its contexts/browser first. If that fails,
+            // never turn this join into an unbounded cleanup wait.
+            await boundedStep(() => Promise.all([...entries].map(entry => entry.settlement)), deadline);
+            const errors = [...entries].filter(entry => !entry.observed && !entry.outcome.ok)
+                .map(entry => entry.outcome.error);
+            entries.clear();
+            return errors;
+        },
+    });
+}
+
 export function observeReadLane(page, origin) {
     const pending = new Map(), waiters = new Set();
     let stopped = false, poisoned = false, draining = false, revision = 0, catalogCompleted = 0;

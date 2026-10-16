@@ -50,6 +50,9 @@ FAILURE_CODES = {'ERR_ASSERTION', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE
                  'ABORT_ERR', 'ENOENT', 'EACCES', 'ETIMEDOUT', 'unknown'}
 FAILURE_OPERATORS = {'strictEqual', 'deepStrictEqual', 'notStrictEqual', 'notDeepStrictEqual',
                      'match', 'doesNotMatch', '==', '===', '!=', '!==', 'ok', 'fail', 'unknown'}
+FAILURE_STEPS = {'initial-caller', 'default-state', 'personal-write', 'personal-open',
+                 'personal-close', 'personal-delete', 'admin-seed', 'admin-open', 'admin-close', 'admin-delete',
+                 'fallback-open', 'fallback-focus', 'fallback-modules'}
 
 
 def safe_browser_failure(stderr, phase):
@@ -74,11 +77,14 @@ def safe_browser_failure(stderr, phase):
             result[key] = value
         return result
 
+    def invalid_constant(_value):
+        raise ValueError('non-JSON diagnostic constant')
+
     try:
         value = json.loads(lines[0], object_pairs_hook=unique_object,
-                           parse_constant=lambda _value: None)
+                           parse_constant=invalid_constant)
         if (not isinstance(value, dict) or set(value) != {'schema_version', 'phase', 'completed_count',
-                'completed_groups', 'source', 'category', 'code', 'operator'} or
+                'completed_groups', 'source', 'failure_step', 'category', 'code', 'operator'} or
             type(value['schema_version']) is not int or value['schema_version'] != 1 or
             value['phase'] != phase or phase not in {'install', 'verify'} or
             type(value['completed_count']) is not int or not 0 <= value['completed_count'] <= len(EXPECTED_CASES) or
@@ -94,7 +100,9 @@ def safe_browser_failure(stderr, phase):
             (source['file'] == 'unknown' and (source['line'] != 0 or source['column'] != 0)) or
             (source['file'] != 'unknown' and (source['line'] == 0 or source['column'] == 0)) or
             value['category'] not in FAILURE_CATEGORIES or value['code'] not in FAILURE_CODES or
-            value['operator'] not in FAILURE_OPERATORS):
+            value['operator'] not in FAILURE_OPERATORS or
+            (value['failure_step'] is not None and (value['failure_step'] not in FAILURE_STEPS or
+                phase != 'verify' or value['completed_count'] != 1))):
             return unavailable
         return value
     except (ValueError, TypeError, RecursionError):

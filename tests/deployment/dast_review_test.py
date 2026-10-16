@@ -41,6 +41,31 @@ PUBLIC_OWNERSHIP_COMMENTS = (
      "rent Preact frame's later unmount callback.",
      "afac0b3696d45db69b08f192d63e6589b639f0c5a16eeaf871b93f770dd05b6e"),
 )
+# Independently read tracked source comments. No private scanner record, URL,
+# account, response, or evidence inventory is copied into these fixtures.
+PUBLIC_FLOAT_COMMENTS = (
+    ("shell.js", "// Capture before any installed panel factory runs; later DOM changes cannot",
+     "panel factory runs; later DOM changes cannot",
+     "6bf5558f9bc01bb74bc29ac41dc2bb39f3230413d40920e745b9c66fd8a81b1b"),
+    ("shell.js", "// select another platform graph for a replacement authenticated frame.",
+     "// select another platform gr",
+     "06e8a5e09a9e3ffcd210b82067bd7118981eed4784abe75ddede32084cbd8e8e"),
+    ("panels/float-transport.js", "// document request owner still fences dispatch from retired frames.",
+     "ill fences dispatch from retired frames.",
+     "a95527fe7ee20c9a6e726ac996c0519ea920c7edd37b5d50f5982aeabbd620cb"),
+    ("panels/float-controller.js", "// successor frame from a retired request.",
+     "// successor frame from a retired request.",
+     "a05ea41128422d95eda5769ef6f6ba140524054430b73f56b9422370b5430b43"),
+    ("panels/float-persistence-adapter.js", "// Validate before transport; no Symbol or caller/user scope is serialized.",
+     "no Symbol or caller/user scope is serialized",
+     "d807b3deb946c34718f4e0ea701c2a5fedbca6754eda0628ab3a510263591618"),
+    ("panels/float-persistence-adapter.js", "/* No authority from status. */",
+     "/* No authority from status. */",
+     "21b58aef6eaee7b0ee6eee68012cfbea5f1174cd0e341b1db9808c2d30476e53"),
+    ("panels/float-resolver.js", "// In particular: NO administrator/catalog request.",
+     "/ In particular: NO administrator/catalog request.",
+     "bbab5c3a56980ae0cb89ff3df54ed89d016decbe4d262144f3945d6769df948e"),
+)
 
 
 def context():
@@ -68,6 +93,22 @@ def run(records, ctx=None):
 
 
 class DastReviewTest(unittest.TestCase):
+    def public_float_records(self):
+        version = (ROOT / "VERSION").read_text().strip()
+        self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
+        self.assertEqual(json.loads((ROOT / "client/shell/manifest.json").read_text())["version"], version)
+        ctx, records = context(), []
+        for number, (relative, comment, evidence, digest) in enumerate(PUBLIC_FLOAT_COMMENTS, 100):
+            body = (ROOT / "client/shell/client" / relative).read_bytes().decode("utf-8")
+            self.assertIn(comment, body)
+            self.assertIn(evidence, comment)
+            self.assertEqual(hashlib.sha256(evidence.encode()).hexdigest(), digest)
+            self.assertIn(digest, COMMENT_DIGESTS[Path(relative).name])
+            path = f"/ext/shell/{version}/{relative}"
+            ctx.assets[path] = body
+            records.append(pair(10027, path, evidence=evidence, body=body, mid=str(number)))
+        return records, ctx
+
     def public_ownership_records(self):
         version = (ROOT / "VERSION").read_text().strip()
         self.assertRegex(version, r"^[0-9]+\.[0-9]+\.[0-9]+$")
@@ -219,6 +260,107 @@ class DastReviewTest(unittest.TestCase):
         self.assertEqual((result[0]["dispositionId"], result[0]["reviewId"]),
                          ("INFORMATIONAL", "REVIEWED_PUBLIC_SOURCE_COMMENT"))
         self.assertEqual(result[0]["risk"], 0)
+
+    def test_actual_float_comments_and_existing_ownership_comments_form_one_exact_group(self):
+        records, ctx = self.public_float_records()
+        existing, old_context = self.public_ownership_records()
+        ctx.assets.update(old_context.assets)
+        self.assertEqual(len(records), 7)
+        for fixture in (records, records + existing):
+            result = run(fixture, ctx)
+            self.assertEqual(len(result), 1)
+            self.assertEqual((result[0]["pluginId"], result[0]["risk"], result[0]["confidence"],
+                              result[0]["dispositionId"], result[0]["reviewId"]),
+                             (10027, 0, 2, "INFORMATIONAL", "REVIEWED_PUBLIC_SOURCE_COMMENT"))
+
+    def test_every_float_comment_digest_is_required_for_the_mixed_group(self):
+        records, ctx = self.public_float_records()
+        existing, old_context = self.public_ownership_records()
+        ctx.assets.update(old_context.assets)
+        for relative, _, _, digest in PUBLIC_FLOAT_COMMENTS:
+            allow = {name: set(values) for name, values in COMMENT_DIGESTS.items()}
+            allow[Path(relative).name].remove(digest)
+            with self.subTest(digest=digest), patch("dast_review.COMMENT_DIGESTS", allow):
+                self.assertEqual(run(records + existing, ctx), [])
+
+    def test_float_comment_changed_truncated_empty_or_unknown_evidence_rejects_whole_group(self):
+        records, ctx = self.public_float_records()
+        for index, record in enumerate(records):
+            evidence = record[0]["evidence"]
+            for altered in (evidence[:-1], evidence[1:], evidence + " changed", "// unknown comment", ""):
+                with self.subTest(member=index, evidence=altered):
+                    changed = copy.deepcopy(records)
+                    changed[index][0]["evidence"] = altered
+                    self.assertEqual(run(changed, ctx), [])
+        unknown = pair(10027, records[0][0]["url"].removeprefix(ORIGIN),
+                       evidence="// unreviewed public comment", body=records[0][1]["responseBody"], mid="999")
+        self.assertEqual(run(records + [unknown], ctx), [])
+
+    def test_float_comment_current_whole_body_version_and_filename_are_required(self):
+        records, ctx = self.public_float_records()
+        for index in range(len(records)):
+            for change in ("body", "version", "file"):
+                changed = copy.deepcopy(records)
+                item = changed[index]
+                if change == "body":
+                    item[1]["responseBody"] += "\n// changed current asset"
+                else:
+                    old = item[0]["url"]
+                    path = old.removeprefix(ORIGIN)
+                    new_path = (re.sub(r"/shell/[^/]+/", "/shell/0.0.0/", path)
+                                if change == "version" else path.rsplit("/", 1)[0] + "/unreviewed.js")
+                    item[0]["url"] = ORIGIN + new_path
+                    item[1]["requestHeader"] = item[1]["requestHeader"].replace(old, ORIGIN + new_path)
+                    if change == "file":
+                        # Even an independently matching body at a different
+                        # filename cannot borrow this filename-scoped digest.
+                        ctx.assets[new_path] = item[1]["responseBody"]
+                with self.subTest(member=index, change=change):
+                    self.assertEqual(run(changed, ctx), [])
+
+    def test_float_comment_rule_http_and_authority_boundaries_are_not_relaxed(self):
+        records, ctx = self.public_float_records()
+        fields = (("pluginId", "10028"), ("alertRef", "10027-1"), ("alertRef", "10027-*"),
+                  ("risk", 1), ("confidence", 1), ("confidence", 3), ("method", "POST"))
+        for index in range(len(records)):
+            for field, value in fields:
+                changed = copy.deepcopy(records[index])
+                changed[0][field] = value
+                if field == "method":
+                    changed[1]["requestHeader"] = changed[1]["requestHeader"].replace("GET ", "POST ", 1)
+                with self.subTest(member=index, field=field):
+                    self.assertEqual(run([changed], ctx), [])
+            for change in ("status", "host", "origin", "route", "duplicate-header"):
+                changed = copy.deepcopy(records[index])
+                if change == "status":
+                    changed[1]["responseHeader"] = changed[1]["responseHeader"].replace("200 Fixture", "404 Fixture")
+                elif change == "host":
+                    changed[1]["requestHeader"] = changed[1]["requestHeader"].replace("Host: plinth.test:8443", "Host: other.test")
+                elif change in ("origin", "route"):
+                    old = changed[0]["url"]
+                    new = old.replace(ORIGIN, "https://other.test:8443") if change == "origin" else ORIGIN + "/app/"
+                    changed[0]["url"] = new
+                    changed[1]["requestHeader"] = changed[1]["requestHeader"].replace(old, new)
+                else:
+                    changed[1]["responseHeader"] = changed[1]["responseHeader"].replace(
+                        "\r\n\r\n", "\r\nContent-Type: text/javascript\r\nContent-Type: text/plain\r\n\r\n")
+                with self.subTest(member=index, change=change):
+                    self.assertEqual(run([changed], ctx), [])
+            for parameter in ("fake-field", "username", " "):
+                self.assertFalse(_review_class("INFORMATIONAL", "REVIEWED_PUBLIC_SOURCE_COMMENT",
+                                               10027, 0, 2, "STATIC", parameter, "10027"))
+
+    def test_float_comment_message_inventory_and_join_are_exact(self):
+        records, ctx = self.public_float_records()
+        alerts, messages = [item[0] for item in records], [item[1] for item in records]
+        self.assertEqual(reviewed_dispositions(alerts, messages[:-1], ORIGIN, ctx), [])
+        self.assertEqual(reviewed_dispositions(alerts, messages + [messages[0]], ORIGIN, ctx), [])
+        for index in range(len(records)):
+            for identifier in ("999", "01", records[(index + 3) % len(records)][1]["id"]):
+                changed = copy.deepcopy(records)
+                changed[index][0]["messageId"] = identifier
+                with self.subTest(member=index, identifier=identifier):
+                    self.assertEqual(run(changed, ctx), [])
 
     def test_public_ownership_comment_changed_truncated_unknown_or_empty_evidence_rejects_group(self):
         records, ctx = self.public_ownership_records()

@@ -43,6 +43,9 @@ COMMENT_DIGESTS = {
         "2f311734e5ba5b0e03cf915b707bd8ed82a0b07d577b7fca852409dd608f0ead",
         # Public ICD/capability-name compatibility explanation.
         "e27fc039f222f9deeaddccfeb57f882d039c788495f405278e9029bbdb018cc2",
+        # Public captured-platform profile selection before installed code runs.
+        "6bf5558f9bc01bb74bc29ac41dc2bb39f3230413d40920e745b9c66fd8a81b1b",
+        "06e8a5e09a9e3ffcd210b82067bd7118981eed4784abe75ddede32084cbd8e8e",
     }),
     "runtime-config.js": frozenset({
         "99844512c709ee6b4b0876da0061f42faaa0ca1f729b3c78ca885d9cdfb5babc",
@@ -61,6 +64,23 @@ COMMENT_DIGESTS = {
     "float-chrome.js": frozenset({
         # Public layer-owned UI-reference cleanup explanation before unmount.
         "afac0b3696d45db69b08f192d63e6589b639f0c5a16eeaf871b93f770dd05b6e",
+    }),
+    "float-transport.js": frozenset({
+        # Public retired-frame dispatch fence after physical body settlement.
+        "a95527fe7ee20c9a6e726ac996c0519ea920c7edd37b5d50f5982aeabbd620cb",
+    }),
+    "float-controller.js": frozenset({
+        # Public late-terminal ownership fence, not a credential or runtime value.
+        "a05ea41128422d95eda5769ef6f6ba140524054430b73f56b9422370b5430b43",
+    }),
+    "float-persistence-adapter.js": frozenset({
+        # Public wire-serialization boundary and non-authoritative status callback.
+        "d807b3deb946c34718f4e0ea701c2a5fedbca6754eda0628ab3a510263591618",
+        "21b58aef6eaee7b0ee6eee68012cfbea5f1174cd0e341b1db9808c2d30476e53",
+    }),
+    "float-resolver.js": frozenset({
+        # Public personal-default short-circuit, not private administrator data.
+        "bbab5c3a56980ae0cb89ff3df54ed89d016decbe4d262144f3945d6769df948e",
     }),
 }
 

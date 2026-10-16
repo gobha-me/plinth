@@ -38,24 +38,42 @@ const failureOperators = new Set(['strictEqual', 'deepStrictEqual', 'notStrictEq
 const failureCategories = new Map([['AssertionError', 'assertion'], ['TimeoutError', 'timeout'],
     ['TypeError', 'type'], ['RangeError', 'range'], ['SyntaxError', 'syntax'],
     ['AggregateError', 'aggregate'], ['Error', 'operation']]);
+const failureSteps = new Set(['initial-caller', 'default-state', 'personal-write', 'personal-open',
+    'personal-close', 'personal-delete', 'admin-seed', 'admin-open', 'admin-close', 'admin-delete',
+    'fallback-open', 'fallback-focus', 'fallback-modules']);
 
-export function journeyFailureSummary(phase, completed, error) {
+export function createJourneyFailureSteps() {
+    let failed = null;
+    return Object.freeze({ failed: () => failed, run(step, action) {
+        const rejected = error => { failed = failureSteps.has(step) ? step : null; throw error; };
+        try {
+            const value = action();
+            return value && typeof value.then === 'function' ? Promise.resolve(value).catch(rejected) : value;
+        } catch (error) { return rejected(error); }
+    } });
+}
+
+export function journeyFailureSummary(phase, completed, error, failedStep = null) {
     // Only a known source basename and finite coordinates leave the private
     // stack. No message, actual/expected value, path, URL or identifier escapes.
     const source = { file: 'unknown', line: 0, column: 0 };
     const stack = typeof error?.stack === 'string' ? error.stack.slice(0, 16384) : '';
-    const frame = stack.match(/^\s+at (?:[^\r\n()]*\()?file:\/\/[^\r\n()]*\/installed-float-production\.mjs:([1-9][0-9]{0,5}):([1-9][0-9]{0,5})\)?\s*$/m);
+    // Playwright may rewrite a known frame to a plain path. Node names timer
+    // callbacks with this exact alias; never accept arbitrary bracketed text.
+    // This is format support, not an assertion about any particular CI failure.
+    const frame = stack.match(/^\s+at (?:async )?(?:[A-Za-z0-9_.$<>]{1,128}(?: \[as _onTimeout\])? \()?(?:file:\/\/[^\r\n()]*\/|\/[^\r\n()]*\/|tests\/browser\/)?installed-float-production\.mjs:([1-9][0-9]{0,5}):([1-9][0-9]{0,5})\)?\s*$/m);
     if (frame) Object.assign(source, { file: 'installed-float-production.mjs', line: Number(frame[1]), column: Number(frame[2]) });
     const count = Array.isArray(completed) && completed.length <= 12 ? completed.length : 0;
     return JSON.stringify({ schema_version: 1, phase: phase === 'install' || phase === 'verify' ? phase : 'unknown',
         completed_count: count, completed_groups: Array.from({ length: count }, (_, index) => index + 1), source,
+        failure_step: phase === 'verify' && count === 1 && failureSteps.has(failedStep) ? failedStep : null,
         category: failureCategories.get(error?.name) ?? 'unknown',
         code: failureCodes.has(error?.code) ? error.code : 'unknown',
         operator: failureOperators.has(error?.operator) ? error.operator : 'unknown' });
 }
 
-export function emitJourneyFailure(phase, completed, error, write = line => console.error(line)) {
-    try { write(journeyFailurePrefix + journeyFailureSummary(phase, completed, error)); }
+export function emitJourneyFailure(phase, completed, error, write = line => console.error(line), failedStep = null) {
+    try { write(journeyFailurePrefix + journeyFailureSummary(phase, completed, error, failedStep)); }
     catch {
         // Diagnostic property getters or output failures must never replace
         // the original primary/cleanup AggregateError at the call site.

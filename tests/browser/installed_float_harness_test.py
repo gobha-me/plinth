@@ -144,7 +144,7 @@ for (const malformed of [null, [], 'not-json']) {
     def test_journey_failure_summary_only_emits_finite_identifiers(self):
         script = r'''
 import assert from 'node:assert/strict';
-import { journeyFailurePrefix, journeyFailureSummary, emitJourneyFailure } from './installed-float-diagnostics.mjs';
+import { journeyFailurePrefix, journeyFailureSummary, emitJourneyFailure, createJourneyFailureSteps } from './installed-float-diagnostics.mjs';
 const secret = 'fake-password-query-id-never-public';
 const error = {name: 'AssertionError', code: 'ERR_ASSERTION', operator: 'deepStrictEqual',
     message: secret, actual: secret, expected: secret,
@@ -154,8 +154,23 @@ assert.equal(journeyFailurePrefix, 'PLINTH_FLOAT_FAILURE ');
 assert(raw.length <= 2048); assert(!raw.includes(secret));
 assert.deepEqual(value, {schema_version: 1, phase: 'verify', completed_count: 1, completed_groups: [1],
     source: {file: 'installed-float-production.mjs', line: 127, column: 9},
-    category: 'assertion', code: 'ERR_ASSERTION', operator: 'deepStrictEqual'});
+    failure_step: null, category: 'assertion', code: 'ERR_ASSERTION', operator: 'deepStrictEqual'});
+for (const frame of [`    at open (/private/${secret}/installed-float-production.mjs:127:9)`,
+    '    at async tests/browser/installed-float-production.mjs:127:9',
+    '    at installed-float-production.mjs:127:9',
+    `    at Timeout.fail [as _onTimeout] (file:///private/${secret}/installed-float-production.mjs:127:9)`,
+    `    at Timeout.fail [as _onTimeout] (/private/${secret}/installed-float-production.mjs:127:9)`]) {
+    const summary = journeyFailureSummary('verify', ['one'], {...error, stack: secret + '\n' + frame}, 'personal-open');
+    assert(!summary.includes(secret));
+    assert.deepEqual(JSON.parse(summary).source, value.source);
+    assert.equal(JSON.parse(summary).failure_step, 'personal-open');
+}
 for (const stack of [secret, `${secret}:123:4`, `    at file:///private/${secret}.mjs:1:2`,
+    `    at Timeout.fail [as ${secret}] (file:///private/installed-float-production.mjs:127:9)`,
+    `    at ${'x'.repeat(129)} [as _onTimeout] (file:///private/installed-float-production.mjs:127:9)`,
+    '    at Timeout.fail [as _onTimeout] (file:///private/installed-float-production.mjs:1000000:9)',
+    '    at Timeout.fail [as _onTimeout] (file:///private/installed-float-production.mjs:127:0)',
+    '    at Timeout.fail [as _onTimeout] (file:///private/another.mjs:127:9)',
     'x'.repeat(20000) + error.stack]) {
     const encoded = journeyFailureSummary('verify', [], {name: secret, code: secret, operator: secret,
         message: secret, actual: secret, stack});
@@ -175,15 +190,67 @@ for (const property of ['stack', 'name', 'code', 'operator']) {
 const output = [];
 emitJourneyFailure('verify', ['group one'], error, line => output.push(line));
 assert.deepEqual(output, [journeyFailurePrefix + raw]);
+const labels = ['initial-caller', 'default-state', 'personal-write', 'personal-open', 'personal-close',
+    'personal-delete', 'admin-seed', 'admin-open', 'admin-close', 'admin-delete',
+    'fallback-open', 'fallback-focus', 'fallback-modules'];
+for (const label of labels) {
+    assert.equal(JSON.parse(journeyFailureSummary('verify', ['one'], error, label)).failure_step, label);
+}
+assert.equal(JSON.parse(journeyFailureSummary('verify', ['one'], error, secret)).failure_step, null);
+assert.equal(JSON.parse(journeyFailureSummary('verify', ['one', 'two'], error, 'personal-open')).failure_step, null);
+assert.equal(JSON.parse(journeyFailureSummary('install', [], error, 'personal-open')).failure_step, null);
+for (const rejected of [new Error(secret), null, undefined, false, 0, '']) {
+    const steps = createJourneyFailureSteps();
+    assert.equal(steps.run('personal-write', () => 200), 200);
+    assert.equal(await steps.run('personal-write', async () => 200), 200);
+    assert.equal(steps.failed(), null, 'successful substeps cannot leave a stale label');
+    let caught = false;
+    try { await steps.run('personal-open', () => Promise.reject(rejected)); }
+    catch (actual) { caught = true; assert.equal(actual, rejected); }
+    assert(caught); assert.equal(steps.failed(), 'personal-open');
+    steps.run('personal-delete', () => 200);
+    assert.equal(steps.failed(), 'personal-open', 'successful cleanup preserves the actual failed step');
+    const cleanup = new Error(secret);
+    try { steps.run('personal-delete', () => { throw cleanup; }); }
+    catch (actual) { assert.equal(actual, cleanup); }
+    assert.equal(steps.failed(), 'personal-delete', 'later finally failure matches the final caught error');
+}
 '''
         subprocess.run(['node', '--input-type=module', '-e', script],
                        cwd=repo / 'tests/browser', check=True, timeout=10,
                        capture_output=True, text=True)
 
+        # Exercise Node's actual named-timer stack rather than only spelling a
+        # synthetic alias. Only this known basename and finite coordinates emit.
+        with tempfile.TemporaryDirectory(prefix='plinth-timer-diagnostic-') as temporary:
+            fixture = Path(temporary) / 'installed-float-production.mjs'
+            module = (repo / 'tests/browser/installed-float-diagnostics.mjs').as_uri()
+            fixture.write_text("import assert from 'node:assert/strict';\n" +
+                'import { journeyFailureSummary } from ' + json.dumps(module) + ';\n' + r'''
+const secret = 'fake-timer-password-never-public';
+const observed = await new Promise(resolve => {
+    function fail() { resolve(new Error(secret)); }
+    setTimeout(fail, 0);
+});
+assert(observed.stack.includes('Timeout.fail [as _onTimeout]'));
+const encoded = journeyFailureSummary('verify', ['one'], observed, 'personal-open');
+const value = JSON.parse(encoded);
+assert.equal(value.source.file, 'installed-float-production.mjs');
+assert(Number.isInteger(value.source.line) && value.source.line > 0 && value.source.line <= 999999);
+assert(Number.isInteger(value.source.column) && value.source.column > 0 && value.source.column <= 999999);
+assert.equal(value.category, 'operation');
+assert.equal(value.failure_step, 'personal-open');
+assert(!encoded.includes(secret));
+assert(!encoded.includes('Timeout.fail'));
+assert(!encoded.includes('file:'));
+''', encoding='utf-8')
+            subprocess.run(['node', str(fixture)], check=True, timeout=10,
+                           capture_output=True, text=True)
+
     def test_supervisor_rejects_unsafe_or_malformed_failure_summaries(self):
         value = {'schema_version': 1, 'phase': 'verify', 'completed_count': 1,
             'completed_groups': [1], 'source': {'file': 'installed-float-production.mjs', 'line': 127, 'column': 9},
-            'category': 'assertion', 'code': 'ERR_ASSERTION', 'operator': 'deepStrictEqual'}
+            'failure_step': None, 'category': 'assertion', 'code': 'ERR_ASSERTION', 'operator': 'deepStrictEqual'}
         prefix = harness.FAILURE_PREFIX
         encoded = prefix + json.dumps(value)
         secret = 'fake-credential-marker-never-public'
@@ -199,13 +266,30 @@ assert.deepEqual(output, [journeyFailurePrefix + raw]);
                          ('source', {'file': secret, 'line': 1, 'column': 2}),
                          ('source', {'file': 'unknown', 'line': 1, 'column': 0}),
                          ('source', {'file': 'installed-float-production.mjs', 'line': 1000000, 'column': 1}),
-                         ('category', secret), ('code', secret), ('operator', {}), ('extra', secret)]:
+                         ('category', secret), ('code', secret), ('operator', {}), ('extra', secret),
+                         ('failure_step', secret), ('failure_step', []), ('failure_step', False),
+                         ('failure_step', 'x' * 2049)]:
             changed = dict(value, **{key: bad})
             result = harness.safe_browser_failure(prefix + json.dumps(changed), 'verify')
             self.assertEqual(result, {'diagnostic': 'unavailable'})
             self.assertNotIn(secret, json.dumps(result))
         self.assertEqual(harness.safe_browser_failure(encoded, 'install'), {'diagnostic': 'unavailable'})
         self.assertEqual(harness.safe_browser_failure(encoded.replace('127', 'NaN'), 'verify'),
+                         {'diagnostic': 'unavailable'})
+        for constant in ['NaN', 'Infinity', '-Infinity']:
+            invalid = encoded.replace('"failure_step": null', '"failure_step": ' + constant)
+            self.assertNotEqual(invalid, encoded)
+            self.assertEqual(harness.safe_browser_failure(invalid, 'verify'), {'diagnostic': 'unavailable'})
+        self.assertEqual(len(harness.FAILURE_STEPS), 13)
+        for step in harness.FAILURE_STEPS:
+            changed = dict(value, failure_step=step)
+            self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(changed), 'verify'), changed)
+            changed.update(completed_count=2, completed_groups=[1, 2])
+            self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(changed), 'verify'),
+                             {'diagnostic': 'unavailable'})
+        missing = dict(value)
+        missing.pop('failure_step')
+        self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(missing), 'verify'),
                          {'diagnostic': 'unavailable'})
 
     def test_passive_read_lane_requires_bodies_and_coalesced_ui_settlement(self):
@@ -246,7 +330,7 @@ for (const event of ['request', 'response', 'requestfailed']) assert.equal(page.
         script = r'''
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { boundedStep, observeReadLane } from './installed-float-coordination.mjs';
+import { boundedStep, createResponseBodyRegistry, observeReadLane } from './installed-float-coordination.mjs';
 const origin = 'http://127.0.0.1:4321';
 const makePage = () => Object.assign(new EventEmitter(), {evaluate: async () => {}});
 const request = () => ({url: () => origin + '/api/frontend/surfaces/admission', method: () => 'POST'});
@@ -264,6 +348,61 @@ await idleLane.drain(performance.now() + 100); assert.equal(barriers, 1); idleLa
 const failedPage = makePage(), failedLane = observeReadLane(failedPage, origin), failed = request();
 failedPage.emit('request', failed); failedPage.emit('requestfailed', failed);
 await assert.rejects(failedLane.drain(performance.now() + 100)); failedLane.stop();
+
+// A native Response is lazy: capture must start before its resource disappears.
+let valid = true, bodyCalls = 0;
+const owned = createResponseBodyRegistry();
+const captured = owned.capture({body() {
+    bodyCalls++; assert(valid, 'late body lookup after navigation');
+    return Promise.resolve(Buffer.from('{"owned":1}'));
+}});
+assert.equal(bodyCalls, 1); valid = false;
+assert.deepEqual(await captured.json(), {owned: 1});
+assert.deepEqual(await captured.json(), {owned: 1});
+assert.equal(bodyCalls, 1, 'consumers reuse one native body capture');
+assert.deepEqual(await owned.drain(performance.now() + 100), []);
+assert.throws(() => owned.capture({body() { assert.fail('closed admission'); }}));
+
+let resolveBody;
+const delayed = createResponseBodyRegistry();
+const delayedCapture = delayed.capture({body: () => new Promise(resolve => { resolveBody = resolve; })});
+let consumed = false;
+const consumption = delayedCapture.json().then(value => { consumed = true; return value; });
+await Promise.resolve(); assert(!consumed, 'headers cannot complete body validation');
+resolveBody(Buffer.from('{"delayed":true}'));
+assert.deepEqual(await consumption, {delayed: true});
+assert.deepEqual(await delayed.drain(performance.now() + 100), []);
+
+const primary = new Error('controlled body rejection');
+const consumedFailure = createResponseBodyRegistry();
+const rejectedBody = consumedFailure.capture({body: () => Promise.reject(primary)});
+await assert.rejects(rejectedBody.json(), error => error === primary);
+assert.deepEqual(await consumedFailure.drain(performance.now() + 100), []);
+const unconsumedFailure = createResponseBodyRegistry();
+unconsumedFailure.capture({body() { throw primary; }});
+assert.deepEqual(await unconsumedFailure.drain(performance.now() + 100), [primary]);
+
+// Status remains the first assertion; an empty error body is not parsed first.
+const statusFirst = createResponseBodyRegistry();
+const empty = statusFirst.capture({body: async () => Buffer.from('')});
+let parsed = false;
+await assert.rejects((async () => {
+    assert.equal(404, 200, 'HTTP status first'); parsed = true; await empty.json();
+})(), error => error.code === 'ERR_ASSERTION' && error.message.includes('HTTP status first'));
+assert(!parsed); assert.deepEqual(await statusFirst.drain(performance.now() + 100), []);
+
+let release;
+const pending = createResponseBodyRegistry();
+pending.capture({body: () => new Promise(resolve => { release = resolve; })});
+try { await assert.rejects(pending.drain(performance.now() + 5)); }
+finally { release(Buffer.from('{}')); }
+assert.deepEqual(await pending.drain(performance.now() + 100), [], 'timed-out join retains its owner');
+const capped = createResponseBodyRegistry();
+let started = 0;
+for (let index = 0; index < 64; index++) capped.capture({body() { started++; return Promise.resolve(Buffer.from('{}')); }});
+assert.throws(() => capped.capture({body() { started++; }}));
+assert.equal(started, 64, 'overflow refuses before native capture');
+assert.deepEqual(await capped.drain(performance.now() + 100), []);
 '''
         subprocess.run(['node', '--input-type=module', '-e', script], cwd=repo / 'tests/browser',
                        check=True, timeout=10, capture_output=True, text=True)
