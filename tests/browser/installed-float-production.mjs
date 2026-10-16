@@ -6,7 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
-import { installFailureSummary } from './installed-float-diagnostics.mjs';
+import { installFailureSummary, emitJourneyFailure } from './installed-float-diagnostics.mjs';
+import { boundedStep, observeReadLane, withFrozenReadLane } from './installed-float-coordination.mjs';
 
 const phase = process.argv[2];
 assert(['install', 'verify'].includes(phase), 'owned supervisor phase required');
@@ -29,6 +30,7 @@ const sha = bytes => createHash('sha256').update(bytes).digest('hex');
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const fixtureRules = ['floatcaller.panel', 'floatprovider.panel', 'floatprovider.preview'];
 const contexts = [];
+const readLanes = new Map();
 let browser;
 let state;
 let failure;
@@ -59,10 +61,11 @@ async function request(page, path, method = 'GET', payload, csrf = true) {
         return { status: response.status, value, profile: response.headers.get('X-Plinth-Platform-Profile') };
     }, { path, method, payload, csrf });
 }
-async function login(account) {
+async function login(account, { observeReads = false } = {}) {
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     contexts.push(context);
     const page = await context.newPage();
+    if (observeReads) readLanes.set(page, observeReadLane(page, origin));
     page.setDefaultTimeout(15000);
     page.on('dialog', dialog => dialog.accept());
     await page.goto(base + '/app/');
@@ -496,7 +499,7 @@ try {
         console.log(JSON.stringify({ phase, installed: 2, actualAuth: true, defaultFixtureGrants: 0 }));
     } else {
         state = JSON.parse(await readFile(statePath, 'utf8'));
-        const a = await login(state.accounts.a), b = await login(state.accounts.b), denied = await login(state.accounts.denied);
+        const a = await login(state.accounts.a), b = await login(state.accounts.b, { observeReads: true }), denied = await login(state.accounts.denied);
         const targets = await surfaces(a);
         assert.equal(targets.length, 2);
         const preview = targets.find(item => item.panel_id === 'preview');
@@ -687,11 +690,22 @@ try {
         await retiredInstances(b, [unaffectedInstance]);
         completed.push('fresh capability revocation retires only the affected authenticated user');
 
-        const operator = await login(state.accounts.operator);
+        const disableDeadline = performance.now() + 15000;
+        const operator = await boundedStep(() => login(state.accounts.operator, { observeReads: true }), disableDeadline);
         const originalPackage = state.packages.floatprovider;
-        await bOriginal.locator('.installed-float-unsaved').fill('fake dirty before disable');
-        const disabled = await request(operator, `/api/packages/${originalPackage.id}`, 'PATCH', { action: 'disable' });
-        assert.equal(disabled.status, 200);
+        await operator.locator('.launcher-main[aria-busy="false"]').waitFor({ timeout: remaining(disableDeadline) });
+        await readLanes.get(operator).drain(disableDeadline);
+        assert(readLanes.get(operator).catalogCompleted() > 0, 'actual operator catalog body and rendering settled');
+        await bOriginal.locator('.installed-float-unsaved').fill('fake dirty before disable', { timeout: remaining(disableDeadline) });
+        await readLanes.get(b).drain(disableDeadline);
+        // A legitimately suspended background tab keeps its dirty/live owner,
+        // but cannot start another periodic/focus read during this one PATCH.
+        // This is fixture coordination, not an unfrozen polling stress claim.
+        const disabled = await withFrozenReadLane(b, readLanes.get(b), disableDeadline, async () => {
+            const value = await request(operator, `/api/packages/${originalPackage.id}`, 'PATCH', { action: 'disable' });
+            assert.equal(value.status, 200, installFailureSummary('floatprovider', value, null));
+            return value;
+        });
         assert.equal(disabled.value.state, 'DISABLED');
         assert.equal(packageRow('floatprovider').state, 'DISABLED');
         await revalidateFromUI(b, 'fixture-record-B', 'fixture-disabled-B', [preview]);
@@ -791,6 +805,8 @@ try {
     }
 } catch (error) { failure = error; }
 finally {
+    for (const lane of readLanes.values()) lane.stop();
+    readLanes.clear();
     for (const context of contexts) { try { await context.close(); } catch (error) { cleanupFailures.push(error); } }
     if (browser) { try { await browser.close(); } catch (error) { cleanupFailures.push(error); } }
 }
@@ -832,7 +848,10 @@ if (phase === 'verify' && state && !failure && !cleanupFailures.length) {
     } catch (error) { cleanupFailures.push(error); }
     finally { if (browser) { try { await browser.close(); } catch (error) { cleanupFailures.push(error); } } }
 }
-if (failure || cleanupFailures.length) throw new AggregateError([...(failure ? [failure] : []), ...cleanupFailures], 'installed float journey/cleanup failed');
+if (failure || cleanupFailures.length) {
+    emitJourneyFailure(phase, completed, failure ?? cleanupFailures[0]);
+    throw new AggregateError([...(failure ? [failure] : []), ...cleanupFailures], 'installed float journey/cleanup failed');
+}
 if (phase === 'verify') {
     assert.equal(completed.length, 12);
     console.log(JSON.stringify({ phase, expectedCases: 12, completed, actualAuth: true,

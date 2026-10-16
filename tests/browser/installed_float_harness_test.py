@@ -110,6 +110,11 @@ assert.deepEqual(value.reportRules, ['rbac-orphan-namespace']);
 assert.deepEqual(value.responseKeys, ['state', 'failed_at_stage', 'kind', 'message', 'id']);
 assert.deepEqual(value.reportKeys, ['files_scanned', 'total_bytes', 'disposition', 'messages']);
 assert(!encoded.includes(secret));
+const transition = installFailureSummary('floatprovider', {status: 409,
+    value: {error: {code: 'in-flight-operation', message: secret}}}, null);
+assert.equal(JSON.parse(transition).code, 'in-flight-operation');
+assert.equal(JSON.parse(transition).httpStatus, 409);
+assert(!transition.includes(secret));
 const hostile = JSON.stringify(installFailureSummary(secret, {status: secret,
     value: {error: {code: secret, message: secret}, state: secret, failed_at_stage: secret}},
     {messages: Array(10000).fill({rule: secret, path: secret})}));
@@ -135,6 +140,225 @@ for (const malformed of [null, [], 'not-json']) {
             path.chmod(0o644)
             self.assertEqual(harness.artifact_digest(root),
                              '2980df2ad79e3c7a334cbea99bc241c784f57bafdee55a8c9fb2aecb4a38411b')
+
+    def test_journey_failure_summary_only_emits_finite_identifiers(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { journeyFailurePrefix, journeyFailureSummary, emitJourneyFailure } from './installed-float-diagnostics.mjs';
+const secret = 'fake-password-query-id-never-public';
+const error = {name: 'AssertionError', code: 'ERR_ASSERTION', operator: 'deepStrictEqual',
+    message: secret, actual: secret, expected: secret,
+    stack: `${secret}\n    at open (file:///private/${secret}/installed-float-production.mjs:127:9)\n`};
+const raw = journeyFailureSummary('verify', ['group one'], error), value = JSON.parse(raw);
+assert.equal(journeyFailurePrefix, 'PLINTH_FLOAT_FAILURE ');
+assert(raw.length <= 2048); assert(!raw.includes(secret));
+assert.deepEqual(value, {schema_version: 1, phase: 'verify', completed_count: 1, completed_groups: [1],
+    source: {file: 'installed-float-production.mjs', line: 127, column: 9},
+    category: 'assertion', code: 'ERR_ASSERTION', operator: 'deepStrictEqual'});
+for (const stack of [secret, `${secret}:123:4`, `    at file:///private/${secret}.mjs:1:2`,
+    'x'.repeat(20000) + error.stack]) {
+    const encoded = journeyFailureSummary('verify', [], {name: secret, code: secret, operator: secret,
+        message: secret, actual: secret, stack});
+    assert(!encoded.includes(secret));
+    assert.deepEqual(JSON.parse(encoded).source, {file: 'unknown', line: 0, column: 0});
+    assert.equal(JSON.parse(encoded).category, 'unknown');
+}
+assert.equal(JSON.parse(journeyFailureSummary('verify', [], {name: 'TimeoutError'})).category, 'timeout');
+assert.equal(JSON.parse(journeyFailureSummary('install', [], new Error(secret))).completed_count, 0);
+for (const property of ['stack', 'name', 'code', 'operator']) {
+    const hostile = new Error(secret), output = [];
+    Object.defineProperty(hostile, property, {get() { throw new Error(secret); }});
+    assert.doesNotThrow(() => emitJourneyFailure('verify', [], hostile, line => output.push(line)));
+    assert.deepEqual(output, [journeyFailurePrefix + '{"diagnostic":"unavailable"}']);
+    assert.doesNotThrow(() => emitJourneyFailure('verify', [], hostile, () => { throw new Error(secret); }));
+}
+const output = [];
+emitJourneyFailure('verify', ['group one'], error, line => output.push(line));
+assert.deepEqual(output, [journeyFailurePrefix + raw]);
+'''
+        subprocess.run(['node', '--input-type=module', '-e', script],
+                       cwd=repo / 'tests/browser', check=True, timeout=10,
+                       capture_output=True, text=True)
+
+    def test_supervisor_rejects_unsafe_or_malformed_failure_summaries(self):
+        value = {'schema_version': 1, 'phase': 'verify', 'completed_count': 1,
+            'completed_groups': [1], 'source': {'file': 'installed-float-production.mjs', 'line': 127, 'column': 9},
+            'category': 'assertion', 'code': 'ERR_ASSERTION', 'operator': 'deepStrictEqual'}
+        prefix = harness.FAILURE_PREFIX
+        encoded = prefix + json.dumps(value)
+        secret = 'fake-credential-marker-never-public'
+        self.assertEqual(harness.safe_browser_failure(secret + '\n' + encoded, 'verify'), value)
+        for invalid in [None, secret, encoded[:-2], encoded + '\n' + encoded,
+                        prefix + '{"schema_version":1,"schema_version":1}',
+                        prefix + '[]', prefix + '{"value":' + '[' * 1500,
+                        prefix + 'x' * 2049, 'x' * 65537, '\ud800']:
+            with self.subTest(kind=type(invalid).__name__):
+                self.assertEqual(harness.safe_browser_failure(invalid, 'verify'), {'diagnostic': 'unavailable'})
+        for key, bad in [('phase', secret), ('completed_count', True), ('completed_count', 13),
+                         ('completed_groups', [True]), ('completed_groups', [2]),
+                         ('source', {'file': secret, 'line': 1, 'column': 2}),
+                         ('source', {'file': 'unknown', 'line': 1, 'column': 0}),
+                         ('source', {'file': 'installed-float-production.mjs', 'line': 1000000, 'column': 1}),
+                         ('category', secret), ('code', secret), ('operator', {}), ('extra', secret)]:
+            changed = dict(value, **{key: bad})
+            result = harness.safe_browser_failure(prefix + json.dumps(changed), 'verify')
+            self.assertEqual(result, {'diagnostic': 'unavailable'})
+            self.assertNotIn(secret, json.dumps(result))
+        self.assertEqual(harness.safe_browser_failure(encoded, 'install'), {'diagnostic': 'unavailable'})
+        self.assertEqual(harness.safe_browser_failure(encoded.replace('127', 'NaN'), 'verify'),
+                         {'diagnostic': 'unavailable'})
+
+    def test_passive_read_lane_requires_bodies_and_coalesced_ui_settlement(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { observeReadLane } from './installed-float-coordination.mjs';
+const origin = 'http://127.0.0.1:4321';
+const deferred = () => { let resolve; const promise = new Promise(yes => { resolve = yes; }); return {promise, resolve}; };
+const request = path => ({url: () => origin + path, method: () => 'GET'});
+const page = new EventEmitter(), barriers = [];
+page.evaluate = () => { const gate = deferred(); barriers.push(gate); return gate.promise; };
+const lane = observeReadLane(page, origin), first = request('/api/frontend/applications'), body = deferred();
+page.emit('request', first);
+page.emit('response', {request: () => first, status: () => 200, finished: () => body.promise});
+let done = false;
+const drained = lane.drain(performance.now() + 1000).then(() => { done = true; });
+await Promise.resolve(); assert(!done); assert.equal(barriers.length, 0); assert.equal(lane.catalogCompleted(), 0);
+body.resolve(null);
+for (let index = 0; index < 8; index++) await Promise.resolve();
+assert.equal(lane.catalogCompleted(), 1); assert.equal(barriers.length, 1); assert(!done);
+const coalesced = request('/api/frontend/float-layout'), nextBody = deferred();
+page.emit('request', coalesced);
+page.emit('response', {request: () => coalesced, status: () => 200, finished: () => nextBody.promise});
+barriers[0].resolve();
+for (let index = 0; index < 8; index++) await Promise.resolve();
+assert(!done); assert.equal(barriers.length, 1);
+nextBody.resolve(null);
+for (let index = 0; index < 8; index++) await Promise.resolve();
+assert.equal(barriers.length, 2); barriers[1].resolve(); await drained; assert(done);
+lane.stop(); lane.stop();
+for (const event of ['request', 'response', 'requestfailed']) assert.equal(page.listenerCount(event), 0);
+'''
+        subprocess.run(['node', '--input-type=module', '-e', script], cwd=repo / 'tests/browser',
+                       check=True, timeout=10, capture_output=True, text=True)
+
+    def test_passive_read_lane_is_bounded_and_has_no_early_idle_success(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { boundedStep, observeReadLane } from './installed-float-coordination.mjs';
+const origin = 'http://127.0.0.1:4321';
+const makePage = () => Object.assign(new EventEmitter(), {evaluate: async () => {}});
+const request = () => ({url: () => origin + '/api/frontend/surfaces/admission', method: () => 'POST'});
+let calls = 0;
+await assert.rejects(boundedStep(() => { calls++; }, performance.now() - 1)); assert.equal(calls, 0);
+const page = makePage(), lane = observeReadLane(page, origin);
+for (let index = 0; index < 65; index++) page.emit('request', request());
+await assert.rejects(lane.drain(performance.now() + 100)); lane.stop();
+const waitingPage = makePage(), waitingLane = observeReadLane(waitingPage, origin);
+waitingPage.emit('request', request());
+await assert.rejects(waitingLane.drain(performance.now() + 5)); waitingLane.stop();
+const idlePage = makePage(), idleLane = observeReadLane(idlePage, origin);
+let barriers = 0; idlePage.evaluate = async () => { barriers++; };
+await idleLane.drain(performance.now() + 100); assert.equal(barriers, 1); idleLane.stop();
+const failedPage = makePage(), failedLane = observeReadLane(failedPage, origin), failed = request();
+failedPage.emit('request', failed); failedPage.emit('requestfailed', failed);
+await assert.rejects(failedLane.drain(performance.now() + 100)); failedLane.stop();
+'''
+        subprocess.run(['node', '--input-type=module', '-e', script], cwd=repo / 'tests/browser',
+                       check=True, timeout=10, capture_output=True, text=True)
+
+    def test_background_tab_coordination_is_one_action_and_preserves_cleanup_failures(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { withFrozenReadLane } from './installed-float-coordination.mjs';
+const exercise = async ({actionError, freezeError, resumeError, drainError} = {}) => {
+    const calls = [];
+    const session = {send: async (_command, {state}) => {
+        calls.push(state);
+        if (state === 'frozen' && freezeError) throw freezeError;
+        if (state === 'active' && resumeError) throw resumeError;
+    }, detach: async () => { calls.push('detach'); }};
+    const page = {context: () => ({newCDPSession: async () => session})};
+    const lane = {drain: async (_deadline, options) => {
+        assert.deepEqual(options, {uiBarrier: false}); calls.push('drain'); if (drainError) throw drainError;
+    }};
+    let value, error;
+    try { value = await withFrozenReadLane(page, lane, performance.now() + 1000, async () => {
+        calls.push('action'); if (actionError) throw actionError; return 200;
+    }); } catch (caught) { error = caught; }
+    return {calls, value, error};
+};
+let result = await exercise(); assert.equal(result.value, 200);
+assert.deepEqual(result.calls, ['frozen', 'drain', 'action', 'active', 'detach']);
+const primary = new Error('controlled primary'), cleanup = new Error('controlled cleanup');
+result = await exercise({actionError: primary}); assert.equal(result.error, primary);
+assert.deepEqual(result.calls, ['frozen', 'drain', 'action', 'active', 'detach']);
+result = await exercise({actionError: primary, resumeError: cleanup});
+assert.deepEqual(result.error.errors, [primary, cleanup]); assert.equal(result.calls.filter(x => x === 'action').length, 1);
+result = await exercise({freezeError: primary}); assert.equal(result.error, primary);
+assert.deepEqual(result.calls, ['frozen', 'active', 'detach']);
+result = await exercise({drainError: primary}); assert.equal(result.error, primary);
+assert.deepEqual(result.calls, ['frozen', 'drain', 'active', 'detach']);
+// An actual expired action still resumes/detaches. Its timeout is not a
+// successful mutation, and the finite cleanup budget does not renew it.
+let calls = [], actions = 0;
+const expiredSession = {send: async (_command, {state}) => { calls.push(state); },
+    detach: async () => { calls.push('detach'); }};
+const expiredPage = {context: () => ({newCDPSession: async () => expiredSession})};
+await assert.rejects(withFrozenReadLane(expiredPage, {drain: async () => {}}, performance.now() + 5,
+    () => { actions++; return new Promise(() => {}); }));
+assert.equal(actions, 1); assert.deepEqual(calls, ['frozen', 'active', 'detach']);
+// A resume ACK timeout must not precheck away the detach dispatch.
+calls = [];
+const slowResume = {send: async (_command, {state}) => {
+    calls.push(state); if (state === 'active') return new Promise(() => {});
+}, detach: async () => { calls.push('detach'); }};
+try {
+    await withFrozenReadLane({context: () => ({newCDPSession: async () => slowResume})},
+        {drain: async () => {}}, performance.now() + 1000, () => { throw primary; });
+    assert.fail('must preserve primary and cleanup timeout');
+} catch (error) { assert.equal(error.errors[0], primary); assert.equal(error.errors.length, 2); }
+assert.deepEqual(calls, ['frozen', 'active', 'detach']);
+// Closing the owning context settles/owns a late session acquisition. Even a
+// close failure cannot replace the original acquisition timeout.
+for (const closeFails of [false, true]) {
+    let resolve; const late = new Promise(yes => { resolve = yes; }); calls = [];
+    const lateSession = {detach: async () => { calls.push('late-detach'); }};
+    const context = {newCDPSession: () => late, close: async () => {
+        calls.push('context-close'); resolve(lateSession); if (closeFails) throw cleanup;
+    }};
+    try {
+        await withFrozenReadLane({context: () => context}, {drain: async () => {}}, performance.now() + 5,
+            () => { actions++; });
+        assert.fail('late acquisition cannot perform action');
+    } catch (error) {
+        if (closeFails) { assert(error instanceof AggregateError); assert.equal(error.errors[1], cleanup); }
+        else assert(!(error instanceof AggregateError));
+    }
+    assert.deepEqual(calls, ['context-close', 'late-detach']);
+}
+assert.equal(actions, 1);
+for (const rejected of [null, undefined, false, 0, '']) {
+    const trace = [];
+    const session = {send: async (_command, {state}) => { trace.push(state); },
+        detach: async () => { trace.push('detach'); }};
+    const page = {context: () => ({newCDPSession: async () => session})};
+    let caught = false;
+    try { await withFrozenReadLane(page, {drain: async () => {}}, performance.now() + 1000,
+        () => { trace.push('action'); throw rejected; }); }
+    catch (error) { caught = true; assert.equal(error, rejected); }
+    assert(caught); assert.deepEqual(trace, ['frozen', 'action', 'active', 'detach']);
+    session.send = async (_command, {state}) => { if (state === 'active') throw cleanup; };
+    caught = false;
+    try { await withFrozenReadLane(page, {drain: async () => {}}, performance.now() + 1000,
+        () => { throw rejected; }); }
+    catch (error) { caught = true; assert.deepEqual(error.errors, [rejected, cleanup]); }
+    assert(caught);
+}
+'''
+        subprocess.run(['node', '--input-type=module', '-e', script], cwd=repo / 'tests/browser',
+                       check=True, timeout=10, capture_output=True, text=True)
 
     def test_fixture_zip_has_exact_files_modes_no_default_grants(self):
         for source in ['float-caller', 'float-provider']:

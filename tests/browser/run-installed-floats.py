@@ -44,6 +44,62 @@ EXPECTED_CASES = [
     'normal authenticated package uninstall after consumer contexts close',
 ]
 
+FAILURE_PREFIX = 'PLINTH_FLOAT_FAILURE '
+FAILURE_CATEGORIES = {'assertion', 'timeout', 'type', 'range', 'syntax', 'operation', 'aggregate', 'unknown'}
+FAILURE_CODES = {'ERR_ASSERTION', 'ERR_INVALID_ARG_TYPE', 'ERR_INVALID_ARG_VALUE',
+                 'ABORT_ERR', 'ENOENT', 'EACCES', 'ETIMEDOUT', 'unknown'}
+FAILURE_OPERATORS = {'strictEqual', 'deepStrictEqual', 'notStrictEqual', 'notDeepStrictEqual',
+                     'match', 'doesNotMatch', '==', '===', '!=', '!==', 'ok', 'fail', 'unknown'}
+
+
+def safe_browser_failure(stderr, phase):
+    """Validate the failure-only channel; never return raw child diagnostics."""
+    unavailable = {'diagnostic': 'unavailable'}
+    if not isinstance(stderr, str) or len(stderr) > 65536:
+        return unavailable
+    try:
+        if len(stderr.encode('utf-8')) > 65536:
+            return unavailable
+    except UnicodeError:
+        return unavailable
+    lines = [line[len(FAILURE_PREFIX):] for line in stderr.splitlines() if line.startswith(FAILURE_PREFIX)]
+    if len(lines) != 1 or len(lines[0].encode('utf-8')) > 2048:
+        return unavailable
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('duplicate diagnostic key')
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(lines[0], object_pairs_hook=unique_object,
+                           parse_constant=lambda _value: None)
+        if (not isinstance(value, dict) or set(value) != {'schema_version', 'phase', 'completed_count',
+                'completed_groups', 'source', 'category', 'code', 'operator'} or
+            type(value['schema_version']) is not int or value['schema_version'] != 1 or
+            value['phase'] != phase or phase not in {'install', 'verify'} or
+            type(value['completed_count']) is not int or not 0 <= value['completed_count'] <= len(EXPECTED_CASES) or
+            (phase == 'install' and value['completed_count'] != 0) or
+            not isinstance(value['completed_groups'], list) or
+            value['completed_groups'] != list(range(1, value['completed_count'] + 1)) or
+            any(type(index) is not int for index in value['completed_groups']) or
+            not isinstance(value['source'], dict) or set(value['source']) != {'file', 'line', 'column'}):
+            return unavailable
+        source = value['source']
+        if (source['file'] not in {'installed-float-production.mjs', 'unknown'} or
+            any(type(source[key]) is not int or not 0 <= source[key] <= 999999 for key in ['line', 'column']) or
+            (source['file'] == 'unknown' and (source['line'] != 0 or source['column'] != 0)) or
+            (source['file'] != 'unknown' and (source['line'] == 0 or source['column'] == 0)) or
+            value['category'] not in FAILURE_CATEGORIES or value['code'] not in FAILURE_CODES or
+            value['operator'] not in FAILURE_OPERATORS):
+            return unavailable
+        return value
+    except (ValueError, TypeError, RecursionError):
+        return unavailable
+
 
 def artifact_digest(root):
     """Independent profile1 framing of the actual installed tree, not ZIP bytes."""
@@ -309,7 +365,8 @@ def main():
                             path = location / name
                             path.write_text(contents, encoding='utf-8')
                             path.chmod(0o600)
-                        raise RuntimeError(f'installed float {phase} failed; private diagnostics {location}')
+                        summary = json.dumps(safe_browser_failure(error, phase), sort_keys=True)
+                        raise RuntimeError(f'installed float {phase} failed; safe summary {summary}; private diagnostics {location}')
                     lines = output.splitlines()
                     if len(lines) != 1:
                         raise RuntimeError('browser phase must produce exactly one receipt')
