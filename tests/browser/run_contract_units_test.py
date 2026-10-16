@@ -136,9 +136,12 @@ class ContractUnitDiscoveryTest(unittest.TestCase):
     def test_fixed_real_file_counts_are_preserved(self):
         self.assertEqual(gate.GROUPS, {
             "transport": (("sdk-transport.test.mjs", 35), ("smart-data-controller.test.mjs", 30)),
-            "launcher": (("launcher-model.test.mjs", 2), ("launcher-owner.test.mjs", 59),
-                         ("float-model.test.mjs", 19), ("float-owner.test.mjs", 46),
-                         ("float-preferences.test.mjs", 30)),
+            "launcher": (("launcher-model.test.mjs", 2), ("launcher-owner.test.mjs", 67),
+                         ("float-model.test.mjs", 19), ("float-owner.test.mjs", 51),
+                         ("float-preferences.test.mjs", 30), ("float-wire.test.mjs", 7),
+                         ("float-resolver.test.mjs", 4), ("float-production-owner.test.mjs", 11),
+                         ("float-persistence-adapter.test.mjs", 8), ("float-transport.test.mjs", 8),
+                         ("platform-storage.test.mjs", 8)),
             "admin": (("admin-package.test.mjs", 20),),
         })
 

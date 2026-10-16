@@ -12,8 +12,10 @@
 #include "kernel/logging.hpp"
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/capabilities_manifest.hpp"
+#include "kernel/packages/installed_generation_registry.hpp"
 #include "kernel/packages/manifest.hpp"
 #include "kernel/packages/migrations.hpp"
+#include "kernel/packages/name_operation.hpp"
 #include "kernel/packages/panels.hpp"
 #include "kernel/packages/panels_manifest.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
@@ -47,6 +49,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -154,6 +157,99 @@ auto pg_exec(PGconn* conn, const char* sql)
   }
   return {};
 }
+
+// Optional typed/canonical-shell participation, never a replacement for the
+// ordinary installer's validation/readiness contract. A stage/publication pair
+// shares ONE inherited stop/deadline budget, including its post-COMMIT check.
+struct GenerationStageAttempt {
+  std::optional<generation::PreparedGeneration> prepared;
+  std::optional<std::chrono::steady_clock::time_point> deadline;
+  std::stop_token stop;
+
+  static auto clean(generation::InstalledGenerationError error) -> bool {
+    return error == generation::InstalledGenerationError::PROFILE_UNAVAILABLE ||
+           error == generation::InstalledGenerationError::BUSY;
+  }
+
+  auto stage(PGconn& connection, const InstallerContext& context,
+             std::string_view id, std::string_view name,
+             std::string_view version) -> std::expected<void, std::string> try {
+    if (!context.generation_registry) return {};
+    if (!deadline) {
+      deadline =
+          std::min(std::chrono::steady_clock::now() + std::chrono::seconds{10},
+                   db::OperationScope::current_deadline());
+      stop = db::OperationScope::current_stop_token();
+    }
+    db::OperationScope scope{stop, *deadline};
+    scope.checkpoint();
+    const std::string package_id{id};
+    const char* value = package_id.c_str();
+    const PgResultPtr eligible{
+        db::exec_params(&connection,
+                        "SELECT EXISTS(SELECT 1 FROM plinth.panels pn WHERE "
+                        "pn.package_id=p.id "
+                        "AND pn.validated_format_version=2) OR "
+                        "COALESCE((p.provenance='bundled' "
+                        "AND p.name='shell' AND p.frontend_mount='/app' AND "
+                        "p.frontend_entry='index.html'),false) "
+                        "FROM plinth.packages p WHERE p.id=$1::uuid",
+                        1, nullptr, &value, nullptr, nullptr, 0),
+        PQclear};
+    if (!eligible || PQresultStatus(eligible.get()) != PGRES_TUPLES_OK ||
+        PQntuples(eligible.get()) != 1 || PQgetisnull(eligible.get(), 0, 0))
+      return std::unexpected(
+          "installed generation participation lookup failed");
+    if (std::string_view{PQgetvalue(eligible.get(), 0, 0)} != "t") return {};
+    auto operation = name_operation::NameOperation::borrow_existing(
+        connection, std::string{name});
+    if (!operation)
+      return std::unexpected("installed generation name ownership unavailable");
+    auto result = context.generation_registry->stage_locked(
+        *operation,
+        {.package_id = package_id,
+         .name = std::string{name},
+         .version = std::string{version},
+         .profile = 1},
+        *deadline, stop);
+    if (result) {
+      prepared.emplace(std::move(*result));
+      return {};
+    }
+    if (clean(result.error()) && PQstatus(&connection) == CONNECTION_OK &&
+        PQtransactionStatus(&connection) == PQTRANS_INTRANS) {
+      scope.checkpoint();
+      // No receipt/platform claim. Pressure/profile eligibility cannot revoke
+      // the independently validated ordinary package or launder a DB failure.
+      return {};
+    }
+    return std::unexpected("installed generation staging failed");
+  } catch (const std::exception&) {
+    return std::unexpected("installed generation staging interrupted");
+  }
+
+  auto publish(PGconn& connection, const InstallerContext& context,
+               std::string_view name) -> std::expected<void, std::string> try {
+    if (!prepared) return {};
+    db::OperationScope scope{stop, *deadline};
+    scope.checkpoint();
+    auto operation = name_operation::NameOperation::borrow_existing(
+        connection, std::string{name});
+    if (!operation)
+      return std::unexpected("installed generation name ownership unavailable");
+    const auto result = context.generation_registry->publish_committed_locked(
+        *operation, *prepared, *deadline, stop);
+    if (result) return {};
+    if (clean(result.error()) && PQstatus(&connection) == CONNECTION_OK &&
+        PQtransactionStatus(&connection) == PQTRANS_IDLE) {
+      scope.checkpoint();
+      return {}; // No typed cache publication; legacy readiness is unchanged.
+    }
+    return std::unexpected("installed generation publication failed");
+  } catch (const std::exception&) {
+    return std::unexpected("installed generation publication interrupted");
+  }
+};
 
 auto emit_applications_changed(PGconn* conn)
     -> std::expected<void, std::string> {
@@ -389,62 +485,23 @@ auto advisory_lock_key(std::string_view name) -> std::string {
   // `hashtextextended('plinth.packages.' || name, 0)` on the PG side;
   // here we build the seed string and let PG compute the hash via the
   // SQL-side call — see `try_acquire_name_lock` below.
-  return std::string{"plinth.packages."} + std::string{name};
+  return name_operation::lock_key(name);
 }
 
 auto try_acquire_name_lock(PGconn* conn, std::string_view name)
     -> std::expected<void, std::string> {
-  std::string seed = advisory_lock_key(name);
-  std::array<const char*, 1> values = {seed.c_str()};
-  PgResultPtr res(plinth::db::exec_params(
-                      conn,
-                      "SELECT pg_try_advisory_lock(hashtextextended($1, 0))", 1,
-                      nullptr, values.data(), nullptr, nullptr, 0),
-                  PQclear);
-  if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
-    return std::unexpected(std::string{PQresultErrorMessage(res.get())});
-  }
-  if (PQntuples(res.get()) == 0) {
-    return std::unexpected(std::string{"advisory-lock probe returned no rows"});
-  }
-  const char* got = PQgetvalue(res.get(), 0, 0);
-  if (got == nullptr || std::strcmp(got, "t") != 0) {
-    return std::unexpected(std::string{"advisory-lock-held"});
-  }
-  return {};
+  return name_operation::try_acquire_seed(conn, advisory_lock_key(name));
 }
 
 auto release_name_lock(PGconn* conn, std::string_view name) -> void {
-  std::string seed = advisory_lock_key(name);
-  std::array<const char*, 1> values = {seed.c_str()};
-  PgResultPtr res(plinth::db::exec_params(
-                      conn,
-                      "SELECT pg_advisory_unlock(hashtextextended($1, 0))", 1,
-                      nullptr, values.data(), nullptr, nullptr, 0),
-                  PQclear);
-  (void)res; // best-effort; backend cleanup covers us on connection drop
+  name_operation::release_seed(conn, advisory_lock_key(name));
 }
 
 // Worker scheduling is a handoff to another PostgreSQL session. Unlike the
 // best-effort unwind path, it must observe the server's unlock acknowledgement.
 auto release_name_lock_checked(PGconn* conn, std::string_view name)
     -> std::expected<void, std::string> {
-  const auto seed = advisory_lock_key(name);
-  const char* value = seed.c_str();
-  PgResultPtr res(plinth::db::exec_params(
-                      conn,
-                      "SELECT pg_advisory_unlock(hashtextextended($1, 0))", 1,
-                      nullptr, &value, nullptr, nullptr, 0),
-                  PQclear);
-  if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
-    return std::unexpected(std::string{PQresultErrorMessage(res.get())});
-  }
-  if (PQntuples(res.get()) != 1 || PQnfields(res.get()) != 1 ||
-      PQgetisnull(res.get(), 0, 0) != 0 ||
-      std::strcmp(PQgetvalue(res.get(), 0, 0), "t") != 0) {
-    return std::unexpected("package name lock release was not acknowledged");
-  }
-  return {};
+  return name_operation::release_seed_checked(conn, advisory_lock_key(name));
 }
 
 auto rbac_handoff_failure_report(std::string_view error) -> nlohmann::json {
@@ -1467,6 +1524,9 @@ auto restore_routes_from_loaded(const InstallerContext& ctx,
 auto run_uninstall_cleanup(PGconn* admin, const LoadedPackage& lp,
                            const InstallerContext& ctx)
     -> std::expected<void, TransitionFailure> {
+  // Both callers established durable UNINSTALLING under the name owner and
+  // drained live admission (or are startup recovery before ingress).
+  if (ctx.generation_registry) ctx.generation_registry->retire(lp.id);
   // Step 4: in-memory route + capability unregister. Safe if prior
   // crash already cleared them.
   asset_server::unregister_routes(lp.name, lp.version);
@@ -1968,7 +2028,8 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
                                 manifest_checksum);
   const bool server_package =
       fs::is_regular_file(dest_root / minimal.entry_point);
-  const bool pool_created = plinth::extensions::create_pool(minimal.name);
+  const bool pool_created = plinth::extensions::create_pool(
+      minimal.name, install_uuid, minimal.version);
   if (!server_package || !pool_created) {
     asset_server::unregister_routes(minimal.name, minimal.version);
     return fail_at(InstallFailure{
@@ -1998,6 +2059,7 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
   }
   const bool application_ready =
       panels_opt.has_value() && !panels_opt->panels.empty();
+  GenerationStageAttempt generation_attempt;
   auto activation_begin = pg_exec(pg.conn, "BEGIN");
   if (!activation_begin.has_value()) {
     asset_server::unregister_routes(minimal.name, minimal.version);
@@ -2019,6 +2081,14 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
     if (!ready || !*ready) {
       activation_error =
           ready ? "typed surface readiness verification failed" : ready.error();
+    }
+  }
+  if (activation_error.empty()) {
+    const auto staged = generation_attempt.stage(*pg.conn, ctx, install_uuid,
+                                                 minimal.name, minimal.version);
+    if (!staged) {
+      activation_error = staged.error();
+      install_fence.preserve();
     }
   }
   if (activation_error.empty()) {
@@ -2062,6 +2132,12 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
       // discovery blocked until restart reconciliation establishes the exact
       // durable outcome.
       install_fence.preserve();
+      return std::unexpected(InstallFailure{
+          .failed_at = InstallStage::ACTIVATING,
+          .package_id = install_uuid,
+          .kind = "activation-commit-unknown",
+          .message = "activation commit acknowledgement unavailable",
+          .report = {{"committed", nullptr}, {"commit_outcome", "unknown"}}});
     } else {
       static_cast<void>(pg_exec(pg.conn, "ROLLBACK"));
       asset_server::unregister_routes(minimal.name, minimal.version);
@@ -2074,6 +2150,18 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
         .kind = "activation-failed",
         .message = activation_error,
     });
+  }
+
+  if (const auto published =
+          generation_attempt.publish(*pg.conn, ctx, minimal.name);
+      !published) {
+    install_fence.preserve();
+    return std::unexpected(
+        InstallFailure{.failed_at = InstallStage::ACTIVE,
+                       .package_id = install_uuid,
+                       .kind = "generation-publication-failed",
+                       .message = published.error(),
+                       .report = {{"committed", true}, {"state", "ACTIVE"}}});
   }
 
   // Build success record.
@@ -2338,6 +2426,7 @@ auto disable_package(std::string_view package_id, const InstallerContext& ctx)
   // dispatches (the shared_lock in `extensions::dispatch` waits for
   // in-flight callers before destroy_pool's exclusive lock proceeds).
   plinth::extensions::destroy_pool(lp.name);
+  if (ctx.generation_registry) ctx.generation_registry->retire(lp.id);
   disable_fence.finish();
 
   // §DISABLED step 8 (audit, post-commit, best-effort).
@@ -2590,6 +2679,15 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
                                               package_id, "db-error",
                                               PQresultErrorMessage(upd.get())));
   }
+  GenerationStageAttempt generation_attempt;
+  if (const auto staged =
+          generation_attempt.stage(*pg.conn, ctx, lp.id, lp.name, lp.version);
+      !staged) {
+    enable_fence.preserve();
+    return std::unexpected(
+        transition_failure(TransitionKind::ENABLE, package_id,
+                           "generation-staging-failed", staged.error()));
+  }
   // §ACTIVE-from-DISABLED step 8 (COMMIT). Fence discovery before the
   // commit attempt so a lost acknowledgement cannot expose an uncertain row.
   enable_fence.preserve();
@@ -2605,7 +2703,8 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
   // capability ingress fenced until an explicit retry repairs the generation.
   const bool server_package =
       fs::is_regular_file(package_root / lp.entry_point);
-  const bool pool_created = plinth::extensions::create_pool(lp.name);
+  const bool pool_created =
+      plinth::extensions::create_pool(lp.name, lp.id, lp.version);
   if (!server_package || !pool_created) {
     return std::unexpected(transition_failure(
         TransitionKind::ENABLE, package_id, "runtime-start-failed",
@@ -2683,6 +2782,15 @@ auto enable_package(std::string_view package_id, const InstallerContext& ctx)
     }
   }
 
+  if (const auto published = generation_attempt.publish(*pg.conn, ctx, lp.name);
+      !published) {
+    auto failure =
+        transition_failure(TransitionKind::ENABLE, package_id,
+                           "generation-publication-failed", published.error());
+    failure.report["committed"] = true;
+    failure.report["state"] = "ACTIVE";
+    return std::unexpected(std::move(failure));
+  }
   emit_transition_audit(ctx, "packages.enabled", lp, "enabled_by_user_id");
   enable_fence.finish();
   if (auto released = release_name_lock_checked(pg.conn, lp.name); !released) {
@@ -3032,7 +3140,9 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
   };
   auto write_recovery_record =
       [&](std::string_view id, std::string_view state,
-          const nlohmann::json& report) -> std::expected<void, std::string> {
+          const nlohmann::json& report,
+          GenerationStageAttempt* generation_attempt =
+              nullptr) -> std::expected<void, std::string> {
     auto begin = pg_exec(pg.conn, "BEGIN");
     if (!begin.has_value()) {
       return std::unexpected(begin.error());
@@ -3048,6 +3158,19 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
         !updated.has_value()) {
       rollback();
       return updated;
+    }
+    if (state == "ACTIVE" && generation_attempt && ctx.generation_registry) {
+      const auto package = load_package_row(pg.conn, id);
+      if (!package) {
+        rollback();
+        return std::unexpected("recovery generation identity unavailable");
+      }
+      if (const auto staged = generation_attempt->stage(
+              *pg.conn, ctx, id, package->name, package->version);
+          !staged) {
+        rollback();
+        return std::unexpected(staged.error());
+      }
     }
     if (auto reported = write_report(id, report); !reported.has_value()) {
       rollback();
@@ -3078,12 +3201,13 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
       return std::unexpected("reconcile terminal record failed for " +
                              std::string{id} + ": " + r.error());
     }
+    if (ctx.generation_registry) ctx.generation_registry->retire(id);
     spdlog::info("reconcile: id={} name={} -> INSTALL_FAILED ({})", id, name,
                  reason);
     return {};
   };
   auto mark_active =
-      [&](std::string_view id, std::string_view name,
+      [&](std::string_view id, std::string_view name, std::string_view version,
           std::string_view from_state,
           std::string_view note) -> std::expected<void, std::string> {
     nlohmann::json report;
@@ -3094,14 +3218,22 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
     // Bootstrap currently initializes the runtime registry before replaying
     // package recovery. Ensure a row promoted here becomes executable during
     // this same boot rather than waiting for a second restart.
-    if (!plinth::extensions::create_pool(name)) {
+    if (!plinth::extensions::create_pool(name, id, version)) {
       return std::unexpected("reconcile runtime pool creation failed for " +
                              std::string{name});
     }
-    if (auto r = write_recovery_record(id, "ACTIVE", report); !r) {
+    GenerationStageAttempt generation_attempt;
+    if (auto r =
+            write_recovery_record(id, "ACTIVE", report, &generation_attempt);
+        !r) {
       plinth::extensions::destroy_pool(name);
       return std::unexpected("reconcile active record failed for " +
                              std::string{id} + ": " + r.error());
+    }
+    if (const auto published = generation_attempt.publish(*pg.conn, ctx, name);
+        !published) {
+      capabilities::drain::block_application(name);
+      return std::unexpected(published.error());
     }
     spdlog::info("reconcile: id={} name={} -> ACTIVE ({})", id, name, note);
     return {};
@@ -3155,6 +3287,7 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
       return std::unexpected("reconcile upgrade predecessor " + sup_s +
                              " has unexpected state '" + old_state + "'");
     }
+    if (ctx.generation_registry) ctx.generation_registry->retire(supersedes_id);
 
     // old=SUPERSEDED + new=ACTIVATING → T3 PG tx committed, symlink
     // rename may not have. Compare symlink target against versions
@@ -3167,11 +3300,11 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
     if (link_str == new_version) {
       // Symlink already points at new; just advance state.
       if (new_state == "ACTIVATING") {
-        return mark_active(new_id, new_name, new_state,
+        return mark_active(new_id, new_name, new_version, new_state,
                            "mid-swap forward-completed "
                            "(symlink already points at new version)");
       }
-      if (!plinth::extensions::create_pool(new_name)) {
+      if (!plinth::extensions::create_pool(new_name, new_id, new_version)) {
         return std::unexpected("reconcile runtime pool recreation failed for " +
                                std::string{new_name});
       }
@@ -3201,7 +3334,7 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
                                std::strerror(errno));
       }
       if (new_state == "ACTIVATING") {
-        auto active = mark_active(new_id, new_name, new_state,
+        auto active = mark_active(new_id, new_name, new_version, new_state,
                                   "mid-swap forward-completed "
                                   "(symlink replayed new version)");
         if (!active.has_value()) {
@@ -3212,7 +3345,7 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
                      new_id, new_version);
       }
       if (new_state != "ACTIVATING") {
-        if (!plinth::extensions::create_pool(new_name)) {
+        if (!plinth::extensions::create_pool(new_name, new_id, new_version)) {
           return std::unexpected(
               "reconcile runtime pool recreation failed for " +
               std::string{new_name});
@@ -3292,8 +3425,9 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
         // MIGRATING, not EXTRACTING/ACTIVATING). Advancing to ACTIVE
         // is safe — the bootstrap restore_routes() call rebuilds
         // the in-memory asset route map from every ACTIVE row.
-        if (auto recovered = mark_active(
-                id, name, state, "on-disk tree and manifest present; advanced");
+        if (auto recovered =
+                mark_active(id, name, version, state,
+                            "on-disk tree and manifest present; advanced");
             !recovered.has_value()) {
           return recovered;
         }
@@ -3308,6 +3442,7 @@ auto reconcile_in_flight_installs(const InstallerContext& ctx)
       continue;
     }
     if (state == "SUPERSEDED") {
+      if (ctx.generation_registry) ctx.generation_registry->retire(id);
       // ICD-0.4.5 §Crash Recovery: a SUPERSEDED row with no
       // matching ACTIVE for the same name is either (a) an
       // uninstalled-child orphan (scenario U.05) — no action,
@@ -3592,6 +3727,8 @@ auto garbage_collect_superseded_versions(std::chrono::hours retention,
       release_name_lock(pg.conn, name);
       continue;
     }
+
+    if (ctx.generation_registry) ctx.generation_registry->retire(id);
 
     std::error_code rm_ec;
     fs::remove_all(version_dir, rm_ec);
@@ -4066,6 +4203,9 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   const bool bundled = provenance == Provenance::BUNDLED;
   bool bundle_transaction_open = false;
   bool bundle_committed = false;
+  bool activation_commit_attempted = false;
+  bool activation_acknowledged = false;
+  GenerationStageAttempt generation_attempt;
   std::optional<fs::path> owned_version_dir;
   auto rollback_bundle = [&]() {
     if (bundle_transaction_open) {
@@ -4098,8 +4238,18 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
         r[it.key()] = it.value();
       }
     }
-    rollback_bundle();
-    mark_upgrade_failed(pg.conn, new_id, r);
+    if (activation_commit_attempted) {
+      r["committed"] = activation_acknowledged ? nlohmann::json(true)
+                                               : nlohmann::json(nullptr);
+      r["commit_outcome"] =
+          activation_acknowledged ? "acknowledged" : "unknown";
+      r["state"] = activation_acknowledged ? "ACTIVE" : "unknown";
+      // Never rewrite a possibly/confirmed committed successor as
+      // INSTALL_FAILED.
+    } else {
+      rollback_bundle();
+      mark_upgrade_failed(pg.conn, new_id, r);
+    }
     if (bundled) {
       Json::Value detail(Json::objectValue);
       detail["id"] = new_id;
@@ -4360,6 +4510,12 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
       return std::unexpected(
           fail_and_mark("upgrade-swap-failed", ordered.error()));
     }
+    if (const auto staged = generation_attempt.stage(
+            *pg.conn, ctx, new_id, minimal.name, minimal.version);
+        !staged) {
+      return std::unexpected(
+          fail_and_mark("generation-staging-failed", staged.error()));
+    }
     std::string old_id_s = existing.id;
     std::array<const char*, 1> old_v = {old_id_s.c_str()};
     PgResultPtr r1(plinth::db::exec_params(
@@ -4395,11 +4551,14 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
       retired_at_s = PQgetvalue(rt.get(), 0, 0);
     }
     if (!bundled) {
+      activation_commit_attempted = true;
       auto commit = pg_exec(pg.conn, "COMMIT");
       if (!commit.has_value()) {
         return std::unexpected(
             fail_and_mark("upgrade-swap-failed", commit.error()));
       }
+      activation_acknowledged = true;
+      if (ctx.generation_registry) ctx.generation_registry->retire(existing.id);
     }
     swap_committed = true;
     (void)retired_at_s; // structured report sent at T4
@@ -4431,6 +4590,7 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
   }
 
   if (bundled) {
+    activation_commit_attempted = true;
     auto commit = pg_exec(pg.conn, "COMMIT");
     if (!commit) {
       // A lost COMMIT acknowledgement has an uncertain database outcome.
@@ -4469,7 +4629,11 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     }
     bundle_transaction_open = false;
     bundle_committed = true;
+    activation_acknowledged = true;
   }
+
+  if (bundled && ctx.generation_registry)
+    ctx.generation_registry->retire(existing.id);
 
   emit_upgrade_audit(ctx, "packages.upgrade_swapped", existing, new_id,
                      minimal.version);
@@ -4499,7 +4663,8 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
                                 manifest_checksum);
   const bool server_package =
       fs::is_regular_file(new_version_dir / minimal.entry_point);
-  const bool pool_created = plinth::extensions::create_pool(minimal.name);
+  const bool pool_created =
+      plinth::extensions::create_pool(minimal.name, new_id, minimal.version);
   if (!server_package || !pool_created) {
     return std::unexpected(upgrade_failure(
         new_id, "runtime-start-failed",
@@ -4577,6 +4742,15 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     }
   }
 
+  if (const auto published =
+          generation_attempt.publish(*pg.conn, ctx, minimal.name);
+      !published) {
+    auto failure = upgrade_failure(new_id, "generation-publication-failed",
+                                   published.error());
+    failure.report["committed"] = true;
+    failure.report["state"] = "ACTIVE";
+    return std::unexpected(std::move(failure));
+  }
   emit_upgrade_audit(ctx, "packages.upgrade_completed", existing, new_id,
                      minimal.version);
   upgrade_drain.finish();

@@ -28,19 +28,152 @@
 #pragma once
 #include "kernel/lifecycle/async_task_registry.hpp"
 
+#include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/js/async_op.hpp"
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <drogon/utils/coroutine.h>
 #include <expected>
+#include <functional>
 #include <json/value.h>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
+namespace plinth::frontend {
+class FloatLayoutService;
+}
+namespace plinth::packages::generation {
+class CapturedArtifact;
+class Budget;
+} // namespace plinth::packages::generation
+
 namespace plinth::extensions {
+
+// Metadata only: never exposes an uncounted pool owner. Serial changes on each
+// replacement, even when the database UUID/version are unchanged.
+struct PoolIdentity {
+  std::string package_id;
+  std::string name;
+  std::string version;
+  std::uint64_t serial = 0;
+  auto operator==(const PoolIdentity&) const -> bool = default;
+};
+
+struct FixedShellStorageDigests {
+  std::string module;
+  std::string contract;
+  std::string migration;
+  std::string applied_migration;
+};
+
+struct FixedStorageSource;
+class PreparedShellStorage {
+ public:
+  PreparedShellStorage() = default;
+
+ private:
+  friend auto prepare_fixed_shell_storage(
+      const packages::generation::CapturedArtifact&, const PoolIdentity&,
+      const FixedShellStorageDigests&, packages::generation::Budget&)
+      -> std::expected<PreparedShellStorage, js::PromiseRejection>;
+  friend auto publish_fixed_shell_storage(PreparedShellStorage) -> bool;
+  std::shared_ptr<const FixedStorageSource> source;
+};
+
+// Kernel-generated expected pins plus the acknowledged kernel-owned migration
+// receipt are required. Preparation does no IO and holds no registry mutex.
+// Publication attaches only to the exact current stamped pool. Neither step
+// establishes the service's fresh RBAC/policy/readiness preconditions.
+[[nodiscard]] auto prepare_fixed_shell_storage(
+    const packages::generation::CapturedArtifact& artifact,
+    const PoolIdentity& expected, const FixedShellStorageDigests& digests,
+    packages::generation::Budget& budget)
+    -> std::expected<PreparedShellStorage, js::PromiseRejection>;
+[[nodiscard]] auto publish_fixed_shell_storage(PreparedShellStorage prepared)
+    -> bool;
+[[nodiscard]] auto pool_identity(std::string_view name)
+    -> std::optional<PoolIdentity>;
+[[nodiscard]] auto fixed_shell_storage_identity()
+    -> std::optional<PoolIdentity>;
+struct FixedShellStorageBinding {
+  PoolIdentity identity;
+  std::string artifact_digest;
+};
+// One immutable metadata snapshot, not a runtime owner or authority lease.
+[[nodiscard]] auto fixed_shell_storage_binding()
+    -> std::optional<FixedShellStorageBinding>;
+
+enum class FixedStorageOperation {
+  FLOATS_READ,
+  OWN_DEFAULTS_READ,
+  ADMIN_DEFAULT_READ,
+  ADMIN_DEFAULT_PUT,
+  ADMIN_DEFAULT_DELETE,
+  RESOLVE_ADMIN_CANDIDATE,
+};
+
+// Opaque service-created authority. No public JSON decoder/factory or bypass
+// flag. In particular the non-layout operations cannot select FLOATS_COMMIT.
+class FixedStorageCall {
+ public:
+  [[nodiscard]] auto operation() const -> FixedStorageOperation { return op; }
+  [[nodiscard]] auto identity() const -> const PoolIdentity& {
+    return expected;
+  }
+  [[nodiscard]] auto arguments() const -> const Json::Value& { return args; }
+  auto take_guard() -> std::unique_ptr<capabilities::drain::DispatchGuard> {
+    return std::move(guard);
+  }
+
+ private:
+  friend class plinth::frontend::FloatLayoutService;
+  FixedStorageCall(FixedStorageOperation operation, PoolIdentity identity,
+                   Json::Value arguments,
+                   std::unique_ptr<capabilities::drain::DispatchGuard> guard);
+  FixedStorageOperation op;
+  PoolIdentity expected;
+  Json::Value args;
+  std::unique_ptr<capabilities::drain::DispatchGuard> guard;
+};
+
+class ValidatedFloatCommit {
+ public:
+  [[nodiscard]] auto identity() const -> const PoolIdentity& {
+    return expected;
+  }
+  [[nodiscard]] auto snapshot() const -> const Json::Value& { return layout; }
+  auto take_guard() -> std::unique_ptr<capabilities::drain::DispatchGuard> {
+    return std::move(guard);
+  }
+
+ private:
+  friend class plinth::frontend::FloatLayoutService;
+  ValidatedFloatCommit(
+      PoolIdentity identity, Json::Value snapshot,
+      std::unique_ptr<capabilities::drain::DispatchGuard> guard);
+  PoolIdentity expected;
+  Json::Value layout;
+  std::unique_ptr<capabilities::drain::DispatchGuard> guard;
+};
+
+// Frame-owned values: lazy tasks do not borrow a temporary caller or args.
+// Both paths acquire a real shell lifecycle guard and counted runtime lease.
+auto dispatch_fixed_shell_storage(
+    FixedStorageCall call, capabilities::UserContext caller,
+    int caller_call_depth,
+    std::shared_ptr<lifecycle::AsyncTaskLease> accepted = nullptr)
+    -> drogon::Task<std::expected<Json::Value, js::PromiseRejection>>;
+auto dispatch_fixed_shell_commit(
+    ValidatedFloatCommit commit, capabilities::UserContext caller,
+    int caller_call_depth,
+    std::shared_ptr<lifecycle::AsyncTaskLease> accepted = nullptr)
+    -> drogon::Task<std::expected<Json::Value, js::PromiseRejection>>;
 
 // Process-lifetime bootstrap. Caches a pointer to `cfg` for use at
 // dispatch time (handler-path resolution consumes `cfg.packages_data_dir`)
@@ -75,6 +208,8 @@ auto shutdown_registry(std::chrono::milliseconds timeout = std::chrono::seconds{
 // dispatch to). Returns true on a created pool, or on an error where
 // the kernel chooses to continue (the error is logged).
 auto create_pool(std::string_view extension_name) -> bool;
+auto create_pool(std::string_view extension_name, std::string_view package_id,
+                 std::string_view version) -> bool;
 
 // Install-lifecycle hook — called from DISABLED / UPGRADING / UNINSTALL
 // commit sites. Removes the pool under the registry's exclusive lock and
@@ -94,6 +229,15 @@ auto destroy_pool(std::string_view extension_name) -> void;
 // plus the number of pools retained after a bounded close failure.
 [[nodiscard]] auto owner_loop_handoff_count_for_test() -> std::size_t;
 [[nodiscard]] auto failed_pool_count_for_test() -> std::size_t;
+
+enum class PoolCreationStage { RESERVED, CONSTRUCTED };
+// Deterministic interleaving/fault injection only; invoked OUTSIDE registry_mu.
+// A throwing hook uses the real exception/unpublished-retirement path.
+using PoolCreationHook =
+    std::function<void(std::string_view, PoolCreationStage)>;
+auto set_pool_creation_hook_for_test(PoolCreationHook hook) -> void;
+[[nodiscard]] auto pending_pool_constructions_for_test() -> std::size_t;
+[[nodiscard]] auto fixed_storage_retained_bytes_for_test() -> std::size_t;
 
 // The Tier 2 extension dispatch entry — invoked from
 // `capabilities::call_capability_async` after resolve + RBAC for an

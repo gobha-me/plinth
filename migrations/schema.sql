@@ -215,6 +215,19 @@ CREATE INDEX idx_packages_supersedes
     ON plinth.packages(supersedes_id)
     WHERE supersedes_id IS NOT NULL;
 
+-- Kernel-owned, write-once per exact installed generation/capture profile.
+-- Existing v2 generations are captured on demand; never backfill guessed hashes.
+CREATE TABLE plinth.package_artifact_receipts (
+    package_id UUID NOT NULL REFERENCES plinth.packages(id) ON DELETE CASCADE,
+    profile INTEGER NOT NULL CHECK (profile = 1),
+    artifact_digest TEXT NOT NULL CHECK (artifact_digest ~ '^[0-9a-f]{64}$'),
+    declarations_digest TEXT NOT NULL CHECK (declarations_digest ~ '^[0-9a-f]{64}$'),
+    record_count INTEGER NOT NULL CHECK (record_count >= 0 AND record_count <= 4096),
+    content_bytes BIGINT NOT NULL CHECK (content_bytes >= 0 AND content_bytes <= 52428800),
+    metadata_bytes INTEGER NOT NULL CHECK (metadata_bytes >= 32 AND metadata_bytes <= 1048576),
+    PRIMARY KEY (package_id, profile)
+);
+
 CREATE TABLE plinth.panels (
     package_id    UUID        NOT NULL REFERENCES plinth.packages(id) ON DELETE CASCADE,
     panel_id      TEXT        NOT NULL,

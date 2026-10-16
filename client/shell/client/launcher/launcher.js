@@ -6,6 +6,10 @@ import { FloatLayer } from '../panels/float-chrome.js';
 import { FloatPreferences, FloatPreferenceIoOwner } from '../panels/float-preferences.js';
 import { createFloatReservations } from '../panels/float-reservations.js';
 import { DocumentInteractionOwner } from '../panels/interaction-owner.js';
+import { FloatRequestOwner } from '../panels/float-request-owner.js';
+import { createFloatTransport, readFloatPlatformProfile } from '../panels/float-transport.js';
+import { InstalledFloatController } from '../panels/float-controller.js';
+import { createFloatPersistenceAdapter } from '../panels/float-persistence-adapter.js';
 import {
     catalogTargetKeys, choosePanel, makeTarget, normalizeCatalog,
     normalizeLauncherPreference, orderApplications, updatePreference,
@@ -15,6 +19,7 @@ const APPLICATIONS_CHANNEL = 'plinth:system:applications.changed';
 const DEVELOPMENT_MODE = window.__PLINTH_PRODUCTION__ === false;
 const TERMINAL_SESSION = new Set(['not_authenticated', 'session_expired', 'session_revoked']);
 const TERMINAL_RECOVERABLE = new Set(['auth_failed', 'auth_timeout']);
+const standaloneFloatRequests = new FloatRequestOwner();
 const IDENTITY_COLORS = Object.freeze([
     'var(--accent)', 'var(--success)', 'var(--warn)', 'var(--danger)', 'var(--text-2)',
 ]);
@@ -101,6 +106,7 @@ export class Launcher extends Component {
             menuOpen: false, menuIndex: 0, focusedPanel: null, dirtyIntent: null,
             liveMessage: '', statusMessage: '', panelFailure: null,
             authorityCode: null, overlay: false,
+            floatMessage: '', floatPreferenceStatus: null,
             narrow: typeof window !== 'undefined' && window.matchMedia('(max-width: 42rem)').matches,
         };
         this.preference = normalizeLauncherPreference(null);
@@ -120,6 +126,8 @@ export class Launcher extends Component {
             this.interaction = this.documentInteraction.beginFrame({ isCurrent: () => !this.retired });
         }
         this.floatPreferenceIoOwner = props.floatPreferenceIoOwner || new FloatPreferenceIoOwner();
+        this.floatRequestOwner = props.floatRequestOwner || standaloneFloatRequests;
+        this.floatIntentRevision = 0;
         this.switcherToken = Symbol();
         this.primaryConfirmationToken = Symbol();
     }
@@ -149,14 +157,15 @@ export class Launcher extends Component {
         const owner = this.owner;
         const isCurrent = () => this.owns(owner);
         if (!isCurrent()) return;
-        // Mechanism only: #46 must supply reviewed authority and persistence
-        // adapters. Never substitute the unrestricted generic preferences API.
-        this.floatPreferences = new FloatPreferences({ ioOwner: this.floatPreferenceIoOwner });
-        this.unsubscribePreferenceRetire = this.interaction.onRetire(() => this.floatPreferences.retire());
+        // Register before FloatManager's retirement callback: fence storage and
+        // request dispatch before extension cleanup can run reentrant callbacks.
+        this.unsubscribePreferenceRetire = this.interaction.onRetire(() => this.retireFloats());
         this.floatManager = new FloatManager({ reservations: this.floatReservations,
             interaction: this.interaction });
+        this.setupFloats();
         this.panelManager = new PanelManager(this.panelHost, {
             interaction: this.interaction,
+            floatActions: this.floatController?.panelActions(),
             onFailure: (target, error, info) => {
                 if (isCurrent()) this.auditPanelFailure(target, error, info);
             },
@@ -176,10 +185,11 @@ export class Launcher extends Component {
             }
             this.forceOwnedUpdate();
         });
-        this.floatPreferences.start();
+        if (this.floatAdapter) this.prepareFloatRestore(false);
+        else this.floatPreferences.start();
         this.preferencePromise = this.loadPreference();
         this.unsubscribeApplications = subscribe(APPLICATIONS_CHANNEL,
-            () => { if (isCurrent()) this.refreshWhenPreferencesReady(); }, {
+            () => { if (isCurrent()) { this.refreshWhenPreferencesReady(); this.refreshFloatAuthority('applications'); } }, {
                 onReady: () => { if (isCurrent()) this.realtimeReady(); },
                 onError: error => { if (isCurrent()) this.realtimeError(error); },
             });
@@ -214,6 +224,121 @@ export class Launcher extends Component {
         this.panelManager?.dispose();
     }
 
+    setupFloats() {
+        this.floatRetired = false;
+        let profile = null;
+        try {
+            const documentProfile = readFloatPlatformProfile(document);
+            // shell.js passes its pre-panel immutable capture. An explicit null
+            // denotes an incompatible/legacy document, never a late upgrade.
+            profile = Object.hasOwn(this.props, 'floatPlatformProfile')
+                ? this.props.floatPlatformProfile === documentProfile ? documentProfile : null
+                : documentProfile;
+        } catch { /* Missing/incompatible trusted document stays legacy. */ }
+        if (profile) {
+            const transport = createFloatTransport({ platformProfile: profile, location: window.location });
+            this.floatController = new InstalledFloatController({ manager: this.floatManager, transport,
+                requestOwner: this.floatRequestOwner,
+                onIntent: () => this.acceptFloatIntent(),
+                onStatus: code => this.floatStatus(code),
+                onAuthorityChange: () => this.invalidateFloatStorage(),
+                isPersistable: (record, target) => this.floatAdapter?.isPersistable(record, target) === true });
+            this.floatAdapter = createFloatPersistenceAdapter({ transport, controller: this.floatController,
+                manager: this.floatManager, ioOwner: this.floatPreferenceIoOwner,
+                onStatus: code => this.floatStatus(code) });
+        }
+        this.floatPreferences = new FloatPreferences({ ioOwner: this.floatPreferenceIoOwner,
+            ...(this.floatAdapter || {}), onStatus: status => {
+                if (this.owns()) this.setOwnedState({ floatPreferenceStatus: status });
+            } });
+        this.unsubscribeFloatLayout = this.floatManager.onLayout(() => {
+            if (this.owns() && this.floatAdapter) this.floatPreferences.layoutChanged();
+        });
+    }
+
+    floatStatus(code) {
+        if (!this.owns()) return;
+        if (code === 'session-ended') {
+            this.retireFloats(); this.interaction.retire(); this.props.onSessionEnd('not_authenticated'); return;
+        }
+        if (code === 'reload-required') this.retireFloats();
+        const messages = {
+            'reload-required': 'The platform changed. Reload the shell before opening or restoring panels.',
+            'live-only': 'Some panels are not restored after reload. Unsaved edits are never restored.',
+            'restore-approved': '', 'invalid-input': 'This panel request has invalid context or content type.',
+            'missing-handler': 'No available application handles this content type.',
+            'limit-refused': 'Five panels are already open. Close one before opening another.',
+            'request-busy': 'Panel work is still pending. Try again after it finishes.',
+            'load-failed': 'This panel could not be displayed. Retry or close its fallback.',
+            'cancelled': 'The panel request was cancelled.',
+        };
+        this.setOwnedState({ floatMessage: messages[code] ?? 'Panel access or restore storage could not be verified. Try again explicitly.' });
+    }
+
+    invalidateFloatStorage() {
+        if (!this.owns()) return;
+        this.floatAdapter?.invalidate(); this.floatPreferences?.policyChanged();
+    }
+
+    acceptFloatIntent() {
+        if (!this.owns()) return;
+        this.floatIntentRevision++;
+        this.floatPreferences?.acceptIntent();
+    }
+
+    prepareFloatRestore(explicit) {
+        if (!this.owns() || this.floatRetired || !this.floatAdapter || this.floatPreparing) return false;
+        if (explicit) this.acceptFloatIntent();
+        const intent = this.floatIntentRevision;
+        const token = this.floatPreparing = Symbol('float storage prepare');
+        this.floatAdapter.prepare().then(() => {
+            if (!this.owns() || this.floatPreparing !== token) return;
+            this.floatPreparing = null;
+            if (intent !== this.floatIntentRevision) {
+                this.setOwnedState({ floatMessage: 'Saved panel restore was interrupted by a newer action.' });
+                return;
+            }
+            if (explicit) this.floatPreferences.retryRestore();
+            else this.floatPreferences.start();
+            this.forceOwnedUpdate();
+        }, () => {
+            if (!this.owns() || this.floatPreparing !== token) return;
+            this.floatPreparing = null; this.floatStatus('authority-unavailable');
+        });
+        return true;
+    }
+
+    refreshFloatAuthority(reason) {
+        if (this.owns()) this.floatController?.refresh(reason);
+    }
+
+    retireFloats() {
+        this.floatRetired = true;
+        this.floatPreparing = null;
+        this.unsubscribeFloatLayout?.(); this.unsubscribeFloatLayout = null;
+        this.floatPreferences?.retire(); this.floatAdapter?.retire(); this.floatController?.retire();
+        this.floatManager?.retire();
+    }
+
+    floatStorageMessage() {
+        const state = this.state.floatPreferenceStatus;
+        if (!state) return '';
+        const saves = {
+            uncertain: 'The last save outcome is uncertain. It may have completed; no automatic retry was made.',
+            'not-saved': 'Panel layout is not confirmed saved. Use Save panel layout to try again.',
+            unavailable: 'Panel layout storage is unavailable. Current panels remain live-only until verified.',
+            'cleanup-pending': 'Panel layout I/O is still pending. Wait for its owned work to finish.',
+            pending: 'Panel layout save is pending.', writing: 'Saving the approved panel layout…',
+            saved: 'Approved panel layout saved. Unsaved edits are never saved.',
+        };
+        if (saves[state.save]) return saves[state.save];
+        if (state.restore === 'retry-required') return 'Saved panels could not be verified. Restore again explicitly to retry.';
+        if (state.restore === 'cleanup-pending') return 'Saved panel preparation is still pending. Wait for its owned work to finish.';
+        if (state.restore === 'interrupted') return 'Saved panel restore was interrupted by a newer action.';
+        if (state.restore === 'complete' && state.warning) return 'Some saved panels could not be restored.';
+        return '';
+    }
+
     componentDidUpdate() {
         if (!this.owns()) return;
         if (this.state.menuOpen && this.state.narrow) this.interaction.setModal('switcher', this.switcherToken);
@@ -222,9 +347,9 @@ export class Launcher extends Component {
 
     backgroundElements() {
         // Never inert the switcher's own ancestor while it holds the modal lease.
-        return this.interaction.modal?.kind === 'switcher'
-            ? [this.primaryMain, this.homeButton, this.appTrigger, this.tabs, this.userControlsHost, this.overlayButton]
-            : [this.primaryMain, this.topbar];
+        return (this.interaction.modal?.kind === 'switcher'
+            ? [this.primaryMain, this.homeButton, this.appTrigger, this.tabs, this.userControlsHost, this.overlayButton, this.floatStorageControls]
+            : [this.primaryMain, this.topbar, this.floatStorageControls]).filter(Boolean);
     }
 
     primaryFocusFallback() { return this.panelManager?.active?.container || this.homeHeading; }
@@ -263,6 +388,7 @@ export class Launcher extends Component {
         this.recovering = false;
         this.setOwnedState({ authorityCode: null });
         this.refreshWhenPreferencesReady();
+        this.refreshFloatAuthority('realtime-ready');
     }
 
     refreshWhenPreferencesReady() {
@@ -277,6 +403,7 @@ export class Launcher extends Component {
         if (!this.owns()) return;
         const reportedCode = error?.code || 'auth_failed';
         if (reportedCode === 'disconnected') {
+            this.invalidateFloatStorage();
             this.setOwnedState(({ applications }) => ({
                 catalogStatus: applications.length ? 'stale' : 'failed',
                 statusMessage: 'Realtime updates are reconnecting.',
@@ -304,6 +431,8 @@ export class Launcher extends Component {
         this.interaction.dismissConfirmation();
         this.interaction.clearModal(this.switcherToken);
         this.panelManager?.destroyAll();
+        this.invalidateFloatStorage();
+        if (TERMINAL_SESSION.has(code)) this.retireFloats();
         this.setOwnedState({
             applications: [], navigation: { kind: 'home' }, catalogStatus: 'failed',
             authorityCode: code, menuOpen: false, dirtyIntent: null, panelFailure: null,
@@ -503,7 +632,8 @@ export class Launcher extends Component {
         this.focusBeforeDialog = null;
         this.setOwnedState({ dirtyIntent: null }, () => {
             if (this.interaction.modal?.kind === 'float') {
-                this.floatManager.focus(this.interaction.modal.token);
+                if (this.floatController) this.floatController.raise(this.interaction.modal.token, { acceptIntent: false });
+                else this.floatManager.focus(this.interaction.modal.token);
                 return;
             }
             this.interaction.focusPrimary();
@@ -830,8 +960,18 @@ export class Launcher extends Component {
             this.state.overlay ? h('div', { class: 'ipoint-legend', role: 'status' },
                 'Ownership: blue = shell, amber = extension') : null,
             this.floatManager ? h(FloatLayer, { manager: this.floatManager, interaction: this.interaction,
+                controller: this.floatController, onIntent: () => this.acceptFloatIntent(),
                 topbarElement: () => this.topbar, backgroundElements: () => this.backgroundElements(),
                 focusFallback: () => this.primaryFocusFallback() }) : null,
+            this.floatController && h('div', { class: 'float-storage-status', role: 'status',
+                ref: element => { this.floatStorageControls = element; } },
+                this.state.floatMessage && h('p', null, this.state.floatMessage),
+                this.floatStorageMessage() && h('p', null, this.floatStorageMessage()),
+                h('button', { type: 'button', disabled: this.floatRetired || !!this.floatPreparing ||
+                    this.state.floatPreferenceStatus?.readPending || this.state.floatPreferenceStatus?.restorePending,
+                    onClick: () => this.prepareFloatRestore(true) }, 'Restore saved panels'),
+                h('button', { type: 'button', disabled: this.floatRetired || this.state.floatPreferenceStatus?.writePending,
+                    onClick: () => { this.acceptFloatIntent(); this.floatPreferences.retrySave(); } }, 'Save panel layout')),
             this.state.dirtyIntent ? h(DirtyDialog, {
                 onCancel: () => this.cancelDirty(), onDiscard: () => this.confirmDirty(),
                 isCurrent: () => this.owns(owner),

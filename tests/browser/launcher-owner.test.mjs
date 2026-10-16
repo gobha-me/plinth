@@ -4,6 +4,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import vm from 'node:vm';
+import { target as typedTarget, entry as savedEntry, snapshot as savedSnapshot,
+    generation as typedGeneration, artifact as typedArtifact } from './float-production-fixtures.mjs';
 
 // Evaluate the complete shipping graph. Only external Preact and browser APIs
 // are controlled here; these tests do not emulate a deployed backend.
@@ -11,7 +13,9 @@ const client = resolve(dirname(fileURLToPath(import.meta.url)), '../../client/sh
 const paths = ['launcher/launcher.js', 'launcher/model.js', 'sdk.js',
     'panels/loader.js', 'panels/panel_api.js', 'data-query.js', 'data-controller.js',
     'panels/float-manager.js', 'panels/float-chrome.js', 'panels/float-model.js',
-    'panels/float-preferences.js', 'panels/float-reservations.js', 'panels/interaction-owner.js'];
+    'panels/float-preferences.js', 'panels/float-reservations.js', 'panels/interaction-owner.js',
+    'panels/float-request-owner.js', 'panels/float-transport.js', 'panels/float-wire.js',
+    'panels/float-controller.js', 'panels/float-resolver.js', 'panels/float-persistence-adapter.js'];
 const sources = new Map(await Promise.all(paths.map(async path =>
     [resolve(client, path), await readFile(resolve(client, path), 'utf8')])));
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -39,23 +43,31 @@ function response(status = 200, body = catalog) {
 const capResponse = value => response(200, { ok: true, value });
 async function turns() { for (let index = 0; index < 8; index++) await Promise.resolve(); }
 
-async function fixture() {
+async function fixture({ profile = null, layout = undefined, layoutGate = null } = {}) {
+    const trustedProfile = profile;
     const requests = [];
     const sockets = [];
     const microtasks = [];
     const timers = new Map();
     const plans = new Map();
     const pending = [];
+    if (layoutGate) pending.push({ url: '/api/frontend/float-layout', item: layoutGate });
     const operations = [];
     const launchers = [];
     const effects = [];
     const sessionEnds = [];
     const listeners = new Map();
     const documentEvents = [], windowEvents = [], windowListeners = new Map();
+    const nativeImports = [], importedAPIs = [];
     let nextTimer = 0;
     let account = 'A';
     const document = {
         cookie: 'plinth_csrf=fake-A', visibilityState: 'visible', activeElement: null,
+        location: { origin: 'https://plinth.test', href: 'https://plinth.test/app/' },
+        querySelectorAll(selector) {
+            assert.equal(selector, 'meta[name="plinth-platform-profile"]');
+            return profile === null ? [] : [{ getAttribute: () => profile }];
+        },
         addEventListener(type, fn) { documentEvents.push(['add', type, fn]); listeners.set(type, fn); },
         removeEventListener(type, fn) { documentEvents.push(['remove', type, fn]); if (listeners.get(type) === fn) listeners.delete(type); },
         getElementById(id) { return new Element(id); },
@@ -117,6 +129,15 @@ async function fixture() {
         if (url === '/api/cap/shell.preferences.set' || url === '/api/cap/shell.audit.emit') {
             return capResponse({ ok: true });
         }
+        const typedResponse = body => new Response(JSON.stringify(body), { status: 200,
+            headers: { 'Content-Type': 'application/json', 'X-Plinth-Platform-Profile': trustedProfile } });
+        if (url === '/api/frontend/float-layout') return typedResponse({ schema_version: 1, present: layout !== undefined,
+            ...(layout === undefined ? {} : { layout }), policy_revision: '1',
+            restore_targets: (layout?.floats || []).map((_, index) => ({ index, status: 'available', target: typedTarget() })) });
+        if (url.startsWith('/api/frontend/surfaces?')) return typedResponse({ schema_version: 1, kind: 'float',
+            targets: [typedTarget()], next_cursor: null, ...(url.includes('include_admin_default=1') ? { admin_default_candidate: null } : {}) });
+        if (url === '/api/frontend/surfaces/admission') return typedResponse({ schema_version: 1,
+            results: [{ index: 0, status: 'available', target: typedTarget() }] });
         throw new Error(`unexpected platform fetch ${url}`);
     }
     const context = vm.createContext({
@@ -125,7 +146,8 @@ async function fixture() {
                 protocol: 'https:', host: 'plinth.test' },
             addEventListener(type, fn) { windowEvents.push(['add', type, fn]); windowListeners.set(type, fn); },
             removeEventListener(type, fn) { windowEvents.push(['remove', type, fn]); if (windowListeners.get(type) === fn) windowListeners.delete(type); } },
-        document, URL, Headers, AbortController, DOMException, TextEncoder,
+        document, URL, URLSearchParams, Headers, AbortController, DOMException, TextEncoder, TextDecoder,
+        crypto: globalThis.crypto,
         performance: { now: () => 0 },
         console: { error() {} }, WebSocket: Socket,
         queueMicrotask(fn) { microtasks.push(fn); },
@@ -135,7 +157,17 @@ async function fixture() {
             requests.push({ url, account, csrf: options.headers?.get?.('X-Plinth-CSRF'),
                 args: options.body ? JSON.parse(options.body).args : undefined, options });
             const queue = plans.get(url);
-            return queue?.length ? queue.shift().promise : Promise.resolve(defaultResponse(url));
+            if (queue?.length) return queue.shift().promise;
+            if (url === '/api/frontend/float-layout' && options.method === 'GET' && layoutGate) return layoutGate.promise;
+            if (url === '/api/cap/shell.preferences.get' && JSON.parse(options.body).args?.key === 'shell.handler_defaults') {
+                return Promise.resolve(new Response(JSON.stringify({ ok: true, value: {}, resolved_tier: 'tier2', provider_type: 'extension' }), { status: 200 }));
+            }
+            if (url === '/api/frontend/surfaces/admission') return Promise.resolve(new Response(JSON.stringify({ schema_version: 1,
+                results: JSON.parse(options.body).targets.map((_, index) => ({ index, status: 'available', target: typedTarget() })) }),
+            { status: 200, headers: { 'X-Plinth-Platform-Profile': trustedProfile } }));
+            if (url === '/api/frontend/float-layout' && options.method === 'PUT') return Promise.resolve(new Response(
+                '{"schema_version":1,"saved":true}', { status: 200, headers: { 'X-Plinth-Platform-Profile': trustedProfile } }));
+            return Promise.resolve(defaultResponse(url));
         },
     });
     const preact = new vm.SyntheticModule(['h', 'render', 'Component'], function () {
@@ -152,7 +184,14 @@ async function fixture() {
     function load(path) {
         assert(sources.has(path), `module outside exact shipping graph: ${path}`);
         if (!modules.has(path)) modules.set(path, new vm.SourceTextModule(sources.get(path),
-            { context, identifier: path }));
+            { context, identifier: path, async importModuleDynamically(url) {
+                nativeImports.push(url);
+                const imported = new vm.SyntheticModule(['default'], function () {
+                    this.setExport('default', api => { importedAPIs.push(api); return () => {}; });
+                }, { context, identifier: url });
+                await imported.link(() => { throw new Error('unexpected fixture provider import'); });
+                await imported.evaluate(); return imported;
+            } }));
         return modules.get(path);
     }
     const launcherModule = load(resolve(client, 'launcher/launcher.js'));
@@ -171,7 +210,7 @@ async function fixture() {
     const model = modules.get(resolve(client, 'launcher/model.js')).namespace;
     const sdk = modules.get(resolve(client, 'sdk.js')).namespace;
     function createLauncher() {
-        const launcher = new Launcher({ onSessionEnd: code => sessionEnds.push(code) });
+        const launcher = new Launcher({ onSessionEnd: code => sessionEnds.push(code), floatPlatformProfile: trustedProfile });
         launcher.panelHost = new Element('host'); launcher.homeHeading = new Element('home');
         launcher.componentDidMount(); launchers.push(launcher); return launcher;
     }
@@ -181,12 +220,23 @@ async function fixture() {
         documentEvents, windowEvents, listeners, windowListeners,
         FloatLayer: modules.get(resolve(client, 'panels/float-chrome.js')).namespace.FloatLayer,
         document, microtasks, createLauncher,
+        nativeImports, importedAPIs, setProfile(value) { profile = value; },
+        realm(value) {
+            context.fixtureJSON = JSON.stringify(value);
+            try { return vm.runInContext('JSON.parse(fixtureJSON)', context); }
+            finally { delete context.fixtureJSON; }
+        },
         run(promise) { operations.push(promise); promise.catch(() => {}); return promise; },
         hold(url) {
             const item = deferred(); pending.push({ url, item });
             const queue = plans.get(url) || []; queue.push(item); plans.set(url, queue); return item;
         },
         rotate() { account = 'B'; document.cookie = 'plinth_csrf=fake-B'; },
+        expireFloatRequests() {
+            const current = [...timers.entries()].filter(([, timer]) => timer.milliseconds === 10000);
+            assert(current.length > 0, 'an actual shipping request deadline must be armed');
+            for (const [id, timer] of current) { timers.delete(id); timer.fn(); }
+        },
         writes() { return requests.filter(r => r.url === '/api/cap/shell.preferences.set'); },
         catalogs() { return requests.filter(r => r.url === '/api/frontend/applications'); },
         audits() { return requests.filter(r => r.url === '/api/cap/shell.audit.emit'); },
@@ -668,4 +718,166 @@ ownerTest('F08 authority retirement deactivates actual primary once before repea
     api.setDirty(true); await turns();
     assert.equal(deactivated, 1); assert.equal(f.requests.length, before);
     assert.equal(f.launcher.documentInteraction.beforeUnloadInstalled, false);
+});
+
+const validProfile = `v1:${typedGeneration}:${typedArtifact}`;
+const platformTurns = async () => { await turns(); await new Promise(resolve => setImmediate(resolve)); await turns(); };
+test('F09 incompatible platform marker preserves legacy unactivated launcher behavior', async () => {
+    for (const profile of [null, 'not-a-platform-profile']) {
+        const f = await fixture({ profile });
+        try {
+            assert.equal(f.launcher.floatController, undefined);
+            assert.equal(f.requests.some(request => request.url === '/api/frontend/float-layout'), false);
+        } finally { await f.cleanup(); }
+    }
+});
+
+test('F10 conditional shipping primary port opens through real adapter graph with controlled native I/O', async () => {
+    const f = await fixture({ profile: validProfile });
+    try {
+        await platformTurns();
+        assert.equal(f.launcher.floatAdapter.authority().ready, true);
+        assert.equal(f.requests.filter(request => request.url === '/api/frontend/float-layout').length, 1);
+        f.launcher.floatManager.setWorkArea({ width: 1200, height: 800 });
+        const api = await activePrimary(f);
+        const opened = await api.openFloat('text/plain', f.realm({ record_id: 'fixture-only' }));
+        assert.equal(typeof opened.floatId, 'string');
+        assert.equal(f.nativeImports.length, 1);
+        assert.equal(f.nativeImports[0], 'https://plinth.test' + typedTarget().module_url);
+        assert.equal(f.launcher.floatManager.snapshot()[0].liveOnly, false);
+        assert.equal(f.requests.filter(request => request.url === '/api/cap/shell.preferences.get' &&
+            request.args.key === 'shell.handler_defaults').length, 1);
+        assert.equal(f.requests.some(request => request.args?.key === 'shell.floats'), false);
+        api.__shell_internal.unbind();
+        await assert.rejects(api.openFloat('text/plain', f.realm({ record_id: 'late' })), { name: 'PanelUnboundError' });
+    } finally { await f.cleanup(); }
+});
+
+test('F11 background saved restore keeps original layout without destructive read-time save', async () => {
+    const f = await fixture({ profile: validProfile, layout: savedSnapshot(savedEntry()) });
+    try {
+        f.launcher.floatManager.setWorkArea({ width: 1200, height: 800 });
+        // This is the exact shipping actor/import graph under controlled I/O,
+        // not the separate required real installed-package browser journey.
+        for (let index = 0; index < 5; index++) await platformTurns();
+        assert.equal(f.launcher.floatPreferences.status().restore, 'complete');
+        assert.equal(f.launcher.floatManager.snapshot().length, 1);
+        assert.equal(f.requests.filter(request => request.url === '/api/frontend/float-layout').length, 1);
+        assert.equal(f.requests.some(request => request.url === '/api/frontend/float-layout' && request.options.method === 'PUT'), false);
+        assert.equal(f.launcher.floatPreferences.status().save, 'idle');
+    } finally { await f.cleanup(); }
+});
+
+test('F12 marker replacement cannot activate a new platform graph and retirement fences pending storage', async () => {
+    const f = await fixture({ profile: validProfile });
+    try {
+        await platformTurns();
+        f.launcher.componentWillUnmount(); f.setProfile(`v1:${typedGeneration}:${'c'.repeat(64)}`);
+        const next = f.createLauncher();
+        assert.equal(next.floatController, undefined);
+        assert.equal(f.launcher.floatController.isCurrent(), false);
+        assert.equal(f.launcher.floatAdapter.authority().ready, false);
+    } finally { await f.cleanup(); }
+});
+
+test('F13 user open during initial guarded prepare fences late automatic restore', async () => {
+    const held = deferred(), f = await fixture({ profile: validProfile, layoutGate: held });
+    try {
+        f.launcher.floatManager.setWorkArea({ width: 1200, height: 800 });
+        const api = await activePrimary(f);
+        await api.openFloat('text/plain', f.realm({ record_id: 'new-user-intent' }));
+        assert.equal(f.nativeImports.length, 1);
+        held.resolve(new Response(JSON.stringify({ schema_version: 1, present: true,
+            layout: savedSnapshot(savedEntry('old-saved-id')), policy_revision: '1',
+            restore_targets: [{ index: 0, status: 'available', target: typedTarget() }] }),
+        { status: 200, headers: { 'X-Plinth-Platform-Profile': validProfile } }));
+        for (let index = 0; index < 4; index++) await platformTurns();
+        assert.equal(f.nativeImports.length, 1, 'late saved layout must not reopen after a newer user intent');
+        assert.equal(f.launcher.floatManager.snapshot().length, 1);
+    } finally { await f.cleanup(); }
+});
+
+test('F14 initial guarded-layout terminal identity and profile failures fence the shipping frame', async () => {
+    for (const [status, profile] of [[401, validProfile], [200, 'incompatible-profile']]) {
+        const held = deferred(), f = await fixture({ profile: validProfile, layoutGate: held });
+        try {
+            held.resolve(new Response(status === 401 ? 'not-json-identity-error' : JSON.stringify({ schema_version: 1,
+                present: false, policy_revision: null, restore_targets: [] }),
+            { status, headers: { 'X-Plinth-Platform-Profile': profile } }));
+            for (let index = 0; index < 3; index++) await platformTurns();
+            assert.equal(f.launcher.floatController.isCurrent(), false);
+            assert.equal(f.launcher.floatAdapter.authority().ready, false);
+            assert.equal(f.launcher.floatManager.isCurrent(), false);
+            if (status === 401) assert.deepEqual(f.sessionEnds, ['not_authenticated']);
+            else { assert.deepEqual(f.sessionEnds, []); assert.match(f.launcher.state.floatMessage, /Reload the shell/); }
+        } finally { await f.cleanup(); }
+    }
+});
+
+test('F15 shipping chrome routes retry and focus through controller; dirty Cancel is not layout intent', async () => {
+    const f = await fixture({ profile: validProfile });
+    let layer;
+    try {
+        await platformTurns(); f.launcher.floatManager.setWorkArea({ width: 1200, height: 800 });
+        const api = await activePrimary(f);
+        await api.openFloat('text/plain', f.realm({ record_id: 'chrome-controls' }));
+        const [record] = f.launcher.floatManager.records.values();
+        const calls = []; let intents = 0;
+        layer = new f.FloatLayer({ manager: f.launcher.floatManager, interaction: f.launcher.interaction,
+            controller: { retry: token => calls.push(['retry', token]), raise: (token, options) => calls.push(['raise', token, options]) },
+            onIntent: () => { intents++; } });
+        layer.mounted = true;
+        layer.action('retry', record.token); layer.select(record.token, { focusChrome: false });
+        assert.equal(calls[0][0], 'retry'); assert.equal(calls[1][0], 'raise'); assert.equal(calls[1][2].focusChrome, false);
+        f.importedAPIs[0].setDirty(true);
+        layer.action('requestClose', record.token);
+        assert.equal(f.launcher.interaction.confirmation.kind, 'float'); assert.equal(intents, 0);
+        layer.resolveConfirmation(false); assert.equal(intents, 0);
+        assert.equal(calls.at(-1)[2].acceptIntent, false);
+        layer.action('requestClose', record.token); layer.resolveConfirmation(true);
+        assert.equal(intents, 1); assert.equal(f.launcher.floatManager.records.size, 0);
+    } finally { layer?.retireLayer(); await f.cleanup(); }
+});
+
+test('F16 late terminal responses after actual open deadline fence only the still-owned Launcher frame', async () => {
+    for (const [status, profile, raw] of [
+        [401, validProfile, '{}'], [401, validProfile, 'not-json'],
+        [200, 'incompatible-profile', '{}'],
+    ]) {
+        for (const retired of [false, true]) {
+            const f = await fixture({ profile: validProfile });
+            try {
+                await platformTurns();
+                f.launcher.floatManager.setWorkArea({ width: 1200, height: 800 });
+                const api = await activePrimary(f), held = f.hold('/api/frontend/surfaces/admission');
+                const result = assert.rejects(api.openFloat('text/plain', f.realm({ record_id: 'late-terminal' })),
+                    { code: 'authority-unavailable' });
+                await platformTurns();
+                assert(f.requests.some(item => item.url === '/api/frontend/surfaces/admission'));
+                f.expireFloatRequests(); await result;
+                assert.equal(f.launcher.floatController.isCurrent(), true);
+                assert.equal(f.nativeImports.length, 0);
+                let successor;
+                if (retired) {
+                    f.launcher.componentWillUnmount(); f.rotate(); successor = f.createLauncher();
+                    await platformTurns();
+                    assert.equal(successor.floatController.isCurrent(), true);
+                }
+                held.resolve(new Response(raw, { status, headers: { 'X-Plinth-Platform-Profile': profile } }));
+                await platformTurns();
+                assert.equal(f.nativeImports.length, 0, 'no late ordinary success/import actions');
+                if (retired) {
+                    assert.equal(successor.floatController.isCurrent(), true);
+                    assert.equal(successor.floatManager.isCurrent(), true);
+                    assert.deepEqual(f.sessionEnds, []);
+                } else {
+                    assert.equal(f.launcher.floatController.isCurrent(), false);
+                    assert.equal(f.launcher.floatManager.isCurrent(), false);
+                    assert.equal(f.launcher.floatAdapter.authority().ready, false);
+                    if (status === 401) assert.deepEqual(f.sessionEnds, ['not_authenticated']);
+                    else { assert.deepEqual(f.sessionEnds, []); assert.match(f.launcher.state.floatMessage, /Reload the shell/); }
+                }
+            } finally { await f.cleanup(); }
+        }
+    }
 });

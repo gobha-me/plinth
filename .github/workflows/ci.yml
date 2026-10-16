@@ -176,7 +176,8 @@ jobs:
           PLINTH_PG_PASSWORD: plinth
           PLINTH_PG_DATABASE: plinth_test
         run: |
-          sudo apt-get install -y postgresql-client
+          set -euo pipefail
+          sudo apt-get install -y postgresql-client util-linux
           npm ci --prefix tests/browser
           (cd tests/browser && npx playwright install --with-deps chromium)
           npm run test:transport --prefix tests/browser
@@ -189,6 +190,8 @@ jobs:
           python3 tests/browser/run-bundled-upgrade.py --binary build/plinth
           python3 tests/browser/run-client-contracts.py --binary build/plinth
           python3 tests/browser/run-admin-package.py --binary build/plinth
+          python3 tests/browser/installed_float_harness_test.py
+          python3 tests/browser/run-installed-floats.py --binary build/plinth --bundle-dir build/share/plinth/bundled
 
   asan-ubsan:
     name: clang-${{ matrix.llvm_version }} / ASan+UBSan
@@ -559,3 +562,18 @@ jobs:
           set -euo pipefail
           ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 16'
           ctest --test-dir build --output-on-failure --parallel 1 -R '^plinth_tsan_'
+
+      - name: Installed float generation and physical ownership TSan tests
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_(generation_|installed_float_)' |
+            grep -Ex 'Total Tests: 37'
+          ctest --test-dir build --output-on-failure --parallel 1 -R \
+            '^plinth_tests_(generation_|installed_float_)'

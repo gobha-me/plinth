@@ -1,0 +1,11 @@
+{
+  "panels": [
+    {
+      "id": "caller",
+      "title": "Float Caller",
+      "icon": "edit-3",
+      "rbac_rule": "floatcaller.panel",
+      "client_path": "caller.js"
+    }
+  ]
+}

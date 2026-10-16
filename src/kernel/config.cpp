@@ -196,6 +196,15 @@ auto apply_ws(Config& cfg, const nlohmann::json& j) -> void {
 }
 
 auto apply_packages(Config& cfg, const nlohmann::json& p) -> void {
+  if (p.contains("restore_policy_file")) {
+    if (!p["restore_policy_file"].is_string())
+      throw std::runtime_error("config.packages.restore_policy_file_invalid");
+    const auto path = p["restore_policy_file"].get<std::string>();
+    if (path.size() > 4096 || path.find('\0') != std::string::npos ||
+        (!path.empty() && path.front() != '/'))
+      throw std::runtime_error("config.packages.restore_policy_file_invalid");
+    cfg.restore_policy_file = path;
+  }
   if (p.contains("data_dir")) {
     cfg.packages_data_dir = p["data_dir"].get<std::string>();
   }
@@ -663,6 +672,13 @@ auto apply_env(Config& cfg) -> void {
   v = env("PLINTH_MIGRATIONS_DIR");
   if (!v.empty()) {
     cfg.migrations_dir = v;
+  }
+
+  v = env("PLINTH_RESTORE_POLICY_FILE");
+  if (!v.empty()) {
+    if (v.size() > 4096 || v.front() != '/')
+      throw std::runtime_error("config.packages.restore_policy_file_invalid");
+    cfg.restore_policy_file = v;
   }
 
   v = env("PLINTH_DEV_MODE");

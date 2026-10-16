@@ -16,6 +16,10 @@
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/frontend/api_frontend.hpp"
 #include "kernel/frontend/applications.hpp"
+#include "kernel/frontend/float_layout_service.hpp"
+#include "kernel/frontend/float_routes.hpp"
+#include "kernel/frontend/platform_startup.hpp"
+#include "kernel/frontend/typed_assets.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/js/db_batch_audit.hpp"
 #include "kernel/js/db_search_path.hpp"
@@ -27,6 +31,8 @@
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/handlers.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/installed_generation_registry.hpp"
+#include "kernel/packages/protected_restore_policy.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
 #include "kernel/packages/validator.hpp"
 #include "kernel/rbac/enforcement.hpp"
@@ -43,6 +49,7 @@
 
 #include <json/value.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -52,6 +59,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <pthread.h>
@@ -61,6 +69,49 @@
 #include <unistd.h>
 
 namespace {
+
+// Declared before the shutdown guard and retained by its injected hooks and
+// route closures. Startup failure never destroys a live worker/stream before
+// the same production coordinator has closed admission and joined its owners.
+struct FrontendResources {
+  std::shared_ptr<plinth::packages::generation::InstalledGenerationRegistry>
+      registry;
+  std::shared_ptr<const plinth::packages::restore::ProtectedPolicy> policy;
+  std::shared_ptr<plinth::frontend::TypedAssetStreams> streams;
+  std::shared_ptr<plinth::frontend::FloatLayoutService> service;
+};
+
+auto frontend_shutdown_hooks(std::shared_ptr<FrontendResources> owner)
+    -> plinth::lifecycle::ShutdownHooks {
+  auto hooks = plinth::lifecycle::production_shutdown_hooks();
+  auto close = std::move(hooks.close_ingress);
+  hooks.close_ingress =
+      [owner, close = std::move(close)](std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        if (owner->service) owner->service->close_admission();
+        if (owner->streams) owner->streams->close_admission();
+        const bool stopped = !owner->streams || owner->streams->request_stop();
+        const auto remaining =
+            std::max(std::chrono::milliseconds{0},
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadline - std::chrono::steady_clock::now()));
+        const bool closed = close(remaining);
+        return stopped && closed;
+      };
+  auto drain = std::move(hooks.drain_async_tasks);
+  hooks.drain_async_tasks =
+      [owner, drain = std::move(drain)](std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        if (owner->service && !owner->service->drain(deadline)) return false;
+        if (owner->streams && !owner->streams->drain(deadline)) return false;
+        const auto remaining =
+            std::max(std::chrono::milliseconds{0},
+                     std::chrono::duration_cast<std::chrono::milliseconds>(
+                         deadline - std::chrono::steady_clock::now()));
+        return drain(remaining);
+      };
+  return hooks;
+}
 
 auto register_healthz() -> void {
   drogon::app().registerHandler(
@@ -520,7 +571,9 @@ auto main(int argc, char* argv[]) -> int {
       // coordinator outside signal context.
       block_shutdown_signals();
       ShutdownSignalOwner signals;
-      plinth::lifecycle::ShutdownCoordinator shutdown;
+      auto frontend = std::make_shared<FrontendResources>();
+      plinth::lifecycle::ShutdownCoordinator shutdown{
+          frontend_shutdown_hooks(frontend), std::chrono::seconds{40}};
       plinth::db::OperationScope database_operations{signals.token()};
       ServeShutdownGuard shutdown_guard{shutdown, signals};
 
@@ -529,6 +582,23 @@ auto main(int argc, char* argv[]) -> int {
         database_operations.checkpoint();
         plinth::log::init(cfg);
         plinth::log::set_node_id(cfg.node_id);
+
+        // The protected deployment snapshot is immutable for this process.
+        // A configured trust/load failure is not silently treated as absence.
+        const auto loaded_policy =
+            plinth::packages::restore::load_protected_policy(
+                cfg.restore_policy_file);
+        if (!loaded_policy) {
+          spdlog::critical("bootstrap: configured restore policy unavailable");
+          return 1;
+        }
+        if (*loaded_policy)
+          frontend->policy = std::make_shared<
+              const plinth::packages::restore::ProtectedPolicy>(
+              **loaded_policy);
+        frontend->registry = std::make_shared<
+            plinth::packages::generation::InstalledGenerationRegistry>(
+            cfg.packages_data_dir);
 
         // ICD-0.4.1 — wire the scanner policy from loaded Config and
         // emit the one-shot `security.unicode_scanner_disabled`
@@ -683,6 +753,7 @@ auto main(int argc, char* argv[]) -> int {
             .staging_dir = cfg.packages_staging_dir,
             .max_package_size_bytes = package_limits.package_bytes,
             .upgrade_drain_timeout_ms = cfg.packages_upgrade_drain_timeout_ms,
+            .generation_registry = frontend->registry,
         };
         plinth::packages::register_package_routes(pkgs_cfg);
         // Bootstrap install path (ICD-0.4.4 slice B + ICD-0.6.1 §3.6):
@@ -707,6 +778,7 @@ auto main(int argc, char* argv[]) -> int {
                 std::chrono::milliseconds{
                     cfg.packages_upgrade_drain_timeout_ms},
             .schedule_rbac_tests = false,
+            .generation_registry = frontend->registry,
         };
         if (!plinth::packages::rbac_test::start_async_workers()) {
           throw std::runtime_error(
@@ -758,6 +830,28 @@ auto main(int argc, char* argv[]) -> int {
                            reconciled.error());
           return 1;
         }
+        // Publish fixed storage and the one captured document graph while
+        // ingress is closed, before pending RBAC probes can contend for names.
+        auto active_frontend = plinth::frontend::prepare_platform_startup(
+            cfg, frontend->registry,
+            std::min(std::chrono::steady_clock::now() +
+                         std::chrono::seconds{10},
+                     plinth::db::OperationScope::current_deadline()),
+            signals.token());
+        if (!active_frontend) {
+          if (active_frontend.error() !=
+              plinth::frontend::PlatformStartupError::RECOVERY_REQUIRED)
+            database_operations.checkpoint();
+          spdlog::critical("bootstrap: platform preparation unavailable; "
+                           "inspect installed state before retry");
+          return 1;
+        }
+        frontend->streams =
+            std::make_shared<plinth::frontend::TypedAssetStreams>(
+                frontend->registry->source_budget());
+        frontend->service =
+            std::make_shared<plinth::frontend::FloatLayoutService>(
+                cfg, frontend->registry, frontend->policy, frontend->streams);
         if (auto scheduled =
                 plinth::packages::schedule_pending_rbac_tests(bootstrap_ctx);
             !scheduled.has_value()) {
@@ -785,6 +879,8 @@ auto main(int argc, char* argv[]) -> int {
         // (so the catch-all does not shadow `/api/frontend/*`).
         plinth::frontend::register_api_frontend_routes(cfg.db);
         plinth::frontend::register_application_routes();
+        plinth::frontend::register_float_routes(frontend->service,
+                                                cfg.browser_origin);
 
         // ICD-0.6.1 §4.4 / §4.6 — register the active frontend's
         // `/` redirect + `<mount>(.*)` SPA-fallback handler AFTER
@@ -794,8 +890,9 @@ auto main(int argc, char* argv[]) -> int {
         // mount + entry + installed `client/` directory. Replaces
         // ICD-0.6.0 §8.1's hardcoded `/app/*` static handler.
         database_operations.checkpoint();
-        plinth::shell::register_routes_for_active_frontend(
-            cfg.shell, cfg.db, cfg.packages_data_dir);
+        if (*active_frontend)
+          plinth::shell::register_active_frontend_routes(cfg.shell,
+                                                         **active_frontend);
 
         plinth::security::register_response_headers(cfg.browser_origin);
         shutdown.install_ingress_gate();

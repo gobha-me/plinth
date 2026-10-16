@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       libjsoncpp-dev libssl-dev zlib1g-dev \
       uuid-dev libargon2-dev \
       clang-21 llvm-21 clang-format-21 clang-tidy-21 clang-tools-21 libclang-rt-21-dev \
-      python3 postgresql-client \
+      python3 postgresql-client util-linux \
       nodejs npm \
     && rm -rf /var/lib/apt/lists/*
 

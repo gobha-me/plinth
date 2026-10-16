@@ -1,0 +1,23 @@
+#pragma once
+
+#include <array>
+#include <string_view>
+
+// Generated only from this kernel build's trusted bundled source files.
+// Version labels and extension-provided profile metadata cannot replace these
+// hashes. These pins recognize a graph; they grant no caller/storage authority.
+namespace plinth::shell::platform_profile {
+
+struct FileDigest {
+  std::string_view path;
+  std::string_view sha256;
+};
+
+inline constexpr std::array<FileDigest, @PLINTH_PLATFORM_CLIENT_COUNT@>
+    CLIENT_FILES{{
+@PLINTH_PLATFORM_CLIENT_DIGESTS@}};
+inline constexpr std::string_view MODULE_SHA256 = "@PLINTH_PLATFORM_MODULE_SHA@";
+inline constexpr std::string_view CONTRACT_SHA256 = "@PLINTH_PLATFORM_CONTRACT_SHA@";
+inline constexpr std::string_view MIGRATION_SHA256 = "@PLINTH_PLATFORM_MIGRATION_SHA@";
+
+} // namespace plinth::shell::platform_profile

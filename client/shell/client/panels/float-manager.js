@@ -1,7 +1,7 @@
 import { h, render, Component } from 'preact';
 import { makePanelApi, normaliseCombo } from './panel_api.js';
 import {
-    normalizeFloatDescriptor, floatIdentityKey, normalizeFloatContext, copyPanelContext,
+    normalizeFloatDescriptor, floatIdentityKey, normalizeFloatContext, copyPanelContext, isFloatMetadataString,
     classifyFloatWorkArea, defaultFloatGeometry, clampFloatGeometry, saveFloatGeometry,
 } from './float-model.js';
 import { createFloatDispatch, trackFloatImport, retireFloatRecord } from './float-reservations.js';
@@ -26,6 +26,22 @@ function dirtyNotifier(dispatch, token, attempt) {
 }
 function delayedBoundaryFailure(dispatch, token, attempt) {
     queueMicrotask(() => dispatch.deliver(token, attempt, { phase: 'boundary' }));
+}
+// This physical-settlement waiter captures the document reservation owner and
+// opaque token, not the manager/authenticated frame or descriptor/context.
+function preparationSettlement(reservations, token, ready) {
+    return new Promise(resolve => {
+        let outcome = null, unsubscribe = () => {};
+        const changed = () => {
+            const state = reservations.inspect(token);
+            if (!state || (!state.pending && (outcome === 'ready' || state.cleanupComplete))) {
+                unsubscribe(); resolve({ status: outcome === 'ready' ? 'ready' : 'skipped' });
+            }
+        };
+        unsubscribe = reservations.subscribe(changed);
+        ready.then(value => { outcome = value.status; changed(); });
+        changed();
+    });
 }
 class FloatBoundary extends Component {
     constructor(props) { super(props); this.state = { failed: false }; }
@@ -55,6 +71,7 @@ export class FloatManager {
         this.dispatch = createFloatDispatch();
         this.listeners = new Set();
         this.focusListeners = new Set();
+        this.layoutListeners = new Set();
         this.chromeCleanup = new Map();
         this.retired = false;
         this.workArea = classifyFloatWorkArea(0, 0);
@@ -63,7 +80,20 @@ export class FloatManager {
     }
 
     isCurrent() { return !this.retired && this.interaction.isCurrent(); }
+    readyFloatId(token, attempt) {
+        const record = this.records.get(token);
+        return this.currentAttempt(record, attempt) && record.readiness === 'ready' ? record.id : null;
+    }
+    whenPreparationSettled(token, attempt) {
+        const record = this.records.get(token);
+        if (!record || record.incarnation?.token !== attempt) return Promise.resolve({ status: 'skipped' });
+        return preparationSettlement(this.reservations, token, record.ready.promise);
+    }
     subscribe(callback) { this.listeners.add(callback); return () => this.listeners.delete(callback); }
+    onLayout(callback) { this.layoutListeners.add(callback); return () => this.layoutListeners.delete(callback); }
+    layoutChanged(kind, token) {
+        if (this.isCurrent()) for (const callback of [...this.layoutListeners]) callback({ kind, token });
+    }
     onFocus(callback) { this.focusListeners.add(callback); return () => this.focusListeners.delete(callback); }
     focusTrigger(token) {
         const record = this.records.get(token);
@@ -101,8 +131,12 @@ export class FloatManager {
                 !this.reservations.status().poisoned &&
                 this.reservations.inspect(record.token)?.pending === false &&
                 this.reservations.inspect(record.token)?.cleanupComplete === true,
-            rank: record.rank, retiring: record.retiring, liveOnly: true,
+            rank: record.rank, retiring: record.retiring, liveOnly: this.liveOnly(record),
         }));
+    }
+    liveOnly(record) {
+        try { return this.adapter?.liveOnly?.(record.token) !== false; }
+        catch { return true; }
     }
 
     authorize(input) {
@@ -112,20 +146,25 @@ export class FloatManager {
         const fresh = normalizeFloatDescriptor(dataField(resolved, 'descriptor'));
         const source = dataField(resolved, 'target');
         const panel = dataField(source, 'panel');
+        const label = source && typeof source === 'object'
+            ? Object.getOwnPropertyDescriptor(source, 'applicationTitle') : undefined;
+        if (label && !Object.hasOwn(label, 'value')) return null;
         const target = { applicationId: dataField(source, 'applicationId'),
             generation: dataField(source, 'generation'), version: dataField(source, 'version'),
-            applicationTitle: dataField(source, 'applicationTitle'),
+            // Optional INTERNAL adapter label, not another canonical wire key.
+            applicationTitle: label ? label.value : fresh.application_id,
             panel: { id: dataField(panel, 'id'), title: dataField(panel, 'title'),
                 module_url: dataField(panel, 'module_url') } };
         if (!target || target.applicationId !== fresh.application_id ||
             target.generation !== fresh.generation || target.panel?.id !== fresh.panel_id ||
-            typeof target.version !== 'string' || !target.version.length || target.version.length > 128 ||
-            typeof target.panel.title !== 'string' || !target.panel.title.length || target.panel.title.length > 256 ||
-            typeof target.applicationTitle !== 'string' || !target.applicationTitle.length ||
-            target.applicationTitle.length > 128 || typeof target.panel.module_url !== 'string' ||
-            target.panel.module_url.length > 2048) return null;
+            !isFloatMetadataString(target.version, 256) ||
+            !isFloatMetadataString(target.panel.title, 1024, 256) ||
+            // Preserve the pre-existing internal fixture-label bound.
+            !isFloatMetadataString(target.applicationTitle, 512) || target.applicationTitle.length > 128 ||
+            !isFloatMetadataString(target.panel.module_url, 2048)) return null;
         const url = new URL(target.panel.module_url, this.document.location.href);
-        if (url.origin !== this.document.location.origin || url.username || url.password || url.hash) return null;
+        if (url.origin !== this.document.location.origin || url.username || url.password || url.hash ||
+            !isFloatMetadataString(url.href, 2048)) return null;
         // Copy shell-owned metadata. Adapter labels/URL are not descriptor identity.
         return { descriptor: fresh, target: {
             applicationId: target.applicationId, generation: target.generation, version: target.version,
@@ -194,6 +233,7 @@ export class FloatManager {
             readiness: 'loading', presentation, maximized: maximized === true,
             geometry: geometry || defaultFloatGeometry(this.workArea, this.records.size),
             trigger, rank: this.records.size, dirty: false, retiring: false, incarnation: null,
+            backgroundRestore: background === true,
         };
         this.records.set(token, record);
         this.identities.set(key, record);
@@ -283,6 +323,7 @@ export class FloatManager {
                 context: copyPanelContext(normalizeFloatContext(record.descriptor.context)),
                 packageRow: { name: record.target.applicationId, version: record.target.version,
                     generation: record.target.generation },
+                floatActions: this.adapter?.actions?.(record.token),
             });
             const Panel = module.default(incarnation.api);
             if (!this.checkLoading(record, attempt) || typeof Panel !== 'function') throw new Error('float factory failed');
@@ -303,6 +344,7 @@ export class FloatManager {
             this.clock.clearTimeout(record.timer);
             record.timer = null;
             record.ready.resolve({ status: 'ready' });
+            if (!record.backgroundRestore) this.layoutChanged('ready', record.token);
             this.changed(); // Background readiness never requests focus.
         } catch { this.fail(record, attempt); }
     }
@@ -383,35 +425,45 @@ export class FloatManager {
     minimize(token) {
         const record = this.records.get(token);
         if (!this.owns(record)) return;
+        const changed = record.presentation !== 'minimized';
         record.presentation = 'minimized';
         record.container.hidden = true;
         record.container.inert = true;
         if (this.interaction.focused.kind === 'float' && this.interaction.focused.token === token) {
             this.interaction.focusShell();
         }
+        if (changed) this.layoutChanged('minimized', token);
         this.changed();
     }
-    restore(token) {
+    restore(token, { focusChrome = true } = {}) {
         const record = this.records.get(token);
         if (!this.owns(record)) return;
+        const changed = record.presentation !== 'shown';
         record.presentation = 'shown';
         record.container.hidden = false;
         record.container.inert = false;
         if (record.readiness === 'ready') this.activate(record, record.incarnation.token);
-        this.focus(token);
+        if (changed) this.layoutChanged('restored', token);
+        this.focus(token, { focusChrome });
         this.changed();
     }
     maximize(token) {
         const record = this.records.get(token);
         if (!this.owns(record) || this.workArea.mode !== 'desktop') return;
         record.maximized = !record.maximized;
+        this.layoutChanged('maximized', token);
         this.changed();
     }
     setGeometry(token, geometry) {
         const record = this.records.get(token);
         if (!this.owns(record) || this.workArea.mode !== 'desktop') return;
         const value = clampFloatGeometry(geometry, this.workArea);
-        if (value) { record.geometry = value; this.changed(); }
+        if (value) {
+            const changed = !record.geometry || ['x', 'y', 'width', 'height'].some(key => record.geometry[key] !== value[key]);
+            record.geometry = value;
+            if (changed) this.layoutChanged('geometry', token);
+            this.changed();
+        }
     }
     setWorkArea(area) {
         if (!this.isCurrent()) return;
@@ -423,13 +475,13 @@ export class FloatManager {
         }
         this.changed();
     }
-    requestClose(token) {
+    requestClose(token, { onCancel } = {}) {
         const record = this.records.get(token);
         if (!this.owns(record) || this.interaction.confirmation) return false;
         if (!record.dirty) { this.close(token); return true; }
         return this.interaction.confirm({ kind: 'float', recordToken: token,
             trigger: this.document.activeElement,
-            onCancel: () => this.focus(token), onDiscard: () => this.close(token) });
+            onCancel: onCancel || (() => this.focus(token)), onDiscard: () => this.close(token) });
     }
     close(token) {
         const record = this.records.get(token);
@@ -463,6 +515,7 @@ export class FloatManager {
             if (record.retiring && !this.reservations.inspect(token)) {
                 this.records.delete(token);
                 this.identities.delete(record.key);
+                this.layoutChanged('closed', token);
                 changed = true;
             }
         }
@@ -492,6 +545,7 @@ export class FloatManager {
         this.dispatch.clear();
         this.listeners.clear();
         this.focusListeners.clear();
+        this.layoutListeners.clear();
         this.unsubscribeInteraction();
         this.unsubscribeFrame();
         for (const record of this.records.values()) {

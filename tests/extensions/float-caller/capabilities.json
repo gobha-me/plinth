@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "floatcaller",
+      "version": 1,
+      "function": "fixture",
+      "params": [],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Test-only no-I/O ownership witness for the caller's existing panel rule.",
+      "rbac_rule": "floatcaller.panel"
+    }
+  ],
+  "requires": []
+}

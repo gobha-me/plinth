@@ -13,7 +13,9 @@
 // structurally by `main.cpp` placing the active-frontend route
 // registration AFTER the kernel API + asset-server registrations.
 
+#include "kernel/packages/generation_capture.hpp"
 #include "kernel/shell/active_frontend.hpp"
+#include "kernel/shell/platform_graph.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <drogon/HttpRequest.h>
@@ -21,6 +23,7 @@
 #include <drogon/HttpTypes.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -76,6 +79,7 @@ struct Captured {
   std::string location;
   std::string cache_control;
   std::string csp;
+  std::string platform_profile;
   bool content_type_is_custom{false};
 };
 
@@ -97,6 +101,7 @@ auto capture_app(const plinth::shell::ActiveFrontend& active,
         out.location = resp->getHeader("Location");
         out.cache_control = resp->getHeader("Cache-Control");
         out.csp = resp->getHeader("Content-Security-Policy");
+        out.platform_profile = resp->getHeader("X-Plinth-Platform-Profile");
         out.content_type_is_custom =
             resp->getContentType() == drogon::CT_CUSTOM;
       },
@@ -399,4 +404,125 @@ TEST_CASE("replacement frontend preserves its existing policy with either base "
               std::string::npos);
     }
   }
+}
+
+TEST_CASE("captured bundled platform pins one document graph without mutable "
+          "entry IO or permanent artifact lease",
+          "[shell][active-frontend][platform-graph]") {
+  namespace generation = plinth::packages::generation;
+  namespace shell = plinth::shell;
+  shell::test_seam::set_active_frontend(std::nullopt);
+  generation::Budget budget;
+  const generation::CaptureRequest request{
+      .key = {.package_id = "00000000-0000-4000-8000-000000000046",
+              .name = "shell",
+              .version = "test-version",
+              .profile = 1},
+      .root = fs::path{CMAKE_SOURCE_DIR} / "client" / "shell",
+      .deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10},
+      .cancellation = {},
+  };
+  auto artifact = generation::capture_artifact(request, budget);
+  REQUIRE(artifact.has_value());
+  const auto* template_file = (*artifact)->find("client/index.html");
+  REQUIRE(template_file != nullptr);
+  // The module-syntax example in an HTML comment precedes the import map.
+  // Recognition must locate the actual trusted entry tag, not this example.
+  REQUIRE(template_file->content.find("<script type=\"module\"> on the page") <
+          template_file->content.find("PLINTH_PLATFORM_IMPORT_MAP_BEGIN"));
+  generation::Budget no_space{0};
+  auto busy = shell::prepare_platform(**artifact, no_space);
+  REQUIRE_FALSE(busy.has_value());
+  REQUIRE(busy.error() == shell::PlatformGraphError::BUSY);
+  auto prepared = shell::prepare_platform(**artifact, budget);
+  REQUIRE(prepared.has_value());
+  REQUIRE((*prepared)->key() == request.key);
+  REQUIRE((*prepared)->artifact_digest() == (*artifact)->digest());
+  REQUIRE((*prepared)->client_graph_digest().size() == 64);
+  REQUIRE((*prepared)->profile() ==
+          "v1:" + request.key.package_id + ":" + (*artifact)->digest());
+  const auto base = "/_plinth/platform/" + request.key.package_id + "/" +
+                    (*artifact)->digest() + "/client/";
+  REQUIRE((*prepared)->base() == base);
+  const auto& body = (*prepared)->document();
+  REQUIRE(body.size() <= std::size_t{64} * 1024);
+  REQUIRE(body.find("<base href=\"" + base + "\">") != std::string::npos);
+  REQUIRE(body.find("name=\"plinth-platform-profile\" content=\"" +
+                    (*prepared)->profile()) != std::string::npos);
+  REQUIRE(body.find("\"@plinth/frontend/sdk\":\"" + base + "sdk.js\"") !=
+          std::string::npos);
+  REQUIRE(body.find("\"preact\":\"" + base + "vendor/preact.module.js\"") !=
+          std::string::npos);
+  REQUIRE(body.find("\"preact/hooks\":\"" + base +
+                    "vendor/preact-hooks.module.js\"") != std::string::npos);
+  REQUIRE(body.find("\"htm\":\"" + base + "vendor/htm.module.js\"") !=
+          std::string::npos);
+  REQUIRE(body.find("/api/frontend/sdk.js") == std::string::npos);
+  REQUIRE(body.find("PLINTH_PLATFORM_IMPORT_MAP_BEGIN") == std::string::npos);
+  const auto import_map = body.find("<script type=\"importmap\">");
+  REQUIRE(import_map != std::string::npos);
+  REQUIRE(body.find("<script type=\"importmap\">", import_map + 1) ==
+          std::string::npos);
+  REQUIRE(import_map <
+          body.find("<script type=\"module\" src=\"shell.js\"></script>"));
+  const auto& policy = (*prepared)->policy();
+  REQUIRE(policy.starts_with("script-src 'self' 'sha256-"));
+  REQUIRE(policy.substr(0, policy.find(';')).find("unsafe-inline") ==
+          std::string::npos);
+  REQUIRE(policy.find("object-src 'none'") != std::string::npos);
+  REQUIRE(policy.find("frame-ancestors 'self'") != std::string::npos);
+
+  // No template/path/asset is read from this intentionally missing directory.
+  shell::ActiveFrontend active{
+      .id = request.key.package_id,
+      .name = "shell",
+      .version = request.key.version,
+      .mount = "/app",
+      .entry = "index.html",
+      .client_dir = "/no-such-platform-client",
+      .bundled = true,
+      .platform = {},
+  };
+  REQUIRE(shell::publish_platform_frontend(active, *prepared));
+  active.platform = shell::current_platform();
+  auto served = capture_app(active, "nested/route");
+  REQUIRE(served.status == drogon::k200OK);
+  REQUIRE(served.body == body);
+  REQUIRE(served.csp == policy);
+  REQUIRE(served.platform_profile == (*prepared)->profile());
+  REQUIRE(served.cache_control == "no-cache");
+  auto wrong = active;
+  wrong.bundled = false;
+  REQUIRE_FALSE(shell::publish_platform_frontend(wrong, *prepared));
+  wrong = active;
+  wrong.version = "other-version";
+  REQUIRE_FALSE(shell::publish_platform_frontend(wrong, *prepared));
+  const auto capture_charge = (*artifact)->charged_bytes();
+  const auto before_release = budget.used();
+  artifact->reset();
+  REQUIRE(budget.used() == before_release - capture_charge);
+  REQUIRE(shell::current_platform()->document() == body);
+  shell::retire_platform_frontend(active.id);
+  REQUIRE_FALSE(shell::current_platform());
+  shell::test_seam::set_active_frontend(std::nullopt);
+
+  // A physically captured but changed/extra client graph is not recognized by
+  // version/profile labels. Only the compiled complete graph is supported.
+  auto copy_root = scratch_client_root({}).parent_path();
+  fs::copy(request.root, copy_root,
+           fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+  {
+    std::ofstream changed(copy_root / "client" / "sdk.js", std::ios::binary);
+    changed << "export const changed = true;";
+  }
+  auto changed_request = request;
+  changed_request.root = copy_root;
+  changed_request.deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{10};
+  auto changed = generation::capture_artifact(changed_request, budget);
+  REQUIRE(changed.has_value());
+  auto incompatible = shell::prepare_platform(**changed, budget);
+  REQUIRE_FALSE(incompatible.has_value());
+  REQUIRE(incompatible.error() == shell::PlatformGraphError::INCOMPATIBLE);
+  fs::remove_all(copy_root);
 }

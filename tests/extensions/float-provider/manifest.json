@@ -1,0 +1,9 @@
+{
+  "name": "floatprovider",
+  "display_name": "Float Provider",
+  "version": "0.1.0",
+  "description": "Test-only ordinary installed typed provider with reviewed fake record ID and an intentionally nonpersistable required field. Never bundled or granted by default.",
+  "author": "plinth",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -31,6 +32,7 @@ struct PackageRoutesConfig {
   std::filesystem::path staging_dir;
   std::size_t max_package_size_bytes = 50ULL * 1024ULL * 1024ULL;
   std::size_t upgrade_drain_timeout_ms = 5000; // ICD-0.4.5 §T2
+  std::shared_ptr<generation::InstalledGenerationRegistry> generation_registry;
 };
 
 // Register the three admin HTTP endpoints against the running Drogon

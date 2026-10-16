@@ -20,6 +20,7 @@
          through kernel indirection (`/api/frontend/*`) so panel
          modules survive shell upgrades without 404'ing on a stale
          versioned URL — same posture as ICD-0.6.2 `tokens.css`. -->
+    <!-- PLINTH_PLATFORM_IMPORT_MAP_BEGIN -->
     <script type="importmap">
       {
         "imports": {
@@ -31,6 +32,7 @@
         }
       }
     </script>
+    <!-- PLINTH_PLATFORM_IMPORT_MAP_END -->
     <!-- External configuration runs before the shell module under strict CSP.
          Bundled deployments redact stacks; development packages may set false. -->
     <script src="./runtime-config.js"></script>

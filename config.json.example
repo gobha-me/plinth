@@ -25,6 +25,9 @@
   "ws_auth_timeout_s": 5.0,
   "ws_heartbeat_interval_s": 30.0,
   "ws_heartbeat_timeout_s": 10.0,
+  "packages": {
+    "restore_policy_file": ""
+  },
   "security": {
     "unicode_scanner": {
       "enabled": true,

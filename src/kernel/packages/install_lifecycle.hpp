@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string>
@@ -34,6 +35,10 @@ struct pg_conn;
 using PGconn = pg_conn;
 
 namespace plinth::packages {
+
+namespace generation {
+class InstalledGenerationRegistry;
+}
 
 enum class Provenance : std::uint8_t { USER, BUNDLED };
 
@@ -133,6 +138,9 @@ struct InstallerContext {
   // reconciled every package under the same per-name lock. Interactive HTTP
   // transitions keep the normal immediate handoff.
   bool schedule_rbac_tests = true;
+  // Optional process-owned facility. Null preserves ordinary legacy/test
+  // behavior; this is neither an eager capture switch nor a permission grant.
+  std::shared_ptr<generation::InstalledGenerationRegistry> generation_registry;
 };
 
 // Primary entry point. Drives UPLOADING through ACTIVE or

@@ -43,7 +43,7 @@ static auto set_env(const char* name, const char* value) -> void {
 }
 
 // Env vars that load_config reads — must be cleared for unit tests
-static constexpr std::array<const char*, 12> PLINTH_ENV_VARS = {
+static constexpr std::array<const char*, 13> PLINTH_ENV_VARS = {
     "PLINTH_PG_HOST",
     "PLINTH_PG_PORT",
     "PLINTH_PG_USER",
@@ -51,6 +51,7 @@ static constexpr std::array<const char*, 12> PLINTH_ENV_VARS = {
     "PLINTH_PG_DATABASE",
     "PLINTH_PG_POOL_SIZE",
     "PLINTH_MIGRATIONS_DIR",
+    "PLINTH_RESTORE_POLICY_FILE",
     "PLINTH_DEV_MODE",
     "PLINTH_REGISTRATION_ENABLED",
     "PLINTH_REGISTRATION_MODE",
@@ -766,4 +767,33 @@ TEST_CASE("Browser origin aliases must not disagree",
   REQUIRE_THROWS_WITH(plinth::load_config(path),
                       "config.browser_origin_conflict");
   remove_file(path);
+}
+
+TEST_CASE("Restore policy configuration is explicit absolute and optional",
+          "[config][unit][protected_restore_policy]") {
+  EnvGuard guard;
+  REQUIRE(plinth::load_config().restore_policy_file.empty());
+  for (const auto& value :
+       std::vector<nlohmann::json>{"", "/run/plinth/policy.json"}) {
+    const auto path =
+        write_temp_config({{"packages", {{"restore_policy_file", value}}}});
+    const auto cfg = plinth::load_config(path);
+    remove_file(path);
+    REQUIRE(cfg.restore_policy_file == value.get<std::string>());
+  }
+  for (const auto& value : std::vector<nlohmann::json>{
+           nullptr, false, 1, nlohmann::json::object(), "relative.json",
+           std::string(4097, '/'), std::string{"/run/a\0b", 8}}) {
+    const auto path =
+        write_temp_config({{"packages", {{"restore_policy_file", value}}}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.packages.restore_policy_file_invalid");
+    remove_file(path);
+  }
+  set_env("PLINTH_RESTORE_POLICY_FILE", "/run/approved-policy.json");
+  REQUIRE(plinth::load_config().restore_policy_file ==
+          "/run/approved-policy.json");
+  set_env("PLINTH_RESTORE_POLICY_FILE", "relative.json");
+  REQUIRE_THROWS_WITH(plinth::load_config(),
+                      "config.packages.restore_policy_file_invalid");
 }
