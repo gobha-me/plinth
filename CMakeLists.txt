@@ -564,6 +564,9 @@ add_executable(plinth
   src/kernel/packages/manifest.cpp
   src/kernel/packages/capabilities_manifest.cpp
   src/kernel/packages/panels_manifest.cpp
+  src/kernel/packages/restore_policy.cpp
+  src/kernel/packages/restore_digest.cpp
+  src/kernel/packages/detail/restore_json.cpp
   src/kernel/packages/config_manifest.cpp
   src/kernel/packages/cross_file_validator.cpp
   src/kernel/packages/validator.cpp
@@ -733,6 +736,8 @@ add_executable(plinth_tests
   tests/kernel/packages/manifest_test.cpp
   tests/kernel/packages/capabilities_manifest_test.cpp
   tests/kernel/packages/panels_manifest_test.cpp
+  tests/kernel/packages/restore_policy_test.cpp
+  tests/kernel/packages/restore_digest_test.cpp
   tests/kernel/packages/config_manifest_test.cpp
   tests/kernel/packages/cross_file_validator_test.cpp
   tests/kernel/packages/validator_test.cpp
@@ -836,6 +841,9 @@ add_executable(plinth_tests
   src/kernel/packages/manifest.cpp
   src/kernel/packages/capabilities_manifest.cpp
   src/kernel/packages/panels_manifest.cpp
+  src/kernel/packages/restore_policy.cpp
+  src/kernel/packages/restore_digest.cpp
+  src/kernel/packages/detail/restore_json.cpp
   src/kernel/packages/config_manifest.cpp
   src/kernel/packages/cross_file_validator.cpp
   src/kernel/packages/validator.cpp
@@ -930,6 +938,24 @@ add_test(NAME plinth_tests_typed_surface_parser
     --timeout 30
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_typed_surface_parser PROPERTIES TIMEOUT 45)
+
+# These are pure format tests, not persistence approval or installed-browser
+# acceptance. Exact positive receipts prevent a renamed/empty case from passing.
+foreach(ENTRY IN ITEMS
+    "policy|restore policy: strict bounded raw contract"
+    "digests|restore digests: canonical bounded byte formats")
+  string(REPLACE "|" ";" PARTS "${ENTRY}")
+  list(GET PARTS 0 NAME)
+  list(GET PARTS 1 CASE)
+  add_test(NAME plinth_tests_restore_${NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${CASE}"
+      --timeout 45
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_restore_${NAME} PROPERTIES TIMEOUT 60)
+endforeach()
 
 set(PLINTH_TYPED_SURFACE_CASES
     "schema|typed surface schema preserves legacy provenance during retained bootstrap"
