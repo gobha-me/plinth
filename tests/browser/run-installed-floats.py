@@ -84,7 +84,7 @@ def safe_browser_failure(stderr, phase):
         value = json.loads(lines[0], object_pairs_hook=unique_object,
                            parse_constant=invalid_constant)
         if (not isinstance(value, dict) or set(value) != {'schema_version', 'phase', 'completed_count',
-                'completed_groups', 'source', 'failure_step', 'category', 'code', 'operator'} or
+                'completed_groups', 'source', 'failure_step', 'body_observation', 'category', 'code', 'operator'} or
             type(value['schema_version']) is not int or value['schema_version'] != 1 or
             value['phase'] != phase or phase not in {'install', 'verify'} or
             type(value['completed_count']) is not int or not 0 <= value['completed_count'] <= len(EXPECTED_CASES) or
@@ -104,6 +104,25 @@ def safe_browser_failure(stderr, phase):
             (value['failure_step'] is not None and (value['failure_step'] not in FAILURE_STEPS or
                 phase != 'verify' or value['completed_count'] != 1))):
             return unavailable
+        body = value['body_observation']
+        if body is not None:
+            if (phase != 'verify' or not isinstance(body, dict) or set(body) != {
+                    'body_error', 'status', 'resource_type', 'frame', 'request_state', 'request_failure',
+                    'response_finished', 'main_frame_navigations', 'frame_detachments'} or
+                body['body_error'] not in {'cdp-no-data', 'cdp-no-resource', 'cdp-evicted', 'pw-detached',
+                    'page-closed', 'unknown'} or
+                type(body['status']) is not int or not 100 <= body['status'] <= 599 or
+                body['resource_type'] not in {'document', 'stylesheet', 'image', 'media', 'font', 'script',
+                    'texttrack', 'xhr', 'fetch', 'eventsource', 'websocket', 'manifest', 'other'} or
+                body['frame'] not in {'attached', 'detached', 'unavailable'} or
+                body['request_state'] not in {'unobserved', 'finished', 'failed'} or
+                body['request_failure'] not in {'none', 'aborted', 'failed', 'timeout', 'connection', 'other'} or
+                (body['request_state'] != 'failed' and body['request_failure'] != 'none') or
+                (body['request_state'] == 'failed' and body['request_failure'] == 'none') or
+                body['response_finished'] not in {'pending', 'ok', 'error'} or
+                any(type(body[key]) is not int or not 0 <= body[key] <= 16
+                    for key in ['main_frame_navigations', 'frame_detachments'])):
+                return unavailable
         return value
     except (ValueError, TypeError, RecursionError):
         return unavailable

@@ -41,6 +41,70 @@ const failureCategories = new Map([['AssertionError', 'assertion'], ['TimeoutErr
 const failureSteps = new Set(['initial-caller', 'default-state', 'personal-write', 'personal-open',
     'personal-close', 'personal-delete', 'admin-seed', 'admin-open', 'admin-close', 'admin-delete',
     'fallback-open', 'fallback-focus', 'fallback-modules']);
+const bodyFailures = new WeakMap();
+const resourceTypes = new Set(['document', 'stylesheet', 'image', 'media', 'font', 'script',
+    'texttrack', 'xhr', 'fetch', 'eventsource', 'websocket', 'manifest', 'other']);
+const bodyAdvice = '\nResponse body is not available for a response that was navigated away from. Read response.body() before triggering any navigation.';
+
+export function bodyErrorKind(error) {
+    // Classify only exact known API errors, never publish the original message.
+    let message;
+    try { message = typeof error?.message === 'string' ? error.message : ''; } catch { return 'unknown'; }
+    if (message.length > 4096) return 'unknown';
+    if (message.endsWith(bodyAdvice)) message = message.slice(0, -bodyAdvice.length);
+    const prefix = 'response.body: Protocol error (Network.getResponseBody): ';
+    if (message === prefix + 'No data found for resource with given identifier') return 'cdp-no-data';
+    if (message === prefix + 'No resource with given identifier found') return 'cdp-no-resource';
+    if (message === prefix + 'Request content was evicted from inspector cache') return 'cdp-evicted';
+    if (message === 'response.body: Response body is unavailable') return 'pw-detached';
+    if (message === 'response.body: Target page, context or browser has been closed') return 'page-closed';
+    return 'unknown';
+}
+
+export function observeSelectedBody(page, response) {
+    const request = response.request();
+    const state = { body_error: 'unknown', status: response.status(), resource_type: 'other',
+        frame: 'unavailable', request_state: 'unobserved', request_failure: 'none',
+        response_finished: 'pending', main_frame_navigations: 0, frame_detachments: 0 };
+    let selectedFrame;
+    try { selectedFrame = request.frame(); } catch { /* Service-worker requests may have no frame. */ }
+    const frameState = () => {
+        try { return selectedFrame ? selectedFrame.isDetached() ? 'detached' : 'attached' : 'unavailable'; }
+        catch { return 'unavailable'; }
+    };
+    try { const type = request.resourceType(); if (resourceTypes.has(type)) state.resource_type = type; } catch { /* Fixed fallback. */ }
+    const finishedRequest = actual => { if (actual === request) state.request_state = 'finished'; };
+    const failedRequest = actual => {
+        if (actual !== request) return;
+        state.request_state = 'failed'; state.request_failure = 'other';
+        let text;
+        try { text = actual.failure()?.errorText; } catch { return; }
+        const known = new Map([['net::ERR_ABORTED', 'aborted'], ['net::ERR_FAILED', 'failed'],
+            ['net::ERR_TIMED_OUT', 'timeout'], ['net::ERR_CONNECTION_CLOSED', 'connection'],
+            ['net::ERR_CONNECTION_RESET', 'connection']]);
+        state.request_failure = known.get(text) ?? 'other';
+    };
+    const navigated = frame => {
+        try { if (frame === page.mainFrame()) state.main_frame_navigations = Math.min(16, state.main_frame_navigations + 1); }
+        catch { /* A closing page cannot turn diagnostics into a failure. */ }
+    };
+    const detached = () => { state.frame_detachments = Math.min(16, state.frame_detachments + 1); };
+    page.on('requestfinished', finishedRequest); page.on('requestfailed', failedRequest);
+    page.on('framenavigated', navigated); page.on('framedetached', detached);
+    let pending;
+    try { pending = Promise.resolve(response.finished()); } catch (error) { pending = Promise.reject(error); }
+    // The caller retains and joins this handled promise after browser closure.
+    const finished = pending.then(error => { state.response_finished = error ? 'error' : 'ok'; },
+        () => { state.response_finished = 'error'; });
+    return Object.freeze({ finished, reject(error) {
+        state.body_error = bodyErrorKind(error); state.frame = frameState();
+        if ((typeof error === 'object' && error !== null) || typeof error === 'function') bodyFailures.set(error, state);
+    }, stop() {
+        state.frame = frameState();
+        page.off('requestfinished', finishedRequest); page.off('requestfailed', failedRequest);
+        page.off('framenavigated', navigated); page.off('framedetached', detached);
+    } });
+}
 
 export function createJourneyFailureSteps() {
     let failed = null;
@@ -67,6 +131,7 @@ export function journeyFailureSummary(phase, completed, error, failedStep = null
     return JSON.stringify({ schema_version: 1, phase: phase === 'install' || phase === 'verify' ? phase : 'unknown',
         completed_count: count, completed_groups: Array.from({ length: count }, (_, index) => index + 1), source,
         failure_step: phase === 'verify' && count === 1 && failureSteps.has(failedStep) ? failedStep : null,
+        body_observation: error !== null && (typeof error === 'object' || typeof error === 'function') ? bodyFailures.get(error) ?? null : null,
         category: failureCategories.get(error?.name) ?? 'unknown',
         code: failureCodes.has(error?.code) ? error.code : 'unknown',
         operator: failureOperators.has(error?.operator) ? error.operator : 'unknown' });

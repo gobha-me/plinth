@@ -13,6 +13,182 @@ export async function boundedStep(run, deadline) {
     } finally { clearTimeout(timer); }
 }
 
+export function authorityRecoveryDOM(timeout) {
+    return new Promise((resolve, reject) => {
+        if (!Number.isFinite(timeout) || timeout <= 0) { reject(new Error('authority recovery deadline')); return; }
+        let observer, timer, done = false;
+        const finish = ready => {
+            if (done) return;
+            done = true; clearTimeout(timer); observer?.disconnect();
+            if (ready) resolve(true); else reject(new Error('authority recovery deadline'));
+        };
+        const check = () => {
+            try {
+                const main = document.querySelector('.launcher-main');
+                const home = document.querySelector('.launcher-home');
+                const host = document.querySelector('.panel-host');
+                const callerTile = document.querySelector('.launcher-grid .launcher-tile[aria-label="Float Caller"]');
+                if (main?.getAttribute('aria-busy') === 'false' && home && !home.hidden &&
+                    host?.isConnected && host.childElementCount === 0 &&
+                    callerTile?.isConnected && home.contains(callerTile) &&
+                    !document.querySelector('#installed-float-caller')) finish(true);
+            } catch { finish(false); }
+        };
+        try {
+            observer = new MutationObserver(check);
+            observer.observe(document.documentElement, { subtree: true, childList: true,
+                attributes: true, attributeFilter: ['hidden', 'aria-busy'] });
+            timer = setTimeout(() => finish(false), timeout);
+            check();
+        } catch { finish(false); }
+    });
+}
+
+/** Actual native recovery observation only; never sends a request or hint. */
+export function observeAuthorityRecovery(page, origin) {
+    const sockets = new Map(), tasks = new Set();
+    let closed = false, active = null, overflow = false, arms = 0;
+    const channel = 'plinth:system:applications.changed';
+    const finish = (entry, rejected = null) => {
+        if (active !== entry || entry.done) return;
+        entry.done = true; clearTimeout(entry.timer); active = null;
+        if (rejected) entry.reject(rejected.error);
+        else entry.resolve(Object.freeze({ terminal: 1, new_socket_ack: 1, fresh_catalog: 1, home_empty: 1 }));
+    };
+    const fail = entry => finish(entry, { error: failure() });
+    const reject = (entry, error) => finish(entry, { error });
+    const decode = event => {
+        const payload = event.payload;
+        if (typeof payload !== 'string' || payload.length > 2048 || Buffer.byteLength(payload, 'utf8') > 2048) return null;
+        try { const value = JSON.parse(payload); return value && typeof value === 'object' && !Array.isArray(value) ? value : null; }
+        catch { return null; }
+    };
+    const acknowledged = value => value &&
+        Object.keys(value).sort().join(',') === 'channels,recommended_debounce_ms,recommended_jitter_ms,type' &&
+        value.type === 'subscribed' && Array.isArray(value.channels) && value.channels.length <= 64 &&
+        value.channels.every(item => typeof item === 'string' && item.length <= 256) &&
+        new Set(value.channels).size === value.channels.length && value.channels.includes(channel) &&
+        ['recommended_debounce_ms', 'recommended_jitter_ms'].every(key => Number.isSafeInteger(value[key]) && value[key] >= 0);
+    const onSocket = socket => {
+        if (closed) return;
+        try {
+            const url = new URL(socket.url()), target = new URL(origin);
+            if (url.protocol !== (target.protocol === 'https:' ? 'wss:' : 'ws:') ||
+                url.host !== target.host || url.pathname !== '/ws/events' || url.search || url.hash) return;
+        } catch { if (active) fail(active); return; }
+        if (sockets.size === 16) { overflow = true; if (active) fail(active); return; }
+        const record = { socket, acknowledged: false, closed: false };
+        if (active?.phase === 'new-socket') { active.next = record; active.phase = 'ack'; }
+        const received = event => {
+            if (closed) return;
+            try {
+                const value = decode(event);
+                if (!value) return;
+                if (acknowledged(value)) {
+                    record.acknowledged = true;
+                    if (active?.phase === 'ack' && active.next === record) active.phase = 'request';
+                }
+                if (Object.keys(value).sort().join(',') === 'error,message,type' && value.type === 'error' &&
+                    typeof value.error === 'string' && typeof value.message === 'string' &&
+                    ['auth_failed', 'auth_timeout', 'already_connected', 'not_authenticated',
+                        'session_expired', 'session_revoked'].includes(value.error)) {
+                    record.acknowledged = false;
+                    if (active?.phase === 'terminal' && active.old === record) {
+                        if (value.error !== 'auth_failed') fail(active);
+                        else active.phase = 'new-socket';
+                    } else if (active?.next === record) fail(active);
+                }
+            } catch { if (active) fail(active); }
+        };
+        const ended = () => {
+            record.closed = true;
+            if (active && ((active.phase === 'terminal' && active.old === record) || active.next === record)) fail(active);
+        };
+        socket.on('framereceived', received); socket.on('close', ended);
+        sockets.set(socket, { received, ended, record });
+    };
+    const onRequest = request => {
+        if (closed || active?.phase !== 'request') return;
+        try {
+            const url = new URL(request.url());
+            if (url.origin !== origin || url.pathname !== '/api/frontend/applications' ||
+                url.search || url.hash || request.method() !== 'GET') return;
+            active.request = request; active.phase = 'response';
+        } catch { fail(active); }
+    };
+    const onResponse = response => {
+        if (closed || active?.phase !== 'response') return;
+        const entry = active;
+        try {
+            if (response.request() !== entry.request) return;
+            if (response.status() !== 200) { fail(entry); return; }
+            entry.phase = 'body';
+            let body, physical, bodyReady = false, physicalReady = false, startedDOM = false;
+            const ready = () => {
+                if (!bodyReady || !physicalReady || startedDOM || closed || active !== entry || entry.done) return;
+                startedDOM = true; entry.phase = 'dom';
+                const timeout = Math.ceil(entry.deadline - performance.now());
+                if (timeout <= 0) { fail(entry); return; }
+                let pending;
+                try { pending = Promise.resolve(page.evaluate(authorityRecoveryDOM, timeout)); }
+                catch (error) { pending = Promise.reject(error); }
+                const handled = pending.then(value => {
+                    if (value !== true) fail(entry); else finish(entry);
+                }, error => { reject(entry, error); });
+                tasks.add(handled);
+            };
+            try { body = Promise.resolve(response.body()); } catch (error) { body = Promise.reject(error); }
+            try { physical = Promise.resolve(response.finished()); } catch (error) { physical = Promise.reject(error); }
+            // Retain EACH physical settlement independently. A first failure
+            // rejects acceptance immediately but cannot release the other task.
+            const bodyTask = body.then(bytes => {
+                if (!Buffer.isBuffer(bytes)) { fail(entry); return; }
+                bodyReady = true; ready();
+            }, error => { reject(entry, error); }).catch(error => { reject(entry, error); });
+            const physicalTask = physical.then(error => {
+                if (error !== null) { reject(entry, error); return; }
+                physicalReady = true; ready();
+            }, error => { reject(entry, error); }).catch(error => { reject(entry, error); });
+            tasks.add(bodyTask); tasks.add(physicalTask);
+        } catch { fail(entry); }
+    };
+    const onFailed = request => { if (active?.request === request) fail(active); };
+    page.on('websocket', onSocket); page.on('request', onRequest);
+    page.on('response', onResponse); page.on('requestfailed', onFailed);
+    return Object.freeze({
+        arm(deadline) {
+            const current = [...sockets.values()].map(value => value.record)
+                .filter(record => record.acknowledged && !record.closed);
+            if (closed || overflow || active || arms === 3 || current.length !== 1 ||
+                !Number.isFinite(deadline) || deadline <= performance.now()) throw failure();
+            arms++;
+            let resolve, reject;
+            const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+            promise.catch(() => {});
+            const entry = { old: current[0], next: null, phase: 'terminal', request: null,
+                done: false, deadline, resolve, reject, timer: null };
+            active = entry;
+            entry.timer = setTimeout(() => fail(entry), Math.ceil(deadline - performance.now()));
+            return Object.freeze({ wait: () => promise, stop: () => fail(entry) });
+        },
+        stop() {
+            if (closed) return;
+            closed = true;
+            if (active) fail(active);
+            page.off('websocket', onSocket); page.off('request', onRequest);
+            page.off('response', onResponse); page.off('requestfailed', onFailed);
+            for (const { record, received, ended } of sockets.values()) {
+                record.socket.off('framereceived', received); record.socket.off('close', ended);
+            }
+            sockets.clear();
+        },
+        async drain(deadline) {
+            await boundedStep(() => Promise.all([...tasks]), deadline);
+            tasks.clear();
+        },
+    });
+}
+
 export function createResponseBodyRegistry() {
     const entries = new Set();
     let closed = false;

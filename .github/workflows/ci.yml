@@ -191,7 +191,8 @@ jobs:
           python3 tests/browser/run-client-contracts.py --binary build/plinth
           python3 tests/browser/run-admin-package.py --binary build/plinth
           python3 tests/browser/installed_float_harness_test.py
-          python3 tests/browser/run-installed-floats.py --binary build/plinth --bundle-dir build/share/plinth/bundled
+          python3 tests/browser/fixed_browser_harness_test.py
+          python3 .github/scripts/run-installed-floats-fixed-browser.py --binary build/plinth --bundle-dir build/share/plinth/bundled
 
   asan-ubsan:
     name: clang-${{ matrix.llvm_version }} / ASan+UBSan

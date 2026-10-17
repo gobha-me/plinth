@@ -38,6 +38,16 @@ component failure. Real SDK Request fixture focus or shell Focus actions trigger
 fresh native authority checks; a prior genuine retirement is followed by a new
 ordinary SDK refusal, not a fabricated realtime hint. Revocation adds no grant.
 
+Rule revocation, disable and enable each pre-arm an observation of the current
+acknowledged native WebSocket. Recovery requires its actual `auth_failed`, a
+different socket created afterward, its application-channel subscription ACK,
+and a new catalog request created after that ACK with HTTP 200, a captured body
+and physical completion. The current Home must contain the authorized Caller
+tile with an empty primary host before an explicit fresh Caller intent. This
+preserves documented fail-closed primary destruction and never automatically
+resurrects Caller. These observations share the original assertion deadline;
+they do not retry a mutation or manufacture a subscription or realtime event.
+
 The failed migration expects the actual HTTP 400 `upgrade-migration-failed`
 contract and old ACTIVE-but-unready fenced generation, not rollback or automatic
 recovery. Only the next deliberate ordinary upgrade can replace it. The new
@@ -66,8 +76,9 @@ Concrete dependencies before execution:
 - Root-owned policy path ancestry and nonroot service identity must genuinely
   pass; unavailable sudo/capability/platform seams are failures, not skipped pass.
 
-The `CI` workflow's existing GCC native browser step runs the eleven harness
-construction controls and then this actual journey against `build/plinth` and
+The `CI` workflow's existing GCC native browser step runs the eighteen harness
+construction controls, the offline fixed-browser helper controls, and then this
+actual journey against `build/plinth` and
 `build/share/plinth/bundled`, after its other production browser journeys.
 Pull-request and main-push runs must each supply fresh evidence for their actual
 checkout; candidate success is not exact-merge success. The twelve named journey
@@ -75,12 +86,34 @@ groups are separate from the construction controls, client units and CTest
 inventory. This placement provides GCC/Linux native coverage only, not OCI,
 ARM, ASan/UBSan or TSan journey coverage; those existing checks remain unchanged.
 
-This is a native-only harness. Existing container staging rewrites copied modes
-and lacks this protected read-only policy mount/privilege launch seam. Container
-support therefore needs a separately reviewed exact-mode-preserving adapter; this
-does not claim an OCI artifact journey. New twelve-group assertions are unexecuted
-until the owner runs this changed harness; earlier seven-group receipts do not
-transfer. Syntax/construction checks do not establish backend,
+Only this installed-float journey uses the exact test-only Chrome for Testing
+**157.0.8103.6 beta** selected by
+`.github/scripts/run-installed-floats-fixed-browser.py`. Its official Linux64
+archive is pinned to SHA256
+`7802b25411aa5b8aa387cc733a45df6eed1aea8cc046fd4e2dec64d5918b1853`
+(202676171 bytes). This checksum was measured from the downloaded official
+artifact, not supplied as a vendor signature. The helper checks integrity before
+bounded extraction and version execution, owns its temporary directory until
+the native supervisor exits, and fails rather than selecting another browser.
+Other browser journeys retain Playwright's bundled Chromium; this browser is
+not shipped with Plinth and establishes no broader browser-support promise.
+
+The pin contains Chromium's completed-stream cancellation fix
+[`62473ad0f747e245e514c93e741bb8e168a2a207`](https://github.com/chromium/chromium/commit/62473ad0f747e245e514c93e741bb8e168a2a207),
+associated with [Playwright issue #42742](https://github.com/microsoft/playwright/issues/42742).
+The older browser can deliver a complete streamed `no-store` body to the page
+while reporting `ERR_ABORTED` and denying the native body observer its data.
+The pin repairs that test-observation boundary; it does not change application
+caching, bounded streaming, payload limits, error assertions or deadlines. Local
+native success is not candidate CI or exact-merge CI success; each still requires
+a fresh complete run. Revisit the pin when a reviewed stable build includes the
+fix, preserving those same gates.
+
+This is a native-only harness. The container adapter preserves copied modes,
+but lacks this protected read-only policy mount/privilege launch seam. Container
+support therefore needs separately reviewed protected-policy/privilege-launch integration; this
+does not claim an OCI artifact journey. Earlier seven-group receipts do not
+establish the twelve-group gate. Syntax/construction checks do not establish backend,
 RBAC, browser, full float mechanism, recovery or operational restore acceptance.
 Remaining wider matrix (e.g. five live/minimized limit, dirty close interactions,
 in-flight install/retirement/policy races, process crashes/lost acknowledgement and

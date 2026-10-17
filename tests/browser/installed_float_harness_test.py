@@ -20,6 +20,264 @@ repo = Path(__file__).resolve().parents[2]
 
 
 class HarnessConstruction(unittest.TestCase):
+    def test_authority_recovery_requires_ordered_native_frames_request_body_and_empty_primary(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { observeAuthorityRecovery, authorityRecoveryDOM } from './installed-float-coordination.mjs';
+const origin = 'http://127.0.0.1:8099';
+const ack = {type: 'subscribed', channels: ['plinth:system:applications.changed'],
+    recommended_debounce_ms: 100, recommended_jitter_ms: 20};
+const terminal = {type: 'error', error: 'auth_failed', message: 'fake-public-message'};
+const frame = (socket, value) => socket.emit('framereceived', {payload: JSON.stringify(value)});
+const request = () => ({url: () => origin + '/api/frontend/applications', method: () => 'GET'});
+function fixture() {
+    const page = new EventEmitter(); let evaluated = 0;
+    page.evaluate = async () => { evaluated++; return true; };
+    const owner = observeAuthorityRecovery(page, origin), sockets = [];
+    const socket = () => {
+        const value = new EventEmitter(); value.url = () => 'ws://127.0.0.1:8099/ws/events';
+        sockets.push(value); page.emit('websocket', value); return value;
+    };
+    const old = socket(); frame(old, ack);
+    return {page, owner, old, socket, sockets, evaluated: () => evaluated};
+}
+async function cleanup(f) {
+    f.owner.stop(); await f.owner.drain(performance.now() + 1000);
+    assert.equal(f.page.eventNames().length, 0);
+    assert(f.sockets.every(socket => socket.eventNames().length === 0));
+}
+const f = fixture(), barrier = f.owner.arm(performance.now() + 1000);
+let complete = false; barrier.wait().then(() => { complete = true; }, () => {});
+const stale = request(); f.page.emit('request', stale);
+frame(f.old, ack); // The old ACK cannot replace the required terminal/new socket.
+const beforeTerminal = f.socket(); frame(beforeTerminal, ack);
+frame(f.old, terminal);
+frame(beforeTerminal, ack); // Socket existed before terminal: still not eligible.
+await Promise.resolve(); assert.equal(complete, false);
+const next = f.socket();
+const beforeAck = request(); f.page.emit('request', beforeAck);
+frame(next, ack);
+f.page.emit('response', {request: () => beforeAck, status: () => 200,
+    body() { throw new Error('pre-ACK request must not be read'); }});
+const selected = request(); f.page.emit('request', selected);
+let bodyRead = 0, physicalRead = 0, bodyDone, physicalDone;
+f.page.emit('response', {request: () => selected, status: () => 200,
+    body() { bodyRead++; return new Promise(resolve => { bodyDone = resolve; }); },
+    finished() { physicalRead++; return new Promise(resolve => { physicalDone = resolve; }); }});
+assert.equal(bodyRead, 1); assert.equal(physicalRead, 1);
+bodyDone(Buffer.from('{}')); await Promise.resolve(); assert.equal(f.evaluated(), 0);
+physicalDone(null);
+assert.deepEqual(await barrier.wait(), {terminal: 1, new_socket_ack: 1, fresh_catalog: 1, home_empty: 1});
+assert.equal(f.evaluated(), 1); await cleanup(f);
+
+for (const change of ['old-ack', 'same-socket', 'pre-ack-request', 'missing-body', 'physical-error',
+    'http-error', 'wrong-request', 'no-home', 'closed', 'non-string-terminal']) {
+    const f = fixture(), barrier = f.owner.arm(performance.now() + 25);
+    if (change === 'closed') { f.owner.stop(); }
+    else {
+        if (change === 'non-string-terminal') frame(f.old, {...terminal, error: ['auth_failed']});
+        else if (change !== 'old-ack') frame(f.old, terminal);
+        const next = change === 'same-socket' ? f.old : f.socket();
+        const selected = request();
+        if (change === 'pre-ack-request') f.page.emit('request', selected);
+        frame(next, ack);
+        if (change !== 'pre-ack-request') f.page.emit('request', selected);
+        if (change === 'no-home') f.page.evaluate = async () => false;
+        f.page.emit('response', {request: () => change === 'wrong-request' ? request() : selected,
+            status: () => change === 'http-error' ? 503 : 200,
+            body: () => change === 'missing-body' ? Promise.reject(new Error('fake-body-failure')) : Promise.resolve(Buffer.from('{}')),
+            finished: () => Promise.resolve(change === 'physical-error' ? new Error('fake-physical-failure') : null)});
+    }
+    await assert.rejects(barrier.wait()); await cleanup(f);
+}
+const noAckPage = new EventEmitter(), noAck = observeAuthorityRecovery(noAckPage, origin);
+assert.throws(() => noAck.arm(performance.now() + 100)); noAck.stop();
+const expired = fixture(); assert.throws(() => expired.owner.arm(performance.now() - 1)); await cleanup(expired);
+
+// Stop rejects the logical checkpoint but late selected body work stays owned
+// until the explicit post-browser-close drain; it never evaluates old DOM.
+const late = fixture(), lateBarrier = late.owner.arm(performance.now() + 1000);
+frame(late.old, terminal); const lateSocket = late.socket(); frame(lateSocket, ack);
+const lateRequest = request(); late.page.emit('request', lateRequest); let release;
+late.page.emit('response', {request: () => lateRequest, status: () => 200,
+    body: () => new Promise(resolve => { release = resolve; }), finished: () => Promise.resolve(null)});
+late.owner.stop(); await assert.rejects(lateBarrier.wait());
+let drained = false; const joined = late.owner.drain(performance.now() + 1000).then(() => { drained = true; });
+await Promise.resolve(); assert.equal(drained, false); release(Buffer.from('{}')); await joined;
+assert.equal(late.evaluated(), 0); await cleanup(late);
+
+const broken = fixture(), brokenBarrier = broken.owner.arm(performance.now() + 1000);
+frame(broken.old, terminal); const brokenSocket = broken.socket(); frame(brokenSocket, ack);
+const brokenRequest = request(); broken.page.emit('request', brokenRequest);
+const exactBodyError = new Error('fake exact body failure'); let releasePhysical;
+broken.page.emit('response', {request: () => brokenRequest, status: () => 200,
+    body: () => Promise.reject(exactBodyError),
+    finished: () => new Promise(resolve => { releasePhysical = resolve; })});
+try { await brokenBarrier.wait(); assert.fail('body failure cannot pass'); }
+catch (error) { assert.equal(error, exactBodyError, 'preserve the actual first rejection'); }
+broken.owner.stop(); let physicalJoined = false;
+const physicalJoin = broken.owner.drain(performance.now() + 1000).then(() => { physicalJoined = true; });
+await Promise.resolve(); assert.equal(physicalJoined, false, 'rejected body does not release pending physical work');
+releasePhysical(null); await physicalJoin; assert.equal(broken.evaluated(), 0); await cleanup(broken);
+
+// Actual event-driven DOM helper: disconnects its MutationObserver and clears
+// its timer on both success and deadline, without polling or DOM mutation.
+let observeMutation, disconnected = 0, ready = false, tilePresent = true, tileInside = true;
+globalThis.MutationObserver = class { constructor(callback) { observeMutation = callback; }
+    observe() {} disconnect() { disconnected++; } };
+globalThis.document = {documentElement: {}, querySelector: selector =>
+    selector === '.launcher-main' ? {getAttribute: () => ready ? 'false' : 'true'} :
+    selector === '.launcher-home' ? {hidden: !ready, contains: () => tileInside} :
+    selector === '.panel-host' ? {isConnected: true, childElementCount: ready ? 0 : 1} :
+    selector.includes('.launcher-tile') && tilePresent ? {isConnected: true} : null};
+const dom = authorityRecoveryDOM(1000); ready = true; observeMutation(); assert.equal(await dom, true);
+assert.equal(disconnected, 1); ready = false;
+await assert.rejects(authorityRecoveryDOM(5)); assert.equal(disconnected, 2);
+ready = true; tilePresent = false;
+await assert.rejects(authorityRecoveryDOM(5)); assert.equal(disconnected, 3, 'failed empty Home has no authorized caller tile');
+tilePresent = true; tileInside = false;
+await assert.rejects(authorityRecoveryDOM(5)); assert.equal(disconnected, 4, 'tile must belong to the current Home');
+'''
+        subprocess.run(['node', '--input-type=module', '-e', script],
+                       cwd=repo / 'tests/browser', check=True, timeout=10,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_private_caller_timeout_observation_is_bounded_and_contains_no_free_text(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+const source = readFileSync('installed-float-production.mjs', 'utf8');
+const start = source.indexOf('function callerTimeoutObservation() {');
+const end = source.indexOf('\nasync function captureFailurePages(', start);
+assert(start > 0 && end > start);
+const observe = new Function('return (' + source.slice(start, end) + ')')();
+const secret = 'fake-credential-url-record-id-never-retained';
+let output = { textContent: secret }, caller = {getAttribute: () => '1'};
+const host = {isConnected: true, hidden: false, childElementCount: 1000};
+globalThis.document = {visibilityState: 'hidden', querySelector: selector =>
+    selector === '#installed-float-caller' ? caller : selector === '#installed-float-open-result' ? output :
+        selector === '.panel-host' ? host : {hidden: true}, querySelectorAll: () => ({length: 1000})};
+const entry = {incarnation: 1, mounted: true, mounts: 1, unmounts: 0, open_starts: 1,
+    resolved: 0, rejected: 1, suppressed: 0, last_code: 'missing-handler', ignored: secret};
+globalThis.__plinthInstalledFloats = {callers: {instances: [entry], events: 3, overflow: false, lastStarted: 1}};
+let value = observe();
+assert.equal(value.visibility, 'hidden'); assert.equal(value.output, 'other');
+assert.equal(value.current.last_code, 'missing-handler'); assert.equal(value.current_is_last_open, true);
+assert.equal(value.primary_host_connected, true); assert.equal(value.primary_child_count, 64);
+assert.equal(value.provider_count, 64); assert.equal(value.home_hidden, true);
+assert(!JSON.stringify(value).includes(secret)); assert(!JSON.stringify(value).includes('incarnation'));
+for (const [text, expected] of [['idle', 'idle'], ['opening', 'opening'], ['opened:' + secret, 'opened'],
+    ['refused:' + secret, 'refused'], ['refused:' + 'x'.repeat(129), 'other']]) {
+    output.textContent = text; assert.equal(observe().output, expected);
+}
+entry.last_code = secret; entry.mounts = 1000; entry.rejected = NaN;
+document.visibilityState = secret;
+__plinthInstalledFloats.callers.instances = Array.from({length: 100}, () => entry);
+__plinthInstalledFloats.callers.events = 1000; __plinthInstalledFloats.callers.overflow = true;
+value = observe(); assert.equal(value.instance_count, 64); assert.equal(value.event_count, 0);
+assert.equal(value.totals.open_starts, 64); assert.equal(value.current.mounts, 0);
+assert.equal(value.current.last_code, 'unknown'); assert.equal(value.visibility, 'unknown');
+assert(!JSON.stringify(value).includes(secret));
+caller = null; output = null;
+value = observe(); assert.equal(value.caller_present, false); assert.equal(value.output, 'absent');
+assert.equal(value.current, null); assert.equal(value.current_is_last_open, null);
+assert(source.includes("console.error('PLINTH_FLOAT_PRIVATE_UI ' + JSON.stringify(await captureFailurePages()))"));
+assert(source.includes("performance.now() + 2000"));
+assert(source.includes('Preserve the exact original failure even if diagnostics fail.'));
+const refusal = source.slice(source.indexOf('async function refusedOpen('), source.indexOf('\nasync function revalidateFromUI('));
+assert.deepEqual([...refusal.matchAll(/stage = '([^']+)'/g)].map(match => match[1]),
+    ['initial-caller', 'fill', 'barrier', 'click', 'native-body', 'refusal-wait', 'refusal-value']);
+assert(refusal.indexOf('try {') < refusal.indexOf('await openCaller('));
+assert(refusal.includes('throw error;\n    } finally { observer?.stop(); }'));
+assert.equal((refusal.match(/\.click\(/g) ?? []).length, 1);
+assert.equal((refusal.match(/page\.waitForFunction\(/g) ?? []).length, 1);
+assert(!refusal.includes('PLINTH_FLOAT_PRIVATE_UI'));
+assert.equal((source.match(/console\.error\('PLINTH_FLOAT_PRIVATE_UI /g) ?? []).length, 1);
+const snapshotStart = source.indexOf('async function captureFailurePages() {');
+const snapshotEnd = source.indexOf('\nasync function refusedOpen(', snapshotStart);
+const captureSource = source.slice(snapshotStart, snapshotEnd);
+const snapshots = new Set(); let selected = 0;
+const contexts = Array.from({length: 10}, () => ({pages: () => Array.from({length: 10}, () => ({
+    evaluate: async () => { selected++; return {schema_version: 1, output: 'refused'}; } }))}));
+let sharedDeadline, boundedCalls = 0;
+const bounded = async (run, deadline) => { boundedCalls++; sharedDeadline = deadline; return await run(); };
+const capture = new Function('contexts', 'privateSnapshotTasks', 'boundedStep', 'callerTimeoutObservation',
+    'refusedFailureStage', 'privateRealtime', 'return (' + captureSource + ')')(contexts, snapshots, bounded, observe, 'click', new Map());
+const globalValue = await capture();
+assert.equal(selected, 8); assert.equal(snapshots.size, 8); assert.equal(boundedCalls, 1);
+assert(Number.isFinite(sharedDeadline)); assert.equal(globalValue.page_count, 8);
+assert.equal(globalValue.context_count, 8); assert.equal(globalValue.overflow, true);
+assert.equal(globalValue.refusal_stage, 'click');
+assert.deepEqual(globalValue.pages.map(page => page.page_ordinal), [1,2,3,4,5,6,7,8]);
+assert(globalValue.pages.every(page => page.context_ordinal === 1 && page.state === 'observed'));
+assert(!JSON.stringify(globalValue).includes(secret));
+await Promise.all([...snapshots]);
+const pendingTasks = new Set(); let release;
+const pendingContexts = [{pages: () => [{evaluate: () => new Promise(resolve => { release = resolve; })},
+    {evaluate: () => Promise.reject(new Error(secret))}]}, {pages() { throw new Error(secret); }}];
+const pendingCapture = new Function('contexts', 'privateSnapshotTasks', 'boundedStep', 'callerTimeoutObservation',
+    'refusedFailureStage', 'privateRealtime', 'return (' + captureSource + ')')(pendingContexts, pendingTasks,
+        async () => { await Promise.resolve(); throw new Error('bounded diagnostic deadline'); }, observe, secret, new Map());
+const pendingValue = await pendingCapture();
+assert.equal(pendingValue.refusal_stage, null); assert.deepEqual(pendingValue.unavailable_context_ordinals, [2]);
+assert.equal(pendingValue.pages[0].state, 'pending'); assert.equal(pendingValue.pages[1].state, 'unavailable');
+assert(!JSON.stringify(pendingValue).includes(secret));
+release({schema_version: 1, output: 'idle'}); await Promise.all([...pendingTasks]);
+assert.equal(pendingValue.pages[0].state, 'observed', 'root retains and joins late diagnostic settlement');
+assert(source.includes('[...bodyObservationTasks, ...privateSnapshotTasks]'));
+assert(source.indexOf('await captureFailurePages()') < source.indexOf('for (const lane of readLanes.values()) lane.stop();'));
+const wsStart = source.indexOf('function observePrivateRealtime(page) {');
+const wsEnd = source.indexOf('\nasync function login(', wsStart);
+const pageMap = new Map();
+const observeWs = new Function('privateRealtime', 'privateRealtimeClosed',
+    'return (' + source.slice(wsStart, wsEnd) + ')')(pageMap, false);
+const wsPage = new EventEmitter(); observeWs(wsPage);
+const socket = new EventEmitter(); wsPage.emit('websocket', socket);
+const emit = value => socket.emit('framereceived', {payload: JSON.stringify(value)});
+for (let index = 0; index < 70; index++) emit({type: 'error', error: 'auth_failed', message: secret});
+emit({type: 'subscribed', channels: ['plinth:system:applications.changed'],
+    recommended_debounce_ms: 100, recommended_jitter_ms: 20});
+for (const payload of [secret, 'x'.repeat(2049), 'é'.repeat(1025), new Uint8Array([1]), '{"type":NaN}'])
+    socket.emit('framereceived', {payload});
+emit({type: 'error', error: secret, message: secret});
+emit({type: 'error', error: 'auth_failed', message: secret, extra: secret});
+for (const error of [['auth_timeout'], {value: 'auth_timeout'}, null, true, false])
+    emit({type: 'error', error, message: secret});
+emit({type: 'subscribed', channels: [secret], recommended_debounce_ms: 100, recommended_jitter_ms: 20});
+const wsSnapshot = pageMap.get(wsPage).snapshot();
+assert.equal(wsSnapshot.terminals.auth_failed, 64); assert.equal(wsSnapshot.application_acks, 1);
+assert.equal(wsSnapshot.terminals.auth_timeout, 0, 'non-string error must not coerce into a known terminal');
+assert.equal(wsSnapshot.frames, 64); assert(!JSON.stringify(wsSnapshot).includes(secret));
+const extraSockets = Array.from({length: 20}, () => new EventEmitter());
+for (const value of extraSockets) wsPage.emit('websocket', value);
+assert.equal(pageMap.get(wsPage).snapshot().sockets, 16); assert.equal(pageMap.get(wsPage).snapshot().overflow, true);
+for (let index = 0; index < 20; index++) observeWs(new EventEmitter());
+assert.equal(pageMap.size, 8);
+pageMap.get(wsPage).stop(); assert.equal(wsPage.eventNames().length, 0);
+assert.equal(socket.eventNames().length, 0); assert(extraSockets.every(value => value.eventNames().length === 0));
+const closedMap = new Map(), latePage = new EventEmitter();
+const observeClosed = new Function('privateRealtime', 'privateRealtimeClosed',
+    'return (' + source.slice(wsStart, wsEnd) + ')')(closedMap, true);
+observeClosed(latePage); assert.equal(closedMap.size, 0); assert.equal(latePage.eventNames().length, 0);
+assert(source.indexOf('observePrivateRealtime(page);') < source.indexOf("await page.goto(base + '/app/')"));
+assert(source.indexOf('for (const observer of privateRealtime.values()) observer.stop();') <
+    source.indexOf('for (const context of contexts) { try { await context.close();'));
+assert(source.indexOf('privateRealtimeClosed = true;') < source.indexOf('for (const observer of privateRealtime.values()) observer.stop();'));
+const fixture = readFileSync('../extensions/float-caller/client/panels/caller.js', 'utf8');
+assert(fixture.includes('hooks.useEffect(() => {'));
+assert(!fixture.includes('useLayoutEffect'));
+assert(fixture.includes('callers.instances.length < 64'));
+assert(fixture.includes('Math.min(64, entry[key] + 1)'));
+assert(fixture.includes('Math.min(64, callers.events + 1)'));
+assert(fixture.includes("if (!mounted.current) count(observation.current, 'suppressed')"));
+assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
+'''
+        subprocess.run(['node', '--input-type=module', '-e', script],
+                       cwd=repo / 'tests/browser', check=True, timeout=10,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
     def test_twelve_native_groups_preserve_the_original_seven_in_order(self):
         original = [
             'real protected policy, captured profile, authorized/denied surface filtering',
@@ -144,7 +402,9 @@ for (const malformed of [null, [], 'not-json']) {
     def test_journey_failure_summary_only_emits_finite_identifiers(self):
         script = r'''
 import assert from 'node:assert/strict';
-import { journeyFailurePrefix, journeyFailureSummary, emitJourneyFailure, createJourneyFailureSteps } from './installed-float-diagnostics.mjs';
+import { journeyFailurePrefix, journeyFailureSummary, emitJourneyFailure, createJourneyFailureSteps,
+    observeSelectedBody, bodyErrorKind } from './installed-float-diagnostics.mjs';
+import { EventEmitter } from 'node:events';
 const secret = 'fake-password-query-id-never-public';
 const error = {name: 'AssertionError', code: 'ERR_ASSERTION', operator: 'deepStrictEqual',
     message: secret, actual: secret, expected: secret,
@@ -154,7 +414,7 @@ assert.equal(journeyFailurePrefix, 'PLINTH_FLOAT_FAILURE ');
 assert(raw.length <= 2048); assert(!raw.includes(secret));
 assert.deepEqual(value, {schema_version: 1, phase: 'verify', completed_count: 1, completed_groups: [1],
     source: {file: 'installed-float-production.mjs', line: 127, column: 9},
-    failure_step: null, category: 'assertion', code: 'ERR_ASSERTION', operator: 'deepStrictEqual'});
+    failure_step: null, body_observation: null, category: 'assertion', code: 'ERR_ASSERTION', operator: 'deepStrictEqual'});
 for (const frame of [`    at open (/private/${secret}/installed-float-production.mjs:127:9)`,
     '    at async tests/browser/installed-float-production.mjs:127:9',
     '    at installed-float-production.mjs:127:9',
@@ -215,6 +475,47 @@ for (const rejected of [new Error(secret), null, undefined, false, 0, '']) {
     catch (actual) { assert.equal(actual, cleanup); }
     assert.equal(steps.failed(), 'personal-delete', 'later finally failure matches the final caught error');
 }
+const advice = '\nResponse body is not available for a response that was navigated away from. Read response.body() before triggering any navigation.';
+const knownBodies = [
+    ['response.body: Protocol error (Network.getResponseBody): No data found for resource with given identifier', 'cdp-no-data'],
+    ['response.body: Protocol error (Network.getResponseBody): No resource with given identifier found', 'cdp-no-resource'],
+    ['response.body: Protocol error (Network.getResponseBody): Request content was evicted from inspector cache', 'cdp-evicted'],
+    ['response.body: Response body is unavailable', 'pw-detached'],
+    ['response.body: Target page, context or browser has been closed', 'page-closed']];
+for (const [message, kind] of knownBodies) {
+    assert.equal(bodyErrorKind(new Error(message)), kind);
+    assert.equal(bodyErrorKind(new Error(message + advice)), kind);
+    assert.equal(bodyErrorKind(new Error(message + secret)), 'unknown');
+}
+assert.equal(bodyErrorKind({get message() { throw new Error(secret); }}), 'unknown');
+assert.equal(bodyErrorKind(new Error('x'.repeat(4097))), 'unknown');
+const page = new EventEmitter(); let detached = false, finish;
+const frame = {isDetached: () => detached}; page.mainFrame = () => frame;
+const nativeRequest = {frame: () => frame, resourceType: () => 'fetch', failure: () => ({errorText: 'net::ERR_ABORTED'})};
+const response = {request: () => nativeRequest, status: () => 200, finished: () => new Promise(resolve => { finish = resolve; })};
+const observation = observeSelectedBody(page, response);
+page.emit('requestfinished', {}); // Never correlate another native request.
+for (let index = 0; index < 20; index++) { page.emit('framenavigated', frame); page.emit('framedetached', {}); }
+page.emit('requestfailed', nativeRequest); detached = true;
+const original = new Error(knownBodies[0][0] + advice), properties = Object.getOwnPropertyNames(original);
+observation.reject(original); finish(null); await observation.finished; observation.stop();
+assert.deepEqual(Object.getOwnPropertyNames(original), properties, 'diagnostics cannot mutate the original Error');
+const observed = JSON.parse(journeyFailureSummary('verify', ['one'], original, 'personal-open'));
+assert.deepEqual(observed.body_observation, {body_error: 'cdp-no-data', status: 200, resource_type: 'fetch',
+    frame: 'detached', request_state: 'failed', request_failure: 'aborted', response_finished: 'ok',
+    main_frame_navigations: 16, frame_detachments: 16});
+assert.equal(JSON.parse(journeyFailureSummary('verify', ['one'], new Error(original.message))).body_observation, null,
+    'same text is not the same selected body Error');
+assert.equal(page.eventNames().length, 0, 'all passive event listeners must stop');
+assert(!JSON.stringify(observed).includes('Network.getResponseBody'));
+const noFrameRequest = {frame() { throw new Error(secret); }, resourceType: () => secret};
+const second = observeSelectedBody(page, {request: () => noFrameRequest, status: () => 503,
+    finished: () => Promise.reject(new Error(secret))});
+const unknown = new Error(secret); second.reject(unknown); await second.finished; second.stop();
+const secondValue = JSON.parse(journeyFailureSummary('verify', [], unknown)).body_observation;
+assert.equal(secondValue.resource_type, 'other'); assert.equal(secondValue.frame, 'unavailable');
+assert.equal(secondValue.response_finished, 'error'); assert.equal(secondValue.request_state, 'unobserved');
+assert.equal(secondValue.body_error, 'unknown'); assert(!JSON.stringify(secondValue).includes(secret));
 '''
         subprocess.run(['node', '--input-type=module', '-e', script],
                        cwd=repo / 'tests/browser', check=True, timeout=10,
@@ -250,7 +551,7 @@ assert(!encoded.includes('file:'));
     def test_supervisor_rejects_unsafe_or_malformed_failure_summaries(self):
         value = {'schema_version': 1, 'phase': 'verify', 'completed_count': 1,
             'completed_groups': [1], 'source': {'file': 'installed-float-production.mjs', 'line': 127, 'column': 9},
-            'failure_step': None, 'category': 'assertion', 'code': 'ERR_ASSERTION', 'operator': 'deepStrictEqual'}
+            'failure_step': None, 'body_observation': None, 'category': 'assertion', 'code': 'ERR_ASSERTION', 'operator': 'deepStrictEqual'}
         prefix = harness.FAILURE_PREFIX
         encoded = prefix + json.dumps(value)
         secret = 'fake-credential-marker-never-public'
@@ -289,6 +590,26 @@ assert(!encoded.includes('file:'));
                              {'diagnostic': 'unavailable'})
         missing = dict(value)
         missing.pop('failure_step')
+        self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(missing), 'verify'),
+                         {'diagnostic': 'unavailable'})
+        body = {'body_error': 'cdp-no-data', 'status': 200, 'resource_type': 'fetch', 'frame': 'attached',
+            'request_state': 'finished', 'request_failure': 'none', 'response_finished': 'ok',
+            'main_frame_navigations': 0, 'frame_detachments': 0}
+        with_body = dict(value, body_observation=body)
+        self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(with_body), 'verify'), with_body)
+        for key, bad in [('body_error', secret), ('status', True), ('status', 600),
+                         ('resource_type', secret), ('frame', secret), ('request_state', []),
+                         ('request_failure', 'aborted'), ('response_finished', {}),
+                         ('main_frame_navigations', True), ('frame_detachments', 17), ('extra', secret)]:
+            invalid = dict(value, body_observation=dict(body, **{key: bad}))
+            result = harness.safe_browser_failure(prefix + json.dumps(invalid), 'verify')
+            self.assertEqual(result, {'diagnostic': 'unavailable'})
+            self.assertNotIn(secret, json.dumps(result))
+        for bad in [False, [], secret, {'body_error': 'unknown'}]:
+            self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(dict(value, body_observation=bad)), 'verify'),
+                             {'diagnostic': 'unavailable'})
+        missing = dict(value)
+        missing.pop('body_observation')
         self.assertEqual(harness.safe_browser_failure(prefix + json.dumps(missing), 'verify'),
                          {'diagnostic': 'unavailable'})
 

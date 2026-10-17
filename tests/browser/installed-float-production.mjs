@@ -6,8 +6,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
-import { installFailureSummary, emitJourneyFailure, createJourneyFailureSteps } from './installed-float-diagnostics.mjs';
-import { boundedStep, createResponseBodyRegistry, observeReadLane, withFrozenReadLane } from './installed-float-coordination.mjs';
+import { installFailureSummary, emitJourneyFailure, createJourneyFailureSteps, observeSelectedBody } from './installed-float-diagnostics.mjs';
+import { boundedStep, createResponseBodyRegistry, observeReadLane, withFrozenReadLane,
+    observeAuthorityRecovery } from './installed-float-coordination.mjs';
 
 const phase = process.argv[2];
 assert(['install', 'verify'].includes(phase), 'owned supervisor phase required');
@@ -32,6 +33,13 @@ const fixtureRules = ['floatcaller.panel', 'floatprovider.panel', 'floatprovider
 const contexts = [];
 const readLanes = new Map();
 const responseBodies = createResponseBodyRegistry();
+const bodyObservationTasks = new Set();
+const privateSnapshotTasks = new Set();
+const privateRealtime = new Map();
+const authorityRecoveries = new Map();
+const recoveryEvidence = [];
+let privateRealtimeClosed = false;
+let refusedFailureStage = null;
 let browser;
 let state;
 let failure;
@@ -63,10 +71,59 @@ async function request(page, path, method = 'GET', payload, csrf = true) {
         return { status: response.status, value, profile: response.headers.get('X-Plinth-Platform-Profile') };
     }, { path, method, payload, csrf });
 }
+function observePrivateRealtime(page) {
+    if (privateRealtimeClosed || privateRealtime.size >= 8) return;
+    const terminals = { auth_failed: 0, auth_timeout: 0, already_connected: 0,
+        not_authenticated: 0, session_expired: 0, session_revoked: 0 };
+    const state = { sockets: 0, closed: 0, frames: 0, application_acks: 0, overflow: false };
+    const sockets = new Map();
+    const increment = key => { state[key] = Math.min(64, state[key] + 1); };
+    const onSocket = socket => {
+        if (sockets.size === 16) { state.overflow = true; return; }
+        increment('sockets');
+        const received = event => {
+            try {
+                const payload = event.payload;
+                if (typeof payload !== 'string' || payload.length > 2048 || Buffer.byteLength(payload, 'utf8') > 2048) return;
+                increment('frames');
+                const value = JSON.parse(payload);
+                if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+                const keys = Object.keys(value).sort().join(',');
+                if (keys === 'error,message,type' && value.type === 'error' &&
+                    typeof value.message === 'string' && typeof value.error === 'string' &&
+                    Object.hasOwn(terminals, value.error)) {
+                    terminals[value.error] = Math.min(64, terminals[value.error] + 1);
+                } else if (keys === 'channels,recommended_debounce_ms,recommended_jitter_ms,type' &&
+                    value.type === 'subscribed' && Array.isArray(value.channels) && value.channels.length <= 64 &&
+                    value.channels.every(channel => typeof channel === 'string' && channel.length <= 256) &&
+                    new Set(value.channels).size === value.channels.length &&
+                    ['recommended_debounce_ms', 'recommended_jitter_ms'].every(key =>
+                        Number.isSafeInteger(value[key]) && value[key] >= 0) &&
+                    value.channels.includes('plinth:system:applications.changed')) increment('application_acks');
+            } catch { /* Unknown/malformed frames never become retained payloads. */ }
+        };
+        const closed = () => increment('closed');
+        socket.on('framereceived', received); socket.on('close', closed);
+        sockets.set(socket, { received, closed });
+    };
+    page.on('websocket', onSocket);
+    privateRealtime.set(page, Object.freeze({ snapshot: () => ({ ...state, terminals: { ...terminals } }), stop() {
+        page.off('websocket', onSocket);
+        for (const [socket, handlers] of sockets) {
+            socket.off('framereceived', handlers.received); socket.off('close', handlers.closed);
+        }
+        sockets.clear();
+    } }));
+}
 async function login(account, { observeReads = false } = {}) {
     const context = await browser.newContext({ viewport: { width: 1440, height: 1000 } });
     contexts.push(context);
     const page = await context.newPage();
+    observePrivateRealtime(page);
+    if (!privateRealtimeClosed) {
+        assert(authorityRecoveries.size < 8, 'bounded verification recovery observers');
+        authorityRecoveries.set(page, observeAuthorityRecovery(page, origin));
+    }
     if (observeReads) readLanes.set(page, observeReadLane(page, origin));
     page.setDefaultTimeout(15000);
     page.on('dialog', dialog => dialog.accept());
@@ -195,7 +252,7 @@ function expectedWatch(nativeRequest, targets) {
 }
 function observeFreshResponse(page, select, barrier, deadline) {
     const requests = new Map(), diagnostics = { requests: 0, responses: [] };
-    let resolve, reject, selectedFresh = false, settled = false, closed = false, outcome = null;
+    let resolve, reject, selectedFresh = false, settled = false, closed = false, outcome = null, bodyObservation;
     const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
     // A click can fail before its observer is awaited; retain a handled promise.
     promise.catch(() => {});
@@ -229,11 +286,16 @@ function observeFreshResponse(page, select, barrier, deadline) {
         let body;
         try { body = responseBodies.capture(response); }
         catch (error) { fail(error); return; }
+        // Passive diagnostics only. No new Network domain, cache or interception.
+        try {
+            bodyObservation = observeSelectedBody(page, response);
+            bodyObservationTasks.add(bodyObservation.finished);
+        } catch { /* A diagnostic failure cannot replace actual body validation. */ }
         selectedFresh = true;
         outcome = { response, selected, body };
         body.settlement.then(result => {
             if (closed || settled) return;
-            if (!result.ok) { fail(result.error); return; }
+            if (!result.ok) { bodyObservation?.reject(result.error); fail(result.error); return; }
             settled = true;
             resolve(outcome);
         }).catch(fail);
@@ -246,6 +308,7 @@ function observeFreshResponse(page, select, barrier, deadline) {
         clearTimeout(timer);
         page.off('request', onRequest);
         page.off('response', onResponse);
+        bodyObservation?.stop();
         requests.clear();
     } };
 }
@@ -345,19 +408,88 @@ function targetArtifactDigest(target) {
     assert.match(digest, /^[0-9a-f]{64}$/);
     return digest;
 }
+function callerTimeoutObservation() {
+    const codes = new Set(['none', 'opened', 'missing-handler', 'authority-unavailable', 'cancelled',
+        'invalid-input', 'limit-refused', 'request-busy', 'load-failed', 'target-unavailable',
+        'reload-required', 'session-ended', 'unknown']);
+    const keys = ['mounts', 'unmounts', 'open_starts', 'resolved', 'rejected', 'suppressed'];
+    const bounded = value => Number.isInteger(value) && value >= 0 && value <= 64 ? value : 0;
+    const caller = document.querySelector('#installed-float-caller');
+    const output = document.querySelector('#installed-float-open-result');
+    const launcher = document.querySelector('.launcher-shell');
+    const home = document.querySelector('.launcher-home');
+    const host = document.querySelector('.panel-host');
+    const text = output?.textContent;
+    const status = !output ? 'absent' : text === 'idle' || text === 'opening' ? text :
+        typeof text === 'string' && text.length <= 128 && text.startsWith('opened:') ? 'opened' :
+        typeof text === 'string' && text.length <= 128 && text.startsWith('refused:') ? 'refused' : 'other';
+    const raw = globalThis.__plinthInstalledFloats?.callers;
+    const instances = Array.isArray(raw?.instances) ? raw.instances.slice(0, 64) : [];
+    const id = Number(caller?.getAttribute('data-caller-incarnation'));
+    const current = Number.isInteger(id) && id >= 1 && id <= 64 ? instances[id - 1] : null;
+    return { schema_version: 1, visibility: ['visible', 'hidden', 'prerender'].includes(document.visibilityState)
+        ? document.visibilityState : 'unknown', caller_present: !!caller, output_present: !!output, output: status,
+        launcher_present: !!launcher, home_present: !!home, home_hidden: home?.hidden === true,
+        primary_host_present: !!host, primary_host_connected: host?.isConnected === true,
+        primary_host_hidden: host?.hidden === true, primary_child_count: Math.min(64, host?.childElementCount ?? 0),
+        provider_count: Math.min(64, document.querySelectorAll('.installed-float-provider').length),
+        instance_count: instances.length, event_count: bounded(raw?.events), overflow: raw?.overflow === true,
+        current_is_last_open: current ? id === raw?.lastStarted : null,
+        totals: Object.fromEntries(keys.map(key => [key, Math.min(64,
+            instances.reduce((total, entry) => total + bounded(entry?.[key]), 0))])),
+        current: current ? { mounted: current.mounted === true,
+            ...Object.fromEntries(keys.map(key => [key, bounded(current[key])])),
+            last_code: codes.has(current.last_code) ? current.last_code : 'unknown' } : null };
+}
+async function captureFailurePages() {
+    const deadline = performance.now() + 2000;
+    const pages = [], unavailableContexts = [];
+    let overflow = contexts.length > 8;
+    for (const [contextIndex, context] of contexts.slice(0, 8).entries()) {
+        let owned;
+        try { owned = context.pages(); }
+        catch { unavailableContexts.push(contextIndex + 1); continue; }
+        const remainingPages = 8 - pages.length;
+        if (owned.length > remainingPages) overflow = true;
+        for (const [pageIndex, page] of owned.slice(0, remainingPages).entries()) {
+            const entry = { context_ordinal: contextIndex + 1, page_ordinal: pageIndex + 1,
+                state: 'pending', snapshot: null, realtime: privateRealtime.get(page)?.snapshot() ?? null };
+            pages.push(entry);
+            let pending;
+            try { pending = Promise.resolve(page.evaluate(callerTimeoutObservation)); }
+            catch (error) { pending = Promise.reject(error); }
+            // Both handlers attach immediately; root joins after browser closure
+            // even when this one diagnostic deadline expires before settlement.
+            const handled = pending.then(snapshot => { entry.state = 'observed'; entry.snapshot = snapshot; },
+                () => { entry.state = 'unavailable'; });
+            privateSnapshotTasks.add(handled);
+        }
+    }
+    try { await boundedStep(() => Promise.all([...privateSnapshotTasks]), deadline); }
+    catch { /* Pending entries remain explicitly pending, not success. */ }
+    return { schema_version: 1, context_count: Math.min(8, contexts.length), page_count: pages.length,
+        overflow, unavailable_context_ordinals: unavailableContexts,
+        refusal_stage: ['initial-caller', 'fill', 'barrier', 'click', 'native-body', 'refusal-wait',
+            'refusal-value'].includes(refusedFailureStage) ? refusedFailureStage : null, pages };
+}
 async function refusedOpen(page, record, deadline = performance.now() + 15000) {
-    await openCaller(page, deadline);
-    await page.locator('#installed-float-record').fill(record, { timeout: remaining(deadline) });
-    const barrier = await withinDeadline(page.evaluate(() => performance.timeOrigin + performance.now()), deadline);
-    const observer = observeFreshResponse(page, nativeRequest => {
-        const url = new URL(nativeRequest.url());
-        return url.origin === origin && nativeRequest.method() === 'GET' && url.pathname === '/api/frontend/surfaces' &&
-            url.searchParams.get('kind') === 'float' &&
-            url.searchParams.get('limit') === '1' && url.searchParams.get('include_admin_default') === '1' &&
-            url.searchParams.get('content_type') === 'application/x-plinth-float-fixture' ? [] : null;
-    }, barrier, deadline);
+    let stage = 'initial-caller', observer;
     try {
+        await openCaller(page, deadline);
+        stage = 'fill';
+        await page.locator('#installed-float-record').fill(record, { timeout: remaining(deadline) });
+        stage = 'barrier';
+        const barrier = await withinDeadline(page.evaluate(() => performance.timeOrigin + performance.now()), deadline);
+        observer = observeFreshResponse(page, nativeRequest => {
+            const url = new URL(nativeRequest.url());
+            return url.origin === origin && nativeRequest.method() === 'GET' && url.pathname === '/api/frontend/surfaces' &&
+                url.searchParams.get('kind') === 'float' &&
+                url.searchParams.get('limit') === '1' && url.searchParams.get('include_admin_default') === '1' &&
+                url.searchParams.get('content_type') === 'application/x-plinth-float-fixture' ? [] : null;
+        }, barrier, deadline);
+        stage = 'click';
         await page.locator('#installed-float-open').click({ timeout: remaining(deadline) });
+        stage = 'native-body';
         const observed = await observer.promise;
         assert.equal(observed.response.status(), 200, 'fresh SDK resolver catalog HTTP status');
         const catalog = await withinDeadline(observed.body.json(), deadline);
@@ -366,15 +498,20 @@ async function refusedOpen(page, record, deadline = performance.now() + 15000) {
             Array.isArray(catalog.targets) && catalog.targets.length === 0 &&
             catalog.next_cursor === null && catalog.admin_default_candidate === null,
         'fresh ordinary SDK resolver must observe complete native absence');
+        stage = 'refusal-wait';
         await page.waitForFunction(() => document.querySelector('#installed-float-open-result')?.textContent?.startsWith('refused:'),
             null, { timeout: remaining(deadline) });
+        stage = 'refusal-value';
         const result = await page.locator('#installed-float-open-result').textContent({ timeout: remaining(deadline) });
         assert(['refused:missing-handler', 'refused:authority-unavailable'].includes(result),
             'fresh ordinary SDK request must refuse unavailable authority');
-    } finally { observer.stop(); }
+    } catch (error) {
+        refusedFailureStage = stage;
+        throw error;
+    } finally { observer?.stop(); }
 }
-async function revalidateFromUI(page, record, refusedRecord, expectedTargets) {
-    const deadline = performance.now() + 15000;
+async function revalidateFromUI(page, record, refusedRecord, expectedTargets,
+    { deadline = performance.now() + 15000, beforeFallback = null } = {}) {
     // This browser epoch timestamp is sampled only AFTER the mutation ACK.
     const barrier = await withinDeadline(page.evaluate(() => performance.timeOrigin + performance.now()), deadline);
     const observer = observeFreshResponse(page,
@@ -412,6 +549,7 @@ async function revalidateFromUI(page, record, refusedRecord, expectedTargets) {
             if (observed?.error) throw observed.cause;
             if (observed?.response) await requireUnavailable(observed, deadline, observer.diagnostics);
             observer.stop();
+            if (beforeFallback) await beforeFallback();
             await refusedOpen(page, refusedRecord, deadline);
         }
         assert((await retired).retired, 'all old native provider owners physically retired');
@@ -690,24 +828,30 @@ try {
             .fill('fake dirty owner cannot veto authority retirement');
         const aInstances = await newA.locator('.installed-float-provider').evaluateAll(elements => elements.map(element => element.dataset.instance));
         assert.equal(aInstances.length, 2);
-        const removed = sql(`WITH removed AS (DELETE FROM plinth.group_rules gr USING plinth.rbac_rules r
-            WHERE gr.group_id=${literal(state.groups[0])} AND gr.rule_id=r.id
-            AND r.rule='floatprovider.preview' AND r.extension_name='floatprovider'
-            AND EXISTS(SELECT 1 FROM plinth.group_members gm WHERE gm.group_id=gr.group_id
-                AND gm.user_id=${literal(state.accounts.a.id)}) RETURNING gr.rule_id)
-            SELECT count(*) FROM removed`);
-        assert.equal(removed, '1', 'revoke only A existing exact owned grant; never re-grant');
-        const revoked = await request(newA, admissionPath, 'POST', {
-            schema_version: 1, targets: [pinnedTuple(preview), pinnedTuple(live)] });
-        assert.equal(revoked.status, 200, 'independent request issued after committed revocation');
-        requireUnavailableValue(revoked.value, 2, { phase: 'independent-after-delete', panels: ['preview', 'live'] });
-        await revalidateFromUI(newA, 'fixture-record-A', 'fixture-revoked-A', [preview, live]);
-        await retiredInstances(newA, aInstances);
-        assert.equal(await newA.getByRole('button', { name: 'Discard', exact: true }).count(), 0);
-        assert.equal((await request(newA, modulePath)).status, 404);
-        const revokedFactories = await newA.evaluate(() => __plinthInstalledFloats.factories);
-        await refusedOpen(newA, 'fixture-still-revoked-A');
-        assert.equal(await newA.evaluate(() => __plinthInstalledFloats.factories), revokedFactories);
+        const revokeDeadline = performance.now() + 15000;
+        const revokedRecovery = authorityRecoveries.get(newA).arm(revokeDeadline);
+        try {
+            const removed = sql(`WITH removed AS (DELETE FROM plinth.group_rules gr USING plinth.rbac_rules r
+                WHERE gr.group_id=${literal(state.groups[0])} AND gr.rule_id=r.id
+                AND r.rule='floatprovider.preview' AND r.extension_name='floatprovider'
+                AND EXISTS(SELECT 1 FROM plinth.group_members gm WHERE gm.group_id=gr.group_id
+                    AND gm.user_id=${literal(state.accounts.a.id)}) RETURNING gr.rule_id)
+                SELECT count(*) FROM removed`);
+            assert.equal(removed, '1', 'revoke only A existing exact owned grant; never re-grant');
+            const revoked = await withinDeadline(request(newA, admissionPath, 'POST', {
+                schema_version: 1, targets: [pinnedTuple(preview), pinnedTuple(live)] }), revokeDeadline);
+            assert.equal(revoked.status, 200, 'independent request issued after committed revocation');
+            requireUnavailableValue(revoked.value, 2, { phase: 'independent-after-delete', panels: ['preview', 'live'] });
+            await revalidateFromUI(newA, 'fixture-record-A', 'fixture-revoked-A', [preview, live],
+                { deadline: revokeDeadline, beforeFallback: () => revokedRecovery.wait() });
+            recoveryEvidence.push(await revokedRecovery.wait());
+            await retiredInstances(newA, aInstances, revokeDeadline);
+            assert.equal(await newA.getByRole('button', { name: 'Discard', exact: true }).count(), 0);
+            assert.equal((await request(newA, modulePath)).status, 404);
+            const revokedFactories = await newA.evaluate(() => __plinthInstalledFloats.factories);
+            await refusedOpen(newA, 'fixture-still-revoked-A', revokeDeadline);
+            assert.equal(await newA.evaluate(() => __plinthInstalledFloats.factories), revokedFactories);
+        } finally { revokedRecovery.stop(); }
         const permitted = await pinned(b, preview);
         assert.equal(permitted.status, 200);
         assert.equal(permitted.value.results[0].status, 'available');
@@ -730,26 +874,39 @@ try {
         // A legitimately suspended background tab keeps its dirty/live owner,
         // but cannot start another periodic/focus read during this one PATCH.
         // This is fixture coordination, not an unfrozen polling stress claim.
-        const disabled = await withFrozenReadLane(b, readLanes.get(b), disableDeadline, async () => {
-            const value = await request(operator, `/api/packages/${originalPackage.id}`, 'PATCH', { action: 'disable' });
-            assert.equal(value.status, 200, installFailureSummary('floatprovider', value, null));
-            return value;
-        });
-        assert.equal(disabled.value.state, 'DISABLED');
-        assert.equal(packageRow('floatprovider').state, 'DISABLED');
-        await revalidateFromUI(b, 'fixture-record-B', 'fixture-disabled-B', [preview]);
-        await retiredInstances(b, [bOriginalInstance]);
-        const disabledAdmission = await pinned(b, preview);
-        assert.equal(disabledAdmission.status, 200);
-        assert.deepEqual(disabledAdmission.value.results, [{ index: 0, status: 'unavailable' }]);
-        assert.equal((await request(b, modulePath)).status, 404);
-        const enabled = await request(operator, `/api/packages/${originalPackage.id}`, 'PATCH', { action: 'enable' });
-        assert.equal(enabled.status, 200);
-        assert.equal(enabled.value.state, 'ACTIVE');
-        assert.equal(packageRow('floatprovider').id, originalPackage.id);
-        assert.equal(packageRow('floatprovider').application_ready, true);
-        assert.equal(await b.locator('.installed-float-provider').count(), 0, 'enable alone never resurrects a component');
-        const enabledFloat = await open(b, 'fixture-enabled-B');
+        const disabledRecovery = authorityRecoveries.get(b).arm(disableDeadline);
+        try {
+            const disabled = await withFrozenReadLane(b, readLanes.get(b), disableDeadline, async () => {
+                const value = await request(operator, `/api/packages/${originalPackage.id}`, 'PATCH', { action: 'disable' });
+                assert.equal(value.status, 200, installFailureSummary('floatprovider', value, null));
+                return value;
+            });
+            assert.equal(disabled.value.state, 'DISABLED');
+            assert.equal(packageRow('floatprovider').state, 'DISABLED');
+            await revalidateFromUI(b, 'fixture-record-B', 'fixture-disabled-B', [preview],
+                { deadline: disableDeadline, beforeFallback: () => disabledRecovery.wait() });
+            recoveryEvidence.push(await disabledRecovery.wait());
+            await retiredInstances(b, [bOriginalInstance], disableDeadline);
+            const disabledAdmission = await pinned(b, preview);
+            assert.equal(disabledAdmission.status, 200);
+            assert.deepEqual(disabledAdmission.value.results, [{ index: 0, status: 'unavailable' }]);
+            assert.equal((await request(b, modulePath)).status, 404);
+        } finally { disabledRecovery.stop(); }
+        const enableDeadline = performance.now() + 15000;
+        const enabledRecovery = authorityRecoveries.get(b).arm(enableDeadline);
+        let enabledFloat;
+        try {
+            const enabled = await withinDeadline(request(operator, `/api/packages/${originalPackage.id}`, 'PATCH',
+                { action: 'enable' }), enableDeadline);
+            assert.equal(enabled.status, 200);
+            assert.equal(enabled.value.state, 'ACTIVE');
+            assert.equal(packageRow('floatprovider').id, originalPackage.id);
+            assert.equal(packageRow('floatprovider').application_ready, true);
+            recoveryEvidence.push(await enabledRecovery.wait());
+            assert.equal(await b.locator('.installed-float-provider').count(), 0, 'enable alone never resurrects a component');
+            await openCaller(b, enableDeadline);
+            enabledFloat = await withinDeadline(open(b, 'fixture-enabled-B'), enableDeadline);
+        } finally { enabledRecovery.stop(); }
         const enabledInstance = await enabledFloat.provider.getAttribute('data-instance');
         assert.notEqual(enabledInstance, bOriginalInstance);
         assert.equal((await surfaces(b)).find(target => target.panel_id === 'preview').generation, preview.generation);
@@ -832,17 +989,32 @@ try {
         assert.equal(await current.provider.getAttribute('data-instance'), currentInstance, 'save does not replace live-only UI');
         completed.push('successful replacement recovers through new native bytes without inherited persistence approval');
     }
-} catch (error) { failure = error; }
+} catch (error) {
+    failure = error;
+    // One global, private-only diagnostic covers every failing journey stage
+    // before contexts close. Never replace or reinterpret the primary error.
+    try { console.error('PLINTH_FLOAT_PRIVATE_UI ' + JSON.stringify(await captureFailurePages())); }
+    catch { /* Preserve the exact original failure even if diagnostics fail. */ }
+}
 finally {
+    privateRealtimeClosed = true;
+    for (const observer of authorityRecoveries.values()) observer.stop();
+    for (const observer of privateRealtime.values()) observer.stop();
+    privateRealtime.clear();
     for (const lane of readLanes.values()) lane.stop();
     readLanes.clear();
     for (const context of contexts) { try { await context.close(); } catch (error) { cleanupFailures.push(error); } }
     if (browser) { try { await browser.close(); } catch (error) { cleanupFailures.push(error); } }
     try {
-        for (const error of await responseBodies.drain(performance.now() + 2000)) {
+        const deadline = performance.now() + 2000;
+        const [bodyErrors] = await Promise.all([responseBodies.drain(deadline),
+            boundedStep(() => Promise.all([...bodyObservationTasks, ...privateSnapshotTasks]), deadline),
+            ...[...authorityRecoveries.values()].map(observer => observer.drain(deadline))]);
+        for (const error of bodyErrors) {
             if (error !== failure && !cleanupFailures.includes(error)) cleanupFailures.push(error);
         }
     } catch (error) { cleanupFailures.push(error); }
+    finally { bodyObservationTasks.clear(); privateSnapshotTasks.clear(); authorityRecoveries.clear(); }
 }
 // The supervisor drops the exact disposable database and owned filesystem even
 // when install or verify fails. Normal package uninstall is separately required
@@ -888,8 +1060,11 @@ if (failure || cleanupFailures.length) {
 }
 if (phase === 'verify') {
     assert.equal(completed.length, 12);
+    assert.deepEqual(recoveryEvidence, Array.from({ length: 3 }, () =>
+        ({ terminal: 1, new_socket_ack: 1, fresh_catalog: 1, home_empty: 1 })));
     console.log(JSON.stringify({ phase, expectedCases: 12, completed, actualAuth: true,
         packageProvenance: 'user', archiveHashes: state.archiveHashes,
         protectedPolicy: true, normalUninstall: true,
+        authorityRecovery: { barriers: 3, terminals: 3, newSocketAcks: 3, freshCatalogs: 3, emptyPrimary: 3 },
         scope: 'native ordinary ZIP/API/auth/RBAC/SDK/import/protected policy/guarded SQL/reload/component recovery/revocation/package lifecycle; no process-crash or lost-ACK proof' }));
 }
