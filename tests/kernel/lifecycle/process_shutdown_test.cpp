@@ -133,6 +133,16 @@ class ChildProcess {
     REQUIRE(::kill(pid, signal) == 0);
   }
 
+  // Barrier oracles defer assertions until their database lock is released.
+  auto try_signal(int signal) const -> bool { return ::kill(pid, signal) == 0; }
+
+  auto poll_running() -> bool {
+    int status = 0;
+    const auto result = ::waitpid(pid, &status, WNOHANG);
+    if (result == pid) pid = -1;
+    return result == 0;
+  }
+
   auto wait_for_exit(std::chrono::milliseconds timeout) -> std::optional<int> {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -654,6 +664,114 @@ auto scalar(PGconn* connection, const std::string& query,
   return std::stoll(PQgetvalue(result.get(), 0, 0));
 }
 
+// Test-thread-owned connection; no SQL owner or borrowed pointer crosses an
+// asynchronous boundary. Failure unwinding must release the real table lock
+// before ChildProcess cleanup waits for the disposable production child.
+class FloatReadBarrier {
+ public:
+  explicit FloatReadBarrier(PgConnection connection_in)
+      : connection(std::move(connection_in)) {}
+  ~FloatReadBarrier() {
+    if (active) static_cast<void>(release());
+  }
+  FloatReadBarrier(const FloatReadBarrier&) = delete;
+  auto operator=(const FloatReadBarrier&) -> FloatReadBarrier& = delete;
+
+  auto acquire() -> bool {
+    plinth::db::OperationScope bounded{std::stop_token{},
+                                       std::chrono::steady_clock::now() + 2s};
+    const PgResult begun{plinth::db::exec(connection.get(), "BEGIN"), PQclear};
+    active = begun && PQresultStatus(begun.get()) == PGRES_COMMAND_OK;
+    if (!active) return false;
+    const PgResult locked{
+        plinth::db::exec(
+            connection.get(),
+            "LOCK TABLE ext_shell.user_preferences IN ACCESS EXCLUSIVE MODE"),
+        PQclear};
+    return locked && PQresultStatus(locked.get()) == PGRES_COMMAND_OK;
+  }
+  auto release() noexcept -> bool {
+    bool released = false;
+    try {
+      plinth::db::OperationScope bounded{std::stop_token{},
+                                         std::chrono::steady_clock::now() + 2s};
+      const PgResult rolled_back{plinth::db::exec(connection.get(), "ROLLBACK"),
+                                 PQclear};
+      released = rolled_back &&
+                 PQresultStatus(rolled_back.get()) == PGRES_COMMAND_OK &&
+                 PQtransactionStatus(connection.get()) == PQTRANS_IDLE;
+    } catch (...) {
+      // A failed/unknown rollback remains a failed test, but must not terminate
+      // before the owned child/database guards can unwind.
+    }
+    active = false;
+    // Closing only our owned connection releases any uncertain transaction.
+    if (!released) connection.reset();
+    return released;
+  }
+  auto backend_pid() const -> int { return PQbackendPID(connection.get()); }
+
+ private:
+  PgConnection connection;
+  bool active = false;
+};
+
+auto receive_http_until(int fd, std::chrono::steady_clock::time_point deadline)
+    -> std::optional<std::string> {
+  constexpr auto RESPONSE_LIMIT = std::size_t{144} * 1024;
+  std::string response;
+  std::array<char, 4096> buffer{};
+  while (std::chrono::steady_clock::now() < deadline) {
+    const auto remaining =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+    if (remaining <= 0ms) break;
+    pollfd readable{.fd = fd, .events = POLLIN, .revents = 0};
+    const auto ready =
+        ::poll(&readable, 1, static_cast<int>(remaining.count()));
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready <= 0) return std::nullopt;
+    const auto received =
+        ::recv(fd, buffer.data(), buffer.size(), MSG_DONTWAIT);
+    if (received == 0) return response;
+    if (received < 0) {
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
+      return std::nullopt;
+    }
+    const auto size = static_cast<std::size_t>(received);
+    if (size > RESPONSE_LIMIT - response.size()) return std::nullopt;
+    response.append(buffer.data(), size);
+  }
+  return std::nullopt;
+}
+
+auto require_float_read_response(const std::string& response) -> void {
+  INFO(response);
+  // A cancellation/503/EOF would be a distinct finding, not a successful read
+  // or a float-write acknowledgement. Do not silently accept those outcomes.
+  REQUIRE(response.starts_with("HTTP/1.1 200 "));
+  const auto separator = response.find("\r\n\r\n");
+  REQUIRE(separator != std::string::npos);
+  auto headers = response.substr(0, separator);
+  for (auto& character : headers)
+    if (character >= 'A' && character <= 'Z')
+      character = static_cast<char>(character - 'A' + 'a');
+  constexpr std::string_view PROFILE = "\r\nx-plinth-platform-profile:";
+  const auto start = headers.find(PROFILE);
+  REQUIRE(start != std::string::npos);
+  const auto first = headers.find_first_not_of(" \t", start + PROFILE.size());
+  REQUIRE(first != std::string::npos);
+  REQUIRE(headers.substr(first).starts_with("v1:"));
+  const auto value = nlohmann::json::parse(response.substr(separator + 4));
+  const nlohmann::json expected{
+      {"schema_version", 1},
+      {"present", true},
+      {"layout", {{"version", 1}, {"floats", nlohmann::json::array()}}},
+      {"policy_revision", nullptr},
+      {"restore_targets", nlohmann::json::array()}};
+  REQUIRE(value == expected);
+}
+
 template <typename Predicate>
 auto wait_for_condition(Predicate predicate, std::chrono::milliseconds timeout)
     -> bool {
@@ -667,8 +785,9 @@ auto wait_for_condition(Predicate predicate, std::chrono::milliseconds timeout)
   return false;
 }
 
-auto require_durable_shutdown(int signal, bool accepted_websocket_work)
-    -> void {
+auto require_durable_shutdown(int signal, bool accepted_websocket_work,
+                              bool blocked_float_read = false) -> void {
+  REQUIRE_FALSE((accepted_websocket_work && blocked_float_read));
   IsolatedDatabase database;
   TempTree tree;
   auto port = test_port();
@@ -702,6 +821,12 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
       "VALUES ($1::uuid, 'shutdown_control', '1'), ($1::uuid, "
       "'shutdown_target', '2')",
       {user_id});
+  if (blocked_float_read)
+    sql(connection.get(),
+        "INSERT INTO ext_shell.user_preferences (user_id, key, value) "
+        "VALUES ($1::uuid, 'shell.floats', "
+        "'{\"version\":1,\"floats\":[]}'::jsonb)",
+        {user_id});
   // A real control deletion proves that this process subscribed and persists
   // coalescer events before the final open-window case begins.
   delete_preference(port, token, "shutdown_control");
@@ -716,6 +841,10 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
   const auto control_seq = scalar(
       connection.get(), "SELECT max(seq) FROM plinth.events WHERE channel = $1",
       {EVENT_CHANNEL});
+
+  std::optional<std::chrono::steady_clock::time_point> float_shutdown_deadline;
+  std::optional<std::string> float_response;
+  std::int64_t float_waiter = 0;
 
   if (accepted_websocket_work) {
     // The blocking transaction caches PostgreSQL statistics snapshots. Use an
@@ -750,17 +879,120 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
     REQUIRE(admitted);
   } else {
     delete_preference(port, token, "shutdown_target");
-    child.send_signal(signal);
+    if (blocked_float_read) {
+      auto observer = open_database(database.name);
+      auto request = connect_to(port);
+      REQUIRE(request.fd >= 0);
+      FloatReadBarrier barrier{open_database(database.name)};
+      const bool acquired = barrier.acquire();
+      const auto blocker = std::to_string(barrier.backend_pid());
+      const auto barrier_deadline = std::chrono::steady_clock::now() + 3s;
+      const auto remaining = [&] {
+        const auto now = std::chrono::steady_clock::now();
+        return now < barrier_deadline
+                   ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                         barrier_deadline - now)
+                   : 0ms;
+      };
+      const auto waiter = [&] {
+        plinth::db::OperationScope bounded{std::stop_token{}, barrier_deadline};
+        const char* parameters[] = {blocker.c_str()};
+        const PgResult observed{
+            plinth::db::exec_params(
+                observer.get(),
+                "SELECT CASE WHEN count(*)=1 THEN min(pid)::bigint ELSE 0 END "
+                "FROM pg_stat_activity WHERE datname=current_database() "
+                "AND pid<>pg_backend_pid() AND state='active' "
+                "AND wait_event_type='Lock' "
+                "AND $1::int=ANY(pg_blocking_pids(pid)) "
+                "AND query LIKE 'SELECT octet_length(value::text) AS size, "
+                "CASE WHEN octet_length(value::text)%FROM "
+                "ext_shell.user_preferences%'",
+                1, nullptr, parameters, nullptr, nullptr, 0),
+            PQclear};
+        if (!observed || PQresultStatus(observed.get()) != PGRES_TUPLES_OK ||
+            PQntuples(observed.get()) != 1 || PQgetisnull(observed.get(), 0, 0))
+          return std::int64_t{0};
+        return static_cast<std::int64_t>(
+            std::stoll(PQgetvalue(observed.get(), 0, 0)));
+      };
+      const auto http =
+          "GET /api/frontend/float-layout HTTP/1.1\r\nHost: 127.0.0.1:" +
+          std::to_string(port) + "\r\nCookie: plinth_session=" + token +
+          "\r\nConnection: close\r\n\r\n";
+      const bool sent = acquired && send_all(request.fd, http);
+      const bool admitted = sent && wait_for_condition(
+                                        [&] {
+                                          float_waiter = waiter();
+                                          return float_waiter > 0;
+                                        },
+                                        remaining());
+      bool signalled = false;
+      bool ingress_closed = false;
+      bool same_waiter = false;
+      bool child_running = false;
+      if (admitted) {
+        float_shutdown_deadline = std::chrono::steady_clock::now() + 15s;
+        signalled = child.try_signal(signal);
+        ingress_closed =
+            signalled && wait_for_condition(
+                             [&] {
+                               return read_text(tree.path / "process.log")
+                                   .contains("shutdown: ingress gate closed");
+                             },
+                             remaining());
+        same_waiter = ingress_closed && waiter() == float_waiter;
+        child_running = child.poll_running();
+      }
+      // Release BEFORE reporting any failed barrier/signal assertion. The
+      // destructor also releases on observer/allocation exception unwinding.
+      const bool released = barrier.release();
+      INFO(read_text(tree.path / "process.log"));
+      INFO(PQerrorMessage(observer.get()));
+      REQUIRE(acquired);
+      REQUIRE(sent);
+      REQUIRE(admitted);
+      REQUIRE(signalled);
+      REQUIRE(ingress_closed);
+      REQUIRE(same_waiter);
+      REQUIRE(child_running);
+      REQUIRE(released);
+      float_response = receive_http_until(request.fd, *float_shutdown_deadline);
+    } else {
+      child.send_signal(signal);
+    }
   }
-  auto status = child.wait_for_exit(15s);
+  std::chrono::milliseconds exit_timeout{15s};
+  if (float_shutdown_deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    exit_timeout = now < *float_shutdown_deadline
+                       ? std::chrono::duration_cast<std::chrono::milliseconds>(
+                             *float_shutdown_deadline - now)
+                       : 0ms;
+  }
+  auto status = child.wait_for_exit(exit_timeout);
   INFO(read_text(tree.path / "process.log"));
   REQUIRE(status);
   REQUIRE(WIFEXITED(*status));
   REQUIRE(WEXITSTATUS(*status) == 0);
+  if (blocked_float_read) {
+    REQUIRE(float_response);
+    require_float_read_response(*float_response);
+    REQUIRE_FALSE(read_text(tree.path / "process.log")
+                      .contains("shutdown failed closed"));
+    REQUIRE(scalar(connection.get(),
+                   "SELECT count(*) FROM pg_stat_activity WHERE pid=$1::int",
+                   {std::to_string(float_waiter)}) == 0);
+    REQUIRE(scalar(connection.get(),
+                   "SELECT count(*) FROM ext_shell.user_preferences "
+                   "WHERE user_id=$1::uuid AND key='shell.floats' "
+                   "AND value='{\"version\":1,\"floats\":[]}'::jsonb",
+                   {user_id}) == 1);
+  }
   REQUIRE(scalar(connection.get(),
                  "SELECT count(*) FROM ext_shell.user_preferences "
                  "WHERE user_id = $1::uuid",
-                 {user_id}) == 0);
+                 {user_id}) == (blocked_float_read ? 1 : 0));
   const auto final_seq = scalar(
       connection.get(), "SELECT max(seq) FROM plinth.events WHERE channel = $1",
       {EVENT_CHANNEL});
@@ -776,6 +1008,17 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
       tree.path / "restarted.log",
       &child_database};
   REQUIRE(wait_for_health(port, 30s));
+  if (blocked_float_read) {
+    REQUIRE(scalar(connection.get(),
+                   "SELECT count(*) FROM ext_shell.user_preferences "
+                   "WHERE user_id=$1::uuid AND key='shell.floats' "
+                   "AND value='{\"version\":1,\"floats\":[]}'::jsonb",
+                   {user_id}) == 1);
+    REQUIRE(scalar(connection.get(),
+                   "SELECT count(*) FROM ext_shell.user_preferences "
+                   "WHERE user_id=$1::uuid",
+                   {user_id}) == 1);
+  }
   auto replay = authenticated_socket(port, token, tree.path / "restarted.log");
   send_frame(replay.fd, {{"type", "subscribe"},
                          {"channels", {EVENT_CHANNEL}},
@@ -797,6 +1040,17 @@ auto require_durable_shutdown(int signal, bool accepted_websocket_work)
   REQUIRE(restarted_status);
   REQUIRE(WIFEXITED(*restarted_status));
   REQUIRE(WEXITSTATUS(*restarted_status) == 0);
+  if (blocked_float_read) {
+    REQUIRE(scalar(connection.get(),
+                   "SELECT count(*) FROM ext_shell.user_preferences "
+                   "WHERE user_id=$1::uuid AND key='shell.floats' "
+                   "AND value='{\"version\":1,\"floats\":[]}'::jsonb",
+                   {user_id}) == 1);
+    REQUIRE(scalar(connection.get(),
+                   "SELECT count(*) FROM ext_shell.user_preferences "
+                   "WHERE user_id=$1::uuid",
+                   {user_id}) == 1);
+  }
   REQUIRE(scalar(connection.get(),
                  "SELECT count(*) FROM plinth.events WHERE channel = $1 AND "
                  "seq > $2::bigint",
@@ -1050,6 +1304,12 @@ TEST_CASE("production shutdown persists and replays the last extension write",
   SECTION("SIGTERM during an accepted WebSocket write") {
     require_durable_shutdown(SIGTERM, true);
   }
+  SECTION("SIGINT while an admitted fixed float read waits on native SQL") {
+    require_durable_shutdown(SIGINT, false, true);
+  }
+  SECTION("SIGTERM while an admitted fixed float read waits on native SQL") {
+    require_durable_shutdown(SIGTERM, false, true);
+  }
 }
 
 TEST_CASE("explicit config failures happen before service startup",
@@ -1185,6 +1445,105 @@ TEST_CASE("startup connection deadlines also stop error-path reconnections",
   connection.reset(plinth::db::connect(conninfo.c_str()));
   REQUIRE(connection == nullptr);
   REQUIRE(std::chrono::steady_clock::now() - retry_started < 100ms);
+}
+
+TEST_CASE("ordinary nested PostgreSQL scopes cannot renew an absolute deadline",
+          "[db][startup][unit]") {
+  const auto deadline = std::chrono::steady_clock::now() + 500ms;
+  {
+    plinth::db::OperationScope parent{std::stop_token{}, deadline, 2s};
+    REQUIRE(plinth::db::Operation{}.deadline == deadline);
+    {
+      plinth::db::OperationScope duration_child{std::stop_token{}, 5s};
+      REQUIRE(plinth::db::Operation{}.deadline == deadline);
+    }
+    {
+      plinth::db::OperationScope later_child{std::stop_token{}, deadline + 1h,
+                                             2h};
+      REQUIRE(plinth::db::Operation{}.deadline == deadline);
+    }
+    {
+      const auto earlier = deadline - 250ms;
+      plinth::db::OperationScope earlier_child{std::stop_token{}, earlier, 2s};
+      REQUIRE(plinth::db::Operation{}.deadline == earlier);
+    }
+    REQUIRE(plinth::db::Operation{}.deadline == deadline);
+  }
+  const auto expired = std::chrono::steady_clock::now() - 1ms;
+  plinth::db::OperationScope parent{std::stop_token{}, expired};
+  parent.retry(); // Clearing a sticky failure never extends the absolute cap.
+  {
+    plinth::db::OperationScope duration_child{std::stop_token{}, 1h};
+    REQUIRE(plinth::db::Operation{}.deadline == expired);
+    REQUIRE_THROWS_AS(duration_child.checkpoint(), std::runtime_error);
+  }
+  {
+    plinth::db::OperationScope later_child{std::stop_token{}, expired + 1h};
+    REQUIRE(plinth::db::Operation{}.deadline == expired);
+    REQUIRE_THROWS_AS(later_child.checkpoint(), std::runtime_error);
+  }
+  REQUIRE_THROWS_AS(parent.checkpoint(), std::runtime_error);
+}
+
+TEST_CASE(
+    "absolute PostgreSQL expiry still permits bounded confirmed cancellation",
+    "[db][startup][integration]") {
+  if (!required_env("PLINTH_PG_HOST")) {
+    SKIP("PostgreSQL environment is not configured");
+  }
+  auto connection = open_database();
+  auto observer = open_database();
+  // Independent server-side backstop bounds a failing regression's query; it
+  // is deliberately much longer than either the main or cleanup deadline.
+  sql(connection.get(), "SET statement_timeout = '10s'");
+  const auto backend = std::to_string(PQbackendPID(connection.get()));
+
+  SECTION("expired parent cannot prevent cancel dispatch and original "
+          "confirmation") {
+    constexpr auto QUERY = "SELECT pg_sleep(10) /* absolute-cleanup-control */";
+    REQUIRE(PQsetnonblocking(connection.get(), 1) == 0);
+    REQUIRE(PQsendQuery(connection.get(), QUERY) == 1);
+    REQUIRE(PQflush(connection.get()) == 0);
+    REQUIRE(wait_for_condition(
+        [&] {
+          return scalar(
+                     observer.get(),
+                     "SELECT count(*) FROM pg_stat_activity WHERE pid=$1::int "
+                     "AND state='active' AND wait_event='PgSleep' "
+                     "AND query LIKE '%absolute-cleanup-control%'",
+                     {backend}) == 1;
+        },
+        2s));
+    const auto expired = std::chrono::steady_clock::now() - 1ms;
+    plinth::db::OperationScope parent{std::stop_token{}, expired};
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(plinth::db::detail::cancel_query(connection.get()));
+    REQUIRE(std::chrono::steady_clock::now() - started < 3s);
+    REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+    // The control scope restored, rather than renewed, the expired parent.
+    REQUIRE(plinth::db::Operation{}.deadline == expired);
+    REQUIRE_THROWS_AS(parent.checkpoint(), std::runtime_error);
+    REQUIRE_FALSE(parent.cancellation_failed());
+    // Raw libpq verifies the SAME original connection is protocol-idle and
+    // reusable after actual cancellation confirmation, not merely disconnected.
+    REQUIRE(PQsetnonblocking(connection.get(), 0) == 0);
+    REQUIRE(scalar(connection.get(), "SELECT 1") == 1);
+  }
+
+  SECTION(
+      "ordinary query expiry records successful cleanup and remains failed") {
+    plinth::db::OperationScope parent{
+        std::stop_token{}, std::chrono::steady_clock::now() + 100ms, 5s};
+    const auto started = std::chrono::steady_clock::now();
+    PgResult result{plinth::db::exec(connection.get(), "SELECT pg_sleep(10)"),
+                    PQclear};
+    REQUIRE(result);
+    REQUIRE(PQresultStatus(result.get()) == PGRES_FATAL_ERROR);
+    REQUIRE(std::chrono::steady_clock::now() - started < 3s);
+    REQUIRE_FALSE(parent.cancellation_failed());
+    REQUIRE_THROWS_AS(parent.checkpoint(), std::runtime_error);
+    require_backend_gone(observer.get(), backend);
+  }
 }
 
 TEST_CASE(

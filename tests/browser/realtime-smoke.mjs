@@ -79,8 +79,27 @@ try {
     // Authentication activates a fresh SDK session owner. Subscribe only after
     // its real frame mounts; a pre-auth subscription is intentionally retired.
     await page.getByRole('heading', { name: 'Home', exact: true }).waitFor();
-    assert.match(await page.evaluate(() => new URL(document.baseURI).pathname),
-        /^\/ext\/shell\/[^/]+\/$/, 'production document selects versioned module assets');
+    const profiles = await page.locator('meta[name="plinth-platform-profile"]')
+        .evaluateAll(elements => elements.map(element => element.getAttribute('content')));
+    assert.equal(profiles.length, 1, 'production document selects one captured platform profile');
+    const captured = /^v1:([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}):([0-9a-f]{64})$/.exec(profiles[0]);
+    assert(captured, 'captured platform profile must be canonical');
+    assert.equal(captured[1], sql(`SELECT id FROM plinth.packages WHERE name='shell'
+        AND state IN ('ACTIVE','ACTIVE_FLAGGED') AND provenance='bundled'`),
+    'captured profile belongs to the actual active bundled shell');
+    const capturedBase = `/_plinth/platform/${captured[1]}/${captured[2]}/client/`;
+    assert.equal(await page.locator('base').count(), 1);
+    assert.equal(await page.locator('base').getAttribute('href'), capturedBase);
+    assert.equal(await page.evaluate(() => document.baseURI), new URL(capturedBase, baseURL).href,
+        'production document selects the exact same-origin captured module namespace');
+    assert.equal(await page.locator('script[type="importmap"]').count(), 1);
+    assert.deepEqual(JSON.parse(await page.locator('script[type="importmap"]').textContent()), { imports: {
+        '@plinth/frontend/sdk': capturedBase + 'sdk.js',
+        '@plinth/frontend/tokens': capturedBase + 'css/tokens.css',
+        preact: capturedBase + 'vendor/preact.module.js',
+        'preact/hooks': capturedBase + 'vendor/preact-hooks.module.js',
+        htm: capturedBase + 'vendor/htm.module.js',
+    } }, 'SDK, tokens, Preact, hooks and htm share the exact captured graph');
     assert.equal(await page.evaluate(() => document.cookie.includes('plinth_session')), false);
     await page.evaluate(async ({ channel, keepChannel }) => {
         const sdk = await import('@plinth/frontend/sdk');

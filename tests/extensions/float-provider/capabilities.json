@@ -1,0 +1,15 @@
+{
+  "provides": [
+    {
+      "namespace": "floatprovider",
+      "version": 1,
+      "function": "preview",
+      "params": [],
+      "returns": "object",
+      "scope": "instance",
+      "description": "Test-only provider ownership witness, without I/O.",
+      "rbac_rule": "floatprovider.preview"
+    }
+  ],
+  "requires": []
+}

@@ -37,3 +37,11 @@ description = "Deterministic CSRF HMAC test vector, not a credential"
 condition = "AND"
 paths = ['''^tests/kernel/auth/csrf_test\.cpp$''']
 regexes = ['''4QiLXgHg5DvZWCPXHWwVyPE0YuvaKX67CSLnZh72wFs''']
+
+[[allowlists]]
+description = "Deterministic surface cursor HMAC fingerprint, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^tests/kernel/frontend/surface_protocol_test\.cpp$''']
+regexTarget = "secret"
+regexes = ['''^sanADvnIuudZjcwLQI8bj--LzqaiKRooLYrCyYa5WgU$''']

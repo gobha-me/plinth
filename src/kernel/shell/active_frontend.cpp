@@ -1,6 +1,7 @@
 #include "kernel/shell/active_frontend.hpp"
 #include "kernel/db/connection_info.hpp"
 #include "kernel/db/operations.hpp"
+#include "kernel/shell/platform_graph.hpp"
 
 #include <drogon/HttpAppFramework.h>
 #include <drogon/HttpResponse.h>
@@ -75,6 +76,14 @@ auto active_snapshot() -> std::optional<ActiveFrontend> {
 
 auto store_active(std::optional<ActiveFrontend> a) -> void {
   std::unique_lock lk(g_af_mu);
+  // Startup resolution can refresh the same row after the fenced platform
+  // publication. Preserve only an exactly matching captured binding.
+  if (a && !a->platform && g_active && g_active->platform && a->bundled &&
+      a->id == g_active->id && a->name == g_active->name &&
+      a->version == g_active->version && a->mount == g_active->mount &&
+      a->entry == g_active->entry) {
+    a->platform = g_active->platform;
+  }
   g_active = std::move(a);
 }
 
@@ -268,6 +277,19 @@ auto handle_app_request(
   }
   bool fallback = path_targets_html_fallback(*normalized);
   auto target_path = fallback ? active->entry : *normalized;
+  if (target_path == active->entry && active->platform) {
+    // The trusted captured document is served before ANY mutable file lookup.
+    // Its body/map/CSP remain one immutable snapshot even across replacement.
+    auto response = drogon::HttpResponse::newHttpResponse();
+    response->setContentTypeString("text/html; charset=utf-8");
+    response->setBody(active->platform->document());
+    response->addHeader("Cache-Control", std::string{CACHE_MOUNT});
+    response->addHeader("Content-Security-Policy", active->platform->policy());
+    response->addHeader("X-Plinth-Platform-Profile",
+                        active->platform->profile());
+    std::move(cb)(response);
+    return;
+  }
   auto resolved = resolve_under_root(active->client_dir, target_path);
   if (!resolved.has_value()) {
     std::move(cb)(make_404());
@@ -300,6 +322,46 @@ auto trim_trailing_slash(std::string_view s) -> std::string {
 
 } // namespace
 
+auto publish_platform_frontend(ActiveFrontend active,
+                               std::shared_ptr<const PreparedPlatform> platform)
+    -> bool {
+  if (!platform || !active.bundled || active.name != "shell" ||
+      active.mount != "/app" || active.entry != "index.html" ||
+      active.id != platform->key().package_id ||
+      active.name != platform->key().name ||
+      active.version != platform->key().version) {
+    return false;
+  }
+  active.platform = std::move(platform);
+  return refresh_active_frontend(std::move(active));
+}
+
+auto refresh_active_frontend(ActiveFrontend active) -> bool {
+  std::unique_lock lock(g_af_mu);
+  if (g_active && g_active->mount != active.mount) return false;
+  if (active.platform &&
+      (!active.bundled || active.name != "shell" || active.mount != "/app" ||
+       active.entry != "index.html" ||
+       active.id != active.platform->key().package_id ||
+       active.version != active.platform->key().version)) {
+    return false;
+  }
+  g_active = std::move(active);
+  return true;
+}
+
+auto current_platform() -> std::shared_ptr<const PreparedPlatform> {
+  std::shared_lock lock(g_af_mu);
+  return g_active ? g_active->platform : nullptr;
+}
+
+auto retire_platform_frontend(std::string_view package_id) -> void {
+  std::unique_lock lock(g_af_mu);
+  if (g_active && g_active->id == package_id) {
+    g_active->platform.reset();
+  }
+}
+
 auto resolve_active_frontend(const Config::Database& db,
                              const std::filesystem::path& data_dir)
     -> std::optional<ActiveFrontend> {
@@ -315,13 +377,13 @@ auto resolve_active_frontend(const Config::Database& db,
   std::unique_ptr<PGconn, decltype(cleanup)> guard(conn, cleanup);
 
   std::unique_ptr<PGresult, decltype(&PQclear)> res(
-      plinth::db::exec(
-          conn,
-          "SELECT id::text, name, version, frontend_mount, frontend_entry "
-          "FROM plinth.packages "
-          "WHERE frontend_mount IS NOT NULL "
-          "  AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
-          "LIMIT 2"), // LIMIT 2 to detect singleton-violation
+      plinth::db::exec(conn,
+                       "SELECT id::text, name, version, frontend_mount, "
+                       "frontend_entry, provenance "
+                       "FROM plinth.packages "
+                       "WHERE frontend_mount IS NOT NULL "
+                       "  AND state IN ('ACTIVE', 'ACTIVE_FLAGGED') "
+                       "LIMIT 2"), // LIMIT 2 to detect singleton-violation
       PQclear);
   if (PQresultStatus(res.get()) != PGRES_TUPLES_OK) {
     spdlog::warn("shell::resolve_active_frontend: SELECT failed: {}",
@@ -344,6 +406,7 @@ auto resolve_active_frontend(const Config::Database& db,
   a.version = std::string{PQgetvalue(res.get(), 0, 2)};
   a.mount = std::string{PQgetvalue(res.get(), 0, 3)};
   a.entry = std::string{PQgetvalue(res.get(), 0, 4)};
+  a.bundled = std::string_view{PQgetvalue(res.get(), 0, 5)} == "bundled";
   a.client_dir = data_dir / "extensions" / a.name / a.version / "client";
   return a;
 }
@@ -357,7 +420,14 @@ auto register_active_frontend_routes(const Config::Shell& cfg_shell,
   }
 
   std::error_code ec;
-  if (!std::filesystem::is_directory(active.client_dir, ec) || ec) {
+  const auto published = current_platform();
+  const bool captured_matches =
+      published && active.bundled && active.name == "shell" &&
+      active.mount == "/app" && active.entry == "index.html" &&
+      active.id == published->key().package_id &&
+      active.version == published->key().version;
+  if (!active.platform && !captured_matches &&
+      (!std::filesystem::is_directory(active.client_dir, ec) || ec)) {
     spdlog::warn("shell: active frontend client_dir missing at {} — "
                  "{}/* will return 404",
                  active.client_dir.string(), active.mount);

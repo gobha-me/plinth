@@ -251,7 +251,9 @@ export class FloatChrome extends Component {
         } catch { clean = false; }
         try { this.props.interaction.endGeometry(edit.lease); } catch { clean = false; }
         if (!clean) this.props.manager.reservations.poison();
-        if (accept && clean && this.current()) this.props.manager.setGeometry(this.props.record.token, edit.geometry);
+        if (accept && clean && this.current()) {
+            this.props.onIntent?.(); this.props.manager.setGeometry(this.props.record.token, edit.geometry);
+        }
         if (this.mounted) this.setState({ preview: null, editing: null });
         return clean;
     }
@@ -291,8 +293,8 @@ export class FloatChrome extends Component {
             'aria-labelledby': titleId, tabIndex: -1,
             style: placed ? { left: `${placed.x}px`, top: `${placed.y}px`, width: `${placed.width}px`,
                 height: `${placed.height}px`, zIndex: record.rank } : {},
-            onFocusIn: () => { if (this.current() && !inactive) manager.focus(record.token, { focusChrome: false }); },
-            onPointerDown: () => { if (this.current() && !inactive) manager.focus(record.token, { focusChrome: false }); },
+            onFocusIn: () => { if (this.current() && !inactive) onSelect(record.token, { focusChrome: false }); },
+            onPointerDown: () => { if (this.current() && !inactive) onSelect(record.token, { focusChrome: false }); },
             onKeyDown: event => this.geometryKey(event),
         }, h('header', { class: 'float-header' },
             h('div', {
@@ -350,12 +352,13 @@ export class FloatLayer extends Component {
         super(props);
         this.state = { records: [], area: { left: 0, top: 0, width: 0, height: 0 }, revision: 0 };
         this.chrome = new Map();
+        this.returnTriggers = new Map();
         this.background = new Map();
         this.mounted = false;
         this.retiredLayer = false;
         this.registerChrome = (token, element) => {
             if (element) this.chrome.set(token, element);
-            else this.chrome.delete(token);
+            else { this.chrome.delete(token); this.returnTriggers.delete(token); }
         };
         this.sync = () => {
             if (!this.current()) return;
@@ -366,7 +369,12 @@ export class FloatLayer extends Component {
             queueMicrotask(() => {
                 if (this.pendingFocus !== request || !this.current() || this.props.interaction.confirmation) return;
                 const element = this.chrome.get(token);
-                if (element && eligible(element)) (controls(element)[0] || element).focus();
+                const trigger = this.returnTriggers.get(token); this.returnTriggers.delete(token);
+                if (element && eligible(element)) {
+                    this.applyingFocus = true;
+                    try { (eligible(trigger) && element.contains(trigger) ? trigger : controls(element)[0] || element).focus(); }
+                    finally { this.applyingFocus = false; }
+                }
             });
         };
         this.keydown = event => {
@@ -474,28 +482,52 @@ export class FloatLayer extends Component {
                 || (this.props.interaction.modal && this.props.interaction.modal.kind !== 'float')) return;
         const origin = this.chrome.get(token);
         const trigger = this.props.manager.focusTrigger(token);
-        this.props.manager[name](token);
+        const record = this.props.manager.snapshot().find(item => item.token === token);
+        if (!record || retiring(record)) return;
+        if (name === 'retry' && this.props.controller) this.props.controller.retry(token);
+        else if (name === 'requestClose' && this.props.controller) {
+            if (!record.dirty) this.props.onIntent?.();
+            this.props.manager.requestClose(token, { onCancel: () =>
+                this.props.controller.raise(token, { acceptIntent: false }) });
+        } else {
+            if (name !== 'requestClose' || !record.dirty) {
+                if (name !== 'maximize' || this.props.manager.workArea.mode === 'desktop') this.props.onIntent?.();
+            }
+            this.props.manager[name](token);
+        }
         if (name !== 'minimize' && name !== 'requestClose') return;
         queueMicrotask(() => {
             if (!this.current() || this.props.interaction.confirmation || eligible(origin)) return;
             this.restoreFocus(trigger);
         });
     }
-    select(token) {
+    select(token, { focusChrome = true } = {}) {
         if (!this.current() || this.props.interaction.confirmation
-                || (this.props.interaction.modal && this.props.interaction.modal.kind !== 'float')) return;
+                || this.applyingFocus || (this.props.interaction.modal && this.props.interaction.modal.kind !== 'float')) return;
         const record = this.props.manager.snapshot().find(item => item.token === token);
         if (!record || retiring(record)) return;
-        if (record.presentation === 'minimized') this.props.manager.restore(token);
-        else this.props.manager.focus(token);
+        if (this.props.controller) this.props.controller.raise(token, { focusChrome });
+        else if (record.presentation === 'minimized') this.props.manager.restore(token, { focusChrome });
+        else this.props.manager.focus(token, { focusChrome });
     }
     restoreFocus(trigger) {
         if (!this.current()) return;
+        if (this.props.controller && eligible(trigger)) {
+            const entry = [...this.chrome].find(([, element]) => element.contains(trigger));
+            if (entry) {
+                this.returnTriggers.set(entry[0], trigger);
+                this.props.controller.raise(entry[0], { acceptIntent: false }); return;
+            }
+        }
         if (eligible(trigger)) { trigger.focus(); return; }
         const record = [...this.props.manager.snapshot()].filter(item => item.presentation === 'shown' && !retiring(item))
             .sort((left, right) => right.rank - left.rank)[0];
         const chrome = record && this.chrome.get(record.token);
-        if (eligible(chrome)) { (controls(chrome)[0] || chrome).focus(); return; }
+        if (eligible(chrome)) {
+            if (this.props.controller) this.props.controller.raise(record.token, { acceptIntent: false });
+            else (controls(chrome)[0] || chrome).focus();
+            return;
+        }
         const fallback = this.props.focusFallback?.();
         if (eligible(fallback)) fallback.focus();
     }
@@ -503,6 +535,7 @@ export class FloatLayer extends Component {
         const confirmation = this.props.interaction.confirmation;
         if (!this.current() || confirmation?.kind !== 'float') return;
         const trigger = discard ? this.props.manager.focusTrigger(confirmation.recordToken) : confirmation.trigger;
+        if (discard) this.props.onIntent?.();
         this.props.interaction.resolveConfirmation(discard);
         queueMicrotask(() => { if (this.current()) this.restoreFocus(trigger); });
     }
@@ -529,6 +562,7 @@ export class FloatLayer extends Component {
             record.container = record.geometry = null;
         }
         this.chrome.clear();
+        this.returnTriggers.clear();
         this.background.clear();
         this.viewport = this.layer = this.confirmationElement = this.confirmationToken = this.modalToken = null;
         this.state = { records: [], area: { left: 0, top: 0, width: 0, height: 0 }, revision: 0 };
@@ -552,7 +586,8 @@ export class FloatLayer extends Component {
             activeModal: modal && top?.token === record.token,
             blocked: !!confirmation || (interaction.modal && interaction.modal.kind !== 'float'),
             registerChrome: this.registerChrome, onAction: (name, token) => this.action(name, token),
-            onSelect: token => this.select(token), onReload, poisoned, pendingCleanup })),
+            onSelect: (token, options) => this.select(token, options), onReload, poisoned, pendingCleanup,
+            onIntent: this.props.onIntent })),
         !modal && h(FloatList, { records, onSelect: token => this.select(token),
             blocked: !!interaction.modal, onAction: (name, token) => this.action(name, token) }),
         (!modal || !top) && poisoned && h(BudgetWarning, { onReload, blocked: !!interaction.modal }),

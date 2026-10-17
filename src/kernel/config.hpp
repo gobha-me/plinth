@@ -87,6 +87,11 @@ struct Config {
   // (not poll-with-budget).
   std::size_t packages_upgrade_drain_timeout_ms = 5000;
 
+  // Optional protected, root-owned deployment file, captured once before
+  // ingress. Empty means no approved restore projections (live-only).
+  // Configuration alone does not establish filesystem trust or reviewer RBAC.
+  std::string restore_policy_file;
+
   // ICD-0.5.0 §Config Surface — PG LISTEN/NOTIFY bridge.
   // ICD-0.5.1 §Config Surface — Coalescer substruct added.
   struct Realtime {

@@ -15,7 +15,15 @@ import { Launcher } from './launcher/launcher.js';
 import { createFloatReservations } from './panels/float-reservations.js';
 import { DocumentInteractionOwner } from './panels/interaction-owner.js';
 import { FloatPreferenceIoOwner } from './panels/float-preferences.js';
+import { FloatRequestOwner } from './panels/float-request-owner.js';
+import { readFloatPlatformProfile } from './panels/float-transport.js';
 const html = htm.bind(h);
+// Capture before any installed panel factory runs; later DOM changes cannot
+// select another platform graph for a replacement authenticated frame.
+const floatPlatformProfile = (() => {
+  try { return readFloatPlatformProfile(document); } catch { return null; }
+})();
+const floatRequestOwner = new FloatRequestOwner();
 
 // ICD-0.6.3 §6.5 — sanitize boundary detail before audit emission.
 // Length-cap per ICD §6.5: error_message 1024, error_stack 8192,
@@ -618,6 +626,8 @@ class AuthFrame extends Component {
       floatInteraction=${this.floatInteraction}
       floatReservations=${floatReservations}
       floatPreferenceIoOwner=${floatPreferenceIoOwner}
+      floatRequestOwner=${floatRequestOwner}
+      floatPlatformProfile=${floatPlatformProfile}
       onModalChange=${(blocked) => this.floatModalChanged(blocked)}
       userControls=${userControls}
       onSessionEnd=${(code) => this.sessionEnded(code)} />`;

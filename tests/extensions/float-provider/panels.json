@@ -1,0 +1,40 @@
+{
+  "format_version": 2,
+  "panels": [
+    {
+      "id": "preview",
+      "type": "float",
+      "title": "Fixture Preview",
+      "icon": "edit-3",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "preview.js",
+      "capability": "floatprovider:1:preview",
+      "content_types": ["application/x-plinth-float-fixture"],
+      "context_schema": {
+        "version": 1,
+        "fields": {
+          "record_id": {"required": true, "max_bytes": 64, "meaning": "Stable fake fixture record identifier"}
+        },
+        "persist_keys": ["record_id"]
+      }
+    },
+    {
+      "id": "live",
+      "type": "float",
+      "title": "Live-only Fixture",
+      "icon": "edit-3",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "preview.js",
+      "capability": "floatprovider:1:preview",
+      "content_types": ["application/x-plinth-float-live"],
+      "context_schema": {
+        "version": 1,
+        "fields": {
+          "record_id": {"required": true, "max_bytes": 64, "meaning": "Stable fake fixture record identifier"},
+          "live_nonce": {"required": true, "max_bytes": 64, "meaning": "Required transient fake fixture nonce, deliberately not approved for persistence"}
+        },
+        "persist_keys": ["record_id"]
+      }
+    }
+  ]
+}

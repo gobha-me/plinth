@@ -58,7 +58,7 @@ export function normaliseCombo(combo) {
     return [...mods, key].join('+');
 }
 
-export function makePanelApi({ shell, panel, context = {}, packageRow }) {
+export function makePanelApi({ shell, panel, context = {}, packageRow, floatActions }) {
     const activateCallbacks   = [];
     const deactivateCallbacks = [];
     const navIntentCallbacks  = [];
@@ -130,11 +130,18 @@ export function makePanelApi({ shell, panel, context = {}, packageRow }) {
         navigate(_target, _ctx) {
             throw new NotImplementedError('navigate', '6');
         },
-        openFloat(_contentType, _ctx) {
-            return Promise.reject(new NotImplementedError('openFloat', '5'));
+        openFloat(contentType, ctx) {
+            if (unbound) return Promise.reject(new PanelUnboundError('openFloat', panel.id));
+            if (!floatActions) return Promise.reject(new NotImplementedError('openFloat', '5'));
+            try { return Promise.resolve(floatActions.openFloat(contentType, ctx)); }
+            catch (error) { return Promise.reject(error); }
         },
         requestFocus() {
-            throw new NotImplementedError('requestFocus', '5');
+            if (unbound) return;
+            if (!floatActions) throw new NotImplementedError('requestFocus', '5');
+            // Deliberately void. The private controller refreshes authority
+            // before presentation; primary panels do not switch themselves.
+            floatActions.requestFocus();
         },
         setTrayState(_stateName) {
             throw new NotImplementedError('setTrayState', '6');
@@ -160,6 +167,7 @@ export function makePanelApi({ shell, panel, context = {}, packageRow }) {
             getPackageRow() { return packageRow; },
             unbind() {
                 unbound = true;
+                floatActions = null;
                 activateCallbacks.length   = 0;
                 deactivateCallbacks.length = 0;
                 navIntentCallbacks.length  = 0;

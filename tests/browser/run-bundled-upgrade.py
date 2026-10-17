@@ -209,9 +209,9 @@ def main():
                 unchanged()
                 validation_id = sql("SELECT id FROM plinth.packages WHERE name='shell' AND version='901.0.2' AND state='INSTALL_FAILED'")
                 assert validation_id
-                first_migration = ("002_upgrade_probe.sql", "ALTER TABLE ext_shell.user_preferences ADD COLUMN upgrade_probe TEXT; "
+                first_migration = ("003_upgrade_probe.sql", "ALTER TABLE ext_shell.user_preferences ADD COLUMN upgrade_probe TEXT; "
                     "UPDATE ext_shell.user_preferences SET value='\"changed\"'::jsonb;")
-                candidate("901.0.2", [first_migration, ("003_failure.sql", "SELECT 1/0;")])
+                candidate("901.0.2", [first_migration, ("004_failure.sql", "SELECT 1/0;")])
                 launch(upgrade=True, fails="division by zero")
                 unchanged()
                 failed_id = sql("SELECT id FROM plinth.packages WHERE name='shell' AND version='901.0.2' AND state='INSTALL_FAILED'")
@@ -219,7 +219,7 @@ def main():
                 failure_audits = sql("SELECT count(*) FROM plinth.audit_log WHERE action='packages.bundled_upgrade_failed'")
                 # Transaction control cannot escape the encompassing transaction.
                 candidate("901.0.5", [first_migration,
-                    ("003_commit.sql", r"SELECT E'it\'s'; COMMIT; SELECT 'x';")])
+                    ("004_commit.sql", r"SELECT E'it\'s'; COMMIT; SELECT 'x';")])
                 launch(upgrade=True, fails="cannot contain transaction control")
                 unchanged()
                 # Registration failure must also roll back already successful migrations.
@@ -270,7 +270,7 @@ def main():
                     shutil.rmtree(retained)
                 sql("DROP TRIGGER pause_bundled_commit ON plinth.packages; "
                     "DROP FUNCTION plinth.pause_bundled_commit();")
-                candidate("901.0.2", [("002_upgrade_probe.sql",
+                candidate("901.0.2", [("003_upgrade_probe.sql",
                     "ALTER TABLE ext_shell.user_preferences ADD COLUMN upgrade_probe TEXT;")])
                 transition.legacy.clear()
                 child = launch(upgrade=True)
@@ -279,8 +279,11 @@ def main():
                 assert sql("SELECT value::text FROM ext_shell.user_preferences WHERE key='theme'") == '"dark"'
                 for key in ("rules", "grants"):
                     assert after[key] == before[key], f"{key} identities changed"
-                assert after["migrations"].splitlines()[0] == before["migrations"], "original migration history changed"
-                assert len(after["migrations"].splitlines()) == 2
+                before_migrations = before["migrations"].splitlines()
+                after_migrations = after["migrations"].splitlines()
+                assert after_migrations[:-1] == before_migrations, "original migration history changed"
+                assert len(after_migrations) == len(before_migrations) + 1
+                assert after_migrations[-1].startswith("003_upgrade_probe.sql|")
                 assert sql("SELECT count(*) FROM plinth.packages n JOIN plinth.packages o ON n.supersedes_id=o.id "
                     "WHERE n.version='901.0.2' AND n.state IN ('ACTIVE','ACTIVE_FLAGGED') AND n.provenance='bundled' "
                     "AND o.version='901.0.1' AND o.state='SUPERSEDED' AND o.retired_at IS NOT NULL") == "1"

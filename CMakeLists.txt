@@ -365,6 +365,41 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 file(GLOB_RECURSE PLINTH_SHELL_INPUTS CONFIGURE_DEPENDS
      ${PLINTH_SHELL_SRC_DIR}/*)
 
+# Recognize only this kernel's exact bundled platform client graph. Expected
+# bytes are compiled into the kernel, never supplied by an installed frontend's
+# version string or profile declaration. Keep ordinary custom/legacy frontends
+# outside this optional typed-platform profile.
+file(GLOB_RECURSE PLINTH_PLATFORM_CLIENT_INPUTS LIST_DIRECTORIES false
+     CONFIGURE_DEPENDS ${PLINTH_SHELL_SRC_DIR}/client/*)
+list(SORT PLINTH_PLATFORM_CLIENT_INPUTS)
+list(LENGTH PLINTH_PLATFORM_CLIENT_INPUTS PLINTH_PLATFORM_CLIENT_COUNT)
+if(PLINTH_PLATFORM_CLIENT_COUNT GREATER 4096)
+  message(FATAL_ERROR "Bundled platform graph exceeds capture inventory profile")
+endif()
+set(PLINTH_PLATFORM_CLIENT_DIGESTS "")
+foreach(PLATFORM_FILE IN LISTS PLINTH_PLATFORM_CLIENT_INPUTS)
+  file(RELATIVE_PATH PLATFORM_PATH ${PLINTH_SHELL_SRC_DIR} ${PLATFORM_FILE})
+  if(PLATFORM_PATH MATCHES "[\"\\\\;\n\r]")
+    message(FATAL_ERROR "Bundled platform graph contains an unsupported file name")
+  endif()
+  file(SHA256 ${PLATFORM_FILE} PLATFORM_SHA)
+  string(APPEND PLINTH_PLATFORM_CLIENT_DIGESTS
+         "  {\"${PLATFORM_PATH}\", \"${PLATFORM_SHA}\"},\n")
+endforeach()
+set(PLINTH_PLATFORM_MODULE_FILE
+    ${PLINTH_SHELL_SRC_DIR}/server/platform-storage-v1.js)
+set(PLINTH_PLATFORM_CONTRACT_FILE
+    ${PLINTH_SHELL_SRC_DIR}/server/plinth-platform.json)
+set(PLINTH_PLATFORM_MIGRATION_FILE
+    ${PLINTH_SHELL_SRC_DIR}/migrations/002_platform_storage_v1.sql)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${PLINTH_PLATFORM_CLIENT_INPUTS} ${PLINTH_PLATFORM_MODULE_FILE}
+    ${PLINTH_PLATFORM_CONTRACT_FILE} ${PLINTH_PLATFORM_MIGRATION_FILE})
+file(SHA256 ${PLINTH_PLATFORM_MODULE_FILE} PLINTH_PLATFORM_MODULE_SHA)
+file(SHA256 ${PLINTH_PLATFORM_CONTRACT_FILE} PLINTH_PLATFORM_CONTRACT_SHA)
+file(SHA256 ${PLINTH_PLATFORM_MIGRATION_FILE} PLINTH_PLATFORM_MIGRATION_SHA)
+configure_file(cmake/platform_profile.hpp.in generated/plinth/platform_profile.hpp @ONLY)
+
 add_custom_command(
   OUTPUT ${PLINTH_SHELL_ZIP}
   COMMAND ${Python3_EXECUTABLE} ${PLINTH_SHELL_PACKER}
@@ -565,6 +600,13 @@ add_executable(plinth
   src/kernel/packages/capabilities_manifest.cpp
   src/kernel/packages/panels_manifest.cpp
   src/kernel/packages/restore_policy.cpp
+  src/kernel/packages/protected_restore_policy.cpp
+  src/kernel/packages/generation_capture.cpp
+  src/kernel/packages/generation_cache.cpp
+  src/kernel/packages/generation_receipts.cpp
+  src/kernel/packages/generation_binding.cpp
+  src/kernel/packages/installed_generation_registry.cpp
+  src/kernel/packages/name_operation.cpp
   src/kernel/packages/restore_digest.cpp
   src/kernel/packages/detail/restore_json.cpp
   src/kernel/packages/config_manifest.cpp
@@ -579,9 +621,20 @@ add_executable(plinth
   src/kernel/security/unicode_scanner.cpp
   src/kernel/security/response_headers.cpp
   src/kernel/shell/active_frontend.cpp
+  src/kernel/shell/platform_graph.cpp
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
   src/kernel/frontend/applications.cpp
+  src/kernel/frontend/typed_requests.cpp
+  src/kernel/frontend/persistence_projection.cpp
+  src/kernel/frontend/typed_assets.cpp
+  src/kernel/frontend/owned_frontend_worker.cpp
+  src/kernel/frontend/surface_authority.cpp
+  src/kernel/frontend/float_layout_service.cpp
+  src/kernel/frontend/surface_protocol.cpp
+  src/kernel/frontend/float_layout_contract.cpp
+  src/kernel/frontend/platform_startup.cpp
+  src/kernel/frontend/float_routes.cpp
   src/kernel/cap/api_cap.cpp
 )
 
@@ -737,6 +790,14 @@ add_executable(plinth_tests
   tests/kernel/packages/capabilities_manifest_test.cpp
   tests/kernel/packages/panels_manifest_test.cpp
   tests/kernel/packages/restore_policy_test.cpp
+  tests/kernel/packages/protected_restore_policy_test.cpp
+  tests/kernel/packages/generation_capture_test.cpp
+  tests/kernel/packages/generation_cache_test.cpp
+  tests/kernel/packages/generation_receipts_test.cpp
+  tests/kernel/packages/generation_binding_test.cpp
+  tests/kernel/packages/installed_generation_registry_test.cpp
+  tests/kernel/packages/generation_lifecycle_test.cpp
+  tests/kernel/packages/generation_schema_test.cpp
   tests/kernel/packages/restore_digest_test.cpp
   tests/kernel/packages/config_manifest_test.cpp
   tests/kernel/packages/cross_file_validator_test.cpp
@@ -767,6 +828,16 @@ add_executable(plinth_tests
   tests/kernel/shell/preferences_dispatch_test.cpp
   tests/kernel/frontend/api_frontend_test.cpp
   tests/kernel/frontend/applications_test.cpp
+  tests/kernel/frontend/typed_requests_test.cpp
+  tests/kernel/frontend/typed_assets_test.cpp
+  tests/kernel/frontend/owned_frontend_worker_test.cpp
+  tests/kernel/frontend/surface_authority_test.cpp
+  tests/kernel/frontend/surface_protocol_test.cpp
+  tests/kernel/frontend/float_layout_contract_test.cpp
+  tests/kernel/frontend/platform_startup_test.cpp
+  tests/kernel/frontend/float_layout_service_test.cpp
+  tests/kernel/frontend/float_routes_test.cpp
+  tests/kernel/frontend/persistence_projection_test.cpp
   tests/kernel/cap/api_cap_test.cpp
   src/kernel/config.cpp
   src/kernel/browser_origin.cpp
@@ -842,6 +913,13 @@ add_executable(plinth_tests
   src/kernel/packages/capabilities_manifest.cpp
   src/kernel/packages/panels_manifest.cpp
   src/kernel/packages/restore_policy.cpp
+  src/kernel/packages/protected_restore_policy.cpp
+  src/kernel/packages/generation_capture.cpp
+  src/kernel/packages/generation_cache.cpp
+  src/kernel/packages/generation_receipts.cpp
+  src/kernel/packages/generation_binding.cpp
+  src/kernel/packages/installed_generation_registry.cpp
+  src/kernel/packages/name_operation.cpp
   src/kernel/packages/restore_digest.cpp
   src/kernel/packages/detail/restore_json.cpp
   src/kernel/packages/config_manifest.cpp
@@ -856,9 +934,20 @@ add_executable(plinth_tests
   src/kernel/security/unicode_scanner.cpp
   src/kernel/security/response_headers.cpp
   src/kernel/shell/active_frontend.cpp
+  src/kernel/shell/platform_graph.cpp
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
   src/kernel/frontend/applications.cpp
+  src/kernel/frontend/typed_requests.cpp
+  src/kernel/frontend/persistence_projection.cpp
+  src/kernel/frontend/typed_assets.cpp
+  src/kernel/frontend/owned_frontend_worker.cpp
+  src/kernel/frontend/surface_authority.cpp
+  src/kernel/frontend/float_layout_service.cpp
+  src/kernel/frontend/surface_protocol.cpp
+  src/kernel/frontend/float_layout_contract.cpp
+  src/kernel/frontend/platform_startup.cpp
+  src/kernel/frontend/float_routes.cpp
   src/kernel/cap/api_cap.cpp
 )
 
@@ -867,6 +956,11 @@ target_include_directories(plinth_tests PRIVATE
   ${CMAKE_BINARY_DIR}/generated
   ${Argon2_INCLUDE_DIRS}
 )
+
+# Only this pinned-framework serializer test uses Drogon's private definition;
+# it is not part of the production include interface or a fabricated admission.
+set_source_files_properties(tests/kernel/frontend/typed_assets_test.cpp
+  PROPERTIES INCLUDE_DIRECTORIES "${drogon_SOURCE_DIR}/lib/src")
 
 target_compile_definitions(plinth_tests PRIVATE
   CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -938,6 +1032,105 @@ add_test(NAME plinth_tests_typed_surface_parser
     --timeout 30
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_typed_surface_parser PROPERTIES TIMEOUT 45)
+
+add_test(NAME plinth_tests_protected_restore_policy
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "protected restore policy: absence is not failed configured trust"
+    --timeout 30)
+set_tests_properties(plinth_tests_protected_restore_policy PROPERTIES TIMEOUT 40)
+
+# This gate deliberately needs a privileged fixture provisioner and then runs
+# the test as a different unprivileged identity. A service-owned chmod 0444
+# fixture is not equivalent. CI/Linux runners must support sudo -n (or root).
+add_test(NAME plinth_tests_protected_restore_policy_deployment
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/protected_policy_fixture.py
+    --binary $<TARGET_FILE:plinth_tests>)
+set_tests_properties(plinth_tests_protected_restore_policy_deployment
+  PROPERTIES TIMEOUT 90)
+
+foreach(GENERATION_CASE IN ITEMS
+    "capture|generation capture: bounded immutable physical inventory"
+    "cache|generation cache: charged shared ownership not authority"
+    "receipts|generation receipts: write-once transaction and lock ownership"
+    "schema|generation receipts schema: validated retained bootstrap"
+    "binding|generation binding: exact captured and registered inventory"
+    "installed_registry|installed generation registry: receipt commit and immutable cache ownership"
+    "request|typed admission: exact bounded raw lookup variants")
+  string(REPLACE "|" ";" CASE_PARTS "${GENERATION_CASE}")
+  list(GET CASE_PARTS 0 CASE_NAME)
+  list(GET CASE_PARTS 1 CASE_TITLE)
+  add_test(NAME plinth_tests_generation_${CASE_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${CASE_TITLE}"
+      --timeout 45)
+  set_tests_properties(plinth_tests_generation_${CASE_NAME}
+    PROPERTIES TIMEOUT 55)
+endforeach()
+
+# Installed-float physical-owner gates. These remain exact positive/no-skip
+# cases, not an installed-browser acceptance substitute.
+foreach(ENTRY IN ITEMS
+    "stream_owner|typed assets: physical callback-copy ownership"
+    "stream_bounds|typed assets: bounded source admission and stop"
+    "stream_registry|typed assets: state outlives registry and invalid sources refuse"
+    "stream_headers|typed assets: bodyless native header serialization"
+    "worker_owner|frontend worker: physical work and completion retain one slot"
+    "worker_errors|frontend worker: fixed error completion and rejected admission"
+    "worker_failed_drain|frontend worker: failed completion is sticky not a clean drain"
+    "worker_fifo|frontend worker: bounded FIFO admits parallel module metadata"
+    "worker_queued_expiry|frontend worker: queued expiry and caller cancellation skip work"
+    "worker_queued_stop|frontend worker: stop physically drains every queued closure FIFO"
+    "worker_disposal|frontend worker: closure disposal retains occupied capacity"
+    "worker_capacity|frontend worker: capacity is finite before thread construction"
+    "worker_failed_delivery|frontend worker: failed delivery cancels queued work without retry"
+    "authority_credentials|surface authority: exact fresh credential and current rule gates"
+    "authority_targets|surface authority: both gates provider ownership and bounded ordinal prefix"
+    "storage_schema|P.platform.01: shell storage migration and generic layout mutation guard preserve existing data"
+    "storage_cutover|P.platform.02: pool construction has per-name reservations and exception-safe bounded cutover"
+    "storage_physical|P.platform.03: fixed storage keeps the shell fence and service lane until actual native SQL settlement"
+    "rejected_delivery|P.platform.04: rejected request delivery is attempted once"
+    "protocol|surface protocol: canonical asset paths float wire and bound cursors"
+    "layout_contract|float layout contract: strict raw saved descriptors and complete bindings"
+    "projection_failure|persistence projection: operational failure is not semantic ineligibility"
+    "generation_lifecycle|generation lifecycle: optional receipts follow acknowledged package cutover"
+    "platform_startup|platform startup: exact bundled publication and explicit receipt ownership"
+    "routes|float routes: strict raw facade and one-shot redacted responses"
+    "service_catalog|float layout service: real installed catalog admission and credential refresh"
+    "service_storage|float layout service: native storage restore envelope and policy refusal"
+    "service_assets|float layout service: admitted asset physical ownership and public bootstrap"
+    "db_deadline|ordinary nested PostgreSQL scopes cannot renew an absolute deadline"
+    "db_cleanup|absolute PostgreSQL expiry still permits bounded confirmed cancellation")
+  string(REPLACE "|" ";" PARTS "${ENTRY}")
+  list(GET PARTS 0 NAME)
+  list(GET PARTS 1 CASE)
+  add_test(NAME plinth_tests_installed_float_${NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${CASE}"
+      --timeout 90
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_installed_float_${NAME}
+    PROPERTIES TIMEOUT 105)
+endforeach()
+foreach(NAME IN ITEMS authority_credentials authority_targets storage_schema
+                      storage_cutover storage_physical db_cleanup
+                      generation_lifecycle platform_startup
+                      service_catalog service_storage service_assets)
+  set_tests_properties(plinth_tests_installed_float_${NAME}
+    PROPERTIES RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
+               LABELS "needs_pg;native_ownership")
+endforeach()
+set_tests_properties(plinth_tests_generation_receipts
+                     plinth_tests_generation_schema
+                     plinth_tests_generation_binding
+                     plinth_tests_generation_installed_registry
+  PROPERTIES RESOURCE_LOCK plinth_pg_schema LABELS needs_pg)
 
 # These are pure format tests, not persistence approval or installed-browser
 # acceptance. Exact positive receipts prevent a renamed/empty case from passing.
@@ -1271,13 +1464,23 @@ add_plinth_native_setup_case(commit_bookkeeping
 add_plinth_native_setup_case(domain_retry
   "private database domain failed close is retained until actual retry")
 
+# Keep every integration section in the same process, including repeated schema
+# bootstrap. Sanitizer instrumentation needs a larger aggregate runner budget;
+# individual database, worker and lifecycle deadlines remain unchanged.
+set(PLINTH_PG_AGGREGATE_TIMEOUT 300)
+set(PLINTH_PG_REPORT_ARGS)
+if(PLINTH_SANITIZERS)
+  set(PLINTH_PG_AGGREGATE_TIMEOUT 450)
+  set(PLINTH_PG_REPORT_ARGS --durations yes)
+endif()
 add_test(NAME plinth_tests_pg
   COMMAND plinth_tests "[integration] ~[ws] ~[js] ~[subprocess]"
+    ${PLINTH_PG_REPORT_ARGS}
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pg
   PROPERTIES RESOURCE_LOCK plinth_pg_schema
              LABELS "needs_pg"
-             TIMEOUT 300)
+             TIMEOUT ${PLINTH_PG_AGGREGATE_TIMEOUT})
 
 # Reuse the focused case verifier's exit/positive-assertion/no-skip contract.
 add_test(NAME plinth_tests_buffered_realtime_hints

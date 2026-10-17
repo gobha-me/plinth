@@ -13,5 +13,7 @@ curl --fail --location --silent --show-error \
 printf '%s  %s\n' "$scanner_sha256" "$archive" | sha256sum --check --status
 tar --extract --gzip --file "$archive" --directory "$scanner_dir" gitleaks
 
+python3 tests/tools/gitleaks_allowlist_test.py --scanner "$scanner_dir/gitleaks"
+
 "$scanner_dir/gitleaks" git --redact --log-opts='--all'
 "$scanner_dir/gitleaks" dir --redact .

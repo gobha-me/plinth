@@ -11,30 +11,62 @@
 // the full suite assumes hold.
 
 #include "../ws/ws_test_fixture.hpp"
+#include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
+#include "kernel/frontend/float_layout_service.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/packages/asset_server.hpp"
+#include "kernel/packages/generation_binding.hpp"
+#include "kernel/packages/generation_capture.hpp"
+#include "kernel/packages/generation_receipts.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
+#include "kernel/packages/installed_generation_registry.hpp"
+#include "kernel/packages/migrations_internal.hpp"
+#include "kernel/packages/name_operation.hpp"
+#include "kernel/packages/panels_manifest.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
+#include "kernel/shell/active_frontend.hpp"
 #include "kernel/shell/firstboot.hpp"
+#include "kernel/shell/platform_graph.hpp"
 
 #include "../js/async_bridge_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <drogon/drogon.h>
 #include <drogon/utils/coroutine.h>
 #include <json/value.h>
 #include <libpq-fe.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <future>
+#include <mutex>
+#include <new>
+#include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace fs = std::filesystem;
+namespace capabilities = plinth::capabilities;
+namespace extensions = plinth::extensions;
+
+static_assert(!std::is_constructible_v<
+              plinth::extensions::ValidatedFloatCommit,
+              plinth::extensions::PoolIdentity, Json::Value,
+              std::unique_ptr<capabilities::drain::DispatchGuard>>);
+static_assert(!std::is_constructible_v<
+              plinth::extensions::FixedStorageCall,
+              plinth::extensions::FixedStorageOperation,
+              plinth::extensions::PoolIdentity, Json::Value,
+              std::unique_ptr<capabilities::drain::DispatchGuard>>);
 
 namespace {
 
@@ -515,4 +547,767 @@ TEST_CASE("P.dispatch.01: bundled-shell preferences round-trip via "
   REQUIRE(r3.has_value());
   REQUIRE(r3->isMember("value"));
   REQUIRE(r3->operator[]("value").asString() == "dark");
+}
+
+TEST_CASE("P.platform.01: shell storage migration and generic layout mutation "
+          "guard preserve existing data",
+          "[shell][preferences][integration][platform-storage]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  PrefScratch scratch;
+  const auto uid = seed_user(scratch.db, "platform_guard_owner");
+  auto [marker_status, marker_error] = pg_run(
+      scratch.db, "SELECT storage_version FROM ext_shell.platform_contract "
+                  "WHERE singleton = true AND storage_version = 1");
+  INFO(marker_error);
+  REQUIRE(marker_status == PGRES_TUPLES_OK);
+  auto [seed_status, seed_error] = pg_run(
+      scratch.db, "INSERT INTO ext_shell.user_preferences (user_id,key,value) "
+                  "VALUES ('" +
+                      uid + "','shell.floats','null'::jsonb)");
+  INFO(seed_error);
+  REQUIRE(seed_status == PGRES_COMMAND_OK);
+  capabilities::UserContext caller{
+      .user_id = uid,
+      .username = "platform_guard_owner",
+      .auth_type = "session",
+      .effective_rules = {"shell.preferences.read", "shell.preferences.write"},
+      .session_id = "",
+      .ip_address = "",
+  };
+  Json::Value args(Json::objectValue);
+  args["key"] = "shell.floats";
+  args["bypass"] = true;
+  args["validated"] = true;
+  // Missing value is the generic delete gesture: it must be refused too.
+  auto deleted = drogon::sync_wait(
+      extensions::dispatch("shell", "preferences.set", args, caller, 0));
+  REQUIRE_FALSE(deleted.has_value());
+  REQUIRE(deleted.error().code == "invalid_argument");
+  args["value"] = Json::Value(Json::objectValue);
+  auto written = drogon::sync_wait(
+      extensions::dispatch("shell", "preferences.set", args, caller, 0));
+  REQUIRE_FALSE(written.has_value());
+  REQUIRE(written.error().code == "invalid_argument");
+  args.removeMember("value");
+  auto retained = drogon::sync_wait(
+      extensions::dispatch("shell", "preferences.get", args, caller, 0));
+  REQUIRE(retained.has_value());
+  REQUIRE(retained->isMember("value"));
+  REQUIRE((*retained)["value"].isNull());
+
+  Json::Value defaults(Json::objectValue);
+  defaults["version"] = 1;
+  defaults["choices"] = Json::Value(Json::arrayValue);
+  args["key"] = "shell.handler_defaults";
+  args["value"] = defaults;
+  auto valid = drogon::sync_wait(
+      extensions::dispatch("shell", "preferences.set", args, caller, 0));
+  REQUIRE(valid.has_value());
+  args["value"]["version"] = Json::UInt64{18446744073709551615ULL};
+  auto invalid = drogon::sync_wait(
+      extensions::dispatch("shell", "preferences.set", args, caller, 0));
+  REQUIRE_FALSE(invalid.has_value());
+  REQUIRE(invalid.error().code == "invalid_argument");
+
+  auto before = extensions::pool_identity("shell");
+  REQUIRE(before.has_value());
+  REQUIRE(extensions::create_pool("shell", "test-package-id", "test-version"));
+  auto after = extensions::pool_identity("shell");
+  REQUIRE(after.has_value());
+  REQUIRE(after->serial != before->serial);
+  REQUIRE(after->package_id == "test-package-id");
+  REQUIRE(after->version == "test-version");
+  REQUIRE_FALSE(extensions::fixed_shell_storage_identity().has_value());
+
+  plinth::packages::generation::Budget budget;
+  const plinth::packages::generation::CaptureRequest capture_request{
+      .key = {.package_id = after->package_id,
+              .name = after->name,
+              .version = after->version,
+              .profile = 1},
+      .root = fs::canonical(scratch.ctx.data_dir / "extensions" / "shell" /
+                            "active"),
+      .deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10},
+      .cancellation = {},
+  };
+  auto captured =
+      plinth::packages::generation::capture_artifact(capture_request, budget);
+  REQUIRE(captured.has_value());
+  const auto* module = (*captured)->find("server/platform-storage-v1.js");
+  const auto* contract = (*captured)->find("server/plinth-platform.json");
+  const auto* migration =
+      (*captured)->find("migrations/002_platform_storage_v1.sql");
+  REQUIRE(module != nullptr);
+  REQUIRE(contract != nullptr);
+  REQUIRE(migration != nullptr);
+  extensions::FixedShellStorageDigests pins{
+      .module = plinth::packages::detail::sha256_hex(module->content),
+      .contract = plinth::packages::detail::sha256_hex(contract->content),
+      .migration = plinth::packages::detail::sha256_hex(migration->content),
+      .applied_migration =
+          plinth::packages::detail::sha256_hex(migration->content),
+  };
+  auto wrong_receipt = pins;
+  wrong_receipt.applied_migration[0] = pins.migration[0] == '0' ? '1' : '0';
+  REQUIRE_FALSE(extensions::prepare_fixed_shell_storage(**captured, *after,
+                                                        wrong_receipt, budget)
+                    .has_value());
+  plinth::packages::generation::Budget insufficient_budget{0};
+  REQUIRE_FALSE(extensions::prepare_fixed_shell_storage(
+                    **captured, *after, pins, insufficient_budget)
+                    .has_value());
+  plinth::packages::generation::Budget module_only_budget{
+      module->content.size()};
+  REQUIRE_FALSE(extensions::prepare_fixed_shell_storage(
+                    **captured, *after, pins, module_only_budget)
+                    .has_value());
+  const auto captured_bytes = budget.used();
+  auto prepared =
+      extensions::prepare_fixed_shell_storage(**captured, *after, pins, budget);
+  REQUIRE(prepared.has_value());
+  const auto retained_bytes = budget.used() - captured_bytes;
+  REQUIRE(retained_bytes > module->content.size());
+  // Keep a second prepared owner to prove a stale pool stamp cannot publish
+  // after replacement, even though UUID/version and physical artifact match.
+  auto stale = *prepared;
+  REQUIRE(extensions::publish_fixed_shell_storage(std::move(*prepared)));
+  REQUIRE(extensions::fixed_storage_retained_bytes_for_test() ==
+          retained_bytes);
+  REQUIRE(extensions::fixed_shell_storage_identity() == after);
+  REQUIRE(extensions::create_pool("shell", after->package_id, after->version));
+  auto replacement = extensions::pool_identity("shell");
+  REQUIRE(replacement.has_value());
+  REQUIRE(replacement->serial != after->serial);
+  const bool stale_published =
+      extensions::publish_fixed_shell_storage(std::move(stale));
+  REQUIRE_FALSE(stale_published);
+  REQUIRE_FALSE(extensions::fixed_shell_storage_identity().has_value());
+  // All prepared/published small-source owners were dropped by stale rejection
+  // and pool replacement; capture itself remains physically leased separately.
+  REQUIRE(budget.used() == captured_bytes);
+  extensions::destroy_pool("shell");
+  REQUIRE_FALSE(extensions::pool_identity("shell").has_value());
+}
+
+namespace {
+class ConstructionGate {
+ public:
+  auto arrive() -> void {
+    std::unique_lock lock(mutex);
+    entered = true;
+    changed.notify_all();
+    if (!changed.wait_for(lock, std::chrono::seconds{20},
+                          [this] { return released; })) {
+      throw std::runtime_error("construction test gate expired");
+    }
+  }
+  auto wait() -> bool {
+    std::unique_lock lock(mutex);
+    return changed.wait_for(lock, std::chrono::seconds{10},
+                            [this] { return entered; });
+  }
+  auto release() -> void {
+    std::lock_guard lock(mutex);
+    released = true;
+    changed.notify_all();
+  }
+
+ private:
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool entered = false;
+  bool released = false;
+};
+struct ResetConstructionHook {
+  ~ResetConstructionHook() { extensions::set_pool_creation_hook_for_test({}); }
+};
+
+class HeldStorageRead {
+ public:
+  explicit HeldStorageRead(const plinth::Config::Database& db) : owner(db) {
+    REQUIRE(PQstatus(owner.conn) == CONNECTION_OK);
+    auto started = owner.exec("BEGIN");
+    REQUIRE(PQresultStatus(started.get()) == PGRES_COMMAND_OK);
+    auto locked = owner.exec(
+        "LOCK TABLE ext_shell.platform_contract IN ACCESS EXCLUSIVE MODE");
+    REQUIRE(PQresultStatus(locked.get()) == PGRES_COMMAND_OK);
+  }
+  ~HeldStorageRead() {
+    if (held) static_cast<void>(owner.exec("ROLLBACK"));
+  }
+  auto release() -> void {
+    auto result = owner.exec("ROLLBACK");
+    REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+    held = false;
+  }
+  [[nodiscard]] auto backend_pid() const -> int {
+    return PQbackendPID(owner.conn);
+  }
+
+ private:
+  plinth::ws_test::TestPg owner;
+  bool held = true;
+};
+
+struct ResetPlatformReadState {
+  std::string package_id;
+  ~ResetPlatformReadState() {
+    capabilities::drain::end_drain("shell");
+    plinth::shell::retire_platform_frontend(package_id);
+  }
+};
+
+class MainLoopBarrier {
+ public:
+  auto hold() -> void {
+    std::unique_lock lock(mutex);
+    entered = true;
+    changed.notify_all();
+    expired = !changed.wait_for(lock, std::chrono::seconds{20},
+                                [this] { return released; });
+  }
+  auto wait_entered() -> bool {
+    std::unique_lock lock(mutex);
+    return changed.wait_for(lock, std::chrono::seconds{5},
+                            [this] { return entered; });
+  }
+  auto release() -> void {
+    std::lock_guard lock(mutex);
+    released = true;
+    changed.notify_all();
+  }
+  [[nodiscard]] auto timed_out() const -> bool {
+    std::lock_guard lock(mutex);
+    return expired;
+  }
+
+ private:
+  mutable std::mutex mutex;
+  std::condition_variable changed;
+  bool entered = false;
+  bool released = false;
+  bool expired = false;
+};
+
+struct ReleaseMainLoopBarrier {
+  std::shared_ptr<MainLoopBarrier> barrier;
+  ~ReleaseMainLoopBarrier() { barrier->release(); }
+};
+
+auto storage_read_is_blocked(plinth::ws_test::TestPg& observer,
+                             const std::string& blocker_pid) -> bool {
+  auto result = observer.exec_params(
+      "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+      "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+      "AND query LIKE 'SELECT storage_version FROM "
+      "ext_shell.platform_contract%' "
+      "AND $1::int = ANY(pg_blocking_pids(pid)))",
+      {blocker_pid});
+  REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(result.get()) == 1);
+  return std::string_view{PQgetvalue(result.get(), 0, 0)} == "t";
+}
+} // namespace
+
+TEST_CASE(
+    "P.platform.02: pool construction has per-name reservations and "
+    "exception-safe bounded cutover",
+    "[shell][preferences][integration][platform-storage][runtime-ownership]") {
+  if (!pg_available()) SKIP("PG not available");
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  PrefScratch scratch;
+  for (const auto name : {"build-a", "build-b"}) {
+    fs::create_directories(scratch.ctx.data_dir / "extensions" / name /
+                           "active" / "server");
+  }
+  ConstructionGate gate;
+  ResetConstructionHook reset;
+  SECTION("unrelated names both publish despite overlapping completed "
+          "construction") {
+    extensions::set_pool_creation_hook_for_test(
+        [&](std::string_view name, extensions::PoolCreationStage stage) {
+          if (name == "build-a" &&
+              stage == extensions::PoolCreationStage::CONSTRUCTED)
+            gate.arrive();
+        });
+    auto first = std::async(std::launch::async, [] {
+      return extensions::create_pool("build-a", "id-a", "1");
+    });
+    const bool entered = gate.wait();
+    const bool second =
+        entered && extensions::create_pool("build-b", "id-b", "1");
+    gate.release();
+    const bool first_result = first.get();
+    REQUIRE(entered);
+    REQUIRE(second);
+    REQUIRE(first_result);
+    REQUIRE(extensions::has_pool("build-a"));
+    REQUIRE(extensions::has_pool("build-b"));
+    REQUIRE(extensions::pending_pool_constructions_for_test() == 0);
+  }
+  SECTION(
+      "last-started same-name attempt supersedes only its earlier builder") {
+    std::atomic<unsigned int> constructed = 0;
+    extensions::set_pool_creation_hook_for_test(
+        [&](std::string_view name, extensions::PoolCreationStage stage) {
+          if (name == "build-a" &&
+              stage == extensions::PoolCreationStage::CONSTRUCTED &&
+              constructed.fetch_add(1) == 0)
+            gate.arrive();
+        });
+    auto first = std::async(std::launch::async, [] {
+      return extensions::create_pool("build-a", "id-old", "1");
+    });
+    const bool entered = gate.wait();
+    const bool second =
+        entered && extensions::create_pool("build-a", "id-new", "2");
+    gate.release();
+    const bool first_result = first.get();
+    REQUIRE(entered);
+    REQUIRE(second);
+    REQUIRE_FALSE(first_result);
+    auto current = extensions::pool_identity("build-a");
+    REQUIRE(current);
+    REQUIRE(current->package_id == "id-new");
+    REQUIRE(current->version == "2");
+    REQUIRE(extensions::pending_pool_constructions_for_test() == 0);
+  }
+  SECTION("allocation fault after construction preserves old route and retires "
+          "unpublished pool") {
+    REQUIRE(extensions::create_pool("build-a", "id-old", "1"));
+    const auto original = extensions::pool_identity("build-a");
+    extensions::set_pool_creation_hook_for_test(
+        [](std::string_view name, extensions::PoolCreationStage stage) {
+          if (name == "build-a" &&
+              stage == extensions::PoolCreationStage::CONSTRUCTED)
+            throw std::bad_alloc{};
+        });
+    REQUIRE_FALSE(extensions::create_pool("build-a", "id-new", "2"));
+    REQUIRE(extensions::pool_identity("build-a") == original);
+    REQUIRE(extensions::pending_pool_constructions_for_test() == 0);
+    REQUIRE(extensions::failed_pool_count_for_test() == 0);
+  }
+  SECTION(
+      "shutdown seals pending construction without pretending it has joined") {
+    extensions::set_pool_creation_hook_for_test(
+        [&](std::string_view name, extensions::PoolCreationStage stage) {
+          if (name == "build-a" &&
+              stage == extensions::PoolCreationStage::CONSTRUCTED)
+            gate.arrive();
+        });
+    auto first = std::async(std::launch::async, [] {
+      return extensions::create_pool("build-a", "id-a", "1");
+    });
+    const bool entered = gate.wait();
+    const bool first_shutdown =
+        extensions::shutdown_registry(std::chrono::milliseconds{25});
+    gate.release();
+    const bool first_result = first.get();
+    REQUIRE(entered);
+    REQUIRE_FALSE(first_shutdown);
+    REQUIRE_FALSE(first_result);
+    REQUIRE_FALSE(extensions::has_pool("build-a"));
+    REQUIRE(extensions::pending_pool_constructions_for_test() == 0);
+    REQUIRE(extensions::shutdown_registry(std::chrono::seconds{5}));
+  }
+}
+
+TEST_CASE("P.platform.04: rejected request delivery is attempted once",
+          "[frontend][unit]") {
+  plinth::Config config;
+  auto registry = std::make_shared<
+      plinth::packages::generation::InstalledGenerationRegistry>(
+      config.packages_data_dir,
+      plinth::packages::generation::Budget{std::size_t{64} * 1024});
+  plinth::frontend::FloatLayoutService service{config, registry};
+  unsigned calls = 0;
+  service.read_layout_storage({}, "127.0.0.1", 0, [&](auto result) {
+    ++calls;
+    REQUIRE_FALSE(result);
+    throw std::runtime_error("fixture completion failure");
+  });
+  REQUIRE(calls == 1);
+  REQUIRE(service.active_count() == 0);
+  REQUIRE_FALSE(service.drain(std::chrono::steady_clock::now() +
+                              std::chrono::seconds{2}));
+}
+
+TEST_CASE(
+    "P.platform.03: fixed storage keeps the shell fence and service lane "
+    "until actual native SQL settlement",
+    "[shell][preferences][integration][platform-storage][runtime-ownership]") {
+  if (!pg_available()) SKIP("PG not available");
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  PrefScratch scratch;
+  const auto user = seed_user(scratch.db, "platform_physical_owner");
+  plinth::ws_test::TestPg observer{scratch.db};
+  REQUIRE(PQstatus(observer.conn) == CONNECTION_OK);
+  const std::string token_hash(64, 'a');
+  auto session =
+      observer.exec_params("INSERT INTO plinth.sessions(user_id,token_hash) "
+                           "VALUES($1::uuid,$2) RETURNING id::text",
+                           {user, token_hash});
+  REQUIRE(PQresultStatus(session.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(session.get()) == 1);
+  const plinth::auth::AuthContext auth{
+      .user_id = user,
+      .username = "platform_physical_owner",
+      .auth_type = "session",
+      .session_id = PQgetvalue(session.get(), 0, 0),
+      .pat_id = {},
+      .token_hash = token_hash,
+      .credential_source = plinth::auth::CredentialSource::COOKIE};
+
+  // Use the actual installed bundled identity, full trusted client graph and
+  // durable applied migration receipt. There is no test token/friend bypass.
+  auto active =
+      plinth::shell::resolve_active_frontend(scratch.db, scratch.ctx.data_dir);
+  REQUIRE(active);
+  REQUIRE(active->name == "shell");
+  REQUIRE(active->bundled);
+  REQUIRE(extensions::create_pool("shell", active->id, active->version));
+  const auto identity = extensions::pool_identity("shell");
+  REQUIRE(identity);
+  plinth::packages::generation::Budget budget;
+  const plinth::packages::generation::CaptureRequest request{
+      .key = {.package_id = active->id,
+              .name = "shell",
+              .version = active->version,
+              .profile = 1},
+      .root = fs::canonical(scratch.ctx.data_dir / "extensions" / "shell" /
+                            "active"),
+      .deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10},
+      .cancellation = {}};
+  auto captured =
+      plinth::packages::generation::capture_artifact(request, budget);
+  REQUIRE(captured);
+  auto graph = plinth::shell::prepare_platform(**captured, budget);
+  REQUIRE(graph);
+  const auto* module = (*captured)->find("server/platform-storage-v1.js");
+  const auto* contract = (*captured)->find("server/plinth-platform.json");
+  const auto* migration =
+      (*captured)->find("migrations/002_platform_storage_v1.sql");
+  REQUIRE(module != nullptr);
+  REQUIRE(contract != nullptr);
+  REQUIRE(migration != nullptr);
+  auto receipt = observer.exec(
+      "SELECT checksum FROM plinth.migrations WHERE extension_name='shell' "
+      "AND migration_file='002_platform_storage_v1.sql'");
+  REQUIRE(PQresultStatus(receipt.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(receipt.get()) == 1);
+  const extensions::FixedShellStorageDigests pins{
+      .module = plinth::packages::detail::sha256_hex(module->content),
+      .contract = plinth::packages::detail::sha256_hex(contract->content),
+      .migration = plinth::packages::detail::sha256_hex(migration->content),
+      .applied_migration = PQgetvalue(receipt.get(), 0, 0)};
+  const auto* declarations = (*captured)->find("panels.json");
+  REQUIRE(declarations != nullptr);
+  const auto parsed = plinth::packages::PanelsManifest::parse(
+      declarations->content, "panels.json");
+  REQUIRE(parsed.value);
+  REQUIRE(parsed.value->panels.empty());
+  REQUIRE_FALSE(parsed.value->format_version.has_value());
+  const auto registered = observer.exec_params(
+      "SELECT count(*)::text FROM plinth.panels WHERE package_id=$1::uuid",
+      {active->id});
+  REQUIRE(PQresultStatus(registered.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(registered.get()) == 1);
+  REQUIRE(std::string_view{PQgetvalue(registered.get(), 0, 0)} == "0");
+  auto publish_storage = [&](const auto& artifact) {
+    const auto current_identity = extensions::pool_identity("shell");
+    REQUIRE(current_identity);
+    auto storage = extensions::prepare_fixed_shell_storage(
+        *artifact, *current_identity, pins, budget);
+    REQUIRE(storage);
+    REQUIRE(extensions::publish_fixed_shell_storage(std::move(*storage)));
+  };
+  auto receipt_connection = std::shared_ptr<PGconn>{
+      PQconnectdb(conninfo_of(scratch.db).c_str()), PQfinish};
+  REQUIRE(receipt_connection);
+  REQUIRE(PQstatus(receipt_connection.get()) == CONNECTION_OK);
+  auto binding_operation =
+      plinth::packages::name_operation::NameOperation::acquire(
+          receipt_connection, "shell");
+  REQUIRE(binding_operation);
+  const auto declarations_digest =
+      plinth::packages::generation::bind_registered_generation(
+          *binding_operation, **captured, budget);
+  REQUIRE(declarations_digest);
+  auto actual_receipt = plinth::packages::generation::receipt_from_artifact(
+      **captured, *declarations_digest);
+  REQUIRE(actual_receipt);
+  REQUIRE(binding_operation->release_checked());
+  auto command = [&](const char* sql) {
+    const std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexec(receipt_connection.get(), sql), PQclear};
+    REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+  };
+  ResetPlatformReadState reset{active->id};
+  auto require_refused = [&] {
+    plinth::frontend::FloatLayoutService refused_service{scratch.cfg};
+    HeldStorageRead held{scratch.db};
+    const auto blocker = std::to_string(held.backend_pid());
+    auto completion = std::make_shared<
+        std::promise<plinth::frontend::FloatLayoutService::Result>>();
+    auto result = completion->get_future();
+    refused_service.read_layout_storage(
+        auth, "127.0.0.1", 0,
+        [completion](auto value) { completion->set_value(std::move(value)); });
+    REQUIRE(result.wait_for(std::chrono::seconds{5}) ==
+            std::future_status::ready);
+    const auto failed = result.get();
+    REQUIRE_FALSE(failed);
+    REQUIRE(failed.error().code == "storage_unavailable");
+    REQUIRE_FALSE(storage_read_is_blocked(observer, blocker));
+    REQUIRE(refused_service.drain(std::chrono::steady_clock::now() +
+                                  std::chrono::seconds{5}));
+    REQUIRE(refused_service.active_count() == 0);
+  };
+
+  SECTION("missing committed generation receipt is unavailable") {
+    {
+      auto name = plinth::packages::name_operation::NameOperation::acquire(
+          receipt_connection, "shell");
+      REQUIRE(name);
+      const auto missing =
+          plinth::packages::generation::read_receipt(*name, request.key);
+      REQUIRE(missing);
+      REQUIRE_FALSE(missing->has_value());
+      REQUIRE(name->release_checked());
+    }
+    publish_storage(*captured);
+    REQUIRE(plinth::shell::publish_platform_frontend(*active, *graph));
+    require_refused();
+  }
+
+  SECTION("matching immutable receipt is committed before any publication") {
+    {
+      auto name = plinth::packages::name_operation::NameOperation::acquire(
+          receipt_connection, "shell");
+      REQUIRE(name);
+      command("BEGIN");
+      REQUIRE(plinth::packages::generation::insert_matching_receipt(
+          *name, *actual_receipt));
+      command("COMMIT");
+      const auto committed =
+          plinth::packages::generation::read_receipt(*name, request.key);
+      REQUIRE(committed);
+      REQUIRE(committed->has_value());
+      REQUIRE(**committed == *actual_receipt);
+      REQUIRE(name->release_checked());
+    }
+    publish_storage(*captured);
+    REQUIRE(plinth::shell::publish_platform_frontend(*active, *graph));
+
+    SECTION(
+        "same UUID and version cannot combine different captured artifacts") {
+      const auto variant_path = request.root / "physical-capture-variant.txt";
+      REQUIRE_FALSE(fs::exists(variant_path));
+      {
+        std::ofstream variant{variant_path, std::ios::binary};
+        REQUIRE(variant.good());
+        variant
+            << "another real package member changes full artifact identity\n";
+        REQUIRE(variant.good());
+      }
+      auto changed_request = request;
+      changed_request.deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds{10};
+      auto changed = plinth::packages::generation::capture_artifact(
+          changed_request, budget);
+      REQUIRE(changed);
+      REQUIRE((*changed)->key() == (*captured)->key());
+      REQUIRE((*changed)->digest() != (*captured)->digest());
+      for (const auto* path :
+           {"server/platform-storage-v1.js", "server/plinth-platform.json",
+            "migrations/002_platform_storage_v1.sql"}) {
+        const auto* original = (*captured)->find(path);
+        const auto* replacement = (*changed)->find(path);
+        REQUIRE(original != nullptr);
+        REQUIRE(replacement != nullptr);
+        REQUIRE(original->content == replacement->content);
+      }
+      auto changed_graph = plinth::shell::prepare_platform(**changed, budget);
+      REQUIRE(changed_graph);
+      SECTION("changed graph cannot use original fixed storage") {
+        REQUIRE(
+            plinth::shell::publish_platform_frontend(*active, *changed_graph));
+      }
+      SECTION("changed storage cannot use original graph") {
+        REQUIRE(extensions::create_pool("shell", active->id, active->version));
+        const auto replacement_identity = extensions::pool_identity("shell");
+        REQUIRE(replacement_identity);
+        REQUIRE(replacement_identity->serial != identity->serial);
+        publish_storage(*changed);
+      }
+      SECTION(
+          "matching changed graph and storage cannot reuse original receipt") {
+        REQUIRE(extensions::create_pool("shell", active->id, active->version));
+        const auto replacement_identity = extensions::pool_identity("shell");
+        REQUIRE(replacement_identity);
+        REQUIRE(replacement_identity->serial != identity->serial);
+        publish_storage(*changed);
+        REQUIRE(
+            plinth::shell::publish_platform_frontend(*active, *changed_graph));
+      }
+      require_refused();
+    }
+
+    SECTION(
+        "admitted metadata guard survives a fence during main-loop handoff") {
+      plinth::frontend::FloatLayoutService service{scratch.cfg};
+      HeldStorageRead blocked{scratch.db};
+      const auto blocker_pid = std::to_string(blocked.backend_pid());
+      auto barrier = std::make_shared<MainLoopBarrier>();
+      // This RAII release precedes both PG lock and service destruction even
+      // on failed assertions. The queued callback borrows no stack state.
+      ReleaseMainLoopBarrier release{barrier};
+      // A real short-lived fixture guard retains the observable state across
+      // begin/end. It is removed BEFORE testing the request's exact count one.
+      auto observation_guard =
+          std::make_unique<capabilities::drain::DispatchGuard>("shell");
+      REQUIRE(observation_guard->admitted());
+      auto state = capabilities::drain::begin_drain("shell");
+      capabilities::drain::end_drain("shell");
+      drogon::app().getLoop()->queueInLoop([barrier] { barrier->hold(); });
+      REQUIRE(barrier->wait_entered());
+      auto completion = std::make_shared<
+          std::promise<plinth::frontend::FloatLayoutService::Result>>();
+      auto result = completion->get_future();
+      auto calls = std::make_shared<std::atomic<unsigned>>(0);
+      service.read_layout_storage(auth, "127.0.0.1", 0,
+                                  [completion, calls](auto value) {
+                                    if (calls->fetch_add(1) == 0)
+                                      completion->set_value(std::move(value));
+                                  });
+      const auto admission_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds{4};
+      bool admitted = false;
+      do {
+        if (state->in_flight.load() == 2) {
+          admitted = true;
+          break;
+        }
+      } while (std::chrono::steady_clock::now() < admission_deadline &&
+               result.wait_for(std::chrono::milliseconds{10}) !=
+                   std::future_status::ready);
+      REQUIRE(admitted);
+      observation_guard.reset();
+      REQUIRE(state->in_flight.load() == 1);
+      REQUIRE_FALSE(storage_read_is_blocked(observer, blocker_pid));
+      REQUIRE(result.wait_for(std::chrono::milliseconds{0}) ==
+              std::future_status::timeout);
+      auto fenced = capabilities::drain::begin_drain("shell");
+      REQUIRE(fenced == state);
+      const auto [zero, outstanding] = capabilities::drain::wait_for_zero(
+          fenced, std::chrono::milliseconds{25});
+      REQUIRE_FALSE(zero);
+      REQUIRE(outstanding == 1);
+      SECTION("admitted owner completes after a later fence") {
+        blocked.release();
+        barrier->release();
+        REQUIRE_FALSE(barrier->timed_out());
+        REQUIRE(result.wait_for(std::chrono::seconds{5}) ==
+                std::future_status::ready);
+        const auto completed = result.get();
+        REQUIRE(completed);
+        REQUIRE((*completed)["present"].isBool());
+        REQUIRE_FALSE((*completed)["present"].asBool());
+      }
+      SECTION(
+          "stopped metadata consumer cannot resume on late native delivery") {
+        // Stop wakes the owned bridge, not the blocked loop or accepted native
+        // request. Logical failure must not release that request's guard/slot.
+        REQUIRE_FALSE(service.drain(std::chrono::steady_clock::now() +
+                                    std::chrono::milliseconds{25}));
+        REQUIRE(result.wait_for(std::chrono::seconds{2}) ==
+                std::future_status::ready);
+        const auto completed = result.get();
+        REQUIRE_FALSE(completed);
+        REQUIRE(service.active_count() == 1);
+        REQUIRE(fenced->in_flight.load() == 1);
+        REQUIRE_FALSE(storage_read_is_blocked(observer, blocker_pid));
+        barrier->release();
+        REQUIRE_FALSE(barrier->timed_out());
+        // Keep the SQL lock held: a mistakenly launched late native call
+        // would prevent this physical drain from succeeding.
+        REQUIRE(service.drain(std::chrono::steady_clock::now() +
+                              std::chrono::seconds{5}));
+        REQUIRE_FALSE(storage_read_is_blocked(observer, blocker_pid));
+        blocked.release();
+      }
+      REQUIRE(service.drain(std::chrono::steady_clock::now() +
+                            std::chrono::seconds{5}));
+      const auto [settled, remaining] =
+          capabilities::drain::wait_for_zero(fenced, std::chrono::seconds{5});
+      REQUIRE(settled);
+      REQUIRE(remaining == 0);
+      REQUIRE(service.active_count() == 0);
+      REQUIRE(calls->load() == 1);
+    }
+
+    SECTION("genuine native SQL settlement retains name and service owners") {
+
+      plinth::frontend::FloatLayoutService service{scratch.cfg};
+      // Destruction order releases this genuine PG lock BEFORE destroying the
+      // service, including assertion unwinding. No native owner is abandoned.
+      HeldStorageRead blocked{scratch.db};
+      const auto blocker_pid = std::to_string(blocked.backend_pid());
+      auto completion = std::make_shared<
+          std::promise<plinth::frontend::FloatLayoutService::Result>>();
+      auto result = completion->get_future();
+      service.read_layout_storage(auth, "127.0.0.1", 0,
+                                  [completion](auto value) {
+                                    completion->set_value(std::move(value));
+                                  });
+      bool observed = false;
+      const auto observation_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds{4};
+      do {
+        if (storage_read_is_blocked(observer, blocker_pid)) {
+          observed = true;
+          break;
+        }
+        // This is bounded observation of a real lock dependency, not a sleep
+        // standing in for native settlement or a fabricated callback result.
+      } while (std::chrono::steady_clock::now() < observation_deadline &&
+               result.wait_for(std::chrono::milliseconds{10}) !=
+                   std::future_status::ready);
+      REQUIRE(observed);
+      auto fenced = capabilities::drain::begin_drain("shell");
+      REQUIRE(fenced->in_flight.load() == 1);
+
+      // The isolated driver has a real five-second SQL deadline; its timeout
+      // may finish JS BEFORE the still-issued SQL and its callback owner are
+      // released. This deliberately does not claim a 30s wall-clock
+      // cancellation occurred.
+      REQUIRE(result.wait_for(std::chrono::seconds{45}) ==
+              std::future_status::ready);
+      const auto failed = result.get();
+      REQUIRE_FALSE(failed);
+      REQUIRE(failed.error().code == "cap.handler_threw");
+      REQUIRE(storage_read_is_blocked(observer, blocker_pid));
+      const auto [prematurely_zero, outstanding] =
+          capabilities::drain::wait_for_zero(fenced,
+                                             std::chrono::milliseconds{25});
+      REQUIRE_FALSE(prematurely_zero);
+      REQUIRE(outstanding == 1);
+      REQUIRE(service.active_count() == 1);
+      REQUIRE_FALSE(service.drain(std::chrono::steady_clock::now() +
+                                  std::chrono::milliseconds{25}));
+
+      blocked.release();
+      const auto [settled, remaining] =
+          capabilities::drain::wait_for_zero(fenced, std::chrono::seconds{5});
+      REQUIRE(settled);
+      REQUIRE(remaining == 0);
+      REQUIRE(service.drain(std::chrono::steady_clock::now() +
+                            std::chrono::seconds{5}));
+      REQUIRE(service.active_count() == 0);
+      REQUIRE_FALSE(storage_read_is_blocked(observer, blocker_pid));
+    }
+  }
 }

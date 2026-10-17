@@ -271,6 +271,28 @@ try {
         await page.route('**/api/frontend/applications', route => route.fulfill({
             json: { schema_version: 1, applications: [] },
         }));
+        // This session is explicitly mocked and has no authenticated backend
+        // cookie. Model its read-only absence, not a native authentication or
+        // persistence approval. Keep the actual document's captured profile.
+        const profilePattern = /^v1:[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}:[0-9a-f]{64}$/;
+        let layoutReads = 0, resolveLayoutRead;
+        const layoutWrites = [];
+        const layoutRead = new Promise(resolve => { resolveLayoutRead = resolve; });
+        await page.route('**/api/frontend/float-layout', async route => {
+            if (route.request().method() !== 'GET') {
+                layoutWrites.push(route.request().method());
+                await route.fulfill({ status: 405, json: { error: 'fixture_read_only' } });
+                return;
+            }
+            const profiles = await page.locator('meta[name="plinth-platform-profile"]')
+                .evaluateAll(elements => elements.map(element => element.getAttribute('content')));
+            assert.equal(profiles.length, 1, 'layout read requires the actual unique captured document profile');
+            assert.match(profiles[0], profilePattern);
+            layoutReads++;
+            await route.fulfill({ headers: { 'X-Plinth-Platform-Profile': profiles[0] },
+                json: { schema_version: 1, present: false, policy_revision: null, restore_targets: [] } });
+            resolveLayoutRead();
+        });
         await page.route('**/api/auth/logout', route => {
             csrfHeaders.push(route.request().headers()['x-plinth-csrf']);
             if (outcome === 'success') return route.fulfill({ json: { ok: true } });
@@ -298,6 +320,19 @@ try {
         await page.goto(baseURL + '/app/');
         const avatar = page.locator('.zone-avatar > button');
         await avatar.waitFor();
+        const profiles = await page.locator('meta[name="plinth-platform-profile"]')
+            .evaluateAll(elements => elements.map(element => element.getAttribute('content')));
+        assert(profiles.length <= 1, 'captured profile must be unique when present');
+        if (profiles.length) {
+            assert.match(profiles[0], profilePattern);
+            await Promise.race([layoutRead, new Promise((_, reject) => {
+                const timeout = setTimeout(() => reject(new Error('mock session layout read timed out')), 10000);
+                timeout.unref();
+            })]);
+            assert.equal(layoutReads, 1, 'captured native document starts its guarded layout read');
+        } else {
+            assert.equal(layoutReads, 0, 'standalone legacy document does not activate guarded layout transport');
+        }
         await avatar.click();
         const signOut = page.getByRole('menuitem', { name: 'Sign Out', exact: true });
         const logoutRequest = page.waitForRequest('**/api/auth/logout');
@@ -318,6 +353,8 @@ try {
         assert(csrfHeaders.length >= 2, 'capability and logout requests must both be observed');
         assert(csrfHeaders.every(value => value === `csrf-${outcome}`));
         assert.equal((await page.locator('body').textContent()).includes(`csrf-${outcome}`), false);
+        assert.deepEqual(layoutWrites, [], 'mock logout cases must never synthesize successful persistence writes');
+        assert.equal(layoutReads, profiles.length, 'no unexpected guarded layout reads in this mock session');
         await context.close();
         console.log(`PASS CSRF header and logout state: ${outcome}`);
     }

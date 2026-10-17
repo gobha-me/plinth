@@ -1,0 +1,6 @@
+{
+  "rules": [
+    {"rule": "floatprovider.panel", "namespace": "floatprovider", "description": "Test-only typed float declaration visibility."},
+    {"rule": "floatprovider.preview", "namespace": "floatprovider", "description": "Test-only provider capability permission, separate from panel visibility."}
+  ]
+}

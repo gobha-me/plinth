@@ -19,6 +19,10 @@
 
 namespace plinth::db {
 
+namespace detail {
+inline auto cancel_query(PGconn* connection) -> bool;
+}
+
 // A thread-owned policy for synchronous startup and listener operations.
 // Calls retain libpq's error-result contract, including during rollback and
 // advisory-lock destructors. The startup owner checks the sticky failure at
@@ -28,7 +32,23 @@ class OperationScope {
   explicit OperationScope(
       std::stop_token stop,
       std::chrono::milliseconds timeout = std::chrono::seconds{10})
-      : previous(current), stop(stop), timeout(timeout) {
+      : previous(current), stop(stop), timeout(timeout),
+        absolute_deadline(current == nullptr
+                              ? std::chrono::steady_clock::time_point::max()
+                              : current->absolute_deadline) {
+    current = this;
+  }
+  // An owned multi-query operation shares ONE deadline, including connection,
+  // advisory ownership, receipt checks and capture. Individual queries and
+  // nested scopes may shorten that deadline but can never renew it.
+  OperationScope(std::stop_token stop,
+                 std::chrono::steady_clock::time_point deadline,
+                 std::chrono::milliseconds per_query = std::chrono::seconds{10})
+      : previous(current), stop(stop), timeout(per_query),
+        absolute_deadline(
+            current == nullptr
+                ? deadline
+                : std::min(deadline, current->absolute_deadline)) {
     current = this;
   }
   ~OperationScope() { current = previous; }
@@ -43,7 +63,7 @@ class OperationScope {
     if (stop.stop_requested()) {
       throw std::runtime_error("PostgreSQL startup operation cancelled");
     }
-    if (failed) {
+    if (failed || std::chrono::steady_clock::now() >= absolute_deadline) {
       throw std::runtime_error(
           "PostgreSQL startup operation deadline exceeded");
     }
@@ -63,21 +83,47 @@ class OperationScope {
     }
   }
 
+  // Read-only inheritance for owned sub-operations such as a package receipt
+  // stage/publication pair. Neither accessor starts or renews an operation.
+  [[nodiscard]] static auto current_stop_token() noexcept -> std::stop_token {
+    return current == nullptr ? std::stop_token{} : current->stop;
+  }
+  [[nodiscard]] static auto current_deadline() noexcept
+      -> std::chrono::steady_clock::time_point {
+    return current == nullptr ? std::chrono::steady_clock::time_point::max()
+                              : current->absolute_deadline;
+  }
+
  private:
   friend struct Operation;
+  friend auto detail::cancel_query(PGconn* connection) -> bool;
+
+  // Only cancellation control may outlive an expired operation deadline. Its
+  // single two-second budget covers control connect, cancel and confirmation;
+  // it never admits another ordinary query under the failed parent scope.
+  struct CancellationCleanupTag {};
+  explicit OperationScope(CancellationCleanupTag)
+      : previous(current), stop(), timeout(std::chrono::seconds{2}),
+        absolute_deadline(std::chrono::steady_clock::now() + timeout) {
+    current = this;
+  }
+
   static inline thread_local OperationScope* current = nullptr;
   OperationScope* previous;
   std::stop_token stop;
   std::chrono::milliseconds timeout;
+  std::chrono::steady_clock::time_point absolute_deadline;
   bool failed = false;
   bool cancel_failed = false;
 };
 
 struct Operation {
   OperationScope* scope = OperationScope::current;
-  std::chrono::steady_clock::time_point deadline =
+  std::chrono::steady_clock::time_point deadline = std::min(
       std::chrono::steady_clock::now() +
-      (scope == nullptr ? std::chrono::milliseconds{0} : scope->timeout);
+          (scope == nullptr ? std::chrono::milliseconds{0} : scope->timeout),
+      scope == nullptr ? std::chrono::steady_clock::time_point::max()
+                       : scope->absolute_deadline);
 
   [[nodiscard]] auto active() const noexcept -> bool {
     return scope != nullptr;
@@ -122,8 +168,6 @@ struct Operation {
 };
 
 namespace detail {
-
-inline auto cancel_query(PGconn* connection) -> bool;
 
 inline auto finish_connect(PGconn* connection, const Operation& operation)
     -> bool {
@@ -214,7 +258,7 @@ inline auto receive_result(PGconn* connection, const Operation& operation,
 // One two-second deadline covers connect, cancel dispatch, and confirmation on
 // the original connection. Never recursively cancel the control connection.
 inline auto cancel_query(PGconn* connection) -> bool {
-  OperationScope cleanup_scope{std::stop_token{}, std::chrono::seconds{2}};
+  OperationScope cleanup_scope{OperationScope::CancellationCleanupTag{}};
   Operation cleanup;
   using Options = std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)>;
   Options options{PQconninfo(connection), PQconninfoFree};

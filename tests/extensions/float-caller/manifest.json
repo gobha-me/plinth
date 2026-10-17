@@ -1,0 +1,9 @@
+{
+  "name": "floatcaller",
+  "display_name": "Float Caller",
+  "version": "0.1.0",
+  "description": "Test-only ordinary installed primary exercising the existing openFloat SDK. Never bundled or granted by default.",
+  "author": "plinth",
+  "license": "Apache-2.0",
+  "entry_point": "server/main.js"
+}

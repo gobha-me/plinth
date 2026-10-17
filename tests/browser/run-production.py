@@ -60,10 +60,11 @@ def stop_kernel(child):
         raise RuntimeError(f"kernel shutdown failed: {child.returncode}")
 
 
-def start_kernel(runtime, config_path, root, child_env, output_path):
+def start_kernel(runtime, config_path, root, child_env, output_path, *, upgrade=False):
     with output_path.open("w") as output:
         child = runtime.start(
-            ["serve", "--config", runtime.path(root, config_path)],
+            ["serve", "--config", runtime.path(root, config_path)] +
+            (["--upgrade-bundled-shell"] if upgrade else []),
             root=root, env=child_env, output=output)
     try:
         deadline = time.monotonic() + 30
@@ -186,26 +187,13 @@ def main():
                             raise RuntimeError("browser failed before frontend replacement")
                     stop_kernel(child)
                     transition.legacy.clear()
-                    # Simulate the completed supported replacement while stopped.
-                    # Install/upgrade operator behavior has its own regression;
-                    # this case isolates mount caching across two package snapshots.
-                    extension = root / "data/extensions/shell"
-                    version_root = extension / "901.0.2"
-                    with zipfile.ZipFile(replacement) as package:
-                        package.extractall(version_root)
-                    active = extension / "active"
-                    if not active.is_symlink():
-                        raise RuntimeError("expected the installer's active-version symlink")
-                    active.unlink()
-                    active.symlink_to("901.0.2", target_is_directory=True)
-                    install_env = pg_env | {"PGDATABASE": database}
-                    subprocess.run(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-c",
-                        "DO $$ BEGIN UPDATE plinth.packages SET version = '901.0.2' "
-                        "WHERE name = 'shell' AND version = '901.0.1'; "
-                        "IF NOT FOUND THEN RAISE EXCEPTION 'missing first frontend'; END IF; END $$;"],
-                        env=install_env, check=True, timeout=15, stdout=subprocess.DEVNULL)
+                    # Keep the actual installed generation, metadata and
+                    # receipts coherent through the supported operator path.
+                    # The browser still retains its original poisoned cache.
+                    shutil.copyfile(replacement, bundle_path / "shell.zip")
                     output_path = root / "restarted.log"
-                    child = start_kernel(runtime, config_path, root, child_env, output_path)
+                    child = start_kernel(runtime, config_path, root, child_env, output_path,
+                                         upgrade=True)
                     browser.stdin.write("continue\n")
                     browser.stdin.flush()
                     stdout, _ = browser.communicate(timeout=60)

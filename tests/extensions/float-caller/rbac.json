@@ -1,0 +1,9 @@
+{
+  "rules": [
+    {
+      "rule": "floatcaller.panel",
+      "namespace": "floatcaller",
+      "description": "Test-only float caller visibility; no provider permission."
+    }
+  ]
+}

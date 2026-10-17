@@ -429,6 +429,46 @@ shippingFloatTest('shipping five minimized ready floats retain all slots without
     assert.equal(f.imports.length, 5); assert.equal(f.budget.status().count, 5);
 });
 
+shippingFloatTest('shipping ready IDs are incarnation-bound and timeout is not physical preparation settlement', async f => {
+    const admitted = f.manager.admit(f.input('pending'));
+    const attempt = f.record(admitted.token).incarnation.token;
+    assert.equal(f.manager.readyFloatId(admitted.token, attempt), null);
+    let physical = false;
+    const settled = f.manager.whenPreparationSettled(admitted.token, attempt).then(result => { physical = true; return result; });
+    f.advance(15000, true); await f.turns();
+    assert.equal(f.record(admitted.token).readiness, 'failed');
+    assert.equal(physical, false); assert.equal(f.budget.inspect(admitted.token).pending, true);
+    f.manager.close(admitted.token); await f.turns();
+    assert.equal(physical, false); assert.equal(f.manager.readyFloatId(admitted.token, attempt), null);
+    await f.settle();
+    assert.equal((await settled).status, 'skipped'); assert.equal(f.budget.status().count, 0);
+    const ready = await f.ready('fresh');
+    const freshAttempt = f.record(ready.token).incarnation.token;
+    assert.equal(f.manager.readyFloatId(ready.token, freshAttempt), ready.id);
+    assert.equal(f.manager.readyFloatId(ready.token, attempt), null);
+    assert.equal((await f.manager.whenPreparationSettled(ready.token, freshAttempt)).status, 'ready');
+});
+
+shippingFloatTest('shipping layout hooks exclude noisy focus and unchanged presentation or geometry', async f => {
+    const events = [], focus = [];
+    f.manager.onLayout(event => events.push(event.kind)); f.manager.onFocus(token => focus.push(token));
+    const ready = await f.ready('semantic');
+    assert.deepEqual(events, ['ready']);
+    f.manager.focus(ready.token); f.manager.focus(ready.token);
+    assert.deepEqual(events, ['ready']);
+    f.manager.minimize(ready.token); f.manager.minimize(ready.token);
+    assert.deepEqual(events, ['ready', 'minimized']);
+    const oldFocusCount = focus.length;
+    f.manager.restore(ready.token, { focusChrome: false });
+    assert.equal(focus.length, oldFocusCount);
+    assert.deepEqual(events, ['ready', 'minimized', 'restored']);
+    f.manager.setGeometry(ready.token, f.realm({ x: 1, y: 1, width: 640, height: 480 }));
+    f.manager.setGeometry(ready.token, f.realm({ x: 1, y: 1, width: 640, height: 480 }));
+    assert.equal(events.filter(kind => kind === 'geometry').length, 1);
+    f.manager.close(ready.token);
+    assert.equal(events.filter(kind => kind === 'closed').length, 1);
+});
+
 shippingFloatTest('shipping five loading floats cannot reclaim capacity by closing a pending owner', async f => {
     const admitted = Array.from({ length: 5 }, (_, index) => f.manager.admit(f.input('key-' + index)));
     assert.equal(f.manager.admit(f.input('six')).status, 'limit-refused');
@@ -763,10 +803,110 @@ shippingFloatTest('shipping synchronous clock setup failure rolls back unused pr
     }
 });
 
+shippingFloatTest('shipping typed metadata accepts byte and scalar boundaries without truncation', async f => {
+    const resolve = f.adapter.resolve;
+    const title = '😀'.repeat(256);
+    assert.equal([...title].length, 256);
+    assert.equal(new TextEncoder().encode(title).length, 1024);
+    for (const value of ['a'.repeat(256), 'é'.repeat(128), '😀'.repeat(64)]) {
+        f.adapter.resolve = descriptor => {
+            const result = resolve(descriptor);
+            result.target.version = value;
+            result.target.panel.title = title;
+            return result;
+        };
+        const result = f.manager.admit(f.input('boundary', { generation: value }));
+        assert.equal(result.status, 'admitted');
+        await f.settle(f.imports.length - 1);
+        assert.equal(f.record(result.token).title, title);
+        assert.equal(f.record(result.token).target.version, value);
+        assert.equal(f.record(result.token).descriptor.generation, value);
+        f.manager.close(result.token);
+        assert.equal(f.budget.status().count, 0);
+    }
+    for (const [field, values] of [
+        ['version', ['', 'a'.repeat(257), 'é'.repeat(128) + 'a', '😀'.repeat(64) + 'a',
+            '\ud800', '\udc00', '\ud800a']],
+        ['title', ['', 'a'.repeat(257), title + 'a', '\ud800', '\udc00', '\ud800a']],
+    ]) {
+        for (const value of values) {
+            f.adapter.resolve = descriptor => {
+                const result = resolve(descriptor);
+                (field === 'title' ? result.target.panel : result.target)[field] = value;
+                return result;
+            };
+            const imports = f.imports.length;
+            assert.equal(f.manager.admit(f.input()).status, 'target-unavailable');
+            assert.equal(f.imports.length, imports);
+            assert.equal(f.budget.status().count, 0);
+        }
+    }
+});
+
+shippingFloatTest('shipping optional internal application label preserves fixtures or uses the validated ID', async f => {
+    const resolve = f.adapter.resolve;
+    for (const label of [undefined, 'Notes', 'é'.repeat(128), '😀'.repeat(64)]) {
+        f.adapter.resolve = descriptor => {
+            const result = resolve(descriptor);
+            if (label === undefined) delete result.target.applicationTitle;
+            else result.target.applicationTitle = label;
+            return result;
+        };
+        const result = await f.ready();
+        assert.equal(f.record(result.token).applicationTitle, label ?? 'notes');
+        f.manager.close(result.token);
+    }
+    for (const label of [undefined, null, 1, '', 'a'.repeat(129), '\ud800', '\udc00']) {
+        f.adapter.resolve = descriptor => {
+            const result = resolve(descriptor);
+            result.target.applicationTitle = label;
+            return result;
+        };
+        const imports = f.imports.length;
+        assert.equal(f.manager.admit(f.input()).status, 'target-unavailable',
+            'a present invalid label is not an absent optional label');
+        assert.equal(f.imports.length, imports);
+        assert.equal(f.budget.status().count, 0);
+    }
+});
+
+shippingFloatTest('shipping module URL limits cover normalized absolute percent-encoded bytes', async f => {
+    const resolve = f.adapter.resolve;
+    const prefix = new URL('/', f.document.location.href).href;
+    const suffixBytes = 2048 - prefix.length;
+    const paths = ['/' + 'a'.repeat(suffixBytes)];
+    for (const [character, encodedBytes] of [['é', 6], ['😀', 12]]) {
+        paths.push('/' + character.repeat(Math.floor(suffixBytes / encodedBytes)) +
+            'a'.repeat(suffixBytes % encodedBytes));
+    }
+    for (const path of paths) {
+        f.adapter.resolve = descriptor => {
+            const result = resolve(descriptor); result.target.panel.module_url = path; return result;
+        };
+        const expected = new URL(path, f.document.location.href).href;
+        assert.equal(new TextEncoder().encode(expected).length, 2048);
+        const result = await f.ready();
+        assert.equal(f.imports.at(-1).url, expected);
+        assert.equal(f.record(result.token).target.panel.module_url, expected);
+        f.manager.close(result.token);
+    }
+    for (const path of [...paths.map(path => path + 'a'), '/' + 'a'.repeat(2047),
+        '/\ud800', '/\udc00', '/\ud800a', 'https://else.invalid/a',
+        'https://fake:fake@plinth.test/a', '/a#fragment']) {
+        f.adapter.resolve = descriptor => {
+            const result = resolve(descriptor); result.target.panel.module_url = path; return result;
+        };
+        const imports = f.imports.length;
+        assert.equal(f.manager.admit(f.input()).status, 'target-unavailable');
+        assert.equal(f.imports.length, imports);
+        assert.equal(f.budget.status().count, 0);
+    }
+});
+
 shippingFloatTest('shipping authority metadata accessors never execute or admit an import', async f => {
     const resolve = f.adapter.resolve;
     let accessed = 0;
-    for (const path of [['descriptor'], ['target'], ['target', 'version'], ['target', 'panel'],
+    for (const path of [['descriptor'], ['target'], ['target', 'version'], ['target', 'applicationTitle'], ['target', 'panel'],
         ['target', 'panel', 'title'], ['target', 'panel', 'module_url']]) {
         f.adapter.resolve = descriptor => {
             const result = resolve(descriptor);

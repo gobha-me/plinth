@@ -64,6 +64,24 @@ function validString(value, minimum, maximum) {
     if (length < minimum || length > maximum) invalid();
     return value;
 }
+
+// Typed metadata uses UTF-8 byte limits, with a separate display-title scalar
+// limit. Do not let TextEncoder repair lone surrogates or truncate the input.
+// NUL remains permitted by the existing generation grammar; context strings
+// deliberately use the stricter validString() contract above instead.
+export function isFloatMetadataString(value, maximumBytes, maximumScalars = maximumBytes) {
+    if (typeof value !== 'string' || !value.length || value.length > maximumBytes) return false;
+    let scalars = 0;
+    for (let index = 0; index < value.length; index++) {
+        const code = value.charCodeAt(index);
+        if (code >= 0xd800 && code <= 0xdbff) {
+            const next = value.charCodeAt(++index);
+            if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+        } else if (code >= 0xdc00 && code <= 0xdfff) return false;
+        if (++scalars > maximumScalars) return false;
+    }
+    return bytes(value) <= maximumBytes;
+}
 function compareBytes(left, right) {
     for (let index = 0; index < Math.min(left.length, right.length); index++) {
         if (left[index] !== right[index]) return left[index] - right[index];
@@ -193,10 +211,7 @@ function logicalIdentity(input) {
 export function normalizeFloatDescriptor(value) {
     return guarded(() => {
         const input = fields(value, DESCRIPTOR_KEYS);
-        // Match launcher/model.js: generation is nonempty and <=256 codepoints,
-        // not a novel ASCII or UTF-8-byte restriction.
-        if (typeof input.generation !== 'string' || !input.generation.length
-                || [...input.generation].length > 256) invalid();
+        if (!isFloatMetadataString(input.generation, 256)) invalid();
         validString(input.context_key, 1, 512);
         return Object.freeze({ ...logicalIdentity(input), generation: input.generation,
             context_key: input.context_key });

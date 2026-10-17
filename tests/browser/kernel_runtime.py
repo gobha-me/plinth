@@ -9,7 +9,10 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
+import time
 import uuid
 
 
@@ -26,6 +29,36 @@ SERVER_ENV_KEYS = (
     "PLINTH_BOOTSTRAP_TOKEN",
 )
 SERVER_ROOT_ENTRIES = ("config.json", "bundled", "data", "logs")
+# Finite test-transport bounds, not package-installation eligibility limits.
+STAGE_ARCHIVE_MAX_BYTES = 256 * 1024 * 1024
+STAGE_MAX_ENTRIES = 32768
+STAGE_MAX_PATH_BYTES = 4096
+STAGE_MAX_DEPTH = 128
+STAGE_ARCHIVE_TIMEOUT_SECONDS = 30
+IMAGE_UID = IMAGE_GID = 10001
+
+
+class _BoundedTarWriter:
+    def __init__(self, output):
+        self.output = output
+        self.deadline = time.monotonic() + STAGE_ARCHIVE_TIMEOUT_SECONDS
+
+    def check_deadline(self):
+        # Cooperative checks do not promise interruption of a blocking syscall.
+        if time.monotonic() >= self.deadline:
+            raise RuntimeError("container staging archive deadline expired")
+
+    def tell(self):
+        return self.output.tell()
+
+    def write(self, data):
+        self.check_deadline()
+        if len(data) > STAGE_ARCHIVE_MAX_BYTES - self.tell():
+            raise RuntimeError("container staging archive exceeds transport bound")
+        return self.output.write(data)
+
+    def flush(self):
+        self.output.flush()
 
 
 def add_runtime_arguments(parser):
@@ -164,14 +197,11 @@ class ContainerRuntime:
             stdout=subprocess.DEVNULL)
 
     def prepare_root(self, root):
-        # TemporaryDirectory defaults to 0700. The production image deliberately
-        # runs as uid 10001. Docker copies client-side staging into the stopped
-        # container as root, so make only this task-owned tree world-writable.
-        root.chmod(0o777)
+        # No host bind mount is used. Staging assigns the image's numeric owner
+        # without changing permission bits that belong to artifact receipts.
         for relative in ("data", "logs"):
             path = root / relative
             path.mkdir()
-            path.chmod(0o777)
 
     def cleanup_root(self, _root):
         # Each invocation owns and removes its exact container plus the image's
@@ -227,38 +257,101 @@ class ContainerRuntime:
         return "plinth-runtime-test-" + uuid.uuid4().hex
 
     @staticmethod
-    def _make_tree_writable(root):
-        root = Path(root)
-        for path in (Path(root), *Path(root).rglob("*")):
-            try:
-                current = path.lstat()
-                if stat.S_ISLNK(current.st_mode):
-                    continue
-                permissions = 0o777 if stat.S_ISDIR(current.st_mode) else 0o666
-                os.chmod(path, current.st_mode | permissions,
-                         follow_symlinks=False)
-            except FileNotFoundError:
-                # Browser cleanup can race removal of its own temporary files.
-                continue
-            except NotImplementedError:
-                # A path was replaced with a symlink after lstat(). Refuse to
-                # follow it rather than changing anything outside the owned tree.
-                continue
+    def _write_stage_archive(root, output):
+        count = 0
+        writer = _BoundedTarWriter(output)
+
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+                    info.st_mtime_ns, info.st_ctime_ns)
+
+        def add(archive, parent, name, relative, depth, *, top=False):
+            nonlocal count
+            writer.check_deadline()
+            if (count >= STAGE_MAX_ENTRIES or depth > STAGE_MAX_DEPTH or
+                    len(os.fsencode(relative)) > STAGE_MAX_PATH_BYTES or
+                    relative.startswith("/") or
+                    any(part in ("", ".", "..") for part in relative.split("/"))):
+                raise RuntimeError("container staging inventory exceeds transport bound")
+            info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if top and stat.S_ISLNK(info.st_mode):
+                raise RuntimeError("refusing to stage symbolic-link server path")
+            member = tarfile.TarInfo(relative)
+            member.mode = stat.S_IMODE(info.st_mode)
+            member.uid = IMAGE_UID
+            member.gid = IMAGE_GID
+            member.uname = member.gname = "plinth"
+            member.mtime = int(info.st_mtime)
+            count += 1
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(name, dir_fd=parent)
+                if len(os.fsencode(target)) > STAGE_MAX_PATH_BYTES:
+                    raise RuntimeError("container staging link exceeds transport bound")
+                member.type = tarfile.SYMTYPE
+                member.linkname = target
+                archive.addfile(member)
+                if identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) != identity(info):
+                    raise RuntimeError("container staging link changed during capture")
+            elif stat.S_ISDIR(info.st_mode):
+                descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY |
+                                     os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent)
+                try:
+                    if identity(os.fstat(descriptor)) != identity(info):
+                        raise RuntimeError("container staging directory changed before capture")
+                    member.type = tarfile.DIRTYPE
+                    archive.addfile(member)
+                    with os.scandir(descriptor) as entries:
+                        for entry in entries:
+                            add(archive, descriptor, entry.name,
+                                relative + "/" + entry.name, depth + 1)
+                    if identity(os.fstat(descriptor)) != identity(info):
+                        raise RuntimeError("container staging directory changed during capture")
+                finally:
+                    os.close(descriptor)
+            elif stat.S_ISREG(info.st_mode):
+                if (info.st_size < 0 or
+                        info.st_size > STAGE_ARCHIVE_MAX_BYTES - archive.fileobj.tell()):
+                    raise RuntimeError("container staging content exceeds transport bound")
+                descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC |
+                                     os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                with os.fdopen(descriptor, "rb") as source:
+                    if identity(os.fstat(source.fileno())) != identity(info):
+                        raise RuntimeError("container staging file changed before capture")
+                    member.type = tarfile.REGTYPE
+                    member.size = info.st_size
+                    archive.addfile(member, source)
+                    if identity(os.fstat(source.fileno())) != identity(info):
+                        raise RuntimeError("container staging file changed during capture")
+            else:
+                raise RuntimeError("container staging contains unsupported file type")
+
+        descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY |
+                             os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            with tarfile.open(fileobj=writer, mode="w",
+                              format=tarfile.GNU_FORMAT) as archive:
+                for relative in SERVER_ROOT_ENTRIES:
+                    try:
+                        os.stat(relative, dir_fd=descriptor, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    add(archive, descriptor, relative, relative, 1, top=True)
+        finally:
+            os.close(descriptor)
 
     def _stage_container(self, name, root):
-        root = Path(root).resolve()
-        for relative in SERVER_ROOT_ENTRIES:
-            source = root / relative
-            if source.is_symlink():
-                raise RuntimeError(
-                    f"refusing to stage symbolic-link server path: {source}")
-            if not source.exists():
-                continue
-            self._make_tree_writable(source)
+        # The stopped container receives original modes but its real image UID.
+        # stdin is a finite owned disk file, not a materialized in-memory tree.
+        # Do not pass --archive: stdin already carries numeric ownership. Engine
+        # 27's CopyUIDGID path instead looks up Config.User as one account name
+        # (including its :group suffix), rather than retaining these TAR IDs.
+        with tempfile.TemporaryFile(mode="w+b") as archive:
+            self._write_stage_archive(root, archive)
+            archive.seek(0)
             subprocess.run(
-                ["docker", "cp", str(source),
+                ["docker", "cp", "-",
                  name + ":" + str(CONTAINER_ROOT) + "/"],
-                check=True, timeout=30, stdout=subprocess.DEVNULL)
+                stdin=archive, check=True, timeout=30, stdout=subprocess.DEVNULL)
 
     @staticmethod
     def _remove_owned_path(path):
@@ -284,7 +377,6 @@ class ContainerRuntime:
                  name + ":" + str(CONTAINER_ROOT / relative),
                  str(Path(root).resolve()) + "/"],
                 check=True, timeout=30, stdout=subprocess.DEVNULL)
-            self._make_tree_writable(destination)
 
     def _collect_and_remove(self, name, root):
         # Delete only this exact task-owned container and its anonymous volumes

@@ -133,10 +133,15 @@ test('capability validation matches namespace, function, version and byte bounds
 });
 
 test('descriptor IDs, generation and context key are strictly bounded own data', () => {
-    assert.equal(normalizeFloatDescriptor(descriptor({ generation: '😀'.repeat(256),
-        context_key: 'é'.repeat(256) })).generation, '😀'.repeat(256));
+    for (const generation of ['a'.repeat(256), 'é'.repeat(128), '😀'.repeat(64)]) {
+        assert.equal(encoder.encode(generation).length, 256);
+        assert.equal(normalizeFloatDescriptor(descriptor({ generation,
+            context_key: 'é'.repeat(256) })).generation, generation);
+    }
     assert.equal(normalizeFloatDescriptor(descriptor({ generation: 'a\u0000b' })).generation, 'a\u0000b');
-    for (const changes of [{ generation: '' }, { generation: '😀'.repeat(257) },
+    for (const changes of [{ generation: '' }, { generation: 'a'.repeat(257) },
+        { generation: 'é'.repeat(128) + 'a' }, { generation: '😀'.repeat(64) + 'a' },
+        { generation: '\ud800' }, { generation: '\udc00' }, { generation: '\ud800a' },
         { generation: 1 }, { context_key: '' }, { context_key: 'é'.repeat(257) },
         { context_key: '\u0000' }, { application_id: 'a' }, { application_id: 'notes\n' },
         { application_id: 'a'.repeat(65) }, { panel_id: 'preview\n' }, { panel_id: 'a'.repeat(65) },

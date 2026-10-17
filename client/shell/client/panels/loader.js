@@ -141,6 +141,7 @@ export class PanelManager {
                         version: target.version,
                         generation: target.generation,
                     },
+                    floatActions: this.options.floatActions,
                 });
                 const PanelComponent = module.default(instance.api);
                 if (!this.owns(instance)) {

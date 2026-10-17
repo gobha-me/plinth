@@ -14,6 +14,8 @@ const sources = ['panels/float-model.js', 'panels/float-reservations.js', 'panel
     'panels/interaction-owner.js', 'panels/float-chrome.js', 'panels/panel_api.js', 'css/floats.css',
     'sdk.js', 'data-query.js', 'data-controller.js', 'vendor/preact.module.js', 'vendor/preact-hooks.module.js',
     'launcher/launcher.js', 'launcher/model.js', 'panels/loader.js', 'panels/float-preferences.js',
+    'panels/float-request-owner.js', 'panels/float-transport.js', 'panels/float-controller.js',
+    'panels/float-persistence-adapter.js', 'panels/float-wire.js', 'panels/float-resolver.js',
     'css/launcher.css', 'css/tokens.css'];
 const identity = async () => Object.fromEntries(await Promise.all(sources.map(async path =>
     [path, createHash('sha256').update(await readFile(resolve(client, path))).digest('hex')])));
@@ -481,15 +483,15 @@ try {
     await run('F44.17 actual Launcher primary dirty Cancel after responsive change focuses eligible float', async () => {
         const integrated=await context.newPage();integrated.setDefaultTimeout(5000);
         let cleanupResult;
-        const sockets=new Set();
+        const sockets=new Set(),integratedFailures=[];
         integrated.on('pageerror',error=>pageErrors.push(error.message));
-        await integrated.routeWebSocket(/\/ws\/events$/,socket=>{
-            sockets.add(socket);socket.onClose(()=>sockets.delete(socket));
-            socket.onMessage(message=>{const frame=JSON.parse(message);
-                if(frame.type==='subscribe'||frame.type==='unsubscribe')socket.send(JSON.stringify({type:frame.type+'d',channels:frame.channels}));});
-            socket.send(JSON.stringify({type:'connected'}));
-        });
         try {
+            await integrated.routeWebSocket(/\/ws\/events$/,socket=>{
+                sockets.add(socket);socket.onClose(()=>sockets.delete(socket));
+                socket.onMessage(message=>{const frame=JSON.parse(message);
+                    if(frame.type==='subscribe'||frame.type==='unsubscribe')socket.send(JSON.stringify({type:frame.type+'d',channels:frame.channels}));});
+                socket.send(JSON.stringify({type:'connected'}));
+            });
             await integrated.setViewportSize({width:1200,height:900});
             await integrated.goto(`http://127.0.0.1:${server.address().port}/integrated-launcher`);
             await integrated.getByRole('button',{name:'Integrated app',exact:true}).click();
@@ -515,14 +517,20 @@ try {
             assert.equal(state.metrics['integrated-primary'].shortcuts,0,'inert primary never receives float-modal shortcuts');
             await integrated.keyboard.press('Tab');
             assert.equal(await integrated.evaluate(()=>document.activeElement.closest('.float-window')!==null),true);
+        } catch (error) {
+            integratedFailures.push(error);
         } finally {
             try {
                 cleanupResult=await bounded(()=>integrated.evaluate(()=>window.__integratedFloatFixture?.cleanup()),'integrated fixture cleanup');
                 assert.deepEqual(cleanupResult,{count:0,pending:0,hostEmpty:true,probes:0,primaryInert:false,
                     topbarInert:false,unloadRemoved:true,realtime:'failed'});
-            } finally {await bounded(()=>integrated.close(),'integrated page close');}
-            assert.equal(sockets.size,0,'integrated fixture realtime socket is closed');
+            } catch (error) {integratedFailures.push(error);}
+            try {await bounded(()=>integrated.close(),'integrated page close');}
+            catch (error) {integratedFailures.push(error);}
+            try {assert.equal(sockets.size,0,'integrated fixture realtime socket is closed');}
+            catch (error) {integratedFailures.push(error);}
         }
+        if(integratedFailures.length)throw new AggregateError(integratedFailures,'integrated Launcher journey or ownership cleanup failed');
     });
     await run('F44.18 unverifiable chrome/background cleanup poisons even an empty document budget', async () => {
         cleanupPoisonExpected = true;

@@ -152,6 +152,119 @@ auto reset_development_schemas(const PgConnection& pg) -> void {
   }
 }
 
+auto ensure_artifact_receipts_schema(const PgConnection& pg) -> void {
+  // Retained installations do not rerun schema.sql. Create only the new empty
+  // table; do not compute or backfill provenance for existing package rows.
+  // Compare against a temporary independently declared expected schema so a
+  // same-named weakened/preexisting table cannot silently establish receipts.
+  constexpr std::string_view DEFINITION = R"sql((
+    package_id UUID NOT NULL REFERENCES plinth.packages(id) ON DELETE CASCADE,
+    profile INTEGER NOT NULL CHECK (profile = 1),
+    artifact_digest TEXT NOT NULL CHECK (artifact_digest ~ '^[0-9a-f]{64}$'),
+    declarations_digest TEXT NOT NULL CHECK (declarations_digest ~ '^[0-9a-f]{64}$'),
+    record_count INTEGER NOT NULL CHECK (record_count >= 0 AND record_count <= 4096),
+    content_bytes BIGINT NOT NULL CHECK (content_bytes >= 0 AND content_bytes <= 52428800),
+    metadata_bytes INTEGER NOT NULL CHECK (metadata_bytes >= 32 AND metadata_bytes <= 1048576),
+    PRIMARY KEY (package_id, profile)
+  ))sql";
+  pg.exec("BEGIN");
+  pg.exec("CREATE TABLE IF NOT EXISTS plinth.package_artifact_receipts " +
+          std::string{DEFINITION});
+  // PostgreSQL forbids a temporary table's FK to a permanent relation. Compare
+  // ordinary columns/checks/PK against the temp template and verify the real
+  // cascading FK independently below, without changing the live definition.
+  auto temporary_definition = std::string{DEFINITION};
+  const std::string reference =
+      "REFERENCES plinth.packages(id) ON DELETE CASCADE";
+  temporary_definition.erase(temporary_definition.find(reference),
+                             reference.size());
+  pg.exec("CREATE TEMP TABLE plinth_expected_artifact_receipts " +
+          temporary_definition + " ON COMMIT DROP");
+  if (!pg.has_rows(R"sql(
+    SELECT 1 FROM pg_class actual
+    JOIN pg_class packages ON packages.oid='plinth.packages'::regclass
+    WHERE actual.oid='plinth.package_artifact_receipts'::regclass
+      AND actual.relkind='r' AND actual.relpersistence='p'
+      AND actual.relowner=packages.relowner
+      AND NOT actual.relrowsecurity AND NOT actual.relforcerowsecurity
+      AND NOT actual.relispartition
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_inherits
+        WHERE inhrelid=actual.oid OR inhparent=actual.oid)
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_rewrite WHERE ev_class=actual.oid)
+      AND NOT EXISTS (
+        SELECT 1 FROM aclexplode(COALESCE(actual.relacl,
+                   acldefault('r',actual.relowner))) acl
+        WHERE acl.grantee<>actual.relowner)
+      AND NOT EXISTS (
+        SELECT 1 FROM pg_trigger WHERE tgrelid=actual.oid AND NOT tgisinternal)
+      AND (SELECT count(*) FROM pg_constraint c
+           WHERE c.conrelid=actual.oid AND c.contype='f')=1
+      AND EXISTS (
+        SELECT 1 FROM pg_constraint c
+        JOIN pg_attribute p ON p.attrelid=packages.oid AND p.attname='id'
+        WHERE c.conrelid=actual.oid AND c.contype='f'
+          AND c.conkey=ARRAY[1]::smallint[] AND c.confkey=ARRAY[p.attnum]
+          AND c.confrelid=packages.oid AND c.convalidated
+          AND NOT c.condeferrable AND NOT c.condeferred
+          AND c.confdeltype='c' AND c.confupdtype='a' AND c.confmatchtype='s'
+          AND (SELECT count(*) FROM pg_trigger t WHERE t.tgconstraint=c.oid)=4
+          AND NOT EXISTS (SELECT 1 FROM pg_trigger t
+                          WHERE t.tgconstraint=c.oid AND
+                                (NOT t.tgisinternal OR t.tgenabled NOT IN ('O','A'))))
+      AND EXISTS (
+        SELECT 1 FROM pg_constraint c JOIN pg_index i ON i.indexrelid=c.conindid
+        WHERE c.conrelid=actual.oid AND c.contype='p'
+          AND i.indisvalid AND i.indisready AND i.indisunique
+          AND i.indisprimary AND i.indimmediate
+          AND i.indpred IS NULL AND i.indexprs IS NULL)
+  )sql")) {
+    throw std::runtime_error("incompatible artifact receipt table ownership");
+  }
+  if (pg.has_rows(R"sql(
+    WITH columns AS (
+      SELECT a.attrelid, a.attnum, a.attname,
+             format_type(a.atttypid,a.atttypmod) AS type,
+             a.attnotnull, a.attgenerated, a.attidentity, a.attisdropped,
+             pg_get_expr(d.adbin,d.adrelid) AS default_value,
+             a.attacl
+      FROM pg_attribute a LEFT JOIN pg_attrdef d
+        ON d.adrelid=a.attrelid AND d.adnum=a.attnum
+      WHERE a.attnum>0 AND a.attrelid IN (
+        'plinth.package_artifact_receipts'::regclass,
+        'pg_temp.plinth_expected_artifact_receipts'::regclass)
+    ), actual AS (
+      SELECT attnum,attname,type,attnotnull,attgenerated,attidentity,
+             attisdropped,default_value,attacl
+      FROM columns WHERE attrelid='plinth.package_artifact_receipts'::regclass
+    ), expected AS (
+      SELECT attnum,attname,type,attnotnull,attgenerated,attidentity,
+             attisdropped,default_value,attacl
+      FROM columns WHERE attrelid='pg_temp.plinth_expected_artifact_receipts'::regclass
+    )
+    (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    UNION ALL (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+  )sql") ||
+      pg.has_rows(R"sql(
+    WITH actual AS (
+      SELECT contype,convalidated,condeferrable,condeferred,
+             pg_get_constraintdef(oid,true) AS definition
+      FROM pg_constraint WHERE conrelid='plinth.package_artifact_receipts'::regclass
+        AND contype<>'f'
+    ), expected AS (
+      SELECT contype,convalidated,condeferrable,condeferred,
+             pg_get_constraintdef(oid,true) AS definition
+      FROM pg_constraint WHERE conrelid='pg_temp.plinth_expected_artifact_receipts'::regclass
+    )
+    (SELECT * FROM actual EXCEPT SELECT * FROM expected)
+    UNION ALL (SELECT * FROM expected EXCEPT SELECT * FROM actual)
+  )sql")) {
+    throw std::runtime_error("incompatible artifact receipt storage contract");
+  }
+  pg.exec("COMMIT");
+}
+
 auto ensure_typed_panel_schema(const PgConnection& pg) -> void {
   // Existing declaration JSON is never evidence of validation. The additive
   // marker defaults to legacy and no migration interprets old metadata.
@@ -389,6 +502,7 @@ auto bootstrap_schema(const Config::Database& db_cfg,
   }
 
   ensure_typed_panel_schema(pg);
+  ensure_artifact_receipts_schema(pg);
 
   // Kernel-owned, idempotent upgrade for #37 invite registration. Existing
   // retained installations skip schema.sql, so create the digest-only invite

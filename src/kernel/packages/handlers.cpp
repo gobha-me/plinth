@@ -204,6 +204,7 @@ auto handle_post_packages(
       .upgrade_drain_timeout_ms =
           std::chrono::milliseconds{
               effective_upgrade_drain_timeout_ms(cfg.upgrade_drain_timeout_ms)},
+      .generation_registry = cfg.generation_registry,
   };
   std::span<const std::byte> blob{
       // body is raw bytes; std::span<const std::byte> is the installer API.
@@ -480,6 +481,7 @@ auto handle_patch_package(
       .upgrade_drain_timeout_ms =
           std::chrono::milliseconds{
               effective_upgrade_drain_timeout_ms(cfg.upgrade_drain_timeout_ms)},
+      .generation_registry = cfg.generation_registry,
   };
 
   std::expected<PackageRecord, TransitionFailure> r =
@@ -511,6 +513,7 @@ auto handle_delete_package(
       .upgrade_drain_timeout_ms =
           std::chrono::milliseconds{
               effective_upgrade_drain_timeout_ms(cfg.upgrade_drain_timeout_ms)},
+      .generation_registry = cfg.generation_registry,
   };
 
   auto r = uninstall_package(id, confirmed, ctx);

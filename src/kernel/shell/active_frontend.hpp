@@ -34,11 +34,14 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 
 namespace plinth::shell {
+
+class PreparedPlatform;
 
 struct ActiveFrontend {
   std::string id;      // plinth.packages.id
@@ -48,7 +51,22 @@ struct ActiveFrontend {
   std::string entry;   // e.g. "index.html"
   std::filesystem::path
       client_dir; // <data_dir>/extensions/<name>/<version>/client/
+  bool bundled = false;
+  std::shared_ptr<const PreparedPlatform> platform;
 };
+
+// Fenced lifecycle publication: this only attaches immutable document metadata,
+// never storage/caller authority. Root owns the acknowledged DB/current
+// pointer, fixed storage and physical-asset readiness checks before this hook.
+[[nodiscard]] auto publish_platform_frontend(
+    ActiveFrontend active, std::shared_ptr<const PreparedPlatform> platform)
+    -> bool;
+// Refresh only a previously registered mount (or prepare initial registration).
+// A changed mount requires normal route registration, not a hidden new route.
+[[nodiscard]] auto refresh_active_frontend(ActiveFrontend active) -> bool;
+[[nodiscard]] auto current_platform()
+    -> std::shared_ptr<const PreparedPlatform>;
+auto retire_platform_frontend(std::string_view package_id) -> void;
 
 // Resolve the active frontend row from `plinth.packages`. Picks the
 // single ACTIVE row with `frontend_mount IS NOT NULL`. Returns nullopt
