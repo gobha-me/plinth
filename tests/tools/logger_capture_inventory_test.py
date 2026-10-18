@@ -105,18 +105,34 @@ def commands_sync_conversion(command: list, binary: Path) -> bool:
     if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
         return False
     if Path(command[0]).resolve() == binary.resolve():
-        if len(command) == 1:
+        selectors = []
+        index = 1
+        durations_seen = False
+        while index < len(command):
+            argument = command[index]
+            if argument == "--durations":
+                # Pinned Catch2 changes only showDurations for this exact
+                # reporting pair. It does not select tests or waive failures.
+                if durations_seen or index + 1 >= len(command) or command[index + 1] not in ("yes", "no"):
+                    return True
+                durations_seen = True
+                index += 2
+                continue
+            if argument.startswith("-"):
+                # Every other short/long option may alter selection. Keep
+                # unknown, combined and malformed spellings fail closed.
+                return True
+            selectors.append(argument)
+            index += 1
+        if not selectors:
+            # Reporting-only commands still default to running every test.
             return True
-        for selector in command[1:]:
+        for selector in selectors:
             folded = selector.casefold()
             if (SYNC_CONVERSION_TAG.casefold() in folded
                     or SYNC_CONVERSION_CASE.casefold() in folded):
                 # Exclusion-bearing commands need a fully validated identity,
                 # just like the shared and metadata gates checked above.
-                return True
-            if selector.startswith("--"):
-                # Unknown options can change selection; existing direct gates
-                # use exactly one selector, already independently validated.
                 return True
             if selects_sync_conversion(selector):
                 return True
@@ -1161,6 +1177,45 @@ def self_test() -> int:
                      "~?uickJS synchronous evaluation has bounded deterministic conversion corpora"):
         reject_sync_control(gates=gates + [{
             "name": "unexpected_raw_name_exclusion", "command": [str(binary), selector],
+        }])
+    if rejected != 429:
+        raise AssertionError("all 429 existing isolation controls must remain present")
+    pg_selector = "[integration] ~[ws] ~[js] ~[subprocess]"
+    for arguments in (
+        [pg_selector, "--durations", "yes"], [pg_selector, "--durations", "no"],
+        ["--durations", "yes", pg_selector],
+        ["[js][ordinary]", "--durations", "yes"],
+        ["[js] ~[conversion]", "--durations", "no"],
+        ["[unrelated]", "--durations", "yes", "ordinary conversion*"],
+    ):
+        validate_inventory(isolated, ordinary_sync,
+                           gates + [{"name": "ordinary_duration_reporting_gate",
+                                     "command": [str(binary), *arguments]}],
+                           grouped_selector, binary, sync_baseline, pubsub, cap,
+                           db_admission, db_batch, sync_conversion)
+    for arguments in (
+        ["--durations", "yes"], ["--durations", "no"],
+        ["--durations"], [pg_selector, "--durations"],
+        [pg_selector, "--durations", ""], [pg_selector, "--durations", "YES"],
+        [pg_selector, "--durations", "maybe"],
+        [pg_selector, "--durations", SYNC_CONVERSION_CASE],
+        [pg_selector, "--durations=yes"], [pg_selector, "--durations", "yes", "--durations", "no"],
+        ["-d", "yes"], ["-dyes"], ["-r", "xml"], ["-rxml"],
+        [pg_selector, "-d", "yes"], [pg_selector, "-dyes"],
+        [pg_selector, "-rxml", "--durations", "yes"],
+        [pg_selector, "--unknown", "value"],
+        [pg_selector, "--input-file", "wanted-tests.txt"],
+        [pg_selector, "-f", "wanted-tests.txt"],
+        [pg_selector, "--list-tests"], [pg_selector, "--", "--durations", "yes"],
+        [pg_selector, "--durations", "yes", SYNC_CONVERSION_CASE],
+        ["--durations", "no", SYNC_CONVERSION_TAG],
+        ["[ordinary]", "--durations", "yes", "[js]"],
+        [pg_selector, "--durations", "yes", "[CONVERSION][CORPUS]"],
+        [pg_selector, "--durations", "yes", ""],
+    ):
+        reject_sync_control(gates=gates + [{
+            "name": "unexpected_duration_selection_gate",
+            "command": [str(binary), *arguments],
         }])
     return rejected
 
