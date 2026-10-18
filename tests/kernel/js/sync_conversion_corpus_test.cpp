@@ -816,7 +816,7 @@ auto shrink(Harness& harness, Entry entry, plinth::js::RuntimePool& pool,
         break;
       }
       REQUIRE(candidate.family == current.family);
-      REQUIRE(complexity(candidate) < complexity(current));
+      REQUIRE((complexity(candidate) < complexity(current)));
       ++attempts;
       ++harness.shrink_attempts;
       auto observed = harness.observe(entry, pool, candidate);
@@ -969,7 +969,7 @@ auto shrinking_controls(Harness& harness, Entry entry,
   REQUIRE(signature == Mismatch::string_length);
   const auto minimized =
       shrink(harness, entry, pool, original, signature, true);
-  REQUIRE(complexity(minimized) < complexity(original));
+  REQUIRE((complexity(minimized) < complexity(original)));
   REQUIRE(minimized.family == original.family);
   REQUIRE(minimized.source == MINIMAL_NUL_SOURCE);
   const auto clean = harness.observe(entry, pool, minimized);
