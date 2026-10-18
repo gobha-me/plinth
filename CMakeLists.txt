@@ -625,6 +625,7 @@ add_executable(plinth
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
   src/kernel/frontend/applications.cpp
+  src/kernel/frontend/admin_defaults_contract.cpp
   src/kernel/frontend/typed_requests.cpp
   src/kernel/frontend/persistence_projection.cpp
   src/kernel/frontend/typed_assets.cpp
@@ -828,6 +829,7 @@ add_executable(plinth_tests
   tests/kernel/shell/preferences_dispatch_test.cpp
   tests/kernel/frontend/api_frontend_test.cpp
   tests/kernel/frontend/applications_test.cpp
+  tests/kernel/frontend/admin_defaults_contract_test.cpp
   tests/kernel/frontend/typed_requests_test.cpp
   tests/kernel/frontend/typed_assets_test.cpp
   tests/kernel/frontend/owned_frontend_worker_test.cpp
@@ -938,6 +940,7 @@ add_executable(plinth_tests
   src/kernel/shell/firstboot.cpp
   src/kernel/frontend/api_frontend.cpp
   src/kernel/frontend/applications.cpp
+  src/kernel/frontend/admin_defaults_contract.cpp
   src/kernel/frontend/typed_requests.cpp
   src/kernel/frontend/persistence_projection.cpp
   src/kernel/frontend/typed_assets.cpp
@@ -1103,6 +1106,9 @@ foreach(ENTRY IN ITEMS
     "service_catalog|float layout service: real installed catalog admission and credential refresh"
     "service_storage|float layout service: native storage restore envelope and policy refusal"
     "service_assets|float layout service: admitted asset physical ownership and public bootstrap"
+    "admin_service|float layout service: native admin defaults fresh authority and exact storage"
+    "admin_ack|float layout service: admin native settlement and real lifecycle ACK fence"
+    "admin_physical|float layout service: blocked admin SQL retains physical owner after logical cancellation"
     "db_deadline|ordinary nested PostgreSQL scopes cannot renew an absolute deadline"
     "db_cleanup|absolute PostgreSQL expiry still permits bounded confirmed cancellation")
   string(REPLACE "|" ";" PARTS "${ENTRY}")
@@ -1121,7 +1127,8 @@ endforeach()
 foreach(NAME IN ITEMS authority_credentials authority_targets storage_schema
                       storage_cutover storage_physical db_cleanup
                       generation_lifecycle platform_startup
-                      service_catalog service_storage service_assets)
+                      service_catalog service_storage service_assets
+                      admin_service admin_ack admin_physical)
   set_tests_properties(plinth_tests_installed_float_${NAME}
     PROPERTIES RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
                LABELS "needs_pg;native_ownership")
@@ -1134,6 +1141,23 @@ set_tests_properties(plinth_tests_generation_receipts
 
 # These are pure format tests, not persistence approval or installed-browser
 # acceptance. Exact positive receipts prevent a renamed/empty case from passing.
+foreach(ENTRY IN ITEMS
+    "requests|admin defaults: closed raw and native requests"
+    "results|admin defaults: closed fixed module results and schema envelopes"
+    "cursor|admin defaults: independent bounded authenticated cursor domain")
+  string(REPLACE "|" ";" PARTS "${ENTRY}")
+  list(GET PARTS 0 NAME)
+  list(GET PARTS 1 CASE)
+  add_test(NAME plinth_tests_admin_defaults_${NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${CASE}"
+      --timeout 45
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_admin_defaults_${NAME} PROPERTIES TIMEOUT 60)
+endforeach()
+
 foreach(ENTRY IN ITEMS
     "policy|restore policy: strict bounded raw contract"
     "digests|restore digests: canonical bounded byte formats")

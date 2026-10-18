@@ -8,6 +8,7 @@
 #include "kernel/frontend/owned_frontend_worker.hpp"
 #include "kernel/frontend/surface_authority.hpp"
 #include "kernel/frontend/typed_assets.hpp"
+#include "kernel/logging.hpp"
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/installed_generation_registry.hpp"
 #include "kernel/shell/active_frontend.hpp"
@@ -90,6 +91,16 @@ auto unix_seconds() -> std::int64_t {
       .count();
 }
 
+auto frame_identity(const shell::PreparedPlatform& platform,
+                    const extensions::FixedShellStorageBinding& storage)
+    -> admin_ack_detail::FrameIdentity {
+  return {.platform_key = platform.key(),
+          .profile = platform.profile(),
+          .artifact_digest = platform.artifact_digest(),
+          .storage_identity = storage.identity,
+          .storage_artifact_digest = storage.artifact_digest};
+}
+
 auto current_frontend_matches(PGconn& connection,
                               const shell::PreparedPlatform& platform) -> bool {
   const std::unique_ptr<PGresult, decltype(&PQclear)> result(
@@ -114,6 +125,78 @@ auto current_frontend_matches(PGconn& connection,
 
 } // namespace
 
+auto admin_ack_detail::same_identity(const FrameIdentity& admitted,
+                                     const FrameIdentity& current) noexcept
+    -> bool {
+  return admitted.platform_key == current.platform_key &&
+         admitted.profile == current.profile &&
+         admitted.artifact_digest == current.artifact_digest &&
+         admitted.storage_identity == current.storage_identity &&
+         admitted.storage_artifact_digest == current.storage_artifact_digest;
+}
+
+struct FloatLayoutService::AdminAckOwner {
+  struct Stamp {
+    std::shared_ptr<const shell::PreparedPlatform> platform;
+    extensions::FixedShellStorageBinding storage;
+  };
+  AdminAckOwner(std::shared_ptr<void> physical, Stamp stamp,
+                std::unique_ptr<capabilities::drain::DispatchGuard> guard,
+                OwnedFrontendWorker::Deadline deadline)
+      : physical(std::move(physical)), stamp(std::move(stamp)),
+        guard(std::move(guard)), deadline(deadline) {}
+  // Independent accepted/slot/budget owner FIRST, released LAST. No operation,
+  // callback, response, request or PG/name owner can be reached from here.
+  std::shared_ptr<void> physical;
+  const Stamp stamp;
+  std::unique_ptr<capabilities::drain::DispatchGuard> guard;
+  const OwnedFrontendWorker::Deadline deadline;
+};
+
+FloatLayoutService::AdminReply::AdminReply(std::shared_ptr<AdminAckOwner> owner,
+                                           Json::Value body)
+    : owner(std::move(owner)), value(std::move(body)) {
+}
+auto FloatLayoutService::AdminReply::operator=(AdminReply&& other) noexcept
+    -> AdminReply& {
+  if (this != &other) {
+    // Default member assignment would retire the old ACK owner before its old
+    // body. Keep that whole prior frame local until body-first destruction.
+    AdminReply previous{std::move(*this)};
+    owner = std::move(other.owner);
+    value = std::move(other.value);
+  }
+  return *this;
+}
+auto FloatLayoutService::AdminReply::body() const noexcept
+    -> const Json::Value& {
+  return value;
+}
+auto FloatLayoutService::AdminReply::profile() const noexcept
+    -> std::string_view {
+  return owner->stamp.platform->profile();
+}
+auto FloatLayoutService::AdminReply::prepare_handoff() const
+    -> std::expected<void, js::PromiseRejection> try {
+  if (!owner || !owner->guard || !owner->guard->admitted() ||
+      std::chrono::steady_clock::now() >= owner->deadline)
+    return std::unexpected(unavailable());
+  const auto platform = shell::current_platform();
+  const auto storage = extensions::fixed_shell_storage_binding();
+  if (!platform || !storage) return std::unexpected(unavailable());
+  const auto& stamp = owner->stamp;
+  if (!admin_ack_detail::same_identity(
+          frame_identity(*stamp.platform, stamp.storage),
+          frame_identity(*platform, *storage)))
+    return std::unexpected(unavailable("stale_binding"));
+  if (capabilities::drain::is_fenced("shell") ||
+      capabilities::drain::is_application_blocked("shell"))
+    return std::unexpected(unavailable());
+  return {};
+} catch (...) {
+  return std::unexpected(unavailable());
+}
+
 struct FloatLayoutService::State {
   State(
       Config cfg,
@@ -136,12 +219,15 @@ struct FloatLayoutService::State {
   std::shared_ptr<const packages::restore::ProtectedPolicy> policy;
   std::shared_ptr<TypedAssetStreams> streams;
   protocol::CursorCodec cursors;
+  admin_defaults::CursorCodec admin_cursors;
   mutable std::mutex mutex;
   std::condition_variable changed;
   std::size_t active = 0;
   bool accepting = true;
   bool delivery_failed = false;
   std::atomic<std::size_t> fixed_dispatch_attempts{0};
+  std::atomic<int> admin_caller_depth{-1};
+  std::function<void()> admin_native_settled_hook;
 };
 
 struct FloatLayoutService::RequestData {
@@ -151,7 +237,10 @@ struct FloatLayoutService::RequestData {
     ADMIT,
     ASSET,
     LAYOUT_READ,
-    LAYOUT_COMMIT
+    LAYOUT_COMMIT,
+    ADMIN_READ,
+    ADMIN_PUT,
+    ADMIN_DELETE
   };
   Kind kind = Kind::RAW_READ;
   CatalogQuery query;
@@ -160,6 +249,28 @@ struct FloatLayoutService::RequestData {
   drogon::HttpRequestPtr http;
   AssetCompletion asset_completion;
   std::optional<layout_contract::ParsedFloatCommit> commit;
+  std::optional<admin_defaults::ReadRequest> admin_read;
+  std::optional<admin_defaults::PutRequest> admin_put;
+  std::optional<admin_defaults::DeleteRequest> admin_delete;
+  AdminCompletion admin_completion;
+  [[nodiscard]] auto is_admin() const -> bool {
+    return kind == Kind::ADMIN_READ || kind == Kind::ADMIN_PUT ||
+           kind == Kind::ADMIN_DELETE;
+  }
+  [[nodiscard]] auto valid_admin() const -> bool {
+    switch (kind) {
+      case Kind::ADMIN_READ:
+        return admin_read &&
+               admin_defaults::validate_read(*admin_read).has_value();
+      case Kind::ADMIN_PUT:
+        return admin_put &&
+               admin_defaults::validate_put(*admin_put).has_value();
+      case Kind::ADMIN_DELETE:
+        return admin_delete &&
+               admin_defaults::validate_delete(*admin_delete).has_value();
+      default: return false;
+    }
+  }
 };
 
 struct FloatLayoutService::TargetProof {
@@ -211,6 +322,10 @@ struct FloatLayoutService::ReadOperation {
       provider_guards;
   std::unique_ptr<capabilities::drain::DispatchGuard> compatibility_guard;
   std::string platform_profile;
+  std::shared_ptr<AdminAckOwner> admin_ack;
+  std::optional<AdminReply> admin_reply;
+  std::optional<std::string> admin_after;
+  std::atomic<bool> admin_dispatched{false};
   std::optional<js::PromiseRejection> rejection;
   struct NativeBridge {
     std::mutex mutex;
@@ -270,7 +385,60 @@ struct FloatLayoutService::ReadOperation {
     // it alive with a late native database callback. The physical slot remains.
     auto callback = std::move(completion);
     try {
-      if (request && request->asset_completion) {
+      if (request && request->admin_completion) {
+        auto admin_callback = std::move(request->admin_completion);
+        const bool success = result.has_value() && admin_reply.has_value();
+        try {
+          Json::Value detail{Json::objectValue};
+          detail["method"] =
+              request->kind == RequestData::Kind::ADMIN_READ  ? "GET"
+              : request->kind == RequestData::Kind::ADMIN_PUT ? "PUT"
+                                                              : "DELETE";
+          detail["outcome"] =
+              success ? "db_acknowledged_response_attempt"
+              : !result && (result.error().code == "permission_denied" ||
+                            result.error().code == "not_authenticated" ||
+                            result.error().code == "invalid_argument")
+                  ? "denied"
+              : admin_dispatched.load() &&
+                      request->kind != RequestData::Kind::ADMIN_READ
+                  ? "uncertain"
+                  : "unavailable";
+          if (request->valid_admin()) {
+            if (request->admin_put) {
+              detail["content_type"] = request->admin_put->content_type;
+              detail["application_id"] =
+                  request->admin_put->handler.application_id;
+              detail["panel_id"] = request->admin_put->handler.panel_id;
+            } else if (request->admin_delete)
+              detail["content_type"] = request->admin_delete->content_type;
+            else if (const auto* single =
+                         std::get_if<admin_defaults::ReadSingle>(
+                             &*request->admin_read))
+              detail["content_type"] = single->content_type;
+          }
+          // One bounded logical outcome. Existing async audit is not atomic
+          // with business DML and does not acknowledge transport/client
+          // delivery.
+          log::audit("frontend.admin_defaults", detail,
+                     log::AuditCtx{auth.user_id, auth.session_id, ip});
+        } catch (...) {
+          // A failed audit setup remains a sticky drain failure but cannot
+          // suppress the one owned business completion or cause a retry.
+          std::lock_guard lock{state->mutex};
+          state->delivery_failed = true;
+        }
+        if (success) {
+          admin_callback(std::move(*admin_reply));
+        } else {
+          // Release ACK admission before a refusal callback: a lifecycle name
+          // owner waiting for drain must not depend on an error consumer.
+          admin_reply.reset();
+          admin_ack.reset();
+          admin_callback(std::unexpected(result ? unavailable()
+                                                : std::move(result.error())));
+        }
+      } else if (request && request->asset_completion) {
         auto asset_callback = std::move(request->asset_completion);
         // The response/source independently owns its accepted physical alias.
         // Do not retain the HTTP request once delivery is logically finished.
@@ -398,11 +566,62 @@ auto FloatLayoutService::commit_layout(
   }
 }
 
+auto FloatLayoutService::read_admin_defaults(
+    admin_defaults::ReadRequest input, auth::AuthContext auth,
+    std::string trusted_ip, int caller_depth, AdminCompletion completion,
+    std::shared_ptr<lifecycle::AsyncTaskLease> accepted) -> void {
+  try {
+    auto request = std::make_unique<RequestData>();
+    request->kind = RequestData::Kind::ADMIN_READ;
+    request->admin_read = std::move(input);
+    request->admin_completion = std::move(completion);
+    submit(std::move(request), std::move(auth), std::move(trusted_ip),
+           caller_depth, {}, std::move(accepted));
+  } catch (...) {
+    reject_setup({}, {}, std::move(completion));
+  }
+}
+
+auto FloatLayoutService::put_admin_default(
+    admin_defaults::PutRequest input, auth::AuthContext auth,
+    std::string trusted_ip, int caller_depth, AdminCompletion completion,
+    std::shared_ptr<lifecycle::AsyncTaskLease> accepted) -> void {
+  try {
+    auto request = std::make_unique<RequestData>();
+    request->kind = RequestData::Kind::ADMIN_PUT;
+    request->admin_put = std::move(input);
+    request->admin_completion = std::move(completion);
+    submit(std::move(request), std::move(auth), std::move(trusted_ip),
+           caller_depth, {}, std::move(accepted));
+  } catch (...) {
+    reject_setup({}, {}, std::move(completion));
+  }
+}
+
+auto FloatLayoutService::delete_admin_default(
+    admin_defaults::DeleteRequest input, auth::AuthContext auth,
+    std::string trusted_ip, int caller_depth, AdminCompletion completion,
+    std::shared_ptr<lifecycle::AsyncTaskLease> accepted) -> void {
+  try {
+    auto request = std::make_unique<RequestData>();
+    request->kind = RequestData::Kind::ADMIN_DELETE;
+    request->admin_delete = std::move(input);
+    request->admin_completion = std::move(completion);
+    submit(std::move(request), std::move(auth), std::move(trusted_ip),
+           caller_depth, {}, std::move(accepted));
+  } catch (...) {
+    reject_setup({}, {}, std::move(completion));
+  }
+}
+
 auto FloatLayoutService::reject_setup(Completion completion,
-                                      AssetCompletion asset_completion) noexcept
+                                      AssetCompletion asset_completion,
+                                      AdminCompletion admin_completion) noexcept
     -> void {
   try {
-    if (asset_completion)
+    if (admin_completion)
+      admin_completion(std::unexpected(unavailable()));
+    else if (asset_completion)
       asset_completion(std::unexpected(unavailable()));
     else if (completion)
       completion(std::unexpected(unavailable()));
@@ -418,7 +637,7 @@ auto FloatLayoutService::submit(
     std::unique_ptr<RequestData> request, auth::AuthContext auth,
     std::string trusted_ip, int caller_depth, Completion completion,
     std::shared_ptr<lifecycle::AsyncTaskLease> accepted) -> void {
-  if (!completion && !request->asset_completion) {
+  if (!completion && !request->asset_completion && !request->admin_completion) {
     std::lock_guard lock{state->mutex};
     state->delivery_failed = true;
     return;
@@ -431,7 +650,10 @@ auto FloatLayoutService::submit(
     if (!request_charge) {
       auto callback = std::move(completion);
       try {
-        if (request->asset_completion) {
+        if (request->admin_completion) {
+          auto admin_callback = std::move(request->admin_completion);
+          admin_callback(std::unexpected(unavailable("request_busy")));
+        } else if (request->asset_completion) {
           auto asset_callback = std::move(request->asset_completion);
           asset_callback(std::unexpected(unavailable("request_busy")));
         } else {
@@ -457,6 +679,10 @@ auto FloatLayoutService::submit(
     operation->depth = caller_depth;
     operation->deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    if (operation->request->is_admin() && !operation->request->valid_admin()) {
+      operation->finish(std::unexpected(unavailable("invalid_argument")));
+      return;
+    }
     // Native callers receive the same pre-dispatch refusal as HTTP callers.
     // finish owns exactly-once completion even if that callback throws. No
     // worker, PG operation or fixed resolver dispatch has been started here.
@@ -515,10 +741,11 @@ auto FloatLayoutService::submit(
           const bool admin_candidate =
               operation->request->kind == RequestData::Kind::CATALOG &&
               operation->request->query.filters.include_admin_default;
+          const bool admin_management = operation->request->is_admin();
           if (operation->request->kind != RequestData::Kind::RAW_READ &&
               operation->request->kind != RequestData::Kind::LAYOUT_READ &&
               operation->request->kind != RequestData::Kind::LAYOUT_COMMIT &&
-              !admin_candidate) {
+              !admin_candidate && !admin_management) {
             metadata(operation, connection);
             return;
           }
@@ -542,7 +769,10 @@ auto FloatLayoutService::submit(
               return;
             }
             auto caller =
-                admin_candidate
+                admin_management
+                    ? authority::require_rule(*connection, operation->auth,
+                                              "kernel.admin")
+                : admin_candidate
                     ? authority::authenticate(*connection, operation->auth)
                     : authority::require_shell_preference_rule(
                           *connection, operation->auth, false);
@@ -582,9 +812,41 @@ auto FloatLayoutService::submit(
             // proof. This SAME guard crosses queue/frame/native callbacks; the
             // next lifecycle operation must drain it before cutover.
             operation->guard = std::move(guard);
+            if (admin_management) {
+              auto ack_guard =
+                  std::make_unique<capabilities::drain::DispatchGuard>("shell");
+              if (!ack_guard->admitted() ||
+                  capabilities::drain::is_application_blocked("shell")) {
+                operation->rejection = unavailable();
+                return;
+              }
+              operation->admin_ack = std::make_shared<AdminAckOwner>(
+                  operation->physical, AdminAckOwner::Stamp{platform, *storage},
+                  std::move(ack_guard), deadline);
+              if (operation->request->admin_read) {
+                if (const auto* page = std::get_if<admin_defaults::ReadPage>(
+                        &*operation->request->admin_read);
+                    page && page->cursor) {
+                  auto after = operation->state->admin_cursors.decode(
+                      *page->cursor, operation->auth,
+                      {.limit = page->limit,
+                       .platform_profile = platform->profile()},
+                      unix_seconds());
+                  if (!after) {
+                    operation->rejection = unavailable(
+                        after.error() == admin_defaults::Error::INVALID
+                            ? "invalid_argument"
+                            : "storage_unavailable");
+                    return;
+                  }
+                  operation->admin_after = std::move(*after);
+                }
+              }
+            }
             caller->ip_address = operation->ip;
             operation->caller = std::move(*caller);
             operation->binding = storage->identity;
+            scope.checkpoint();
             // The PG/name owner remains thread-confined. Release the name lock
             // AFTER counted admission, BEFORE dispatching native asynchronous
             // work; keep only the idle metadata connection on this worker.
@@ -608,7 +870,24 @@ auto FloatLayoutService::submit(
           }
           operation->output = std::move(operation->native.result);
           lock.unlock();
-          if (admin_candidate) {
+          if (admin_management) {
+            if (!operation->output || !*operation->output) {
+              operation->rejection = unavailable(
+                  operation->output &&
+                          operation->output->error().code == "stale_generation"
+                      ? "stale_binding"
+                      : "storage_unavailable");
+              return;
+            }
+            std::function<void()> hook;
+            {
+              std::lock_guard state_lock{operation->state->mutex};
+              hook = operation->state->admin_native_settled_hook;
+            }
+            if (hook) hook(); // No name/native/registry/frontend lock is held.
+            scope.checkpoint();
+            prepare_admin_reply(operation, connection);
+          } else if (admin_candidate) {
             if (!operation->output || !*operation->output) return;
             metadata(operation, connection);
           } else if (operation->request->kind ==
@@ -656,9 +935,13 @@ auto FloatLayoutService::submit(
     try {
       if (operation &&
           (operation->completion ||
-           (operation->request && operation->request->asset_completion)))
+           (operation->request && (operation->request->asset_completion ||
+                                   operation->request->admin_completion))))
         operation->finish(std::unexpected(unavailable()));
-      else if (request && request->asset_completion) {
+      else if (request && request->admin_completion) {
+        auto admin_callback = std::move(request->admin_completion);
+        admin_callback(std::unexpected(unavailable()));
+      } else if (request && request->asset_completion) {
         auto asset_callback = std::move(request->asset_completion);
         asset_callback(std::unexpected(unavailable()));
       } else if (completion)
@@ -672,6 +955,115 @@ auto FloatLayoutService::submit(
       state->delivery_failed = true;
     }
   }
+}
+
+auto FloatLayoutService::final_admin_fence(
+    std::shared_ptr<ReadOperation> operation,
+    std::shared_ptr<PGconn> connection) -> bool {
+  auto reject = [&](std::string_view code = "storage_unavailable") {
+    operation->rejection = unavailable(code);
+    return false;
+  };
+  db::OperationScope::checkpoint_current();
+  if (!operation->admin_ack) return reject();
+  // Never wait for a lifecycle's name lock while holding the very ACK guard
+  // that lifecycle is draining. BUSY is promptly unavailable/unknown.
+  auto name =
+      packages::name_operation::NameOperation::acquire(connection, "shell");
+  if (!name) return reject();
+  const auto platform = shell::current_platform();
+  const auto storage = extensions::fixed_shell_storage_binding();
+  const auto& stamp = operation->admin_ack->stamp;
+  if (!platform || !storage) return reject();
+  if (!admin_ack_detail::same_identity(
+          frame_identity(*stamp.platform, stamp.storage),
+          frame_identity(*platform, *storage)))
+    return reject("stale_binding");
+  if (capabilities::drain::is_fenced("shell") ||
+      capabilities::drain::is_application_blocked("shell") ||
+      !current_frontend_matches(*connection, *platform))
+    return reject();
+  const auto captured = operation->state->registry->current_locked(
+      *name, stamp.platform->key(), operation->deadline, operation->stop);
+  if (!captured || (*captured)->digest() != stamp.platform->artifact_digest())
+    return reject();
+  db::OperationScope::checkpoint_current();
+  if (!name->release_checked()) return reject();
+  return true;
+}
+
+auto FloatLayoutService::prepare_admin_reply(
+    std::shared_ptr<ReadOperation> operation,
+    std::shared_ptr<PGconn> connection) -> void {
+  if (!operation->admin_ack || !operation->output || !*operation->output) {
+    operation->rejection = unavailable();
+    return;
+  }
+  Json::StreamWriterBuilder writer;
+  writer["indentation"] = "";
+  writer["emitUTF8"] = true;
+  const auto raw = Json::writeString(writer, **operation->output);
+  if (raw.size() > admin_defaults::MAX_RESPONSE_BYTES) {
+    operation->rejection = unavailable();
+    return;
+  }
+  using Wire = nlohmann::json;
+  std::expected<Wire, admin_defaults::Error> encoded =
+      std::unexpected(admin_defaults::Error::UNAVAILABLE);
+  auto& request = *operation->request;
+  if (request.kind == RequestData::Kind::ADMIN_READ) {
+    if (const auto* single =
+            std::get_if<admin_defaults::ReadSingle>(&*request.admin_read)) {
+      const auto parsed = admin_defaults::parse_single_result(raw);
+      if (parsed)
+        encoded =
+            admin_defaults::encode_single_result(single->content_type, *parsed);
+    } else {
+      const auto& page =
+          std::get<admin_defaults::ReadPage>(*request.admin_read);
+      const auto after =
+          operation->admin_after
+              ? std::optional<std::string_view>{*operation->admin_after}
+              : std::nullopt;
+      const auto parsed =
+          admin_defaults::parse_page_result(raw, page.limit, after);
+      if (parsed) {
+        std::optional<std::string> cursor;
+        if (parsed->next_after) {
+          auto signed_cursor = operation->state->admin_cursors.encode(
+              operation->auth,
+              {.limit = page.limit,
+               .platform_profile =
+                   operation->admin_ack->stamp.platform->profile()},
+              *parsed->next_after, unix_seconds());
+          if (!signed_cursor) {
+            operation->rejection = unavailable();
+            return;
+          }
+          cursor = std::move(*signed_cursor);
+        }
+        encoded = admin_defaults::encode_page_result(
+            *parsed,
+            cursor ? std::optional<std::string_view>{*cursor} : std::nullopt);
+      }
+    }
+  } else if (request.kind == RequestData::Kind::ADMIN_PUT) {
+    const auto parsed = admin_defaults::parse_put_result(raw);
+    if (parsed) encoded = admin_defaults::encode_put_result(*parsed);
+  } else if (request.kind == RequestData::Kind::ADMIN_DELETE) {
+    const auto parsed = admin_defaults::parse_delete_result(raw);
+    if (parsed) encoded = admin_defaults::encode_delete_result(*parsed);
+  }
+  if (!encoded) {
+    operation->rejection = unavailable();
+    return;
+  }
+  auto body = jsoncpp(*encoded);
+  if (!final_admin_fence(operation, connection)) return;
+  // Move the independent ACK owner out: it must not retain ReadOperation or
+  // its completion. Native aliases separately retain actual descendants.
+  operation->admin_reply.emplace(
+      AdminReply{std::move(operation->admin_ack), std::move(body)});
 }
 
 auto FloatLayoutService::existing_generation(
@@ -1475,6 +1867,39 @@ auto FloatLayoutService::run_read(std::shared_ptr<ReadOperation> operation)
   try {
     const std::shared_ptr<lifecycle::AsyncTaskLease> physical(
         operation, operation->accepted.get());
+    if (operation->request->is_admin()) {
+      Json::Value arguments{Json::objectValue};
+      auto selected = extensions::FixedStorageOperation::ADMIN_DEFAULT_READ;
+      const auto& request = *operation->request;
+      if (request.admin_put) {
+        selected = extensions::FixedStorageOperation::ADMIN_DEFAULT_PUT;
+        arguments["content_type"] = request.admin_put->content_type;
+        arguments["handler"]["application_id"] =
+            request.admin_put->handler.application_id;
+        arguments["handler"]["panel_id"] = request.admin_put->handler.panel_id;
+      } else if (request.admin_delete) {
+        selected = extensions::FixedStorageOperation::ADMIN_DEFAULT_DELETE;
+        arguments["content_type"] = request.admin_delete->content_type;
+      } else if (const auto* single = std::get_if<admin_defaults::ReadSingle>(
+                     &*request.admin_read)) {
+        arguments["content_type"] = single->content_type;
+      } else {
+        arguments["limit"] = static_cast<Json::UInt>(
+            std::get<admin_defaults::ReadPage>(*request.admin_read).limit);
+        if (operation->admin_after)
+          arguments["after"] = *operation->admin_after;
+      }
+      operation->state->admin_caller_depth.store(operation->depth);
+      operation->admin_dispatched.store(true);
+      operation->state->fixed_dispatch_attempts.fetch_add(1);
+      auto result = co_await extensions::dispatch_fixed_shell_storage(
+          extensions::FixedStorageCall{selected, *operation->binding,
+                                       std::move(arguments),
+                                       std::move(operation->guard)},
+          std::move(*operation->caller), operation->depth, physical);
+      operation->publish_native(std::move(result));
+      co_return;
+    }
     if (operation->request->kind == RequestData::Kind::LAYOUT_COMMIT) {
       operation->state->fixed_dispatch_attempts.fetch_add(1);
       auto result = co_await extensions::dispatch_fixed_shell_commit(
@@ -1536,6 +1961,17 @@ auto FloatLayoutService::active_count() const -> std::size_t {
 auto test_seam::fixed_storage_dispatch_attempts(
     const FloatLayoutService& service) -> std::size_t {
   return service.state->fixed_dispatch_attempts.load();
+}
+
+auto test_seam::set_admin_native_settled_hook(FloatLayoutService& service,
+                                              std::function<void()> hook)
+    -> void {
+  std::lock_guard lock{service.state->mutex};
+  service.state->admin_native_settled_hook = std::move(hook);
+}
+auto test_seam::admin_dispatch_caller_depth(const FloatLayoutService& service)
+    -> int {
+  return service.state->admin_caller_depth.load();
 }
 
 } // namespace plinth::frontend

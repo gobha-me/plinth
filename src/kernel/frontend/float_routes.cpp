@@ -2,6 +2,7 @@
 
 #include "kernel/auth/middleware.hpp"
 #include "kernel/browser_origin.hpp"
+#include "kernel/frontend/admin_defaults_contract.hpp"
 #include "kernel/frontend/float_layout_contract.hpp"
 #include "kernel/frontend/float_layout_service.hpp"
 #include "kernel/frontend/surface_protocol.hpp"
@@ -38,7 +39,17 @@
 namespace plinth::frontend {
 namespace {
 using Callback = std::function<void(const drogon::HttpResponsePtr&)>;
-enum class Route { CATALOG, ADMISSION, READ, COMMIT, TYPED, PLATFORM };
+enum class Route {
+  CATALOG,
+  ADMISSION,
+  READ,
+  COMMIT,
+  TYPED,
+  PLATFORM,
+  ADMIN_READ,
+  ADMIN_PUT,
+  ADMIN_DELETE
+};
 struct Definition {
   Route route;
   std::string_view path;
@@ -50,15 +61,26 @@ constexpr std::array DEFINITIONS{
     Definition{Route::READ, "/api/frontend/float-layout", false},
     Definition{Route::COMMIT, "/api/frontend/float-layout", false},
     Definition{Route::TYPED, "^/_plinth/typed/.*$", true},
-    Definition{Route::PLATFORM, "^/_plinth/platform/.*$", true}};
+    Definition{Route::PLATFORM, "^/_plinth/platform/.*$", true},
+    Definition{Route::ADMIN_READ, "/api/frontend/handler-defaults/admin",
+               false},
+    Definition{Route::ADMIN_PUT, "/api/frontend/handler-defaults/admin", false},
+    Definition{Route::ADMIN_DELETE, "/api/frontend/handler-defaults/admin",
+               false}};
 
 auto asset(Route route) -> bool {
   return route == Route::TYPED || route == Route::PLATFORM;
 }
 auto mutation(Route route) -> bool {
-  return route == Route::ADMISSION || route == Route::COMMIT;
+  return route == Route::ADMISSION || route == Route::COMMIT ||
+         route == Route::ADMIN_PUT || route == Route::ADMIN_DELETE;
+}
+auto admin(Route route) -> bool {
+  return route == Route::ADMIN_READ || route == Route::ADMIN_PUT ||
+         route == Route::ADMIN_DELETE;
 }
 auto maximum(Route route) -> std::size_t {
+  if (admin(route)) return admin_defaults::MAX_RESPONSE_BYTES;
   return route == Route::READ     ? 131072
          : route == Route::COMMIT ? 2048
                                   : 1048576;
@@ -70,8 +92,11 @@ auto constraints(Route route) -> std::vector<drogon::internal::HttpConstraint> {
   if (route == Route::ADMISSION)
     return {drogon::Post, "plinth::auth::SessionFilter",
             "plinth::auth::CsrfFilter"};
-  if (route == Route::COMMIT)
+  if (route == Route::COMMIT || route == Route::ADMIN_PUT)
     return {drogon::Put, "plinth::auth::SessionFilter",
+            "plinth::auth::CsrfFilter"};
+  if (route == Route::ADMIN_DELETE)
+    return {drogon::Delete, "plinth::auth::SessionFilter",
             "plinth::auth::CsrfFilter"};
   return {drogon::Get, "plinth::auth::SessionFilter"};
 }
@@ -268,6 +293,21 @@ auto asset_selector(const drogon::HttpRequestPtr& request, bool platform)
     return std::unexpected(protocol::Error::INVALID);
   return result;
 }
+auto admin_read_request(std::string_view query, std::string_view body)
+    -> std::expected<admin_defaults::ReadRequest, TypedRequestError> {
+  if (!body.empty()) return std::unexpected(TypedRequestError::INVALID);
+  return admin_defaults::parse_read_query(query);
+}
+auto admin_put_request(std::string_view query, std::string_view body)
+    -> std::expected<admin_defaults::PutRequest, TypedRequestError> {
+  if (!query.empty()) return std::unexpected(TypedRequestError::INVALID);
+  return admin_defaults::parse_put(body);
+}
+auto admin_delete_request(std::string_view query, std::string_view body)
+    -> std::expected<admin_defaults::DeleteRequest, TypedRequestError> {
+  if (!query.empty()) return std::unexpected(TypedRequestError::INVALID);
+  return admin_defaults::parse_delete(body);
+}
 
 class Reply {
  public:
@@ -329,6 +369,55 @@ class Reply {
     }
     send(*result); // Actual stream serializer/physical owner stays untouched.
   }
+  auto management(FloatLayoutService::AdminResult result) -> void {
+    // Keep the complete success/ACK owner alive through serialization and the
+    // one-shot callback return/unwind. Never obtain a later global profile to
+    // label rows or cursors from the admitted frame.
+    if (delivered.load()) return;
+    if (!result) {
+      fail(result.error().code);
+      return;
+    }
+    auto response = fallback;
+    try {
+      if (result->body().isObject() && !result->profile().empty()) {
+        Json::StreamWriterBuilder builder;
+        builder["indentation"] = "";
+        builder["emitUTF8"] = true;
+        auto body = Json::writeString(builder, result->body());
+        if (body.size() <= cap) {
+          response = drogon::HttpResponse::newHttpResponse();
+          response->setStatusCode(drogon::k200OK);
+          harden(response, changes);
+          response->addHeader("X-Plinth-Platform-Profile",
+                              std::string{result->profile()});
+          response->setBody(std::move(body));
+        }
+      }
+    } catch (...) {
+      response = fallback;
+    }
+    // This final nonblocking check happens after potentially allocating body
+    // serialization, immediately before handoff. The retained counted guard
+    // excludes normal lifecycle cutover through callback return. Refusal can
+    // follow committed DML; it is not rollback or safe retry permission.
+    if (response != fallback) {
+      std::expected<void, js::PromiseRejection> ready;
+      try {
+        ready = result->prepare_handoff();
+      } catch (...) {
+        response = fallback;
+      }
+      // Callback invocation stays OUTSIDE the exception boundary above. A
+      // throwing callback is sticky delivery failure, not a serialization
+      // exception to swallow or a reason to attempt a second response.
+      if (response != fallback && !ready) {
+        fail(ready.error().code);
+        return;
+      }
+    }
+    send(response);
+  }
 
  private:
   Callback callback;
@@ -382,6 +471,39 @@ auto handle(Route route, const drogon::HttpRequestPtr& request,
             reply->binary(std::move(result));
           },
           accepted);
+      return;
+    }
+    if (admin(route)) {
+      auto completion = [reply](FloatLayoutService::AdminResult result) {
+        reply->management(std::move(result));
+      };
+      if (route == Route::ADMIN_READ) {
+        auto query = admin_read_request(request->query(), request->body());
+        if (!query) {
+          reply->fail(admission_error(query.error()));
+          return;
+        }
+        service->read_admin_defaults(std::move(*query), *caller_auth, ip, 0,
+                                     std::move(completion), accepted);
+      } else {
+        if (route == Route::ADMIN_PUT) {
+          auto value = admin_put_request(request->query(), request->body());
+          if (!value) {
+            reply->fail(admission_error(value.error()));
+            return;
+          }
+          service->put_admin_default(std::move(*value), *caller_auth, ip, 0,
+                                     std::move(completion), accepted);
+        } else {
+          auto value = admin_delete_request(request->query(), request->body());
+          if (!value) {
+            reply->fail(admission_error(value.error()));
+            return;
+          }
+          service->delete_admin_default(std::move(*value), *caller_auth, ip, 0,
+                                        std::move(completion), accepted);
+        }
+      }
       return;
     }
     if (route == Route::CATALOG) {
@@ -492,6 +614,18 @@ auto float_asset_selector(const drogon::HttpRequestPtr& request, bool platform)
     -> std::expected<protocol::AssetSelector, protocol::Error> {
   return asset_selector(request, platform);
 }
+auto float_admin_read_request(std::string_view query, std::string_view body)
+    -> std::expected<admin_defaults::ReadRequest, TypedRequestError> {
+  return admin_read_request(query, body);
+}
+auto float_admin_put_request(std::string_view query, std::string_view body)
+    -> std::expected<admin_defaults::PutRequest, TypedRequestError> {
+  return admin_put_request(query, body);
+}
+auto float_admin_delete_request(std::string_view query, std::string_view body)
+    -> std::expected<admin_defaults::DeleteRequest, TypedRequestError> {
+  return admin_delete_request(query, body);
+}
 auto float_route_contract() -> Json::Value {
   Json::Value result{Json::arrayValue};
   for (const auto& definition : DEFINITIONS) {
@@ -524,6 +658,15 @@ auto float_asset_completion(Callback callback)
                                        false, true, 0);
   return [reply](FloatLayoutService::AssetResult result) {
     reply->binary(std::move(result));
+  };
+}
+auto float_admin_completion(Callback callback, bool changes)
+    -> FloatLayoutService::AdminCompletion {
+  auto reply =
+      std::make_shared<Reply>(std::move(callback), nullptr, nullptr, changes,
+                              false, admin_defaults::MAX_RESPONSE_BYTES);
+  return [reply](FloatLayoutService::AdminResult result) {
+    reply->management(std::move(result));
   };
 }
 } // namespace test_seam

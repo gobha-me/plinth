@@ -3,6 +3,7 @@
 #include "kernel/capabilities/drain.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/db/operations.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/frontend/float_layout_service.hpp"
 #include "kernel/frontend/platform_startup.hpp"
@@ -22,6 +23,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -29,10 +31,19 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+// Existing actual route adapter only; it cannot manufacture an AdminReply.
+namespace plinth::frontend::test_seam {
+auto float_admin_completion(std::function<void(const drogon::HttpResponsePtr&)>,
+                            bool) -> FloatLayoutService::AdminCompletion;
+} // namespace plinth::frontend::test_seam
 
 namespace {
 namespace frontend = plinth::frontend;
@@ -330,6 +341,42 @@ struct Fixture {
       service->read_layout(ORIGIN, auth, "127.0.0.1", std::move(completion));
     });
   }
+  auto grant_admin() -> void {
+    command("INSERT INTO plinth.group_rules(group_id,rule_id) SELECT g.id,r.id "
+            "FROM plinth.groups g CROSS JOIN plinth.rbac_rules r "
+            "WHERE g.name='float_service_viewers' AND r.rule='kernel.admin'");
+  }
+  template <typename Submit>
+  auto management(Submit submit) -> frontend::FloatLayoutService::AdminResult {
+    auto completion = std::make_shared<
+        std::promise<frontend::FloatLayoutService::AdminResult>>();
+    auto result = completion->get_future();
+    submit(
+        [completion](auto value) { completion->set_value(std::move(value)); });
+    REQUIRE(result.wait_for(12s) == std::future_status::ready);
+    return result.get();
+  }
+  auto defaults_read(frontend::admin_defaults::ReadRequest input =
+                         frontend::admin_defaults::ReadPage{},
+                     int depth = 0) {
+    return management([&](auto completion) {
+      service->read_admin_defaults(std::move(input), auth, "127.0.0.1", depth,
+                                   std::move(completion));
+    });
+  }
+  auto defaults_put(std::string type = "text/plain", int depth = 0) {
+    return management([&](auto completion) {
+      service->put_admin_default(
+          {std::move(type), {"uninstalled-app", "old_panel"}}, auth,
+          "127.0.0.1", depth, std::move(completion));
+    });
+  }
+  auto defaults_delete(std::string type = "text/plain") {
+    return management([&](auto completion) {
+      service->delete_admin_default({std::move(type)}, auth, "127.0.0.1", 0,
+                                    std::move(completion));
+    });
+  }
   auto selector(std::string_view member = "client/panels/preview.js")
       -> frontend::protocol::AssetSelector {
     const auto page = catalog(std::nullopt, MIME);
@@ -379,6 +426,71 @@ auto entry() -> nlohmann::json {
           {"maximized", false},
           {"geometry", {{"x", 0}, {"y", 0}, {"width", 320}, {"height", 240}}}};
 }
+
+struct AdminPause {
+  struct Gate {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool released = false;
+    bool expired = false;
+    auto release() -> void {
+      std::lock_guard lock{mutex};
+      released = true;
+      changed.notify_all();
+    }
+  };
+  frontend::FloatLayoutService& service;
+  std::shared_ptr<Gate> gate = std::make_shared<Gate>();
+  explicit AdminPause(frontend::FloatLayoutService& source) : service(source) {
+    frontend::test_seam::set_admin_native_settled_hook(service, [state = gate] {
+      std::unique_lock lock{state->mutex};
+      state->entered = true;
+      state->changed.notify_all();
+      if (!state->changed.wait_for(lock, 5s, [&] { return state->released; }))
+        state->expired = true;
+    });
+  }
+  ~AdminPause() {
+    gate->release(); // Release before fixture/service drain, including asserts.
+    frontend::test_seam::set_admin_native_settled_hook(service, {});
+  }
+  AdminPause(const AdminPause&) = delete;
+  auto operator=(const AdminPause&) -> AdminPause& = delete;
+  auto wait_entered() -> bool {
+    std::unique_lock lock{gate->mutex};
+    return gate->changed.wait_for(lock, 5s, [&] { return gate->entered; });
+  }
+  auto expired() -> bool {
+    std::lock_guard lock{gate->mutex};
+    return gate->expired;
+  }
+};
+
+// Assertion unwinding releases the native pause BEFORE joining the ordinary
+// lifecycle thread, which otherwise needs the ACK guard to leave its drain.
+struct ReleaseAdminBeforeJoin {
+  std::shared_ptr<AdminPause::Gate> gate;
+  std::jthread thread;
+  ~ReleaseAdminBeforeJoin() {
+    gate->release();
+    if (thread.joinable()) thread.join();
+  }
+};
+
+// A real success retained past worker completion must be released BEFORE
+// joining the lifecycle which is waiting for its counted ACK guard, including
+// assertion unwind. No synthetic frame/identity publication is involved.
+struct RetainedAdminBeforeJoin {
+  std::shared_ptr<AdminPause::Gate> gate;
+  std::optional<frontend::FloatLayoutService::AdminResult> result;
+  std::jthread thread;
+  ~RetainedAdminBeforeJoin() {
+    gate->release();
+    result.reset();
+    if (thread.joinable()) thread.join();
+  }
+};
 } // namespace
 
 TEST_CASE("float layout service: real installed catalog admission and "
@@ -891,4 +1003,576 @@ TEST_CASE("float layout service: admitted asset physical ownership and public "
     REQUIRE_FALSE(
         fixture.service->drain(std::chrono::steady_clock::now() + 5s));
   }
+}
+
+TEST_CASE("float layout service: native admin defaults fresh authority and "
+          "exact storage",
+          "[frontend][float_layout_service][admin_defaults][integration]") {
+  if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  Fixture fixture;
+  SECTION("nonadmin every management command refuses before fixed dispatch") {
+    const auto before =
+        frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
+    for (const auto& result : {fixture.defaults_read(), fixture.defaults_put(),
+                               fixture.defaults_delete()}) {
+      REQUIRE_FALSE(result);
+      REQUIRE(result.error().code == "permission_denied");
+    }
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before);
+    REQUIRE(fixture.scalar(
+                "SELECT count(*)::text FROM ext_shell.default_apps") == "0");
+  }
+  SECTION("actual put read upsert delete absence and retained uninstalled "
+          "logical handler") {
+    fixture.grant_admin();
+    {
+      const auto absent = fixture.defaults_read(
+          frontend::admin_defaults::ReadSingle{"text/plain"});
+      REQUIRE(absent);
+      REQUIRE(absent->prepare_handoff());
+      REQUIRE(absent->profile() == fixture.platform->platform->profile());
+      REQUIRE(absent->body().size() == 3);
+      REQUIRE(absent->body()["schema_version"].asInt() == 1);
+      REQUIRE(absent->body()["handler"].isNull());
+    }
+    {
+      const auto saved = fixture.defaults_put();
+      REQUIRE(saved);
+      REQUIRE(saved->prepare_handoff());
+      REQUIRE(saved->body().size() == 2);
+      REQUIRE(saved->body()["saved"].asBool());
+      REQUIRE(fixture.scalar(
+                  "SELECT application_id || '/' || panel_id FROM "
+                  "ext_shell.default_apps WHERE content_type='text/plain'") ==
+              "uninstalled-app/old_panel");
+    }
+    {
+      const auto saved = fixture.management([&](auto completion) {
+        fixture.service->put_admin_default({"text/plain", {"another-app", "p"}},
+                                           fixture.auth, "127.0.0.1", 0,
+                                           std::move(completion));
+      });
+      REQUIRE(saved);
+      REQUIRE(saved->body()["saved"].asBool());
+    }
+    {
+      const auto single = fixture.defaults_read(
+          frontend::admin_defaults::ReadSingle{"text/plain"});
+      REQUIRE(single);
+      REQUIRE(single->body()["handler"]["application_id"].asString() ==
+              "another-app");
+      REQUIRE(single->body()["handler"]["panel_id"].asString() == "p");
+      REQUIRE(single->body()["handler"].size() == 2);
+    }
+    for (const bool expected : {true, false}) {
+      const auto removed = fixture.defaults_delete();
+      REQUIRE(removed);
+      REQUIRE(removed->prepare_handoff());
+      REQUIRE(removed->body().size() == 2);
+      REQUIRE(removed->body()["deleted"].isBool());
+      REQUIRE(removed->body()["deleted"].asBool() == expected);
+    }
+    REQUIRE(fixture.scalar(
+                "SELECT count(*)::text FROM ext_shell.default_apps") == "0");
+    REQUIRE(fixture.scalar(
+                "SELECT count(*)::text FROM ext_shell.user_preferences") ==
+            "0");
+  }
+  SECTION("fresh grant revoke expiry rotation and PAT use actual original "
+          "credential") {
+    fixture.grant_admin();
+    REQUIRE(fixture.defaults_put());
+    fixture.command("DELETE FROM plinth.group_rules WHERE rule_id=(SELECT id "
+                    "FROM plinth.rbac_rules WHERE rule='kernel.admin') AND "
+                    "group_id=(SELECT id FROM plinth.groups WHERE "
+                    "name='float_service_viewers')");
+    auto before =
+        frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
+    const auto revoked_rule = fixture.defaults_read();
+    REQUIRE_FALSE(revoked_rule);
+    REQUIRE(revoked_rule.error().code == "permission_denied");
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before);
+    fixture.grant_admin();
+    fixture.parameters("UPDATE plinth.sessions SET expires_at=NOW()-INTERVAL "
+                       "'1 second' WHERE id=$1::uuid",
+                       {fixture.auth.session_id});
+    const auto expired = fixture.defaults_delete();
+    REQUIRE_FALSE(expired);
+    REQUIRE(expired.error().code == "not_authenticated");
+    fixture.parameters("UPDATE plinth.sessions SET expires_at=NOW()+INTERVAL "
+                       "'1 hour', token_hash=$2 WHERE id=$1::uuid",
+                       {fixture.auth.session_id, std::string(64, 'b')});
+    const auto rotated = fixture.defaults_read();
+    REQUIRE_FALSE(rotated);
+    REQUIRE(rotated.error().code == "not_authenticated");
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before);
+    // PAT creation is an ordinary test identity fixture; no management grant
+    // or browser credential bypass is inferred from the caller's auth fields.
+    const auto token = fixture.pg->exec_params(
+        "INSERT INTO plinth.pats(user_id,name,token_hash,token_prefix) "
+        "VALUES($1::uuid,'admin-service-test',$2,'plinth_test') RETURNING "
+        "id::text",
+        {fixture.auth.user_id, std::string(64, 'c')});
+    REQUIRE(PQresultStatus(token.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(token.get()) == 1);
+    fixture.auth.auth_type = "pat";
+    fixture.auth.pat_id = PQgetvalue(token.get(), 0, 0);
+    fixture.auth.session_id.clear();
+    fixture.auth.token_hash = std::string(64, 'c');
+    fixture.auth.credential_source = plinth::auth::CredentialSource::BEARER;
+    REQUIRE(fixture.defaults_delete());
+  }
+  SECTION(
+      "native grammar and original caller depth are checked before dispatch") {
+    fixture.grant_admin();
+    const auto before =
+        frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
+    for (const int depth : {-1, plinth::capabilities::MAX_CALL_DEPTH}) {
+      const auto bad = fixture.defaults_put("text/plain", depth);
+      REQUIRE_FALSE(bad);
+      REQUIRE(bad.error().code == "invalid_argument");
+    }
+    const auto invalid = fixture.defaults_put("text/plain\n");
+    REQUIRE_FALSE(invalid);
+    REQUIRE(invalid.error().code == "invalid_argument");
+    const auto invalid_page = fixture.defaults_read(
+        frontend::admin_defaults::ReadPage{65, std::nullopt});
+    REQUIRE_FALSE(invalid_page);
+    REQUIRE(invalid_page.error().code == "invalid_argument");
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before);
+    REQUIRE(fixture.defaults_put("text/plain", 2));
+    REQUIRE(frontend::test_seam::admin_dispatch_caller_depth(
+                *fixture.service) == 2);
+    REQUIRE(fixture.defaults_read(
+        frontend::admin_defaults::ReadSingle{"text/plain"},
+        plinth::capabilities::MAX_CALL_DEPTH - 1));
+    REQUIRE(frontend::test_seam::admin_dispatch_caller_depth(
+                *fixture.service) == plinth::capabilities::MAX_CALL_DEPTH - 1);
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before + 2);
+  }
+  SECTION("64 row bytewise paging validates stored rows and credential-bound "
+          "continuation") {
+    fixture.grant_admin();
+    // SQL seeds paging data only, not mutation acknowledgement evidence. The
+    // preceding section exercises actual native PUT/upsert/DELETE completion.
+    fixture.command(
+        "INSERT INTO "
+        "ext_shell.default_apps(content_type,application_id,panel_id) SELECT "
+        "'application/x-' || n::text,'uninstalled-app','old_panel' FROM "
+        "generate_series(100,164) AS n");
+    std::string cursor;
+    {
+      const auto first = fixture.defaults_read();
+      REQUIRE(first);
+      REQUIRE(first->prepare_handoff());
+      REQUIRE(first->body()["entries"].size() == 64);
+      REQUIRE(first->body()["entries"][0]["content_type"].asString() ==
+              "application/x-100");
+      REQUIRE(first->body()["entries"][63]["content_type"].asString() ==
+              "application/x-163");
+      REQUIRE(
+          first->body()["entries"][0]["handler"]["application_id"].asString() ==
+          "uninstalled-app");
+      REQUIRE(first->body()["next_cursor"].isString());
+      REQUIRE_FALSE(first->body().isMember("next_after"));
+      cursor = first->body()["next_cursor"].asString();
+    }
+    {
+      const auto last =
+          fixture.defaults_read(frontend::admin_defaults::ReadPage{64, cursor});
+      REQUIRE(last);
+      REQUIRE(last->body()["entries"].size() == 1);
+      REQUIRE(last->body()["entries"][0]["content_type"].asString() ==
+              "application/x-164");
+      REQUIRE(last->body()["next_cursor"].isNull());
+    }
+    const auto before =
+        frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
+    const auto changed_limit =
+        fixture.defaults_read(frontend::admin_defaults::ReadPage{1, cursor});
+    REQUIRE_FALSE(changed_limit);
+    REQUIRE(changed_limit.error().code == "invalid_argument");
+    fixture.auth.credential_source = plinth::auth::CredentialSource::BEARER;
+    const auto changed_source =
+        fixture.defaults_read(frontend::admin_defaults::ReadPage{64, cursor});
+    REQUIRE_FALSE(changed_source);
+    REQUIRE(changed_source.error().code == "invalid_argument");
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before);
+    fixture.auth.credential_source = plinth::auth::CredentialSource::COOKIE;
+    // The module's JS '$' can accept this stored trailing newline; the exact
+    // native validator must refuse the whole result, not return the good row.
+    fixture.command("UPDATE ext_shell.default_apps SET "
+                    "content_type=E'application/x-160\\n' WHERE "
+                    "content_type='application/x-160'");
+    const auto malformed = fixture.defaults_read();
+    REQUIRE_FALSE(malformed);
+    REQUIRE(malformed.error().code == "storage_unavailable");
+  }
+}
+
+TEST_CASE("float layout service: admin native settlement and real lifecycle "
+          "ACK fence",
+          "[frontend][float_layout_service][admin_defaults][integration]") {
+  if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  Fixture fixture;
+  fixture.grant_admin();
+  AdminPause pause{*fixture.service};
+  plinth::lifecycle::AsyncTaskRegistry accepted;
+  auto completion = std::make_shared<
+      std::promise<frontend::FloatLayoutService::AdminResult>>();
+  auto reply = completion->get_future();
+  auto adapter_mutex = std::make_shared<std::mutex>();
+  auto callback_adapter =
+      std::make_shared<frontend::FloatLayoutService::AdminCompletion>();
+  const auto before =
+      frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
+  fixture.service->put_admin_default(
+      {"text/plain", {"uninstalled-app", "old_panel"}}, fixture.auth,
+      "127.0.0.1", 0,
+      [completion, adapter_mutex, callback_adapter](auto result) {
+        frontend::FloatLayoutService::AdminCompletion adapter;
+        {
+          std::lock_guard lock{*adapter_mutex};
+          adapter = std::move(*callback_adapter);
+        }
+        if (adapter)
+          adapter(std::move(result));
+        else
+          completion->set_value(std::move(result));
+      },
+      accepted.try_acquire());
+  REQUIRE(pause.wait_entered());
+  REQUIRE(reply.wait_for(0ms) == std::future_status::timeout);
+  REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+              *fixture.service) == before + 1);
+  REQUIRE(fixture.scalar("SELECT application_id FROM ext_shell.default_apps "
+                         "WHERE content_type='text/plain'") ==
+          "uninstalled-app");
+  SECTION("unchanged actual settlement control keeps admitted profile through "
+          "handoff") {
+    pause.gate->release();
+    REQUIRE(reply.wait_for(5s) == std::future_status::ready);
+    {
+      const auto result = reply.get();
+      REQUIRE(result);
+      REQUIRE(result->body()["saved"].asBool());
+      REQUIRE(result->profile() == fixture.platform->platform->profile());
+      REQUIRE(result->prepare_handoff());
+      REQUIRE(accepted.active_for_test() == 1);
+      REQUIRE(fixture.service->active_count() == 1);
+    }
+    REQUIRE(accepted.drain(5s));
+    REQUIRE(fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+  }
+  SECTION("ordinary disable owns name and drain so final ACK refuses promptly "
+          "without retry") {
+    auto lifecycle_context = fixture.context;
+    lifecycle_context.upgrade_drain_timeout_ms = 4s;
+    auto disabled = std::make_shared<std::promise<bool>>();
+    auto disabled_result = disabled->get_future();
+    ReleaseAdminBeforeJoin attempt{
+        pause.gate, std::jthread{[context = std::move(lifecycle_context),
+                                  id = fixture.platform->id,
+                                  disabled](std::stop_token stop) {
+          try {
+            plinth::db::OperationScope scope{
+                stop, std::chrono::steady_clock::now() + 8s};
+            disabled->set_value(
+                packages::disable_package(id, context).has_value());
+          } catch (...) {
+            disabled->set_value(false);
+          }
+        }}};
+    const auto fence_deadline = std::chrono::steady_clock::now() + 2s;
+    while (!plinth::capabilities::drain::is_fenced("shell") &&
+           std::chrono::steady_clock::now() < fence_deadline)
+      std::this_thread::yield();
+    REQUIRE(plinth::capabilities::drain::is_fenced("shell"));
+    REQUIRE(disabled_result.wait_for(0ms) == std::future_status::timeout);
+    const auto released = std::chrono::steady_clock::now();
+    pause.gate->release();
+    REQUIRE(reply.wait_for(2s) == std::future_status::ready);
+    const auto result = reply.get();
+    REQUIRE_FALSE(result);
+    REQUIRE(result.error().code == "storage_unavailable");
+    REQUIRE(std::chrono::steady_clock::now() - released < 2s);
+    REQUIRE(disabled_result.wait_for(5s) == std::future_status::ready);
+    REQUIRE(disabled_result.get());
+    attempt.thread.join();
+    REQUIRE(accepted.drain(5s));
+    REQUIRE(fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+    REQUIRE(fixture.scalar("SELECT application_id FROM ext_shell.default_apps "
+                           "WHERE content_type='text/plain'") ==
+            "uninstalled-app");
+    // This is committed data plus refused server acknowledgement. It is not
+    // SQL rollback, lost-COMMIT-ACK fault injection or client receipt proof.
+  }
+  SECTION("real retained worker success is refused by the distinct final route "
+          "handoff fence") {
+    pause.gate->release();
+    REQUIRE(reply.wait_for(5s) == std::future_status::ready);
+    RetainedAdminBeforeJoin retained{pause.gate, std::nullopt, {}};
+    retained.result.emplace(reply.get());
+    REQUIRE(retained.result->has_value());
+    REQUIRE(retained.result->value().prepare_handoff());
+    REQUIRE(retained.result->value().profile() ==
+            fixture.platform->platform->profile());
+    REQUIRE(retained.result->value().body()["saved"].asBool());
+    REQUIRE(accepted.active_for_test() == 1);
+    REQUIRE(fixture.service->active_count() == 1);
+    auto lifecycle_context = fixture.context;
+    lifecycle_context.upgrade_drain_timeout_ms = 4s;
+    auto disabled = std::make_shared<std::promise<bool>>();
+    auto disabled_result = disabled->get_future();
+    retained.thread = std::jthread{[context = std::move(lifecycle_context),
+                                    id = fixture.platform->id,
+                                    disabled](std::stop_token stop) {
+      try {
+        plinth::db::OperationScope scope{stop,
+                                         std::chrono::steady_clock::now() + 8s};
+        disabled->set_value(packages::disable_package(id, context).has_value());
+      } catch (...) {
+        disabled->set_value(false);
+      }
+    }};
+    const auto fence_deadline = std::chrono::steady_clock::now() + 2s;
+    while (!plinth::capabilities::drain::is_fenced("shell") &&
+           std::chrono::steady_clock::now() < fence_deadline)
+      std::this_thread::yield();
+    REQUIRE(plinth::capabilities::drain::is_fenced("shell"));
+    REQUIRE(disabled_result.wait_for(0ms) == std::future_status::timeout);
+    // Observe the ordinary lifecycle's already-established fence/counter; do
+    // not replace the platform or construct an authority frame through it.
+    const auto fence = plinth::capabilities::drain::begin_drain("shell");
+    REQUIRE(fence->in_flight.load() >= 1);
+    REQUIRE(accepted.active_for_test() == 1);
+    REQUIRE(fixture.service->active_count() == 1);
+    unsigned int calls = 0;
+    drogon::HttpResponsePtr response;
+    auto adapter = frontend::test_seam::float_admin_completion(
+        [&](const auto& value) {
+          ++calls;
+          response = value;
+        },
+        true);
+    adapter(std::move(*retained.result));
+    retained.result.reset();
+    REQUIRE(calls == 1);
+    REQUIRE(response);
+    REQUIRE(response->statusCode() == drogon::k503ServiceUnavailable);
+    REQUIRE(response->getHeader("X-Plinth-Platform-Profile").empty());
+    REQUIRE(response->body() == R"({"error":"service_unavailable"})");
+    REQUIRE(response->getHeader("Cache-Control") == "no-store");
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before + 1);
+    REQUIRE(disabled_result.wait_for(5s) == std::future_status::ready);
+    REQUIRE(disabled_result.get());
+    retained.thread.join();
+    REQUIRE(accepted.drain(5s));
+    REQUIRE(fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+    REQUIRE(fence->in_flight.load() == 0);
+    REQUIRE(calls == 1);
+    REQUIRE(fixture.scalar("SELECT application_id FROM ext_shell.default_apps "
+                           "WHERE content_type='text/plain'") ==
+            "uninstalled-app");
+  }
+  SECTION("unchanged real service completion passes the actual adapter with "
+          "its exact admitted profile") {
+    auto observed = std::make_shared<std::promise<drogon::HttpResponsePtr>>();
+    auto response_ready = observed->get_future();
+    auto calls = std::make_shared<std::atomic<unsigned int>>(0);
+    const auto admitted_profile = fixture.platform->platform->profile();
+    auto adapter = frontend::test_seam::float_admin_completion(
+        [observed, calls](const auto& response) {
+          calls->fetch_add(1);
+          observed->set_value(response);
+        },
+        true);
+    {
+      std::lock_guard lock{*adapter_mutex};
+      *callback_adapter = adapter;
+    }
+    pause.gate->release();
+    REQUIRE(response_ready.wait_for(5s) == std::future_status::ready);
+    const auto response = response_ready.get();
+    REQUIRE(response);
+    REQUIRE(response->statusCode() == drogon::k200OK);
+    REQUIRE(response->getHeader("X-Plinth-Platform-Profile") ==
+            admitted_profile);
+    REQUIRE(nlohmann::json::parse(response->body()) ==
+            nlohmann::json{{"schema_version", 1}, {"saved", true}});
+    REQUIRE(calls->load() == 1);
+    REQUIRE(accepted.drain(5s));
+    REQUIRE(fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+  }
+  SECTION("throwing actual success adapter remains one-shot and sticky in the "
+          "service completion") {
+    fixture.expected_delivery_failure = true;
+    auto observed = std::make_shared<std::promise<drogon::HttpResponsePtr>>();
+    auto response_ready = observed->get_future();
+    auto calls = std::make_shared<std::atomic<unsigned int>>(0);
+    auto adapter = frontend::test_seam::float_admin_completion(
+        [observed, calls](const auto& response) {
+          calls->fetch_add(1);
+          observed->set_value(response);
+          throw std::runtime_error{"controlled actual admin handoff callback"};
+        },
+        true);
+    {
+      std::lock_guard lock{*adapter_mutex};
+      *callback_adapter = adapter;
+    }
+    pause.gate->release();
+    REQUIRE(response_ready.wait_for(5s) == std::future_status::ready);
+    const auto response = response_ready.get();
+    REQUIRE(response->statusCode() == drogon::k200OK);
+    REQUIRE(response->getHeader("X-Plinth-Platform-Profile") ==
+            fixture.platform->platform->profile());
+    REQUIRE(accepted.drain(5s));
+    REQUIRE_FALSE(
+        fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+    REQUIRE_FALSE(
+        fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+    REQUIRE_NOTHROW(adapter(std::unexpected(
+        plinth::js::PromiseRejection{.code = "storage_unavailable",
+                                     .message = "controlled",
+                                     .sqlstate = std::nullopt})));
+    REQUIRE(calls->load() == 1);
+  }
+  SECTION("both production fences share the actual immutable identity mismatch "
+          "predicate") {
+    pause.gate->release();
+    REQUIRE(reply.wait_for(5s) == std::future_status::ready);
+    {
+      const auto result = reply.get();
+      REQUIRE(result);
+      const auto storage = plinth::extensions::fixed_shell_storage_binding();
+      REQUIRE(storage);
+      const auto& platform = *fixture.platform->platform;
+      const frontend::admin_ack_detail::FrameIdentity admitted{
+          .platform_key = platform.key(),
+          .profile = platform.profile(),
+          .artifact_digest = platform.artifact_digest(),
+          .storage_identity = storage->identity,
+          .storage_artifact_digest = storage->artifact_digest};
+      REQUIRE(frontend::admin_ack_detail::same_identity(admitted, admitted));
+      for (unsigned int variant = 0; variant < 9; ++variant) {
+        auto changed = admitted;
+        if (variant == 0)
+          changed.platform_key.package_id.back() =
+              changed.platform_key.package_id.back() == '0' ? '1' : '0';
+        if (variant == 1) changed.platform_key.version += ".changed";
+        if (variant == 2)
+          changed.artifact_digest[0] =
+              changed.artifact_digest[0] == 'a' ? 'b' : 'a';
+        if (variant == 3)
+          changed.profile.back() = changed.profile.back() == 'a' ? 'b' : 'a';
+        if (variant == 4) ++changed.storage_identity.serial;
+        if (variant == 5)
+          changed.storage_identity.package_id.back() =
+              changed.storage_identity.package_id.back() == '0' ? '1' : '0';
+        if (variant == 6) changed.storage_identity.version += ".changed";
+        if (variant == 7)
+          changed.storage_artifact_digest[0] =
+              changed.storage_artifact_digest[0] == 'a' ? 'b' : 'a';
+        if (variant == 8) ++changed.platform_key.profile;
+        REQUIRE_FALSE(
+            frontend::admin_ack_detail::same_identity(admitted, changed));
+        REQUIRE_FALSE(
+            frontend::admin_ack_detail::same_identity(changed, admitted));
+      }
+      REQUIRE(result->prepare_handoff());
+      // Copied metadata comparisons do not publish a replacement or create a
+      // success frame/guard; real identity stays unchanged under this ACK
+      // owner.
+    }
+    REQUIRE(accepted.drain(5s));
+    REQUIRE(fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+  }
+  REQUIRE_FALSE(pause.expired());
+  REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+              *fixture.service) == before + 1);
+  REQUIRE(fixture.service->active_count() == 0);
+}
+
+TEST_CASE("float layout service: blocked admin SQL retains physical owner "
+          "after logical cancellation",
+          "[frontend][float_layout_service][admin_defaults][integration]") {
+  if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  Fixture fixture;
+  fixture.grant_admin();
+  // This connection drops/rolls back before fixture drain even if an assertion
+  // unwinds. It blocks actual bundled-module DML, not a simulated result.
+  plinth::ws_test::TestPg blocker{fixture.config.db};
+  {
+    const auto locked = blocker.exec(
+        "BEGIN; LOCK TABLE ext_shell.default_apps IN ACCESS EXCLUSIVE MODE");
+    REQUIRE(PQresultStatus(locked.get()) == PGRES_COMMAND_OK);
+  }
+  plinth::lifecycle::AsyncTaskRegistry accepted;
+  auto completion = std::make_shared<
+      std::promise<frontend::FloatLayoutService::AdminResult>>();
+  auto reply = completion->get_future();
+  auto calls = std::make_shared<std::atomic<unsigned int>>(0);
+  const auto before =
+      frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
+  fixture.service->put_admin_default(
+      {"text/plain", {"uninstalled-app", "old_panel"}}, fixture.auth,
+      "127.0.0.1", 0,
+      [completion, calls](auto result) {
+        calls->fetch_add(1);
+        completion->set_value(std::move(result));
+      },
+      accepted.try_acquire());
+  const auto observed_deadline = std::chrono::steady_clock::now() + 3s;
+  bool waiting = false;
+  while (!waiting && std::chrono::steady_clock::now() < observed_deadline) {
+    waiting =
+        fixture.scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='relation' "
+            "AND relation='ext_shell.default_apps'::regclass AND NOT "
+            "granted)::text") == "true";
+    if (!waiting) std::this_thread::yield();
+  }
+  REQUIRE(waiting);
+  REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+              *fixture.service) == before + 1);
+  REQUIRE(reply.wait_for(0ms) == std::future_status::timeout);
+  REQUIRE_FALSE(
+      fixture.service->drain(std::chrono::steady_clock::now() + 100ms));
+  REQUIRE(reply.wait_for(2s) == std::future_status::ready);
+  const auto cancelled = reply.get();
+  REQUIRE_FALSE(cancelled);
+  REQUIRE(cancelled.error().code == "storage_unavailable");
+  REQUIRE(calls->load() == 1);
+  REQUIRE(fixture.service->active_count() == 1);
+  REQUIRE(accepted.active_for_test() == 1);
+  const auto fenced = plinth::capabilities::drain::begin_drain("shell");
+  REQUIRE(fenced->in_flight.load() >= 1);
+  REQUIRE_FALSE(accepted.drain(0ms));
+  {
+    const auto released = blocker.exec("ROLLBACK");
+    REQUIRE(PQresultStatus(released.get()) == PGRES_COMMAND_OK);
+  }
+  REQUIRE(accepted.drain(5s));
+  REQUIRE(fixture.service->drain(std::chrono::steady_clock::now() + 5s));
+  REQUIRE(fixture.service->active_count() == 0);
+  REQUIRE(fenced->in_flight.load() == 0);
+  REQUIRE(calls->load() == 1);
+  REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+              *fixture.service) == before + 1);
+  REQUIRE(fixture.scalar("SELECT application_id FROM ext_shell.default_apps "
+                         "WHERE content_type='text/plain'") ==
+          "uninstalled-app");
+  // The original mutation completed after logical503. This proves no retry
+  // and retained native ownership, not rollback or lost SQL COMMIT-ACK.
 }

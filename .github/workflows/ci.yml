@@ -564,7 +564,7 @@ jobs:
           ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 16'
           ctest --test-dir build --output-on-failure --parallel 1 -R '^plinth_tsan_'
 
-      - name: Installed float generation and physical ownership TSan tests
+      - name: Installed float generation, ownership and admin-default TSan tests
         env:
           PLINTH_PG_HOST: 127.0.0.1
           PLINTH_PG_PORT: "5432"
@@ -574,7 +574,7 @@ jobs:
           TSAN_OPTIONS: halt_on_error=1:exitcode=66
         run: |
           set -euo pipefail
-          ctest --test-dir build -N -R '^plinth_tests_(generation_|installed_float_)' |
-            grep -Ex 'Total Tests: 37'
+          ctest --test-dir build -N -R '^plinth_tests_(generation_|installed_float_|admin_defaults_)' |
+            grep -Ex 'Total Tests: 43'
           ctest --test-dir build --output-on-failure --parallel 1 -R \
-            '^plinth_tests_(generation_|installed_float_)'
+            '^plinth_tests_(generation_|installed_float_|admin_defaults_)'
