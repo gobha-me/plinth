@@ -11,6 +11,7 @@ import { boundedStep, createResponseBodyRegistry, observeReadLane, withFrozenRea
     observeAuthorityRecovery } from './installed-float-coordination.mjs';
 import { snapshotTypedSurfaceTargets, verifyTypedSurfaceUnavailable,
     verifyTypedSurfaceFoundation } from './installed-typed-surface-foundation.mjs';
+import { verifyAdminDefaultsFoundation } from './installed-admin-defaults-foundation.mjs';
 
 const phase = process.argv[2];
 assert(['install', 'verify'].includes(phase), 'owned supervisor phase required');
@@ -695,8 +696,9 @@ try {
                 assert.equal(sql(`SELECT count(*) FROM ext_shell.user_preferences WHERE ${personalWhere}`), '0');
             });
         }
-        // The administrator manager UI/API is not implemented. Seed exactly
-        // this owned preference row, not a grant or a claimed HTTP admin write.
+        // This is the earlier resolver's isolated seeded-default control, not
+        // a grant or HTTP management proof. Later additive groups exercise the
+        // real administrator endpoint with ordinary HTTP writes and cleanup.
         failureSteps.run('admin-seed', () => {
             assert.equal(sql(`WITH inserted AS (INSERT INTO ext_shell.default_apps(content_type,application_id,panel_id)
                 VALUES (${literal(fixtureContentType)},'floatprovider','preview') RETURNING 1)
@@ -998,6 +1000,8 @@ try {
             account: state.accounts.b, generation: replacement.id, retiredGeneration: originalPackage.id,
             retiredTargets: originalTypedTargets,
             floatTargets: replacementTargets, completed });
+        await verifyAdminDefaultsFoundation({ operator, denied, consumers: [newA, b, denied],
+            request, sql, literal, completed });
     }
 } catch (error) {
     failure = error;
@@ -1069,12 +1073,12 @@ if (failure || cleanupFailures.length) {
     throw new AggregateError([...(failure ? [failure] : []), ...cleanupFailures], 'installed float journey/cleanup failed');
 }
 if (phase === 'verify') {
-    assert.equal(completed.length, 15);
+    assert.equal(completed.length, 19);
     assert.deepEqual(recoveryEvidence, Array.from({ length: 3 }, () =>
         ({ terminal: 1, new_socket_ack: 1, fresh_catalog: 1, home_empty: 1 })));
-    console.log(JSON.stringify({ phase, expectedCases: 15, completed, actualAuth: true,
+    console.log(JSON.stringify({ phase, expectedCases: 19, completed, actualAuth: true,
         packageProvenance: 'user', archiveHashes: state.archiveHashes,
         protectedPolicy: true, normalUninstall: true,
         authorityRecovery: { barriers: 3, terminals: 3, newSocketAcks: 3, freshCatalogs: 3, emptyPrimary: 3 },
-        scope: 'native ordinary ZIP/API/auth/RBAC/SDK/import/protected policy/guarded SQL/reload/component recovery/revocation/package lifecycle plus primary/tray typed transport; no tray-UI/navigation/process-crash or lost-ACK proof' }));
+        scope: 'native ordinary ZIP/API/auth/RBAC/SDK/import/protected policy/guarded SQL/reload/component recovery/revocation/package lifecycle plus primary/tray typed transport and administrator-default HTTP CRUD/CSRF/PAT/raw refusals/paging; no manager-UI/tray-UI/navigation/process-crash or lost-ACK proof' }));
 }

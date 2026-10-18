@@ -4,12 +4,12 @@
 **Implementation owner:** [#46](https://github.com/gobha-me/plinth/issues/46).
 **Source baseline:** `f677f8d16bc35db2821e11859aa5dce13d37f53c`.
 **Status:** Reviewed delivery specification with historical typed-install
-delivery recorded in section 1.1 and later scoped delivery in section 1.2.
-The float path and native primary/tray transport foundation do not complete
-#46. Remaining tray ownership/chrome, bell/avatar dogfooding, navigation and
-default-manager UI are not shipped behavior or a release promise. Concrete
-engineering proposals still require #46 source review; approved product choices
-remain distinguished explicitly.
+delivery recorded in section 1.1 and later scoped delivery in sections 1.2–1.3.
+The float path, native primary/tray transport and administrator-default backend
+do not complete #46. Remaining tray ownership/chrome, bell/avatar dogfooding,
+navigation and default-manager UI are not shipped behavior or a release
+promise. Concrete engineering proposals still require #46 source review;
+approved product choices remain distinguished explicitly.
 
 ## 1. Authority, current behavior and sequencing
 
@@ -23,7 +23,7 @@ Unrelated delivery history remains history. Follow the
 
 The following source-baseline descriptions and section 1.1's original exclusion
 list are milestone history, not assertions that later merged work remains
-absent. Section 1.2 records those later delivery boundaries; it does not turn
+absent. Sections 1.2–1.3 record those later delivery boundaries; they do not turn
 every remaining proposal below into current behavior.
 
 Current behavior at that source baseline remains separate:
@@ -196,6 +196,48 @@ permission grant, notification API, persistence approval, release or repository-
 setting change. Local native/browser success is not candidate or exact-merge CI
 success; those remain separate delivery gates.
 
+### 1.3 Native administrator-default management backend
+
+The current native implementation provides
+`GET/PUT/DELETE /api/frontend/handler-defaults/admin`. This records backend
+availability in source, not a release or whole-#46 acceptance. Every management
+read and mutation freshly authenticates the original cookie/PAT and requires
+`kernel.admin`; cookie mutations retain existing CSRF/same-origin policy and
+the existing explicit bearer policy.
+
+GET selects one canonical `content_type` or a disjoint cursor page, with
+`limit=1..64` (default 64) and at most 64 entries/128 KiB. Closed schema-1 replies
+carry logical handler pairs or successful absence, never partial malformed rows.
+PUT/DELETE use section 5's exact schema-1 shapes and at most 2,048 raw UTF-8 bytes
+before bounded duplicate-key/structure validation. Syntactically valid choices
+remain stored/readable even when their handlers are uninstalled or unusable;
+they grant no presentation permission or persistence approval.
+
+Separate authenticated administrative cursors bind the original user,
+credential/auth kind/source, admitted platform profile, limit and MIME position,
+expire after 60 seconds and confer no authority or transactional page snapshot.
+The existing fixed shell-owned version-1 storage contract retains captured
+code/runtime binding and the original caller/session/IP with bounded incremented
+depth/MAX_CALL_DEPTH; this is the guarded fixed-storage slice, not a claim about
+all extension dispatch. It adds no generic privileged capability or kernel
+business-SQL fallback.
+
+The existing 64 physical slots and one 10-second logical deadline remain. Actual
+SQL descendants stay owned through settlement after logical cancellation; an
+independent counted ACK owner covers response handoff/callback return. Worker
+name/receipt and post-serialization identity fences retain the admitted profile
+with its result, refusing stale/uncertain acknowledgement with 409/503. Only
+actual native completion plus these fences permits 200. A mutation may already
+have committed when acknowledgement fails: no automatic retry or
+rollback inference follows. Admitted work makes one bounded logical audit attempt
+under the original actor, distinguishing DB acknowledgement/response attempt
+from client receipt; asynchronous audit is not atomic with the business mutation.
+
+This backend adds no manager UI, tray ownership/chrome, bell/avatar dogfooding,
+navigation delivery, SDK method, permission grant, shipped asset or version
+change. Those remaining #46 journeys and their acceptance stay open; candidate
+and exact-merge verification remain separate gates.
+
 ## 2. Typed declarations and context proposals
 
 The prospective root is `{format_version: 2, panels: [...]}`. Absence preserves
@@ -318,8 +360,8 @@ generic key/value writes alone do not prove it; public SDK stays unchanged.
 ## 4. Typed authority transport proposals
 
 These transport contracts originated as #46 source-review proposals.
-Implemented scope is recorded in section 1.2; remaining additions are proposals,
-not available APIs.
+Implemented scope is recorded in sections 1.2–1.3; remaining additions are
+proposals, not available APIs.
 Preserve the schema-1 primary applications resource unchanged. SessionFilter's
 existing session/PAT modes establish the original caller; fresh effective RBAC,
 declaration, registered capability, package readiness and immutable asset-path
@@ -391,7 +433,14 @@ fresh authorization filtering. Null requires a successful storage read, not a
 variant (null generation plus content type); never fabricate its capability or
 use an incomplete pinned tuple. Subsequent checks use the returned pinned tuple.
 
-## 5. Defaults storage and privileged dispatch proposal
+## 5. Defaults storage and privileged dispatch: original proposal
+
+This section preserves the original source-baseline proposal history. Sections
+1.2–1.3 record the implemented boundaries: the prospective endpoint/contract
+wording and "current dispatch" limitation below describe that historical
+baseline, not current absence of the guarded fixed-storage slice. This does
+not declare every remaining proposal delivered or extend that slice's binding
+to generic extension dispatch.
 
 Own defaults use existing own-user shell preferences with NEW per-key validation
 for proposed `shell.handler_defaults`:

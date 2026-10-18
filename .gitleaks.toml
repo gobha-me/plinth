@@ -45,3 +45,11 @@ condition = "AND"
 paths = ['''^tests/kernel/frontend/surface_protocol_test\.cpp$''']
 regexTarget = "secret"
 regexes = ['''^sanADvnIuudZjcwLQI8bj--LzqaiKRooLYrCyYa5WgU$''']
+
+[[allowlists]]
+description = "Deterministic admin-default cursor HMAC fingerprint, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^tests/kernel/frontend/admin_defaults_contract_test\.cpp$''']
+regexTarget = "secret"
+regexes = ['''^aU8t7ANB_fIOdAVVM2G5uF5eF9LqZryfCh0aw265nnc$''']

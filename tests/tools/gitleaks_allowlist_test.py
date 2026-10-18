@@ -13,6 +13,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = Path("tests/kernel/frontend/surface_protocol_test.cpp")
+FIXTURES = (
+    ("", FIXTURE),
+    ("admin_defaults_", Path("tests/kernel/frontend/admin_defaults_contract_test.cpp")),
+)
 OTHER_PATH = Path("tests/kernel/frontend/not_allowed_test.cpp")
 REPORT_MAX_BYTES = 1024 * 1024
 
@@ -21,8 +25,8 @@ class RegressionFailure(RuntimeError):
     pass
 
 
-def fixture_inputs():
-    source = (ROOT / FIXTURE).read_text(encoding="utf-8")
+def fixture_inputs(fixture):
+    source = (ROOT / fixture).read_text(encoding="utf-8")
     match = re.search(
         r'\bconstexpr\s+std::string_view\s+PAYLOAD\s*=\s*R"\((.*?)\)";',
         source, re.DOTALL,
@@ -91,15 +95,19 @@ def main():
         scanner = args.scanner.resolve(strict=True)
         if not scanner.is_file() or not os.access(scanner, os.X_OK):
             raise RegressionFailure("pinned scanner is not executable")
-        original, changed = fixture_inputs()
         with tempfile.TemporaryDirectory(prefix="plinth-gitleaks-allowlist-") as temporary:
             root = Path(temporary)
-            controls = [
-                check_control(scanner, root, "exact_fixture_allowed", FIXTURE, original, 0),
-                check_control(scanner, root, "same_value_other_path", OTHER_PATH, original, 1),
-                check_control(scanner, root, "other_value_same_path", FIXTURE, changed, 1),
-            ]
-        print(json.dumps({"gitleaksAllowlistControls": 3, "passed": 3, "controls": controls}, sort_keys=True))
+            controls = []
+            for prefix, fixture in FIXTURES:
+                original, changed = fixture_inputs(fixture)
+                controls.extend([
+                    check_control(scanner, root, prefix + "exact_fixture_allowed", fixture, original, 0),
+                    check_control(scanner, root, prefix + "same_value_other_path", OTHER_PATH, original, 1),
+                    check_control(scanner, root, prefix + "other_value_same_path", fixture, changed, 1),
+                ])
+        if len(controls) != 6:
+            raise RegressionFailure("unexpected cursor fixture control inventory")
+        print(json.dumps({"gitleaksAllowlistControls": 6, "passed": 6, "controls": controls}, sort_keys=True))
     except (OSError, UnicodeError, RegressionFailure) as error:
         # No scanner stdout/stderr, match text or fingerprint is printed.
         print("gitleaks allowlist regression failed: " + str(error), file=sys.stderr)

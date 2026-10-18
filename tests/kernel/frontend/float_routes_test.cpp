@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 
 // Low-level actual facade helpers, not a replacement service/filter/authority.
 // No handler registration, PG, native operation or proof token is fabricated.
@@ -31,6 +32,14 @@ auto float_json_completion(std::function<void(const drogon::HttpResponsePtr&)>,
                            bool) -> FloatLayoutService::Completion;
 auto float_asset_completion(std::function<void(const drogon::HttpResponsePtr&)>)
     -> FloatLayoutService::AssetCompletion;
+auto float_admin_read_request(std::string_view, std::string_view)
+    -> std::expected<admin_defaults::ReadRequest, TypedRequestError>;
+auto float_admin_put_request(std::string_view, std::string_view)
+    -> std::expected<admin_defaults::PutRequest, TypedRequestError>;
+auto float_admin_delete_request(std::string_view, std::string_view)
+    -> std::expected<admin_defaults::DeleteRequest, TypedRequestError>;
+auto float_admin_completion(std::function<void(const drogon::HttpResponsePtr&)>,
+                            bool) -> FloatLayoutService::AdminCompletion;
 } // namespace plinth::frontend::test_seam
 
 namespace {
@@ -109,7 +118,7 @@ TEST_CASE("float routes: strict raw facade and one-shot redacted responses",
           "auth CSRF filters") {
     const auto routes = seam::float_route_contract();
     REQUIRE(routes.isArray());
-    REQUIRE(routes.size() == 6);
+    REQUIRE(routes.size() == 9);
     for (Json::ArrayIndex index = 0; index < routes.size(); ++index) {
       const auto& row = routes[index];
       const auto& filters = row["filters"];
@@ -117,12 +126,13 @@ TEST_CASE("float routes: strict raw facade and one-shot redacted responses",
         REQUIRE(filters.empty());
       else {
         REQUIRE(filters[0].asString() == "plinth::auth::SessionFilter");
-        const bool mutation = index == 1 || index == 3;
+        const bool mutation =
+            index == 1 || index == 3 || index == 7 || index == 8;
         REQUIRE(filters.size() == (mutation ? 2U : 1U));
         if (mutation)
           REQUIRE(filters[1].asString() == "plinth::auth::CsrfFilter");
       }
-      REQUIRE(row["regex"].asBool() == (index >= 4));
+      REQUIRE(row["regex"].asBool() == (index == 4 || index == 5));
     }
     REQUIRE(routes[0]["path"].asString() == "/api/frontend/surfaces");
     REQUIRE(routes[1]["path"].asString() == "/api/frontend/surfaces/admission");
@@ -130,9 +140,16 @@ TEST_CASE("float routes: strict raw facade and one-shot redacted responses",
     REQUIRE(routes[3]["path"].asString() == "/api/frontend/float-layout");
     REQUIRE(routes[4]["path"].asString() == "^/_plinth/typed/.*$");
     REQUIRE(routes[5]["path"].asString() == "^/_plinth/platform/.*$");
+    for (const Json::ArrayIndex index : {6U, 7U, 8U})
+      REQUIRE(routes[index]["path"].asString() ==
+              "/api/frontend/handler-defaults/admin");
     REQUIRE(routes[0]["methods"][0].asInt() == static_cast<int>(drogon::Get));
     REQUIRE(routes[1]["methods"][0].asInt() == static_cast<int>(drogon::Post));
     REQUIRE(routes[3]["methods"][0].asInt() == static_cast<int>(drogon::Put));
+    REQUIRE(routes[6]["methods"][0].asInt() == static_cast<int>(drogon::Get));
+    REQUIRE(routes[7]["methods"][0].asInt() == static_cast<int>(drogon::Put));
+    REQUIRE(routes[8]["methods"][0].asInt() ==
+            static_cast<int>(drogon::Delete));
     for (const Json::ArrayIndex index : {4U, 5U}) {
       REQUIRE(routes[index]["methods"].size() == 2);
       REQUIRE(routes[index]["methods"][0].asInt() ==
@@ -140,6 +157,90 @@ TEST_CASE("float routes: strict raw facade and one-shot redacted responses",
       REQUIRE(routes[index]["methods"][1].asInt() ==
               static_cast<int>(drogon::Head));
     }
+  }
+  SECTION("actual admin raw adapters reject GET bodies and mutation queries") {
+    namespace admin = plinth::frontend::admin_defaults;
+    // HttpRequest::setPath does not populate query() in this pinned framework.
+    // Exercise the SAME raw query/body adapter used by handle(), rather than
+    // fabricate parser state or erase duplicates through a parameter map.
+    // Real HTTP request parsing/filtering is a separate native-browser gate.
+    const auto page = seam::float_admin_read_request("", "");
+    REQUIRE(page);
+    REQUIRE(std::holds_alternative<admin::ReadPage>(*page));
+    REQUIRE(std::get<admin::ReadPage>(*page).limit == 64);
+    const auto single =
+        seam::float_admin_read_request("content_type=text%2Fplain", "");
+    REQUIRE(single);
+    REQUIRE(std::holds_alternative<admin::ReadSingle>(*single));
+    REQUIRE(std::get<admin::ReadSingle>(*single).content_type == "text/plain");
+    REQUIRE_FALSE(seam::float_admin_read_request("", " "));
+    REQUIRE_FALSE(seam::float_admin_read_request("limit=1&l%69mit=2", ""));
+    constexpr std::string_view put =
+        R"({"schema_version":1,"content_type":"text/plain","handler":{"application_id":"uninstalled-app","panel_id":"old_panel"}})";
+    REQUIRE(seam::float_admin_put_request("", put));
+    REQUIRE_FALSE(seam::float_admin_delete_request("", put));
+    REQUIRE_FALSE(seam::float_admin_put_request("limit=1", put));
+    constexpr std::string_view deletion =
+        R"({"schema_version":1,"content_type":"text/plain"})";
+    REQUIRE(seam::float_admin_delete_request("", deletion));
+    REQUIRE_FALSE(seam::float_admin_delete_request("content_type=text%2Fplain",
+                                                   deletion));
+    const auto large =
+        seam::float_admin_put_request("", std::string(2049, ' '));
+    REQUIRE_FALSE(large);
+    REQUIRE(large.error() == plinth::frontend::TypedRequestError::TOO_LARGE);
+  }
+  SECTION(
+      "actual admin error adapter is fixed redacted hardened and one-shot") {
+    for (const bool changes : {false, true}) {
+      for (const auto& [code, status] :
+           {std::pair{"invalid_argument", drogon::k400BadRequest},
+            std::pair{"not_authenticated", drogon::k401Unauthorized},
+            std::pair{"permission_denied", drogon::k403Forbidden},
+            std::pair{"stale_binding", drogon::k409Conflict},
+            std::pair{"body_too_large", drogon::k413RequestEntityTooLarge},
+            std::pair{"storage_unavailable", drogon::k503ServiceUnavailable},
+            std::pair{"private-unrecognized",
+                      drogon::k503ServiceUnavailable}}) {
+        unsigned calls = 0;
+        drogon::HttpResponsePtr response;
+        auto completion = seam::float_admin_completion(
+            [&](const auto& actual) {
+              ++calls;
+              response = actual;
+            },
+            changes);
+        const auto reject =
+            [&]() -> plinth::frontend::FloatLayoutService::AdminResult {
+          return std::unexpected(plinth::js::PromiseRejection{
+              .code = code,
+              .message = "private fake fixture message",
+              .sqlstate = "private-fake-sqlstate"});
+        };
+        completion(reject());
+        completion(reject());
+        REQUIRE(calls == 1);
+        REQUIRE(response->statusCode() == status);
+        hardening(response, changes);
+      }
+    }
+    unsigned calls = 0;
+    auto completion = seam::float_admin_completion(
+        [&](const auto&) {
+          ++calls;
+          throw std::runtime_error{"controlled callback"};
+        },
+        true);
+    const auto reject =
+        []() -> plinth::frontend::FloatLayoutService::AdminResult {
+      return std::unexpected(plinth::js::PromiseRejection{
+          .code = "storage_unavailable", .message = "private", .sqlstate = ""});
+    };
+    REQUIRE_THROWS_AS(completion(reject()), std::runtime_error);
+    REQUIRE_NOTHROW(completion(reject()));
+    REQUIRE(calls == 1);
+    // No success-frame construction seam: actual native service and HTTP
+    // journeys, not this low-level helper, must prove ACK/profile ownership.
   }
   SECTION("single raw query decode validates exact closed fields without "
           "map-erased duplicates") {

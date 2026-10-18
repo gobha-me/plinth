@@ -64,8 +64,25 @@ disable and failed-migration actions also require primary/tray catalog/admission
 module denial; successful enable restores fresh metadata, and replacement refuses
 the actual original captured URLs and generation. No extra lifecycle mutation,
 deadline extension or retry is added. They do not execute navigation callbacks or tray
-owners/chrome. These are fifteen named native groups, retaining all original
-twelve assertions in their original relative order.
+owners/chrome. Four more groups exercise real administrator-default HTTP CRUD,
+upsert and actual delete0/1 acknowledgements, retained syntactically valid
+uninstalled choices, all-method nonadministrator refusal without metadata,
+anonymous refusal, cookie CSRF and wrong-Origin refusal, administrator PAT
+write/read/delete, closed raw request/2048-byte boundary controls and byte-ordered
+65-key paging with 64-row lookahead and credential-bound opaque cursors.
+Browser fetch carries ordinary requests; Playwright APIRequestContext supplies
+real native GET-with-body, chosen-Origin and invalid-UTF8 negatives that browser
+fetch cannot express. These are transport checks, not browser-origin spoofing
+proof. Administrator writes and each attempted owned key's cleanup use only the
+ordinary HTTP endpoint, never SQL writes; fixture SQL only observes rows and
+unchanged permission counts. Cleanup aggregates errors, performs no mutation
+retry and never treats an uncertain result as rollback. No second administrator
+or new grant is created. Source hash capture before execution and comparison
+after owned cleanup pins the additive module in the final success receipt.
+These are nineteen named native groups, retaining all original fifteen
+assertions in their original relative order. They do not prove a management UI,
+fresh admin-grant revocation, platform-cutover projection races, a transactional
+page snapshot, lost SQL COMMIT acknowledgement or whole #46 completion.
 Only after kernel/browser/protected-file/database cleanup does the supervisor emit
 its single success receipt. Failures are aggregated; timeout does not imply
 rollback or permit a mutation retry. Fake credentials remain in owned mode600
@@ -86,12 +103,12 @@ Concrete dependencies before execution:
 - Root-owned policy path ancestry and nonroot service identity must genuinely
   pass; unavailable sudo/capability/platform seams are failures, not skipped pass.
 
-The `CI` workflow's existing GCC native browser step runs the nineteen harness
+The `CI` workflow's existing GCC native browser step runs the twenty-one harness
 construction controls, the offline fixed-browser helper controls, and then this
 actual journey against `build/plinth` and
 `build/share/plinth/bundled`, after its other production browser journeys.
 Pull-request and main-push runs must each supply fresh evidence for their actual
-checkout; candidate success is not exact-merge success. The fifteen named journey
+checkout; candidate success is not exact-merge success. The nineteen named journey
 groups are separate from the construction controls, client units and CTest
 inventory. This placement provides GCC/Linux native coverage only, not OCI,
 ARM, ASan/UBSan or TSan journey coverage; those existing checks remain unchanged.
@@ -123,9 +140,9 @@ This is a native-only harness. The container adapter preserves copied modes,
 but lacks this protected read-only policy mount/privilege launch seam. Container
 support therefore needs separately reviewed protected-policy/privilege-launch integration; this
 does not claim an OCI artifact journey. Earlier seven-group receipts do not
-establish the fifteen-group gate. Syntax/construction checks do not establish backend,
+establish the nineteen-group gate. Syntax/construction checks do not establish backend,
 RBAC, browser, full float mechanism, recovery or operational restore acceptance.
 Remaining wider matrix (e.g. five live/minimized limit, dirty close interactions,
 in-flight install/retirement/policy races, process crashes/lost acknowledgement and
-real image deployment) stays with the integrated feature gates; these fifteen journey
+real image deployment) stays with the integrated feature gates; these nineteen journey
 groups alone do not close either issue.

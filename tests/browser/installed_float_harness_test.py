@@ -278,7 +278,7 @@ assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
                        cwd=repo / 'tests/browser', check=True, timeout=10,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    def test_fifteen_native_groups_preserve_the_original_twelve_in_order(self):
+    def test_nineteen_native_groups_preserve_the_original_fifteen_in_order(self):
         original = [
             'real protected policy, captured profile, authorized/denied surface filtering',
             'ordinary caller SDK openFloat, ready ID, native relative/dynamic imports, shared modules',
@@ -291,10 +291,13 @@ assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
             'ordinary disable and enable retire old owners without automatic resurrection',
             'failed migration upgrade preserves the old generation fence without rollback claims',
             'successful replacement recovers through new native bytes without inherited persistence approval',
+            'ordinary installed primary and tray catalogs, exact typed wire and isolated cursors',
+            'indexed mixed-kind admission, cookie CSRF, PAT access and denied no-metadata',
+            'captured primary and tray imports, foreign essential refusal and fresh rule fencing',
             'normal authenticated package uninstall after consumer contexts close',
         ]
-        self.assertEqual(len(harness.EXPECTED_CASES), 15)
-        self.assertEqual(len(set(harness.EXPECTED_CASES)), 15)
+        self.assertEqual(len(harness.EXPECTED_CASES), 19)
+        self.assertEqual(len(set(harness.EXPECTED_CASES)), 19)
         indexes = [harness.EXPECTED_CASES.index(name) for name in original]
         self.assertEqual(indexes, sorted(indexes))
         self.assertEqual(harness.EXPECTED_CASES[-1], original[-1])
@@ -305,7 +308,7 @@ assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
             "console.log(JSON.stringify(FOUNDATION_CASES));"],
             cwd=repo / 'tests/browser', check=True, timeout=10,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.assertEqual(json.loads(result.stdout), harness.EXPECTED_CASES[11:-1])
+        self.assertEqual(json.loads(result.stdout), harness.EXPECTED_CASES[11:14])
         panels = json.loads((repo / 'tests/extensions/float-provider/panels.json').read_text())['panels']
         by_id = {panel['id']: panel for panel in panels}
         self.assertEqual(len(panels), len(by_id))
@@ -324,6 +327,59 @@ assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
         self.assertTrue(by_id['status-a']['chrome_essential'])
         self.assertNotIn('default_grants', json.loads(
             (repo / 'tests/extensions/float-provider/rbac.json').read_text()))
+
+    def test_admin_default_native_inventory_and_finite_owned_transport_construction(self):
+        script = r'''
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { ADMIN_DEFAULT_CASES, ADMIN_DEFAULT_BOUNDS, adminDefaultFixtureKeys }
+    from './installed-admin-defaults-foundation.mjs';
+assert(Object.isFrozen(ADMIN_DEFAULT_CASES) && Object.isFrozen(ADMIN_DEFAULT_BOUNDS));
+const keys = adminDefaultFixtureKeys('a'.repeat(32));
+assert.equal(keys.length, 65); assert.equal(new Set(keys).size, 65);
+assert.deepEqual([...keys].sort(), keys);
+assert(keys.every(key => /^[a-z0-9-]+\/[a-z0-9-]+$/.test(key) && key.length < 128));
+for (const suffix of ['', 'a'.repeat(31), 'G'.repeat(32), 'a'.repeat(32) + '\n']) {
+    assert.throws(() => adminDefaultFixtureKeys(suffix));
+}
+assert.deepEqual(ADMIN_DEFAULT_BOUNDS, {keys: 65, response: 131072, mutation: 2048,
+    requests: 240, operationMs: 10000, journeyMs: 75000, cleanupMs: 30000});
+const source = readFileSync('installed-admin-defaults-foundation.mjs', 'utf8');
+assert(source.includes('for (const type of attempted)'));
+assert(source.includes('await remove(type, undefined, { end: cleanupDeadline })'));
+assert(source.includes('await response.dispose()'));
+assert(source.includes('maxRedirects: 0, maxRetries: 0'));
+assert(source.includes("'X-Plinth-CSRF': csrf, Origin: origin ?? new URL(operator.url()).origin"));
+assert(source.includes('size > bound'));
+assert(!/\.(?:route|routeFromHAR)\s*\(/.test(source));
+assert(!/\b(?:INSERT INTO|UPDATE ext_shell|DELETE FROM)\b/.test(source));
+console.log(JSON.stringify(ADMIN_DEFAULT_CASES));
+'''
+        result = subprocess.run(['node', '--input-type=module', '-e', script],
+            cwd=repo / 'tests/browser', check=True, timeout=10,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(json.loads(result.stdout), harness.EXPECTED_CASES[14:-1])
+
+    def test_admin_default_executed_source_pin_fails_closed(self):
+        name = 'tests/browser/installed-admin-defaults-foundation.mjs'
+        self.assertEqual(set(harness.admin_defaults_source_hashes(repo)), {name})
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / name
+            path.parent.mkdir(parents=True)
+            with self.assertRaises(RuntimeError):
+                harness.admin_defaults_source_hashes(root)
+            path.write_bytes(b'// mock construction source\n')
+            first = harness.admin_defaults_source_hashes(root)
+            path.write_bytes(b'// changed mock construction source\n')
+            self.assertNotEqual(first, harness.admin_defaults_source_hashes(root))
+            path.write_bytes(b'x' * 65537)
+            with self.assertRaises(RuntimeError):
+                harness.admin_defaults_source_hashes(root)
+            path.unlink()
+            path.symlink_to(repo / name)
+            with self.assertRaises(RuntimeError):
+                harness.admin_defaults_source_hashes(root)
 
     def test_fixed_upgrade_variants_preserve_contracts_and_source_without_new_grants(self):
         source = repo / 'tests/extensions/float-provider'

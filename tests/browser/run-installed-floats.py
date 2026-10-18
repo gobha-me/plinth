@@ -44,8 +44,28 @@ EXPECTED_CASES = [
     'ordinary installed primary and tray catalogs, exact typed wire and isolated cursors',
     'indexed mixed-kind admission, cookie CSRF, PAT access and denied no-metadata',
     'captured primary and tray imports, foreign essential refusal and fresh rule fencing',
+    'native administrator logical-default CRUD and acknowledged stale-handler retention',
+    'fresh admin-only methods, cookie CSRF and explicit administrator PAT transport',
+    'closed native admin query and mutation byte-boundary refusals without storage changes',
+    'native admin byte-ordered 64-plus-one paging and credential-isolated opaque cursors',
     'normal authenticated package uninstall after consumer contexts close',
 ]
+
+
+def admin_defaults_source_hashes(repo):
+    """Pin the additional executed transport source; do not follow symlinks."""
+    name = 'tests/browser/installed-admin-defaults-foundation.mjs'
+    path = repo / name
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+        raise RuntimeError('admin-default browser source outside finite file profile')
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as source:
+        metadata = os.fstat(source.fileno())
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > 65536:
+            raise RuntimeError('admin-default browser source outside finite file profile')
+        value = source.read(65537)
+    if len(value) > 65536:
+        raise RuntimeError('admin-default browser source grew beyond profile')
+    return {name: hashlib.sha256(value).hexdigest()}
 
 FAILURE_PREFIX = 'PLINTH_FLOAT_FAILURE '
 FAILURE_CATEGORIES = {'assertion', 'timeout', 'type', 'range', 'syntax', 'operation', 'aggregate', 'unknown'}
@@ -277,6 +297,7 @@ def main():
     protected_files = []
     protected_created = False
     created_database = False
+    source_hashes = admin_defaults_source_hashes(repo)
     failures = []
     receipt = None
 
@@ -496,6 +517,9 @@ def main():
                 failures.append(error)
     if failures:
         raise BaseExceptionGroup('installed float journey and owned cleanup failures', failures)
+    if admin_defaults_source_hashes(repo) != source_hashes:
+        raise RuntimeError('executed admin-default browser source changed during native journey')
+    receipt['adminDefaultsSourceSha256'] = source_hashes
     receipt['cleanup'] = 'PASS native processes/browser descendants/protected files/disposable database'
     print(json.dumps(receipt), flush=True)
 
