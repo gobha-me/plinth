@@ -7,7 +7,9 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 from unittest import mock
@@ -33,11 +35,15 @@ CAP_GATE = "plinth_tests_cap_corpus"
 DB_ADMISSION_TAG = "[isolated-db-admission]"
 DB_ADMISSION_CASE = "QuickJS ordinary database calls have a bounded deterministic admission and ownership corpus"
 DB_ADMISSION_GATE = "plinth_tests_db_admission_corpus"
+DB_BATCH_TAG = "[isolated-db-batch]"
+DB_BATCH_CASE = "QuickJS db.batch has a bounded deterministic admission and orchestration corpus"
+DB_BATCH_GATE = "plinth_tests_db_batch_corpus"
+INVENTORY_GATE = "plinth_tests_logger_capture_inventory"
 AUDIT_DRAIN_TAG = "[isolated-audit-drain]"
 AUDIT_DRAIN_CASE = "audit drain retains blocked writes before Drogon shutdown and retries"
 AUDIT_DRAIN_GATE = "plinth_tests_audit_drain"
 GROUPED_JS_BASELINE = "[js] ~[batch-transaction]"
-GROUPED_JS_SELECTOR = GROUPED_JS_BASELINE + " ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-audit-drain]"
+GROUPED_JS_SELECTOR = GROUPED_JS_BASELINE + " ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-db-batch] ~[isolated-audit-drain]"
 EXPECTED_GATES = {
     "plinth_tests_logger_capture_isolated": ISOLATION_TAG,
     "plinth_tests_log_regression": "[js][stdlib][log][regression]",
@@ -70,6 +76,7 @@ def validate_inventory(
     pubsub: dict[str, str],
     cap: dict[str, str],
     db_admission: dict[str, str],
+    db_batch: dict[str, str],
 ) -> None:
     if grouped_selector != GROUPED_JS_SELECTOR:
         raise AssertionError("grouped JS selector must preserve its broad baseline and exact exclusions")
@@ -80,24 +87,30 @@ def validate_inventory(
         )
     if any(ISOLATION_TAG not in tags for tags in isolated.values()):
         raise AssertionError("capture fixture lacks its isolation tag")
-    if any(PUBSUB_TAG in tags or CAP_TAG in tags or DB_ADMISSION_TAG in tags for tags in isolated.values()):
+    if any(any(tag in tags for tag in (PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG))
+           for tags in isolated.values()):
         raise AssertionError("logger fixtures must not enter another isolation group")
     if set(pubsub) != {PUBSUB_CASE} or PUBSUB_TAG not in pubsub[PUBSUB_CASE]:
         raise AssertionError("pubsub isolation requires exactly its named tagged corpus")
-    if any(tag in pubsub[PUBSUB_CASE] for tag in (ISOLATION_TAG, CAP_TAG, DB_ADMISSION_TAG)):
+    if any(tag in pubsub[PUBSUB_CASE] for tag in (ISOLATION_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG)):
         raise AssertionError("pubsub corpus must not enter another isolation group")
     if set(cap) != {CAP_CASE} or CAP_TAG not in cap[CAP_CASE]:
         raise AssertionError("cap isolation requires exactly its named tagged corpus")
-    if any(tag in cap[CAP_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, DB_ADMISSION_TAG)):
+    if any(tag in cap[CAP_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG)):
         raise AssertionError("cap corpus must not enter another isolation group")
     if set(db_admission) != {DB_ADMISSION_CASE} or DB_ADMISSION_TAG not in db_admission[DB_ADMISSION_CASE]:
         raise AssertionError("database admission isolation requires exactly its named tagged corpus")
-    if any(tag in db_admission[DB_ADMISSION_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG)):
+    if any(tag in db_admission[DB_ADMISSION_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_BATCH_TAG)):
         raise AssertionError("database admission corpus must not enter another isolation group")
+    if set(db_batch) != {DB_BATCH_CASE} or db_batch[DB_BATCH_CASE].count(DB_BATCH_TAG) != 1:
+        raise AssertionError("database batch isolation requires exactly its named tagged corpus")
+    if any(tag in db_batch[DB_BATCH_CASE] for tag in
+           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, AUDIT_DRAIN_TAG)):
+        raise AssertionError("database batch corpus must not enter another isolation group")
     if EXPECTED_NAMES.intersection(grouped) or any(
-        name in grouped for name in (PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE)
+        name in grouped for name in (PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, DB_BATCH_CASE)
     ) or any(
-        any(tag in tags for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG))
+        any(tag in tags for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG))
         for tags in grouped.values()
     ):
         raise AssertionError("grouped JS selector contains an isolated fixture")
@@ -120,13 +133,18 @@ def validate_inventory(
     }
     if baseline_db_admission != db_admission:
         raise AssertionError("baseline JS discovery lost or changed the database admission corpus")
+    baseline_db_batch = {
+        name: tags for name, tags in baseline.items() if DB_BATCH_TAG in tags
+    }
+    if baseline_db_batch != db_batch:
+        raise AssertionError("baseline JS discovery lost or changed the database batch corpus")
     audit_drain = {name: tags for name, tags in baseline.items() if AUDIT_DRAIN_TAG in tags}
     if set(audit_drain) != {AUDIT_DRAIN_CASE}:
         raise AssertionError("audit drain requires exactly its named isolated fixture")
     if any(tag in audit_drain[AUDIT_DRAIN_CASE] for tag in
-           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG)):
+           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG)):
         raise AssertionError("audit drain must not enter another isolation group")
-    exclusions = EXPECTED_NAMES | {PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, AUDIT_DRAIN_CASE}
+    exclusions = EXPECTED_NAMES | {PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, DB_BATCH_CASE, AUDIT_DRAIN_CASE}
     expected_grouped = {
         name: tags for name, tags in baseline.items() if name not in exclusions
     }
@@ -147,18 +165,57 @@ def validate_inventory(
     for gate_name, case_name in (
         (PUBSUB_GATE, PUBSUB_CASE), (CAP_GATE, CAP_CASE),
         (DB_ADMISSION_GATE, DB_ADMISSION_CASE),
+        (DB_BATCH_GATE, DB_BATCH_CASE),
     ):
         validate_strict_gate(gates, gate_name, case_name, binary)
     validate_strict_gate(gates, AUDIT_DRAIN_GATE, AUDIT_DRAIN_CASE, binary, 30, 40)
+    metadata = [gate for gate in gates if gate.get("name") == INVENTORY_GATE]
+    if len(metadata) != 1:
+        raise AssertionError("inventory metadata gate must occur exactly once")
+    validate_metadata_gate(metadata[0], binary, grouped_selector)
     for gate in gates:
         for gate_name, case_name, isolation_tag in (
             (CAP_GATE, CAP_CASE, CAP_TAG),
             (DB_ADMISSION_GATE, DB_ADMISSION_CASE, DB_ADMISSION_TAG),
+            (DB_BATCH_GATE, DB_BATCH_CASE, DB_BATCH_TAG),
         ):
-            if gate.get("name") != gate_name and any(
-                argument in (case_name, isolation_tag) for argument in gate.get("command", [])
+            if gate.get("name") not in (gate_name, "plinth_tests_js", INVENTORY_GATE) and any(
+                isinstance(argument, str) and (case_name in argument or isolation_tag in argument)
+                for argument in gate.get("command", [])
             ):
                 raise AssertionError("isolated corpus must not have an extra discovery or execution gate")
+
+
+def validate_metadata_gate(gate: dict, binary: Path, grouped_selector: str) -> None:
+    """Validate this helper's metadata inspection before allowing its selector."""
+    command = gate.get("command", [])
+    if (
+        not isinstance(command, list)
+        or len(command) != 10
+        or not all(isinstance(argument, str) and argument and
+                   not any(char in argument for char in "\0\n\r") for argument in command)
+        or Path(command[0]).resolve() != Path(sys.executable).resolve()
+        or Path(command[1]).resolve() != Path(__file__).resolve()
+        or command[2] != "--binary"
+        or Path(command[3]).resolve() != binary.resolve()
+        or command[4:7] != ["--grouped-selector", grouped_selector, "--ctest-command"]
+        or not Path(command[7]).is_absolute()
+        or Path(command[7]).name != "ctest"
+        or not Path(command[7]).is_file()
+        or not os.access(command[7], os.X_OK)
+        or command[8] != "--build-dir"
+        or not Path(command[9]).is_absolute()
+        or Path(command[9]).resolve() != binary.resolve().parent
+        or not Path(command[9]).is_dir()
+    ):
+        raise AssertionError("inventory metadata gate must use its exact inspection command")
+    deadlines = [prop.get("value") for prop in gate.get("properties", [])
+                 if prop.get("name") == "TIMEOUT"]
+    working_directories = [prop.get("value") for prop in gate.get("properties", [])
+                           if prop.get("name") == "WORKING_DIRECTORY"]
+    if (len(deadlines) != 1 or type(deadlines[0]) not in (int, float) or deadlines[0] != 90
+            or working_directories != [command[9]]):
+        raise AssertionError("inventory metadata gate must retain its deadline and working directory")
 
 
 def validate_strict_gate(gates: list[dict], gate_name: str, case_name: str, binary: Path,
@@ -194,8 +251,9 @@ def self_test() -> int:
     pubsub = {PUBSUB_CASE: f"[js][pubsub][corpus]{PUBSUB_TAG}"}
     cap = {CAP_CASE: f"[js][cap][corpus]{CAP_TAG}"}
     db_admission = {DB_ADMISSION_CASE: f"[js][db][corpus]{DB_ADMISSION_TAG}"}
+    db_batch = {DB_BATCH_CASE: f"[js][db][corpus]{DB_BATCH_TAG}"}
     audit_drain = {AUDIT_DRAIN_CASE: "[js][audit]" + AUDIT_DRAIN_TAG}
-    baseline = {**isolated, **grouped, **pubsub, **cap, **db_admission, **audit_drain}
+    baseline = {**isolated, **grouped, **pubsub, **cap, **db_admission, **db_batch, **audit_drain}
     gates = [
         {"name": name, "command": ["plinth_tests", selector]}
         for name, selector in {**EXPECTED_GATES, "plinth_tests_js": grouped_selector}.items()
@@ -224,7 +282,24 @@ def self_test() -> int:
     audit_gate["command"][7] = "30"
     audit_gate["properties"][0]["value"] = 40
     gates.insert(1, audit_gate)
-    validate_inventory(isolated, grouped, gates, grouped_selector, binary, baseline, pubsub, cap, db_admission)
+    db_batch_gate = copy.deepcopy(pubsub_gate)
+    db_batch_gate["name"] = DB_BATCH_GATE
+    db_batch_gate["command"][5] = DB_BATCH_CASE
+    # Add near the front: existing positional cap/pubsub/grouped controls stay intact.
+    gates.insert(1, db_batch_gate)
+    ctest = shutil.which("ctest")
+    if ctest is None:
+        raise AssertionError("inventory self-test requires the CTest metadata tool")
+    metadata_gate = {
+        "name": INVENTORY_GATE,
+        "command": [sys.executable, str(Path(__file__).resolve()),
+                    "--binary", str(binary.resolve()), "--grouped-selector", grouped_selector,
+                    "--ctest-command", ctest, "--build-dir", str(binary.resolve().parent)],
+        "properties": [{"name": "TIMEOUT", "value": 90.0},
+                       {"name": "WORKING_DIRECTORY", "value": str(binary.resolve().parent)}],
+    }
+    gates.insert(1, metadata_gate)
+    validate_inventory(isolated, grouped, gates, grouped_selector, binary, baseline, pubsub, cap, db_admission, db_batch)
     malformed = [
         ({}, grouped, gates),
         ({**isolated, "unexpected": ISOLATION_TAG}, grouped, gates),
@@ -249,7 +324,7 @@ def self_test() -> int:
     ]
     for candidate in malformed:
         try:
-            validate_inventory(*candidate, grouped_selector, binary, baseline, pubsub, cap, db_admission)
+            validate_inventory(*candidate, grouped_selector, binary, baseline, pubsub, cap, db_admission, db_batch)
         except AssertionError:
             continue
         raise AssertionError("inventory negative control was not rejected")
@@ -267,7 +342,7 @@ def self_test() -> int:
     for candidate_baseline, candidate_pubsub in extended:
         try:
             validate_inventory(isolated, grouped, gates, grouped_selector, binary,
-                               candidate_baseline, candidate_pubsub, cap, db_admission)
+                               candidate_baseline, candidate_pubsub, cap, db_admission, db_batch)
         except AssertionError:
             rejected += 1
             continue
@@ -293,7 +368,7 @@ def self_test() -> int:
     for candidate_gates in bad_gates:
         try:
             validate_inventory(isolated, grouped, candidate_gates, grouped_selector,
-                               binary, baseline, pubsub, cap, db_admission)
+                               binary, baseline, pubsub, cap, db_admission, db_batch)
         except AssertionError:
             rejected += 1
             continue
@@ -302,22 +377,22 @@ def self_test() -> int:
                               {**grouped, "unexpected isolated": PUBSUB_TAG}):
         try:
             validate_inventory(isolated, candidate_grouped, gates, grouped_selector,
-                               binary, baseline, pubsub, cap, db_admission)
+                               binary, baseline, pubsub, cap, db_admission, db_batch)
         except AssertionError:
             rejected += 1
             continue
         raise AssertionError("pubsub grouped leakage was not rejected")
 
     # These ordinary fixtures share descriptive tags with the isolated corpora;
-    # only the explicit, independently named nine-case exclusion set may leave.
+    # only the explicit, independently named ten-case exclusion set may leave.
     ordinary = {
         **grouped,
         "ordinary pubsub integration fixture": "[js][pubsub][integration]",
         "ordinary capability fixture": "[js][cap]",
     }
-    ordinary_baseline = {**isolated, **ordinary, **pubsub, **cap, **db_admission, **audit_drain}
+    ordinary_baseline = {**isolated, **ordinary, **pubsub, **cap, **db_admission, **db_batch, **audit_drain}
     validate_inventory(isolated, ordinary, gates, grouped_selector, binary,
-                       ordinary_baseline, pubsub, cap, db_admission)
+                       ordinary_baseline, pubsub, cap, db_admission, db_batch)
 
     def reject_cap_control(**changes) -> None:
         nonlocal rejected
@@ -325,7 +400,7 @@ def self_test() -> int:
             "isolated": isolated, "grouped": ordinary, "gates": gates,
             "grouped_selector": grouped_selector, "binary": binary,
             "baseline": ordinary_baseline, "pubsub": pubsub, "cap": cap,
-            "db_admission": db_admission,
+            "db_admission": db_admission, "db_batch": db_batch,
         }
         arguments.update(changes)
         try:
@@ -420,9 +495,9 @@ def self_test() -> int:
     # Keep the independent logger/pubsub/cap names, rather than subtracting
     # whatever an isolated discovery happens to return from the baseline.
     ordinary_db = {**ordinary, "ordinary database fixture": "[js][db]"}
-    db_baseline = {**isolated, **ordinary_db, **pubsub, **cap, **db_admission, **audit_drain}
+    db_baseline = {**isolated, **ordinary_db, **pubsub, **cap, **db_admission, **db_batch, **audit_drain}
     validate_inventory(isolated, ordinary_db, gates, grouped_selector, binary,
-                       db_baseline, pubsub, cap, db_admission)
+                       db_baseline, pubsub, cap, db_admission, db_batch)
 
     def reject_db_control(**changes) -> None:
         nonlocal rejected
@@ -430,7 +505,7 @@ def self_test() -> int:
             "isolated": isolated, "grouped": ordinary_db, "gates": gates,
             "grouped_selector": grouped_selector, "binary": binary,
             "baseline": db_baseline, "pubsub": pubsub, "cap": cap,
-            "db_admission": db_admission,
+            "db_admission": db_admission, "db_batch": db_batch,
         }
         arguments.update(changes)
         try:
@@ -546,6 +621,178 @@ def self_test() -> int:
                 rejected += 1
                 continue
         raise AssertionError("database admission discovery failure did not fail closed")
+
+    # Independently preserve ordinary database AND batch-tagged fixtures. The
+    # new targeted discovery is required separately from this fixed baseline.
+    ordinary_batch = {**ordinary_db, "ordinary batch fixture": "[js][db][batch]"}
+    batch_baseline = {**db_baseline, **ordinary_batch}
+    validate_inventory(isolated, ordinary_batch, gates, grouped_selector, binary,
+                       batch_baseline, pubsub, cap, db_admission, db_batch)
+
+    def reject_batch_control(**changes) -> None:
+        nonlocal rejected
+        arguments = {
+            "isolated": isolated, "grouped": ordinary_batch, "gates": gates,
+            "grouped_selector": grouped_selector, "binary": binary,
+            "baseline": batch_baseline, "pubsub": pubsub, "cap": cap,
+            "db_admission": db_admission, "db_batch": db_batch,
+        }
+        arguments.update(changes)
+        try:
+            validate_inventory(**arguments)
+        except AssertionError:
+            rejected += 1
+            return
+        raise AssertionError("database batch inventory negative control was not rejected")
+
+    for candidate_batch in (
+        {},
+        {**db_batch, "unexpected database batch": DB_BATCH_TAG},
+        {"renamed database batch": db_batch[DB_BATCH_CASE]},
+        {DB_BATCH_CASE: "[js][db][corpus]"},
+        {DB_BATCH_CASE: db_batch[DB_BATCH_CASE] + DB_BATCH_TAG},
+        *({DB_BATCH_CASE: db_batch[DB_BATCH_CASE] + tag}
+          for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, AUDIT_DRAIN_TAG)),
+    ):
+        reject_batch_control(db_batch=candidate_batch)
+    reject_batch_control(isolated={**isolated, logger_name: isolated[logger_name] + DB_BATCH_TAG})
+    reject_batch_control(pubsub={PUBSUB_CASE: pubsub[PUBSUB_CASE] + DB_BATCH_TAG})
+    reject_batch_control(cap={CAP_CASE: cap[CAP_CASE] + DB_BATCH_TAG})
+    reject_batch_control(db_admission={DB_ADMISSION_CASE: db_admission[DB_ADMISSION_CASE] + DB_BATCH_TAG})
+    reject_batch_control(baseline={**batch_baseline, AUDIT_DRAIN_CASE: audit_drain[AUDIT_DRAIN_CASE] + DB_BATCH_TAG})
+    for candidate_baseline in (
+        {},
+        {name: tags for name, tags in batch_baseline.items() if name != DB_BATCH_CASE},
+        {**batch_baseline, DB_BATCH_CASE: "[js][db][corpus]"},
+        {**batch_baseline, DB_BATCH_CASE: db_batch[DB_BATCH_CASE] + "[changed]"},
+        {**batch_baseline, "unexpected database batch": DB_BATCH_TAG},
+        {name: tags for name, tags in batch_baseline.items() if name != logger_name},
+        {name: tags for name, tags in batch_baseline.items() if name != PUBSUB_CASE},
+        {name: tags for name, tags in batch_baseline.items() if name != CAP_CASE},
+        {name: tags for name, tags in batch_baseline.items() if name != DB_ADMISSION_CASE},
+        {name: tags for name, tags in batch_baseline.items() if name != AUDIT_DRAIN_CASE},
+    ):
+        reject_batch_control(baseline=candidate_baseline)
+    for candidate_grouped in (
+        {**ordinary_batch, **db_batch},
+        {**ordinary_batch, DB_BATCH_CASE: "[js]"},
+        {**ordinary_batch, "unknown isolated database batch": DB_BATCH_TAG},
+        *({name: tags for name, tags in ordinary_batch.items() if name != removed}
+          for removed in ordinary_batch),
+        {**ordinary_batch, "ordinary batch fixture": "[js][changed]"},
+        {**ordinary_batch, "unexpected ordinary fixture": "[js][db][batch]"},
+    ):
+        reject_batch_control(grouped=candidate_grouped)
+    for candidate_selector in (
+        grouped_selector.replace(" ~[isolated-db-batch]", ""),
+        grouped_selector.replace("[js] ~[batch-transaction]", "[js][db]"),
+        GROUPED_JS_BASELINE,
+        grouped_selector + " ~[db]",
+        grouped_selector + " ~[batch]",
+        grouped_selector + " ~[isolated-db-batch]",
+        grouped_selector.replace(" ~[isolated-db-batch] ~[isolated-audit-drain]",
+                                 " ~[isolated-audit-drain] ~[isolated-db-batch]"),
+    ):
+        reject_batch_control(grouped_selector=candidate_selector)
+    reject_batch_control(gates=[gate for gate in gates if gate["name"] != DB_BATCH_GATE])
+    reject_batch_control(gates=gates + [copy.deepcopy(db_batch_gate)])
+    for command in (
+        db_batch_gate["command"], [str(binary), DB_BATCH_TAG],
+        [str(binary), "[js] " + DB_BATCH_TAG, "--list-tests"],
+        [str(binary), DB_BATCH_CASE + "*"],
+    ):
+        reject_batch_control(gates=gates + [{"name": "unexpected_database_batch_gate", "command": command}])
+    batch_index = next(index for index, gate in enumerate(gates) if gate["name"] == DB_BATCH_GATE)
+    for index, replacement in (
+        (0, "true"), (1, "stale-verifier.py"), (2, "--wrong-binary"),
+        (3, "stale-tests"), (4, "--wrong-case"), (5, DB_ADMISSION_CASE),
+        (6, "--wrong-timeout"), (7, "61"),
+    ):
+        mutated = copy.deepcopy(gates)
+        mutated[batch_index]["command"][index] = replacement
+        reject_batch_control(gates=mutated)
+    for command in ([], "unavailable", db_batch_gate["command"] + ["--extra"],
+                    db_batch_gate["command"][:-1], [None] * 8):
+        mutated = copy.deepcopy(gates)
+        mutated[batch_index]["command"] = command
+        reject_batch_control(gates=mutated)
+    for properties in (
+        [], [{"name": "TIMEOUT", "value": 74}],
+        [{"name": "TIMEOUT", "value": "75"}],
+        [{"name": "TIMEOUT", "value": 75}] * 2,
+        *([{"name": "TIMEOUT", "value": value}] for value in
+          (True, False, None, float("nan"), float("inf"), -float("inf"))),
+    ):
+        mutated = copy.deepcopy(gates)
+        mutated[batch_index]["properties"] = properties
+        reject_batch_control(gates=mutated)
+    for replacement in ("dangling_database_batch_gate", DB_ADMISSION_GATE):
+        mutated = copy.deepcopy(gates)
+        mutated[batch_index]["name"] = replacement
+        reject_batch_control(gates=mutated)
+    mutated = copy.deepcopy(gates)
+    mutated[batch_index]["command"], mutated[db_index]["command"] = (
+        mutated[db_index]["command"], mutated[batch_index]["command"]
+    )
+    reject_batch_control(gates=mutated)
+    for failure in (
+        FileNotFoundError("synthetic unavailable"),
+        subprocess.CalledProcessError(7, ["synthetic"]),
+        subprocess.TimeoutExpired(["synthetic"], 30),
+    ):
+        with mock.patch.object(subprocess, "run", side_effect=failure):
+            try:
+                discover(binary, DB_BATCH_TAG)
+            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                rejected += 1
+                continue
+        raise AssertionError("database batch discovery failure did not fail closed")
+
+    # The actual CTest metadata inventory includes this helper's own command.
+    # Its exclusion-bearing selector is safe only after validating the complete
+    # inspection command; retaining the name alone must never create a bypass.
+    metadata_index = next(index for index, gate in enumerate(gates)
+                          if gate["name"] == INVENTORY_GATE)
+    reject_batch_control(gates=[gate for gate in gates if gate["name"] != INVENTORY_GATE])
+    reject_batch_control(gates=gates + [copy.deepcopy(metadata_gate)])
+    for replacement in ("unvalidated_metadata_gate", DB_BATCH_GATE):
+        mutated = copy.deepcopy(gates)
+        mutated[metadata_index]["name"] = replacement
+        reject_batch_control(gates=mutated)
+    for index, replacement in (
+        (0, "true"), (1, "stale-inventory.py"), (2, "--wrong-binary"),
+        (3, "stale-tests"), (4, "--wrong-selector"),
+        (5, grouped_selector + " ~[batch]"), (6, "--wrong-ctest"),
+        (7, "ctest"), (7, "/unavailable/ctest"), (7, sys.executable),
+        (8, "--wrong-build-dir"), (9, "."), (9, "/unavailable/build-dir"),
+        (9, str(binary.resolve().parent.parent)), (7, ctest + "\n"),
+    ):
+        mutated = copy.deepcopy(gates)
+        mutated[metadata_index]["command"][index] = replacement
+        reject_batch_control(gates=mutated)
+    for command in ([], "unavailable", [None] * 10,
+                    metadata_gate["command"] + ["--extra"],
+                    metadata_gate["command"][:-1],
+                    [str(binary), DB_BATCH_TAG]):
+        mutated = copy.deepcopy(gates)
+        mutated[metadata_index]["command"] = command
+        reject_batch_control(gates=mutated)
+    for properties in (
+        [], metadata_gate["properties"] * 2,
+        [{"name": "TIMEOUT", "value": 90}],
+        [{"name": "TIMEOUT", "value": 90},
+         {"name": "WORKING_DIRECTORY", "value": "/wrong/build-dir"}],
+        *([{"name": "TIMEOUT", "value": value}, metadata_gate["properties"][1]]
+          for value in (89, "90", True, float("nan"), float("inf"))),
+    ):
+        mutated = copy.deepcopy(gates)
+        mutated[metadata_index]["properties"] = properties
+        reject_batch_control(gates=mutated)
+    # An extra command with the exact valid metadata shape is still forbidden
+    # when its independently validated identity is absent or already in use.
+    unknown_metadata = copy.deepcopy(metadata_gate)
+    unknown_metadata["name"] = "extra_metadata_inspection"
+    reject_batch_control(gates=gates + [unknown_metadata])
     document = "<MatchingTests><TestCase><Name>fixture</Name><Tags>[js]</Tags></TestCase></MatchingTests>"
     if parse_cases(document) != {"fixture": "[js]"}:
         raise AssertionError("Catch2 XML discovery parsing failed")
@@ -598,16 +845,17 @@ def main() -> int:
     pubsub = discover(args.binary, PUBSUB_TAG)
     cap = discover(args.binary, CAP_TAG)
     db_admission = discover(args.binary, DB_ADMISSION_TAG)
+    db_batch = discover(args.binary, DB_BATCH_TAG)
     grouped = discover(args.binary, args.grouped_selector)
     baseline = discover(args.binary, GROUPED_JS_BASELINE)
     gates = run_json(
         [args.ctest_command, "--test-dir", str(args.build_dir), "--show-only=json-v1"]
     )["tests"]
     validate_inventory(isolated, grouped, gates, args.grouped_selector, args.binary,
-                       baseline, pubsub, cap, db_admission)
+                       baseline, pubsub, cap, db_admission, db_batch)
     print(
-        "logger/pubsub/cap/database inventory: exactly 5 logger fixtures, 1 pubsub corpus, 1 cap corpus "
-        "and 1 database admission corpus plus 1 audit drain isolated, 0 grouped, "
+        "logger/pubsub/cap/database inventory: exactly 5 logger fixtures, 1 pubsub corpus, 1 cap corpus, "
+        "1 database admission corpus, 1 database batch corpus and 1 audit drain isolated, 0 grouped, "
         f"{len(grouped)} ordinary JS fixtures retained, one of each named gate"
     )
     return 0
