@@ -9,6 +9,7 @@
 #include "kernel/lifecycle/async_task_registry.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <expected>
 #include <functional>
 #include <memory>
@@ -29,6 +30,12 @@ namespace plinth::frontend {
 
 class OwnedFrontendWorker;
 class TypedAssetStreams;
+class FloatLayoutService;
+namespace test_seam {
+// Observation only: attempts need not have succeeded. No reset/fault/token API.
+[[nodiscard]] auto fixed_storage_dispatch_attempts(const FloatLayoutService&)
+    -> std::size_t;
+} // namespace test_seam
 
 // Native guarded storage service, not a new SDK/capability or JSON token
 // factory. HTTP layout/catalog/projection integration is a separate caller of
@@ -96,6 +103,8 @@ class FloatLayoutService {
   [[nodiscard]] auto active_count() const -> std::size_t;
 
  private:
+  friend auto test_seam::fixed_storage_dispatch_attempts(
+      const FloatLayoutService&) -> std::size_t;
   struct State;
   struct RequestData;
   struct ReadOperation;

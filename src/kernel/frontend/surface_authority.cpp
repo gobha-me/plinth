@@ -466,7 +466,8 @@ auto catalog_float_prefix_impl(PGconn& connection,
   if (!valid_auth(auth)) return std::unexpected(Error::UNAUTHENTICATED);
   if (limit == 0 || limit > 64 ||
       (content_type && !is_canonical_content_type(*content_type)) ||
-      (after && (!ordinal(after->logical_install_order) ||
+      (after && (!after->logical_install_order ||
+                 !ordinal(*after->logical_install_order) ||
                  !identifier(after->application_id, false) ||
                  !identifier(after->panel_id, true))))
     return std::unexpected(Error::INVALID);
@@ -475,7 +476,7 @@ auto catalog_float_prefix_impl(PGconn& connection,
   values.push_back(std::to_string(limit + 1));
   std::string cursor;
   if (after) {
-    values.push_back(after->logical_install_order);
+    values.push_back(*after->logical_install_order);
     values.push_back(after->application_id);
     values.push_back(after->panel_id);
     cursor =
@@ -512,7 +513,7 @@ auto catalog_float_prefix_impl(PGconn& connection,
     page.targets.pop_back();
     const auto& last = page.targets.back();
     page.next_position =
-        Position{.logical_install_order = *last.logical_install_order,
+        Position{.logical_install_order = last.logical_install_order,
                  .application_id = last.application_id,
                  .panel_id = last.declaration.id};
   }
@@ -535,6 +536,57 @@ auto catalog_float_prefix(PGconn& connection, const auth::AuthContext& auth,
     -> std::expected<SurfacePage, Error> {
   return catalog_float_prefix_impl(connection, auth, std::nullopt, limit,
                                    after);
+}
+
+auto catalog_surface_prefix(PGconn& connection, const auth::AuthContext& auth,
+                            SurfaceKind kind, std::size_t limit,
+                            const std::optional<Position>& after)
+    -> std::expected<SurfacePage, Error> try {
+  if (!valid_auth(auth)) return std::unexpected(Error::UNAUTHENTICATED);
+  if ((kind != SurfaceKind::PRIMARY && kind != SurfaceKind::TRAY) ||
+      limit == 0 || limit > 64 ||
+      (after && (after->logical_install_order ||
+                 !identifier(after->application_id, false) ||
+                 !identifier(after->panel_id, true))))
+    return std::unexpected(Error::INVALID);
+  auto values = auth_values(auth);
+  values.emplace_back(kind_name(kind));
+  values.push_back(std::to_string(limit + 1));
+  std::string cursor;
+  if (after) {
+    values.push_back(after->application_id);
+    values.push_back(after->panel_id);
+    cursor = "AND (p.name COLLATE \"C\",pn.panel_id COLLATE \"C\") > "
+             "($6 COLLATE \"C\",$7 COLLATE \"C\") ";
+  }
+  const auto sql = auth_cte(auth) + ", selected AS (" + std::string{ELIGIBLE} +
+                   "AND pn.panel_type=$4 " + cursor +
+                   "ORDER BY p.name COLLATE \"C\",pn.panel_id COLLATE \"C\" "
+                   "LIMIT $5::integer) " +
+                   std::string{AUTH_REPLY} + " UNION ALL " +
+                   std::string{TARGET_REPLY};
+  auto result = query(connection, sql, values);
+  auto rows = read_rows(result.get(), auth, limit + 1);
+  if (!rows) return std::unexpected(rows.error());
+  SurfacePage page{.caller = std::move(rows->caller),
+                   .targets = std::move(rows->targets),
+                   .next_position = std::nullopt};
+  // UNION ALL does not promise the selected prefix's output order.
+  std::ranges::sort(page.targets, [](const auto& left, const auto& right) {
+    if (left.application_id != right.application_id)
+      return left.application_id < right.application_id;
+    return left.declaration.id < right.declaration.id;
+  });
+  if (page.targets.size() > limit) {
+    page.targets.pop_back();
+    const auto& last = page.targets.back();
+    page.next_position = Position{.logical_install_order = std::nullopt,
+                                  .application_id = last.application_id,
+                                  .panel_id = last.declaration.id};
+  }
+  return page;
+} catch (const std::exception&) {
+  return std::unexpected(Error::UNAVAILABLE);
 }
 
 } // namespace plinth::frontend::authority

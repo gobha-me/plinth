@@ -36,6 +36,25 @@ constexpr std::size_t MAX_PHYSICAL_REQUESTS = 64;
 constexpr std::size_t REQUEST_COPY_BYTES = std::size_t{128} * 1024;
 constexpr std::size_t ACTIVE_COPY_BYTES = std::size_t{16} * 1024 * 1024;
 
+auto kind_name(SurfaceKind kind) -> std::string_view {
+  switch (kind) {
+    case SurfaceKind::PRIMARY: return "primary";
+    case SurfaceKind::FLOAT: return "float";
+    case SurfaceKind::TRAY: return "tray";
+  }
+  return {};
+}
+
+auto valid_catalog_filters(const protocol::CursorQuery& filters) -> bool {
+  return !kind_name(filters.kind).empty() && filters.limit >= 1 &&
+         filters.limit <= 64 &&
+         (!filters.content_type ||
+          (filters.kind == SurfaceKind::FLOAT &&
+           is_canonical_content_type(*filters.content_type))) &&
+         (!filters.include_admin_default ||
+          (filters.kind == SurfaceKind::FLOAT && filters.content_type));
+}
+
 auto unavailable(std::string_view code = "storage_unavailable")
     -> js::PromiseRejection {
   return {.code = std::string{code},
@@ -122,6 +141,7 @@ struct FloatLayoutService::State {
   std::size_t active = 0;
   bool accepting = true;
   bool delivery_failed = false;
+  std::atomic<std::size_t> fixed_dispatch_attempts{0};
 };
 
 struct FloatLayoutService::RequestData {
@@ -147,6 +167,7 @@ struct FloatLayoutService::TargetProof {
   std::shared_ptr<const packages::generation::CapturedArtifact> artifact;
   std::optional<PersistenceProjection> projection;
   std::unique_ptr<capabilities::drain::DispatchGuard> guard;
+  bool chrome_essential = false;
 };
 
 struct FloatLayoutService::ReadOperation {
@@ -436,6 +457,14 @@ auto FloatLayoutService::submit(
     operation->depth = caller_depth;
     operation->deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    // Native callers receive the same pre-dispatch refusal as HTTP callers.
+    // finish owns exactly-once completion even if that callback throws. No
+    // worker, PG operation or fixed resolver dispatch has been started here.
+    if (operation->request->kind == RequestData::Kind::CATALOG &&
+        !valid_catalog_filters(operation->request->query.filters)) {
+      operation->finish(std::unexpected(unavailable("invalid_argument")));
+      return;
+    }
     if (!operation->accepted || caller_depth < 0 ||
         caller_depth >= capabilities::MAX_CALL_DEPTH || operation->ip.empty() ||
         operation->ip.size() > 128) {
@@ -729,21 +758,16 @@ auto FloatLayoutService::prove_target(
   if (!found->target) return std::nullopt;
   auto target = std::move(*found->target);
   const auto& panel = target.declaration;
-  if (lookup.kind != SurfaceKind::FLOAT || !panel.capability ||
-      !panel.context_schema)
+  if (kind_name(lookup.kind).empty() ||
+      (lookup.kind == SurfaceKind::FLOAT &&
+       (!panel.capability || !panel.context_schema)))
     return std::unexpected(unavailable());
   auto artifact = existing_generation(
       operation, *held,
       {target.generation, target.application_id, target.version, 1});
   if (!artifact) return std::unexpected(unavailable());
   const auto identity = extensions::pool_identity(target.application_id);
-  const auto parsed = capabilities::parse_signature(*panel.capability);
-  const auto* signature = std::get_if<capabilities::ParsedSignature>(&parsed);
   const auto* entry = (*artifact)->find("client/panels/" + panel.client_path);
-  const auto* handler =
-      signature
-          ? (*artifact)->find("server/handlers/" + signature->function + ".js")
-          : nullptr;
   const char* parameters[] = {target.generation.c_str()};
   const std::unique_ptr<PGresult, decltype(&PQclear)> declared_entry{
       db::exec_params(connection.get(),
@@ -761,19 +785,27 @@ auto FloatLayoutService::prove_target(
       (*artifact)->find(PQgetvalue(declared_entry.get(), 0, 0));
   if (!identity || identity->package_id != target.generation ||
       identity->version != target.version ||
-      identity->name != target.application_id || !signature ||
-      signature->namespace_ != target.application_id || !entry || !handler ||
-      !runtime_entry ||
+      identity->name != target.application_id || !entry || !runtime_entry ||
       runtime_entry->kind != packages::restore::ArtifactKind::REGULAR ||
       entry->kind != packages::restore::ArtifactKind::REGULAR ||
-      handler->kind != packages::restore::ArtifactKind::REGULAR ||
       !packages::asset_server::has_registered_route(target.application_id,
                                                     target.version) ||
       capabilities::drain::is_fenced(target.application_id) ||
       capabilities::drain::is_application_blocked(target.application_id))
     return std::unexpected(unavailable());
   std::optional<PersistenceProjection> projection;
-  if (operation->state->policy) {
+  if (lookup.kind == SurfaceKind::FLOAT) {
+    const auto parsed = capabilities::parse_signature(*panel.capability);
+    const auto* signature = std::get_if<capabilities::ParsedSignature>(&parsed);
+    const auto* handler = signature
+                              ? (*artifact)->find("server/handlers/" +
+                                                  signature->function + ".js")
+                              : nullptr;
+    if (!signature || signature->namespace_ != target.application_id ||
+        !handler || handler->kind != packages::restore::ArtifactKind::REGULAR)
+      return std::unexpected(unavailable());
+  }
+  if (lookup.kind == SurfaceKind::FLOAT && operation->state->policy) {
     auto reviewer = authority::reviewer_is_admin(
         *connection, operation->state->policy->parsed().review.admin_user_id);
     if (!reviewer) return std::unexpected(authority_error(reviewer.error()));
@@ -787,9 +819,23 @@ auto FloatLayoutService::prove_target(
   if (!guard->admitted() ||
       capabilities::drain::is_application_blocked(target.application_id))
     return std::unexpected(unavailable());
+  // Essential is presentation metadata, never permission. The platform guard
+  // was established by this same request and stays counted through delivery.
+  // Foreign declarations (including their raw flag) cannot become essential.
+  const auto platform = shell::current_platform();
+  const bool essential =
+      lookup.kind == SurfaceKind::TRAY && operation->compatibility_guard &&
+      platform && platform->profile() == operation->platform_profile &&
+      target.application_id == "shell" &&
+      target.generation == platform->key().package_id &&
+      target.version == platform->key().version &&
+      (*artifact)->digest() == platform->artifact_digest() &&
+      panel.rbac_rule == "shell.preferences.read" &&
+      ((panel.id == "bell" && panel.client_path == "shell-bell.js") ||
+       (panel.id == "avatar" && panel.client_path == "shell-avatar.js"));
   if (owned && !owned->release_checked()) return std::unexpected(unavailable());
   return TargetProof{std::move(target), std::move(*artifact),
-                     std::move(projection), std::move(guard)};
+                     std::move(projection), std::move(guard), essential};
 }
 
 auto FloatLayoutService::prepare_commit(
@@ -1067,14 +1113,28 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
     if (!guard_platform(operation, connection)) return;
   }
   auto target_wire = [&](const TargetProof& proof) {
-    return protocol::encode_float_target(proof.target, *proof.artifact,
-                                         proof.projection,
-                                         request.query.trusted_origin);
+    switch (proof.target.kind) {
+      case SurfaceKind::PRIMARY:
+        return protocol::encode_primary_target(proof.target, *proof.artifact,
+                                               request.query.trusted_origin);
+      case SurfaceKind::TRAY:
+        return protocol::encode_tray_target(proof.target, *proof.artifact,
+                                            proof.chrome_essential,
+                                            request.query.trusted_origin);
+      case SurfaceKind::FLOAT:
+        return protocol::encode_float_target(proof.target, *proof.artifact,
+                                             proof.projection,
+                                             request.query.trusted_origin);
+    }
+    return std::expected<Wire, protocol::Error>{
+        std::unexpected(protocol::Error::INVALID)};
   };
   if (request.kind == RequestData::Kind::ADMIT) {
     if (request.targets.size() > 38 ||
         std::ranges::any_of(request.targets, [](const auto& lookup) {
-          return lookup.kind != SurfaceKind::FLOAT;
+          return kind_name(lookup.kind).empty() ||
+                 (lookup.kind != SurfaceKind::FLOAT &&
+                  (lookup.content_type || lookup.capability));
         })) {
       operation->rejection = unavailable("invalid_argument");
       return;
@@ -1098,7 +1158,8 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
         const auto& target = (**proof).target;
         if (lookup.expected_generation &&
             (*lookup.expected_generation != target.generation ||
-             lookup.capability != target.declaration.capability)) {
+             (lookup.kind == SurfaceKind::FLOAT &&
+              lookup.capability != target.declaration.capability))) {
           result["status"] = "stale";
         } else if (!lookup.content_type ||
                    std::ranges::find(target.declaration.content_types,
@@ -1121,10 +1182,7 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
   }
   if (request.kind == RequestData::Kind::CATALOG) {
     auto& filters = request.query.filters;
-    if (filters.limit < 1 || filters.limit > 64 ||
-        (filters.content_type &&
-         !is_canonical_content_type(*filters.content_type)) ||
-        (filters.include_admin_default && !filters.content_type)) {
+    if (!valid_catalog_filters(filters)) {
       operation->rejection = unavailable("invalid_argument");
       return;
     }
@@ -1140,7 +1198,11 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
       after = std::move(*decoded);
     }
     auto page =
-        filters.content_type
+        filters.kind != SurfaceKind::FLOAT
+            ? authority::catalog_surface_prefix(*connection, operation->auth,
+                                                filters.kind, filters.limit,
+                                                after)
+        : filters.content_type
             ? authority::catalog_float_prefix(*connection, operation->auth,
                                               *filters.content_type,
                                               filters.limit, after)
@@ -1158,7 +1220,7 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
     for (const auto& target : page->targets) {
       SurfaceLookup lookup{.application_id = target.application_id,
                            .panel_id = target.declaration.id,
-                           .kind = SurfaceKind::FLOAT,
+                           .kind = filters.kind,
                            .expected_generation = target.generation,
                            .content_type = filters.content_type,
                            .capability = target.declaration.capability};
@@ -1182,7 +1244,7 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
         break;
       }
       bytes += size;
-      last = authority::Position{*target.logical_install_order,
+      last = authority::Position{target.logical_install_order,
                                  target.application_id, target.declaration.id};
       targets.push_back(std::move(*encoded));
     }
@@ -1197,7 +1259,7 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
       next = std::move(*cursor);
     }
     Wire output{{"schema_version", 1},
-                {"kind", "float"},
+                {"kind", kind_name(filters.kind)},
                 {"targets", std::move(targets)},
                 {"next_cursor", next}};
     if (filters.include_admin_default) {
@@ -1295,25 +1357,43 @@ auto FloatLayoutService::metadata(std::shared_ptr<ReadOperation> operation,
         operation->rejection = authority_error(caller.error());
         return;
       }
-      const char* parameters[] = {selector.generation.c_str()};
+      const char* parameters[] = {selector.generation.c_str(),
+                                  selector.panel_id ? selector.panel_id->c_str()
+                                                    : ""};
       const std::unique_ptr<PGresult, decltype(&PQclear)> row{
           db::exec_params(connection.get(),
-                          "SELECT name FROM plinth.packages WHERE id=$1::uuid "
-                          "AND octet_length(name)<=64",
-                          1, nullptr, parameters, nullptr, nullptr, 0),
+                          "SELECT p.name,pn.panel_type FROM plinth.packages p "
+                          "JOIN plinth.panels pn ON pn.package_id=p.id "
+                          "WHERE p.id=$1::uuid AND pn.panel_id=$2 "
+                          "AND pn.validated_format_version=2 "
+                          "AND octet_length(p.name)<=64 LIMIT 2",
+                          2, nullptr, parameters, nullptr, nullptr, 0),
           PQclear};
       if (!row || PQresultStatus(row.get()) != PGRES_TUPLES_OK) {
         operation->rejection = unavailable();
         return;
       }
-      if (PQntuples(row.get()) != 1 || PQgetisnull(row.get(), 0, 0) ||
+      if (PQntuples(row.get()) != 1 || PQnfields(row.get()) != 2 ||
+          PQgetisnull(row.get(), 0, 0) || PQgetisnull(row.get(), 0, 1) ||
           !selector.panel_id) {
+        operation->rejection = unavailable("asset_not_found");
+        return;
+      }
+      const std::string_view stored_kind{PQgetvalue(row.get(), 0, 1)};
+      std::optional<SurfaceKind> kind;
+      if (stored_kind == "primary")
+        kind = SurfaceKind::PRIMARY;
+      else if (stored_kind == "tray")
+        kind = SurfaceKind::TRAY;
+      else if (stored_kind == "float")
+        kind = SurfaceKind::FLOAT;
+      if (!kind) {
         operation->rejection = unavailable("asset_not_found");
         return;
       }
       SurfaceLookup lookup{.application_id = PQgetvalue(row.get(), 0, 0),
                            .panel_id = *selector.panel_id,
-                           .kind = SurfaceKind::FLOAT,
+                           .kind = *kind,
                            .expected_generation = selector.generation,
                            .content_type = std::nullopt,
                            .capability = std::nullopt};
@@ -1396,6 +1476,7 @@ auto FloatLayoutService::run_read(std::shared_ptr<ReadOperation> operation)
     const std::shared_ptr<lifecycle::AsyncTaskLease> physical(
         operation, operation->accepted.get());
     if (operation->request->kind == RequestData::Kind::LAYOUT_COMMIT) {
+      operation->state->fixed_dispatch_attempts.fetch_add(1);
       auto result = co_await extensions::dispatch_fixed_shell_commit(
           extensions::ValidatedFloatCommit{
               *operation->binding, jsoncpp(operation->request->commit->layout),
@@ -1410,6 +1491,7 @@ auto FloatLayoutService::run_read(std::shared_ptr<ReadOperation> operation)
     if (admin_candidate)
       arguments["content_type"] =
           *operation->request->query.filters.content_type;
+    operation->state->fixed_dispatch_attempts.fetch_add(1);
     auto result = co_await extensions::dispatch_fixed_shell_storage(
         extensions::FixedStorageCall{
             admin_candidate
@@ -1449,6 +1531,11 @@ auto FloatLayoutService::drain(std::chrono::steady_clock::time_point deadline)
 auto FloatLayoutService::active_count() const -> std::size_t {
   std::lock_guard lock{state->mutex};
   return state->active;
+}
+
+auto test_seam::fixed_storage_dispatch_attempts(
+    const FloatLayoutService& service) -> std::size_t {
+  return service.state->fixed_dispatch_attempts.load();
 }
 
 } // namespace plinth::frontend

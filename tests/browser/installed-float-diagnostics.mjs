@@ -127,7 +127,7 @@ export function journeyFailureSummary(phase, completed, error, failedStep = null
     // This is format support, not an assertion about any particular CI failure.
     const frame = stack.match(/^\s+at (?:async )?(?:[A-Za-z0-9_.$<>]{1,128}(?: \[as _onTimeout\])? \()?(?:file:\/\/[^\r\n()]*\/|\/[^\r\n()]*\/|tests\/browser\/)?installed-float-production\.mjs:([1-9][0-9]{0,5}):([1-9][0-9]{0,5})\)?\s*$/m);
     if (frame) Object.assign(source, { file: 'installed-float-production.mjs', line: Number(frame[1]), column: Number(frame[2]) });
-    const count = Array.isArray(completed) && completed.length <= 12 ? completed.length : 0;
+    const count = Array.isArray(completed) && completed.length <= 15 ? completed.length : 0;
     return JSON.stringify({ schema_version: 1, phase: phase === 'install' || phase === 'verify' ? phase : 'unknown',
         completed_count: count, completed_groups: Array.from({ length: count }, (_, index) => index + 1), source,
         failure_step: phase === 'verify' && count === 1 && failureSteps.has(failedStep) ? failedStep : null,

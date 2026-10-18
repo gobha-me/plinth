@@ -54,8 +54,18 @@ recovery. Only the next deliberate ordinary upgrade can replace it. The new
 generation must use its new captured native namespace and remain live-only:
 the startup policy still names the original artifact and is never rewritten.
 An explicit Restore refresh followed by an explicit Save verifies exclusion
-without granting approval to the replacement. These are twelve named native
-groups, retaining the original seven assertions in their original relative order.
+without granting approval to the replacement. Three additional transport groups
+exercise ordinary installed opted-in primary/tray catalog paging and cross-kind
+cursor refusal, indexed mixed38 admission, real PAT issue/use/revocation, cookie
+CSRF, denied module access, relative/dynamic captured imports, foreign essential
+refusal and fresh declaration-rule revocation. Non-opted-in primary is excluded
+from this typed receiver path and its typed module is refused. The existing real
+disable and failed-migration actions also require primary/tray catalog/admission/
+module denial; successful enable restores fresh metadata, and replacement refuses
+the actual original captured URLs and generation. No extra lifecycle mutation,
+deadline extension or retry is added. They do not execute navigation callbacks or tray
+owners/chrome. These are fifteen named native groups, retaining all original
+twelve assertions in their original relative order.
 Only after kernel/browser/protected-file/database cleanup does the supervisor emit
 its single success receipt. Failures are aggregated; timeout does not imply
 rollback or permit a mutation retry. Fake credentials remain in owned mode600
@@ -76,12 +86,12 @@ Concrete dependencies before execution:
 - Root-owned policy path ancestry and nonroot service identity must genuinely
   pass; unavailable sudo/capability/platform seams are failures, not skipped pass.
 
-The `CI` workflow's existing GCC native browser step runs the eighteen harness
+The `CI` workflow's existing GCC native browser step runs the nineteen harness
 construction controls, the offline fixed-browser helper controls, and then this
 actual journey against `build/plinth` and
 `build/share/plinth/bundled`, after its other production browser journeys.
 Pull-request and main-push runs must each supply fresh evidence for their actual
-checkout; candidate success is not exact-merge success. The twelve named journey
+checkout; candidate success is not exact-merge success. The fifteen named journey
 groups are separate from the construction controls, client units and CTest
 inventory. This placement provides GCC/Linux native coverage only, not OCI,
 ARM, ASan/UBSan or TSan journey coverage; those existing checks remain unchanged.
@@ -113,9 +123,9 @@ This is a native-only harness. The container adapter preserves copied modes,
 but lacks this protected read-only policy mount/privilege launch seam. Container
 support therefore needs separately reviewed protected-policy/privilege-launch integration; this
 does not claim an OCI artifact journey. Earlier seven-group receipts do not
-establish the twelve-group gate. Syntax/construction checks do not establish backend,
+establish the fifteen-group gate. Syntax/construction checks do not establish backend,
 RBAC, browser, full float mechanism, recovery or operational restore acceptance.
 Remaining wider matrix (e.g. five live/minimized limit, dirty close interactions,
 in-flight install/retirement/policy races, process crashes/lost acknowledgement and
-real image deployment) stays with the integrated feature gates; these twelve journey
+real image deployment) stays with the integrated feature gates; these fifteen journey
 groups alone do not close either issue.

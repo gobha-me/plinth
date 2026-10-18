@@ -7,6 +7,7 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
@@ -140,6 +141,45 @@ struct Fixture {
   auto lookup() -> std::expected<authority::LookupResult, authority::Error> {
     return authority::lookup_surface(*connection, auth, "notes", "preview",
                                      plinth::frontend::SurfaceKind::FLOAT);
+  }
+  auto seed_surface(std::string name, plinth::frontend::SurfaceKind kind,
+                    std::string panel = "preview", bool granted = true,
+                    bool navigation = true) -> void {
+    REQUIRE((kind == plinth::frontend::SurfaceKind::PRIMARY ||
+             kind == plinth::frontend::SurfaceKind::TRAY));
+    const std::string type =
+        kind == plinth::frontend::SurfaceKind::PRIMARY ? "primary" : "tray";
+    grant(name + ".panel", name, granted);
+    run("INSERT INTO "
+        "plinth.packages(name,version,state,provenance,manifest_json,"
+        "entry_point,manifest_checksum,application_ready) "
+        "VALUES($1,'1.0.0','ACTIVE','user','{}','server/"
+        "main.js','fixture',true)",
+        {name});
+    SurfaceJson declaration{{"id", panel},
+                            {"type", type},
+                            {"client_path", "preview.js"},
+                            {"rbac_rule", name + ".panel"}};
+    if (kind == plinth::frontend::SurfaceKind::PRIMARY) {
+      declaration["accepts_navigation_intent"] = navigation;
+      declaration["context_schema"] = {{"version", 1},
+                                       {"fields", SurfaceJson::object()},
+                                       {"persist_keys", SurfaceJson::array()}};
+    } else {
+      declaration["tray_states"] = {{"idle", "circle"}};
+      declaration["tray_initial_state"] = "idle";
+      declaration["preferred_width"] = 320;
+    }
+    const auto validated = plinth::packages::PanelsManifest::parse(
+        SurfaceJson{{"format_version", 2},
+                    {"panels", SurfaceJson::array({declaration})}}
+            .dump(),
+        "nonfloat surface authority fixture");
+    REQUIRE(validated.value);
+    run("INSERT INTO plinth.panels(package_id,panel_id,panel_type,declaration,"
+        "validated_format_version,logical_install_order) "
+        "SELECT id,$2,$3,$4::jsonb,2,NULL FROM plinth.packages WHERE name=$1",
+        {name, panel, type, declaration.dump()});
   }
 };
 } // namespace
@@ -342,6 +382,182 @@ TEST_CASE("surface authority: both gates provider ownership and bounded "
   REQUIRE(initial->target->declaration.capability == "notes:1:preview");
   REQUIRE(initial->target->capability_rule == "notes.call");
   REQUIRE(initial->caller.user_id == USER);
+  SECTION("primary and tray prefixes isolate kinds and filter before bytewise "
+          "limit") {
+    using enum plinth::frontend::SurfaceKind;
+    for (const auto kind : {PRIMARY, TRAY}) {
+      const std::string stem = kind == PRIMARY ? "primary" : "tray";
+      fixture.seed_surface(stem + "a", kind, "zeta", false);
+      fixture.seed_surface(stem + "b", kind, "zeta");
+      fixture.seed_surface(stem + "c", kind);
+      fixture.run(
+          "INSERT INTO "
+          "plinth.panels(package_id,panel_id,panel_type,declaration,"
+          "validated_format_version) SELECT pn.package_id,'pre-view',"
+          "pn.panel_type,jsonb_set(pn.declaration,'{id}','\"pre-view\"'),2 "
+          "FROM plinth.panels pn JOIN plinth.packages p ON p.id=pn.package_id "
+          "WHERE p.name=$1 AND pn.panel_id='zeta'",
+          {stem + "b"});
+      const std::vector<std::pair<std::string, std::string>> expected{
+          {stem + "b", "pre-view"},
+          {stem + "b", "zeta"},
+          {stem + "c", "preview"}};
+      std::optional<authority::Position> after;
+      for (std::size_t index = 0; index < expected.size(); ++index) {
+        const auto page = authority::catalog_surface_prefix(
+            *fixture.connection, fixture.auth, kind, 1, after);
+        REQUIRE(page);
+        REQUIRE(page->targets.size() == 1);
+        REQUIRE(page->targets[0].kind == kind);
+        REQUIRE(page->targets[0].application_id == expected[index].first);
+        REQUIRE(page->targets[0].declaration.id == expected[index].second);
+        REQUIRE_FALSE(page->targets[0].logical_install_order);
+        REQUIRE_FALSE(page->targets[0].declaration.capability);
+        const authority::Position position{std::nullopt, expected[index].first,
+                                           expected[index].second};
+        if (index + 1 < expected.size()) {
+          REQUIRE(page->next_position == position);
+        } else {
+          REQUIRE_FALSE(page->next_position);
+        }
+        after = position;
+      }
+      const auto exhausted = authority::catalog_surface_prefix(
+          *fixture.connection, fixture.auth, kind, 1, after);
+      REQUIRE(exhausted);
+      REQUIRE(exhausted->targets.empty());
+      REQUIRE_FALSE(exhausted->next_position);
+    }
+    fixture.seed_surface("initialonly", PRIMARY, "preview", true, false);
+    const auto receivers = authority::catalog_surface_prefix(
+        *fixture.connection, fixture.auth, PRIMARY, 64);
+    REQUIRE(receivers);
+    REQUIRE(receivers->targets.size() == 3);
+    REQUIRE(authority::catalog_surface_prefix(*fixture.connection, fixture.auth,
+                                              FLOAT, 1)
+                .error() == authority::Error::INVALID);
+    for (const auto limit : {std::size_t{0}, std::size_t{65}})
+      REQUIRE(authority::catalog_surface_prefix(*fixture.connection,
+                                                fixture.auth, TRAY, limit)
+                  .error() == authority::Error::INVALID);
+    for (const auto& position :
+         {authority::Position{"1", "trayb", "preview"},
+          authority::Position{std::nullopt, "../trayb", "preview"},
+          authority::Position{std::nullopt, "trayb", "../preview"}})
+      REQUIRE(authority::catalog_surface_prefix(*fixture.connection,
+                                                fixture.auth, TRAY, 1, position)
+                  .error() == authority::Error::INVALID);
+    REQUIRE(authority::catalog_float_prefix(
+                *fixture.connection, fixture.auth, "text/plain", 1,
+                authority::Position{std::nullopt, "notes", "preview"})
+                .error() == authority::Error::INVALID);
+  }
+  SECTION(
+      "nonfloat maximum prefix has one lookahead without an invented ordinal") {
+    using enum plinth::frontend::SurfaceKind;
+    for (const auto kind : {PRIMARY, TRAY}) {
+      const std::string stem = kind == PRIMARY ? "primary" : "tray";
+      std::vector<std::string> expected;
+      for (unsigned int index = 0; index < 65; ++index) {
+        const auto name = stem + std::to_string(index);
+        fixture.seed_surface(name, kind);
+        expected.push_back(name);
+      }
+      std::ranges::sort(expected);
+      const auto first = authority::catalog_surface_prefix(
+          *fixture.connection, fixture.auth, kind, 64);
+      REQUIRE(first);
+      REQUIRE(first->targets.size() == 64);
+      for (std::size_t index = 0; index < 64; ++index)
+        REQUIRE(first->targets[index].application_id == expected[index]);
+      REQUIRE(first->next_position);
+      REQUIRE_FALSE(first->next_position->logical_install_order);
+      REQUIRE(first->next_position->application_id == expected[63]);
+      const auto last = authority::catalog_surface_prefix(
+          *fixture.connection, fixture.auth, kind, 64, first->next_position);
+      REQUIRE(last);
+      REQUIRE(last->targets.size() == 1);
+      REQUIRE(last->targets[0].application_id == expected[64]);
+      REQUIRE_FALSE(last->next_position);
+    }
+  }
+  SECTION("nonfloat authority is fresh and metadata cannot bypass owned rule "
+          "or provenance") {
+    using enum plinth::frontend::SurfaceKind;
+    fixture.seed_surface("receiver", PRIMARY);
+    fixture.seed_surface("trayapp", TRAY);
+    auto catalog = [&](auto kind) {
+      return authority::catalog_surface_prefix(*fixture.connection,
+                                               fixture.auth, kind, 64);
+    };
+    for (const auto kind : {PRIMARY, TRAY}) {
+      const auto page = catalog(kind);
+      REQUIRE(page);
+      REQUIRE(page->targets.size() == 1);
+    }
+    SECTION("revoked presentation grant never leaks target metadata") {
+      fixture.run("DELETE FROM plinth.group_rules WHERE rule_id IN "
+                  "(SELECT id FROM plinth.rbac_rules WHERE extension_name IN "
+                  "('receiver','trayapp'))");
+    }
+    SECTION("foreign ownership remains denied even to administrator") {
+      fixture.run(
+          "INSERT INTO plinth.group_rules(group_id,rule_id) SELECT g.id,r.id "
+          "FROM plinth.groups g,plinth.rbac_rules r WHERE g.name='everyone' "
+          "AND r.rule='kernel.admin'");
+      fixture.run("UPDATE plinth.rbac_rules SET extension_name='foreign' "
+                  "WHERE extension_name IN ('receiver','trayapp')");
+    }
+    SECTION("orphaned rules remain denied") {
+      fixture.run("UPDATE plinth.rbac_rules SET orphaned_at=clock_timestamp() "
+                  "WHERE extension_name IN ('receiver','trayapp')");
+    }
+    SECTION("unready packages remain absent") {
+      fixture.run("UPDATE plinth.packages SET application_ready=false WHERE "
+                  "name IN ('receiver','trayapp')");
+    }
+    SECTION("legacy marker cannot activate typed authority") {
+      fixture.run("UPDATE plinth.panels SET validated_format_version=0 WHERE "
+                  "panel_type IN ('primary','tray')");
+    }
+    for (const auto kind : {PRIMARY, TRAY}) {
+      const auto page = catalog(kind);
+      REQUIRE(page);
+      REQUIRE(page->targets.empty());
+    }
+  }
+  SECTION("nonfloat PAT auth failure and database unknown are never "
+          "authoritative absence") {
+    using enum plinth::frontend::SurfaceKind;
+    fixture.seed_surface("receiver", PRIMARY);
+    auto pat = fixture.auth;
+    pat.auth_type = "pat";
+    pat.session_id.clear();
+    pat.pat_id = PAT;
+    pat.token_hash = std::string(64, 'b');
+    pat.credential_source = plinth::auth::CredentialSource::BEARER;
+    const auto page =
+        authority::catalog_surface_prefix(*fixture.connection, pat, PRIMARY, 1);
+    REQUIRE(page);
+    REQUIRE(page->targets.size() == 1);
+    fixture.run("UPDATE plinth.pats SET revoked_at=clock_timestamp()");
+    REQUIRE(
+        authority::catalog_surface_prefix(*fixture.connection, pat, PRIMARY, 1)
+            .error() == authority::Error::UNAUTHENTICATED);
+    fixture.run("UPDATE plinth.sessions SET revoked_at=clock_timestamp()");
+    REQUIRE(authority::catalog_surface_prefix(*fixture.connection, fixture.auth,
+                                              PRIMARY, 1)
+                .error() == authority::Error::UNAUTHENTICATED);
+    fixture.run("UPDATE plinth.sessions SET revoked_at=NULL");
+    fixture.run("BEGIN");
+    const Result failed{PQexec(fixture.connection.get(), "SELECT 1/0"),
+                        PQclear};
+    REQUIRE(PQresultStatus(failed.get()) == PGRES_FATAL_ERROR);
+    REQUIRE(authority::catalog_surface_prefix(*fixture.connection, fixture.auth,
+                                              PRIMARY, 1)
+                .error() == authority::Error::UNAVAILABLE);
+    fixture.run("ROLLBACK");
+  }
   SECTION("panel and capability rules are independent and admin cannot bypass "
           "ownership") {
     fixture.run("DELETE FROM plinth.group_rules WHERE rule_id=(SELECT id FROM "

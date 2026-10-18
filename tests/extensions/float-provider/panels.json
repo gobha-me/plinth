@@ -35,6 +35,56 @@
         },
         "persist_keys": ["record_id"]
       }
+    },
+    {
+      "id": "nav-a",
+      "type": "primary",
+      "title": "Typed receiver A",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "typed.js",
+      "accepts_navigation_intent": true,
+      "context_schema": {
+        "version": 1,
+        "fields": {"record_id": {"required": false, "max_bytes": 64, "meaning": "Stable fake navigation record identifier"}},
+        "persist_keys": []
+      }
+    },
+    {
+      "id": "nav-b",
+      "type": "primary",
+      "title": "Typed receiver B",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "typed.js",
+      "accepts_navigation_intent": true,
+      "context_schema": {"version": 1, "fields": {}, "persist_keys": []}
+    },
+    {
+      "id": "legacy-primary",
+      "type": "primary",
+      "title": "Not opted into typed navigation",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "typed.js"
+    },
+    {
+      "id": "status-a",
+      "type": "tray",
+      "title": "Typed status A",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "typed.js",
+      "tray_states": {"idle": "circle", "busy": "loader"},
+      "tray_initial_state": "idle",
+      "preferred_width": 320,
+      "chrome_essential": true
+    },
+    {
+      "id": "status-b",
+      "type": "tray",
+      "title": "Typed status B",
+      "rbac_rule": "floatprovider.panel",
+      "client_path": "typed.js",
+      "tray_states": {"idle": "circle"},
+      "tray_initial_state": "idle",
+      "preferred_width": 320
     }
   ]
 }

@@ -278,7 +278,7 @@ assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
                        cwd=repo / 'tests/browser', check=True, timeout=10,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
-    def test_twelve_native_groups_preserve_the_original_seven_in_order(self):
+    def test_fifteen_native_groups_preserve_the_original_twelve_in_order(self):
         original = [
             'real protected policy, captured profile, authorized/denied surface filtering',
             'ordinary caller SDK openFloat, ready ID, native relative/dynamic imports, shared modules',
@@ -286,13 +286,44 @@ assert(fixture.includes("if (mounted.current) setStatus('refused:' +"));
             'separate user save and fresh authenticated-session restore isolation',
             'required transient field stays live-only and is excluded from storage',
             'actual CSRF, generic write/delete guard, denied pinned admission and module access',
+            'installed render failure and explicit native-admitted Retry isolate component ownership',
+            'fresh capability revocation retires only the affected authenticated user',
+            'ordinary disable and enable retire old owners without automatic resurrection',
+            'failed migration upgrade preserves the old generation fence without rollback claims',
+            'successful replacement recovers through new native bytes without inherited persistence approval',
             'normal authenticated package uninstall after consumer contexts close',
         ]
-        self.assertEqual(len(harness.EXPECTED_CASES), 12)
-        self.assertEqual(len(set(harness.EXPECTED_CASES)), 12)
+        self.assertEqual(len(harness.EXPECTED_CASES), 15)
+        self.assertEqual(len(set(harness.EXPECTED_CASES)), 15)
         indexes = [harness.EXPECTED_CASES.index(name) for name in original]
         self.assertEqual(indexes, sorted(indexes))
         self.assertEqual(harness.EXPECTED_CASES[-1], original[-1])
+
+    def test_typed_foundation_groups_and_ordinary_fixture_declarations(self):
+        result = subprocess.run(['node', '--input-type=module', '-e',
+            "import { FOUNDATION_CASES } from './installed-typed-surface-foundation.mjs';"
+            "console.log(JSON.stringify(FOUNDATION_CASES));"],
+            cwd=repo / 'tests/browser', check=True, timeout=10,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(json.loads(result.stdout), harness.EXPECTED_CASES[11:-1])
+        panels = json.loads((repo / 'tests/extensions/float-provider/panels.json').read_text())['panels']
+        by_id = {panel['id']: panel for panel in panels}
+        self.assertEqual(len(panels), len(by_id))
+        self.assertEqual(set(by_id), {'preview', 'live', 'nav-a', 'nav-b',
+                                     'legacy-primary', 'status-a', 'status-b'})
+        for name in ['nav-a', 'nav-b', 'status-a', 'status-b']:
+            panel = by_id[name]
+            self.assertEqual(panel['rbac_rule'], 'floatprovider.panel')
+            self.assertNotIn('capability', panel)
+            self.assertNotIn('content_types', panel)
+            self.assertTrue((repo / 'tests/extensions/float-provider/client/panels'
+                             / panel['client_path']).is_file())
+        self.assertTrue(by_id['nav-a']['accepts_navigation_intent'])
+        self.assertTrue(by_id['nav-b']['accepts_navigation_intent'])
+        self.assertNotIn('accepts_navigation_intent', by_id['legacy-primary'])
+        self.assertTrue(by_id['status-a']['chrome_essential'])
+        self.assertNotIn('default_grants', json.loads(
+            (repo / 'tests/extensions/float-provider/rbac.json').read_text()))
 
     def test_fixed_upgrade_variants_preserve_contracts_and_source_without_new_grants(self):
         source = repo / 'tests/extensions/float-provider'
@@ -839,7 +870,8 @@ for (const rejected of [null, undefined, false, 0, '']) {
     def test_reviewable_required_field_and_live_only_control(self):
         declarations = json.loads((repo / 'tests/extensions/float-provider/panels.json').read_text())
         self.assertEqual(declarations['format_version'], 2)
-        preview, live = declarations['panels']
+        preview = next(panel for panel in declarations['panels'] if panel['id'] == 'preview')
+        live = next(panel for panel in declarations['panels'] if panel['id'] == 'live')
         self.assertEqual(preview['context_schema']['persist_keys'], ['record_id'])
         self.assertEqual(preview['context_schema']['fields']['record_id'], {
             'required': True, 'max_bytes': 64, 'meaning': 'Stable fake fixture record identifier'})

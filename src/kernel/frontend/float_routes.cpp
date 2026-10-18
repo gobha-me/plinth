@@ -201,8 +201,16 @@ auto parse_query(std::string_view raw)
     begin = amp + 1;
   }
   const auto kind = fields.find("kind");
-  if (kind == fields.end() || kind->second != "float") return std::nullopt;
+  if (kind == fields.end()) return std::nullopt;
   FloatLayoutService::CatalogQuery result;
+  if (kind->second == "float")
+    result.filters.kind = SurfaceKind::FLOAT;
+  else if (kind->second == "primary")
+    result.filters.kind = SurfaceKind::PRIMARY;
+  else if (kind->second == "tray")
+    result.filters.kind = SurfaceKind::TRAY;
+  else
+    return std::nullopt;
   if (const auto found = fields.find("limit"); found != fields.end()) {
     const auto& value = found->second;
     std::size_t limit = 0;
@@ -214,13 +222,18 @@ auto parse_query(std::string_view raw)
     result.filters.limit = limit;
   }
   if (const auto found = fields.find("content_type"); found != fields.end()) {
-    if (!is_canonical_content_type(found->second)) return std::nullopt;
+    if (result.filters.kind != SurfaceKind::FLOAT ||
+        !is_canonical_content_type(found->second))
+      return std::nullopt;
     result.filters.content_type = found->second;
   }
   if (const auto found = fields.find("include_admin_default");
       found != fields.end()) {
     if (found->second != "0" && found->second != "1") return std::nullopt;
     result.filters.include_admin_default = found->second == "1";
+    if (result.filters.kind != SurfaceKind::FLOAT &&
+        result.filters.include_admin_default)
+      return std::nullopt;
     if (result.filters.include_admin_default && !result.filters.content_type)
       return std::nullopt;
   }
@@ -394,12 +407,6 @@ auto handle(Route route, const drogon::HttpRequestPtr& request,
       auto targets = parse_surface_admission(request->body());
       if (!targets) {
         reply->fail(admission_error(targets.error()));
-        return;
-      }
-      if (std::ranges::any_of(*targets, [](const auto& item) {
-            return item.kind != SurfaceKind::FLOAT;
-          })) {
-        reply->fail("invalid_argument");
         return;
       }
       service->admit(

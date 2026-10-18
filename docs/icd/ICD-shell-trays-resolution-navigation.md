@@ -3,11 +3,13 @@
 **Specification owner:** [#45](https://github.com/gobha-me/plinth/issues/45).
 **Implementation owner:** [#46](https://github.com/gobha-me/plinth/issues/46).
 **Source baseline:** `f677f8d16bc35db2821e11859aa5dce13d37f53c`.
-**Status:** Reviewed delivery specification with the bounded typed-install
-foundation recorded in section 1.1. The remaining catalog, resolver, persistence,
-tray and navigation proposals are not shipped behavior, API ratification or a
-release promise. Concrete engineering proposals require #46's architecture/source
-review. Approved product choices remain distinguished explicitly.
+**Status:** Reviewed delivery specification with historical typed-install
+delivery recorded in section 1.1 and later scoped delivery in section 1.2.
+The float path and native primary/tray transport foundation do not complete
+#46. Remaining tray ownership/chrome, bell/avatar dogfooding, navigation and
+default-manager UI are not shipped behavior or a release promise. Concrete
+engineering proposals still require #46 source review; approved product choices
+remain distinguished explicitly.
 
 ## 1. Authority, current behavior and sequencing
 
@@ -19,7 +21,12 @@ supersedes those scoped historical sketches in
 Unrelated delivery history remains history. Follow the
 [documentation authority rules](../contracts/README.md#authority-and-conflicts).
 
-Current behavior remains separate:
+The following source-baseline descriptions and section 1.1's original exclusion
+list are milestone history, not assertions that later merged work remains
+absent. Section 1.2 records those later delivery boundaries; it does not turn
+every remaining proposal below into current behavior.
+
+Current behavior at that source baseline remains separate:
 
 - [Primary discovery and launcher](ICD-application-discovery-launcher.md)
   owns shipped Home/app/tab navigation, retained primaries and generation
@@ -152,6 +159,43 @@ essential-looking flag or `persist_keys` request grants neither access nor
 reviewed safe persistence. Later delivery must still freshly authorize each
 catalog/admission/presentation and prove the full acceptance matrix below.
 
+### 1.2 Later float delivery and native typed receiver transport
+
+[PR #171](https://github.com/gobha-me/plinth/pull/171), merged as
+`329957de7336ccb8e4299c324fa343fdae9dd0a1`, connects the existing SDK
+`openFloat` to ordinary installed-package authority, personal/administrator/
+earliest-authorized resolution, captured modules and protected reviewed minimal
+descriptor save/reload. It preserves five live document-lifetime float owners,
+including minimized/loading/retiring owners, with no automatic eviction. A
+merged source revision is not a release or whole-#46 acceptance; its candidate
+and exact-merge verification remain separate evidence.
+
+The native primary/tray receiver foundation extends the same surfaces/catalog,
+indexed admission and immutable typed-asset path. Each operation retains the
+original session/PAT identity and freshly checks effective presentation rules,
+package-owned rule registration, typed provenance, readiness, active captured
+generation and owned runtime/physical transport. Primary discovery remains
+unchanged; only opted-in typed primaries with a validated context schema enter
+this receiver catalog.
+
+Primary/tray catalog prefixes order by application/panel bytes, filter authority
+before the bounded limit and use one lookahead. Their closed authenticated
+cursors bind kind, credential, profile, limit and 60-second expiry with app/panel
+positions only. Float rank ordering, cursor golden bytes and wire shape remain
+unchanged. Primary/tray requests refuse float content-type and administrator-
+default lookup before storage dispatch; neither kind requires an invented float
+capability or handler. Available wire targets contain only their type's exact
+keys. Shared generation/runtime/asset proof retains the actual physical owner;
+malformed or unavailable authority does not become authoritative absence.
+
+Foreign `chrome_essential` declarations remain false. Transport-only evidence
+does not establish true active-shell essential identity, bell/avatar dogfooding,
+tray reservations/chrome/preferences, navigation callback delivery, the default-
+manager UI or whole #46 acceptance. This foundation adds no SDK method,
+permission grant, notification API, persistence approval, release or repository-
+setting change. Local native/browser success is not candidate or exact-merge CI
+success; those remain separate delivery gates.
+
 ## 2. Typed declarations and context proposals
 
 The prospective root is `{format_version: 2, panels: [...]}`. Absence preserves
@@ -273,7 +317,9 @@ generic key/value writes alone do not prove it; public SDK stays unchanged.
 
 ## 4. Typed authority transport proposals
 
-All routes below are NEW proposals for #46 source review, not available APIs.
+These transport contracts originated as #46 source-review proposals.
+Implemented scope is recorded in section 1.2; remaining additions are proposals,
+not available APIs.
 Preserve the schema-1 primary applications resource unchanged. SessionFilter's
 existing session/PAT modes establish the original caller; fresh effective RBAC,
 declaration, registered capability, package readiness and immutable asset-path

@@ -64,8 +64,8 @@ struct TestTree {
 // Same libzip owned-buffer construction as existing package test helpers;
 // package bytes come from the actual ordinary browser extension fixture.
 auto provider_zip(
-    std::vector<std::pair<std::string, std::string>>& owned_routes)
-    -> std::vector<std::byte> {
+    std::vector<std::pair<std::string, std::string>>& owned_routes,
+    bool add_nonfloat = false) -> std::vector<std::byte> {
   const fs::path root{std::string{CMAKE_SOURCE_DIR} +
                       "/tests/extensions/float-provider"};
   std::map<std::string, std::string> files;
@@ -79,6 +79,56 @@ auto provider_zip(
     REQUIRE_FALSE(input.bad());
   }
   REQUIRE(files.contains("manifest.json"));
+  if (add_nonfloat) {
+    auto panels = nlohmann::json::parse(files.at("panels.json"));
+    // This test owns an exact two-float/two-tray/one-receiver catalog. The
+    // shared native fixture can grow independent nonfloat declarations without
+    // silently changing this test's strict ordering/lookahead assertions.
+    auto original_floats = nlohmann::json::array();
+    for (const auto& panel : panels.at("panels")) {
+      if (panel.at("id") == "preview" || panel.at("id") == "live") {
+        REQUIRE(panel.at("type") == "float");
+        original_floats.push_back(panel);
+      }
+    }
+    REQUIRE(original_floats.size() == 2);
+    panels["panels"] = std::move(original_floats);
+    const nlohmann::json schema{{"version", 1},
+                                {"fields", nlohmann::json::object()},
+                                {"persist_keys", nlohmann::json::array()}};
+    panels["panels"].push_back({{"id", "receiver"},
+                                {"type", "primary"},
+                                {"title", "Typed Receiver"},
+                                {"icon", "edit-3"},
+                                {"rbac_rule", "floatprovider.panel"},
+                                {"client_path", "receiver.js"},
+                                {"accepts_navigation_intent", true},
+                                {"context_schema", schema}});
+    panels["panels"].push_back({{"id", "legacy"},
+                                {"type", "primary"},
+                                {"title", "Nonopted Primary"},
+                                {"icon", "edit-3"},
+                                {"rbac_rule", "floatprovider.panel"},
+                                {"client_path", "receiver.js"}});
+    // These are ordinary foreign declarations. Their flag and even shell-like
+    // IDs never grant essential status, capability or persistent projection.
+    for (const auto id : {"avatar", "bell"})
+      panels["panels"].push_back({{"id", id},
+                                  {"type", "tray"},
+                                  {"title", "Foreign Tray"},
+                                  {"icon", "edit-3"},
+                                  {"rbac_rule", "floatprovider.panel"},
+                                  {"client_path", "tray.js"},
+                                  {"tray_states", {{"ready", "edit-3"}}},
+                                  {"tray_initial_state", "ready"},
+                                  {"preferred_width", 320},
+                                  {"chrome_essential", true}});
+    files["panels.json"] = panels.dump();
+    files["client/panels/receiver.js"] =
+        "export default function receiver() { return null; }\n";
+    files["client/panels/tray.js"] =
+        "export default function tray() { return null; }\n";
+  }
   const auto manifest = nlohmann::json::parse(files.at("manifest.json"));
   // Record identity from the SAME bytes going into the ZIP, before install
   // can publish a route and then throw or return failure.
@@ -149,7 +199,7 @@ struct Fixture {
   plinth::auth::AuthContext auth;
   bool expected_delivery_failure = false;
 
-  Fixture() {
+  explicit Fixture(bool add_nonfloat = false) {
     plinth::ws_test::settle_fixture_work();
     static_cast<void>(plinth::extensions::shutdown_registry());
     plinth::shell::test_seam::set_active_frontend(std::nullopt);
@@ -181,7 +231,7 @@ struct Fixture {
     REQUIRE(*prepared);
     platform = **prepared;
     REQUIRE(platform->platform);
-    const auto bytes = provider_zip(reset.owned_routes);
+    const auto bytes = provider_zip(reset.owned_routes, add_nonfloat);
     const auto installed =
         packages::install_package(bytes, packages::Provenance::USER, context);
     REQUIRE(installed);
@@ -336,7 +386,7 @@ TEST_CASE("float layout service: real installed catalog admission and "
           "[frontend][float_layout_service][integration]") {
   if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
   plinth::async_bridge_test::ensure_drogon_with_db_running();
-  Fixture fixture;
+  Fixture fixture{true};
   SECTION(
       "prefix cursor and fresh indexed available unavailable stale outcomes") {
     const auto first = fixture.catalog();
@@ -420,6 +470,8 @@ TEST_CASE("float layout service: real installed catalog admission and "
   }
   SECTION("resolver-only administrator candidate uses native storage without "
           "impersonation") {
+    const auto before =
+        frontend::test_seam::fixed_storage_dispatch_attempts(*fixture.service);
     const auto result = fixture.json([&](auto completion) {
       fixture.service->catalog({.filters = {.content_type = MIME,
                                             .limit = 1,
@@ -433,10 +485,153 @@ TEST_CASE("float layout service: real installed catalog admission and "
     REQUIRE((*result)["targets"].size() == 1);
     REQUIRE((*result).isMember("admin_default_candidate"));
     REQUIRE((*result)["admin_default_candidate"].isNull());
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == before + 1);
     REQUIRE(fixture.scalar(
                 "SELECT count(*)::text FROM plinth.group_members m JOIN "
                 "plinth.groups g ON g.id=m.group_id WHERE g.name='admin'") ==
             "0");
+  }
+  SECTION("nonfloat native preflight performs zero fixed storage dispatches") {
+    REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                *fixture.service) == 0);
+    for (const auto kind :
+         {frontend::SurfaceKind::PRIMARY, frontend::SurfaceKind::TRAY}) {
+      for (const bool admin : {false, true}) {
+        const auto refused = fixture.json([&](auto completion) {
+          fixture.service->catalog({.filters = {.content_type = MIME,
+                                                .limit = 1,
+                                                .include_admin_default = admin,
+                                                .kind = kind},
+                                    .cursor = std::nullopt,
+                                    .trusted_origin = ORIGIN},
+                                   fixture.auth, "127.0.0.1",
+                                   std::move(completion));
+        });
+        REQUIRE_FALSE(refused);
+        REQUIRE(refused.error().code == "invalid_argument");
+      }
+      const auto admin_only = fixture.json([&](auto completion) {
+        fixture.service->catalog({.filters = {.limit = 1,
+                                              .include_admin_default = true,
+                                              .kind = kind},
+                                  .cursor = std::nullopt,
+                                  .trusted_origin = ORIGIN},
+                                 fixture.auth, "127.0.0.1",
+                                 std::move(completion));
+      });
+      REQUIRE_FALSE(admin_only);
+      REQUIRE(admin_only.error().code == "invalid_argument");
+      const auto valid = fixture.json([&](auto completion) {
+        fixture.service->catalog({.filters = {.limit = 1, .kind = kind},
+                                  .cursor = std::nullopt,
+                                  .trusted_origin = ORIGIN},
+                                 fixture.auth, "127.0.0.1",
+                                 std::move(completion));
+      });
+      REQUIRE(valid);
+      REQUIRE((*valid)["targets"].size() == 1);
+      REQUIRE((*valid)["kind"].asString() ==
+              (kind == frontend::SurfaceKind::PRIMARY ? "primary" : "tray"));
+      REQUIRE((*valid)["targets"][0]["panel_id"].asString() ==
+              (kind == frontend::SurfaceKind::PRIMARY ? "receiver" : "avatar"));
+      REQUIRE_FALSE((*valid).isMember("admin_default_candidate"));
+      if (kind == frontend::SurfaceKind::TRAY) {
+        REQUIRE((*valid)["next_cursor"].isString());
+        const auto cursor = (*valid)["next_cursor"].asString();
+        const auto next = fixture.json([&](auto completion) {
+          fixture.service->catalog({.filters = {.limit = 1, .kind = kind},
+                                    .cursor = cursor,
+                                    .trusted_origin = ORIGIN},
+                                   fixture.auth, "127.0.0.1",
+                                   std::move(completion));
+        });
+        REQUIRE(next);
+        REQUIRE((*next)["targets"].size() == 1);
+        REQUIRE((*next)["targets"][0]["panel_id"].asString() == "bell");
+        REQUIRE((*next)["next_cursor"].isNull());
+        const auto cross_kind = fixture.json([&](auto completion) {
+          fixture.service->catalog(
+              {.filters = {.limit = 1, .kind = frontend::SurfaceKind::PRIMARY},
+               .cursor = cursor,
+               .trusted_origin = ORIGIN},
+              fixture.auth, "127.0.0.1", std::move(completion));
+        });
+        REQUIRE_FALSE(cross_kind);
+        REQUIRE(cross_kind.error().code == "invalid_argument");
+      }
+      REQUIRE(frontend::test_seam::fixed_storage_dispatch_attempts(
+                  *fixture.service) == 0);
+    }
+  }
+  SECTION(
+      "primary and tray share captured authority without float capability") {
+    using Kind = frontend::SurfaceKind;
+    const auto typed = [](std::string panel, Kind kind) {
+      return frontend::SurfaceLookup{.application_id = "floatprovider",
+                                     .panel_id = std::move(panel),
+                                     .kind = kind,
+                                     .expected_generation = std::nullopt,
+                                     .content_type = std::nullopt,
+                                     .capability = std::nullopt};
+    };
+    fixture.parameters("DELETE FROM plinth.group_rules WHERE rule_id=(SELECT "
+                       "id FROM plinth.rbac_rules WHERE rule=$1)",
+                       {"floatprovider.preview"});
+    const auto float_denied = fixture.admit({lookup()});
+    REQUIRE(float_denied);
+    REQUIRE((*float_denied)["results"][0]["status"].asString() ==
+            "unavailable");
+    const auto result = fixture.admit(
+        {typed("receiver", Kind::PRIMARY), typed("legacy", Kind::PRIMARY),
+         typed("bell", Kind::TRAY), typed("avatar", Kind::TRAY)});
+    REQUIRE(result);
+    REQUIRE((*result)["results"].size() == 4);
+    REQUIRE((*result)["results"][1]["status"].asString() == "unavailable");
+    REQUIRE((*result)["results"][1].size() == 2);
+    for (const Json::ArrayIndex index : {0U, 2U, 3U}) {
+      const auto& row = (*result)["results"][index];
+      REQUIRE(row["index"].asUInt() == index);
+      REQUIRE(row["status"].asString() == "available");
+      const auto& target = row["target"];
+      REQUIRE_FALSE(target.isMember("capability"));
+      REQUIRE_FALSE(target.isMember("logical_install_order"));
+      REQUIRE_FALSE(target.isMember("persistence_contract"));
+      if (index == 0) {
+        REQUIRE(target["type"].asString() == "primary");
+        REQUIRE(target["accepts_navigation_intent"].asBool());
+      } else {
+        REQUIRE(target["type"].asString() == "tray");
+        REQUIRE_FALSE(target["chrome_essential"].asBool());
+        REQUIRE_FALSE(target.isMember("context_schema"));
+      }
+      const auto selector = frontend::protocol::parse_asset_selector(
+          target["module_url"].asString());
+      REQUIRE(selector);
+      const auto response =
+          fixture.asset(*selector, fixture.auth, drogon::Head);
+      REQUIRE(response);
+      REQUIRE((*response)->statusCode() == drogon::k200OK);
+    }
+    auto stale = typed("receiver", Kind::PRIMARY);
+    stale.expected_generation = fixture.provider.id;
+    const auto current = fixture.admit({stale});
+    REQUIRE(current);
+    REQUIRE((*current)["results"][0]["status"].asString() == "available");
+    stale.expected_generation = "00000000-0000-0000-0000-000000000046";
+    const auto pinned = fixture.admit({stale});
+    REQUIRE(pinned);
+    REQUIRE((*pinned)["results"][0]["status"].asString() == "stale");
+    fixture.parameters("DELETE FROM plinth.group_rules WHERE rule_id=(SELECT "
+                       "id FROM plinth.rbac_rules WHERE rule=$1)",
+                       {"floatprovider.panel"});
+    const auto denied = fixture.admit(
+        {typed("receiver", Kind::PRIMARY), typed("bell", Kind::TRAY)});
+    REQUIRE(denied);
+    for (const auto& row : (*denied)["results"]) {
+      REQUIRE(row["status"].asString() == "unavailable");
+      REQUIRE(row.size() == 2);
+    }
   }
 }
 

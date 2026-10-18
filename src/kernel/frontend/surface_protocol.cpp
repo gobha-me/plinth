@@ -79,14 +79,38 @@ auto profile(std::string_view value) -> bool {
          uuid(value.substr(3, 36)) && value[39] == ':' &&
          digest(value.substr(40));
 }
-auto position_valid(const authority::Position& value) -> bool {
-  return positive_uint64(value.logical_install_order) &&
-         identifier(value.application_id, 2) &&
+auto kind_name(SurfaceKind kind) -> std::string_view {
+  switch (kind) {
+    case SurfaceKind::FLOAT: return "float";
+    case SurfaceKind::PRIMARY: return "primary";
+    case SurfaceKind::TRAY: return "tray";
+  }
+  return {};
+}
+auto schema_error(packages::restore::CodecError error) -> Error {
+  using enum packages::restore::CodecError;
+  switch (error) {
+    case TOO_LARGE:
+    case LIMIT_EXCEEDED:
+    case HASHING_FAILED: return Error::LIMIT_EXCEEDED;
+    default: return Error::INVALID;
+  }
+}
+auto position_valid(const authority::Position& value, SurfaceKind kind)
+    -> bool {
+  const bool rank_valid =
+      kind == SurfaceKind::FLOAT
+          ? value.logical_install_order &&
+                positive_uint64(*value.logical_install_order)
+          : !kind_name(kind).empty() && !value.logical_install_order;
+  return rank_valid && identifier(value.application_id, 2) &&
          identifier(value.panel_id, 1, true);
 }
 auto query_valid(const CursorQuery& query) -> bool {
   return query.limit >= 1 && query.limit <= 64 &&
-         profile(query.platform_profile) &&
+         !kind_name(query.kind).empty() && profile(query.platform_profile) &&
+         (query.kind == SurfaceKind::FLOAT ||
+          (!query.content_type && !query.include_admin_default)) &&
          (!query.content_type ||
           is_canonical_content_type(*query.content_type)) &&
          (!query.include_admin_default || query.content_type.has_value());
@@ -234,6 +258,57 @@ auto path_components(std::string_view input) -> std::vector<std::string_view> {
     begin = end + 1;
   }
   return result;
+}
+
+auto common_target(const authority::SurfaceTarget& target,
+                   const packages::generation::CapturedArtifact& artifact,
+                   SurfaceKind expected, std::string_view trusted_origin)
+    -> std::expected<WireJson, Error> {
+  const auto& panel = target.declaration;
+  const auto& key = artifact.key();
+  const auto type = expected == SurfaceKind::PRIMARY
+                        ? packages::PanelType::PRIMARY
+                        : packages::PanelType::TRAY;
+  if (target.kind != expected || !panel.typed_declaration ||
+      panel.type != type || !identifier(target.application_id, 2) ||
+      !identifier(panel.id, 1, true) || !uuid(target.generation) ||
+      key.package_id != target.generation ||
+      key.name != target.application_id || key.version != target.version ||
+      key.profile != 1 || !digest(artifact.digest()) ||
+      !metadata_text(target.version, 256, 256) ||
+      target.logical_install_order || panel.capability ||
+      !panel.content_types.empty() || trusted_origin.empty() ||
+      trusted_origin.size() > 2048 || !valid_browser_origin(trusted_origin))
+    return std::unexpected(Error::INVALID);
+  const auto& title = panel.title ? *panel.title : panel.id;
+  const std::string_view icon =
+      panel.icon ? std::string_view{*panel.icon} : std::string_view{"square"};
+  if (!metadata_text(title, 1024, 256) ||
+      !packages::detail::is_icon_token_valid(icon) ||
+      panel.client_path.empty() || panel.client_path.size() > 1024)
+    return std::unexpected(Error::INVALID);
+  std::string url = "/_plinth/typed/" + target.generation + "/" +
+                    artifact.digest() + "/" + panel.id + "/client/panels";
+  for (const auto part : path_components(panel.client_path)) {
+    url.push_back('/');
+    url += encode_component(part);
+  }
+  const auto selected = parse_asset_selector(url);
+  if (!selected ||
+      selected->member_path != "client/panels/" + panel.client_path ||
+      url.size() > 2048 - trusted_origin.size())
+    return std::unexpected(Error::INVALID);
+  const auto* member = artifact.find(selected->member_path);
+  if (!member || member->kind != packages::restore::ArtifactKind::REGULAR)
+    return std::unexpected(Error::INVALID);
+  return WireJson{{"application_id", target.application_id},
+                  {"panel_id", panel.id},
+                  {"type", kind_name(expected)},
+                  {"generation", target.generation},
+                  {"version", target.version},
+                  {"title", title},
+                  {"icon", icon},
+                  {"module_url", std::move(url)}};
 }
 
 // No arbitrary DOM construction until raw byte/depth/node/decoded-duplicate
@@ -433,6 +508,74 @@ auto encode_float_target(const authority::SurfaceTarget& target,
   return std::unexpected(Error::LIMIT_EXCEEDED);
 }
 
+auto encode_primary_target(
+    const authority::SurfaceTarget& target,
+    const packages::generation::CapturedArtifact& artifact,
+    std::string_view trusted_origin) -> std::expected<WireJson, Error> try {
+  const auto& panel = target.declaration;
+  if (!panel.accepts_navigation_intent || !panel.context_schema ||
+      !panel.tray_states.empty() || panel.tray_initial_state ||
+      panel.preferred_width || panel.chrome_essential)
+    return std::unexpected(Error::INVALID);
+  auto result =
+      common_target(target, artifact, SurfaceKind::PRIMARY, trusted_origin);
+  if (!result) return std::unexpected(result.error());
+  const auto schema =
+      packages::restore::canonical_schema(*panel.context_schema);
+  if (!schema) return std::unexpected(schema_error(schema.error()));
+  (*result)["accepts_navigation_intent"] = true;
+  (*result)["context_schema"] = WireJson::parse(*schema);
+  if (!packages::restore::detail::canonical_json(*result, 16384))
+    return std::unexpected(Error::LIMIT_EXCEEDED);
+  return result;
+} catch (const WireJson::exception&) {
+  return std::unexpected(Error::INVALID);
+} catch (const std::bad_alloc&) {
+  return std::unexpected(Error::LIMIT_EXCEEDED);
+} catch (const std::length_error&) {
+  return std::unexpected(Error::LIMIT_EXCEEDED);
+}
+
+auto encode_tray_target(const authority::SurfaceTarget& target,
+                        const packages::generation::CapturedArtifact& artifact,
+                        bool chrome_essential, std::string_view trusted_origin)
+    -> std::expected<WireJson, Error> try {
+  const auto& panel = target.declaration;
+  if (panel.accepts_navigation_intent || panel.tray_states.empty() ||
+      panel.tray_states.size() > 16 || !panel.tray_initial_state ||
+      !panel.tray_states.contains(*panel.tray_initial_state) ||
+      !panel.preferred_width || *panel.preferred_width < 280 ||
+      *panel.preferred_width > 480)
+    return std::unexpected(Error::INVALID);
+  // A valid optional schema is inert for trays: validate it but never expose
+  // primary/float-only wire keys or infer navigation/persistence authority.
+  if (panel.context_schema) {
+    const auto schema =
+        packages::restore::canonical_schema(*panel.context_schema);
+    if (!schema) return std::unexpected(schema_error(schema.error()));
+  }
+  for (const auto& [state, icon] : panel.tray_states)
+    if (!packages::detail::is_icon_token_valid(state) ||
+        !packages::detail::is_icon_token_valid(icon))
+      return std::unexpected(Error::INVALID);
+  auto result =
+      common_target(target, artifact, SurfaceKind::TRAY, trusted_origin);
+  if (!result) return std::unexpected(result.error());
+  (*result)["tray_states"] = panel.tray_states;
+  (*result)["tray_initial_state"] = *panel.tray_initial_state;
+  (*result)["preferred_width"] = *panel.preferred_width;
+  (*result)["chrome_essential"] = chrome_essential;
+  if (!packages::restore::detail::canonical_json(*result, 16384))
+    return std::unexpected(Error::LIMIT_EXCEEDED);
+  return result;
+} catch (const WireJson::exception&) {
+  return std::unexpected(Error::INVALID);
+} catch (const std::bad_alloc&) {
+  return std::unexpected(Error::LIMIT_EXCEEDED);
+} catch (const std::length_error&) {
+  return std::unexpected(Error::LIMIT_EXCEEDED);
+}
+
 CursorCodec::CursorCodec() {
   if (RAND_bytes(secret.data(), static_cast<int>(secret.size())) != 1)
     throw std::runtime_error("surface cursor CSPRNG failed");
@@ -452,27 +595,29 @@ auto CursorCodec::encode(const auth::AuthContext& auth,
                          const authority::Position& position,
                          std::int64_t now) const
     -> std::expected<std::string, Error> try {
-  if (!auth_valid(auth) || !query_valid(query) || !position_valid(position) ||
-      now < 0 || now > std::numeric_limits<std::int64_t>::max() - 60)
+  if (!auth_valid(auth) || !query_valid(query) ||
+      !position_valid(position, query.kind) || now < 0 ||
+      now > std::numeric_limits<std::int64_t>::max() - 60)
     return std::unexpected(Error::INVALID);
   const auto credential = fingerprint(secret, auth);
   if (!credential) return std::unexpected(credential.error());
-  const WireJson payload{
-      {"v", 1},
-      {"user", auth.user_id},
-      {"credential", *credential},
-      {"kind", "float"},
-      {"content_type",
-       query.content_type ? WireJson(*query.content_type) : WireJson(nullptr)},
-      {"include_admin_default", query.include_admin_default},
-      {"limit", query.limit},
-      {"platform_profile", query.platform_profile},
-      {"position",
-       {{"logical_install_order", position.logical_install_order},
-        {"application_id", position.application_id},
-        {"panel_id", position.panel_id}}},
-      {"issued", now},
-      {"expires", now + 60}};
+  WireJson position_wire{{"application_id", position.application_id},
+                         {"panel_id", position.panel_id}};
+  if (position.logical_install_order)
+    position_wire["logical_install_order"] = *position.logical_install_order;
+  const WireJson payload{{"v", 1},
+                         {"user", auth.user_id},
+                         {"credential", *credential},
+                         {"kind", kind_name(query.kind)},
+                         {"content_type", query.content_type
+                                              ? WireJson(*query.content_type)
+                                              : WireJson(nullptr)},
+                         {"include_admin_default", query.include_admin_default},
+                         {"limit", query.limit},
+                         {"platform_profile", query.platform_profile},
+                         {"position", std::move(position_wire)},
+                         {"issued", now},
+                         {"expires", now + 60}};
   const auto bytes =
       packages::restore::detail::canonical_json(payload, MAX_CURSOR);
   if (!bytes) return std::unexpected(Error::LIMIT_EXCEEDED);
@@ -524,7 +669,7 @@ auto CursorCodec::decode(std::string_view raw, const auth::AuthContext& auth,
           credential->size() ||
       CRYPTO_memcmp(payload["credential"].get_ref<const std::string&>().data(),
                     credential->data(), credential->size()) != 0 ||
-      payload["kind"] != "float" ||
+      payload["kind"] != std::string{kind_name(query.kind)} ||
       payload["content_type"] != (query.content_type
                                       ? WireJson(*query.content_type)
                                       : WireJson(nullptr)) ||
@@ -533,8 +678,10 @@ auto CursorCodec::decode(std::string_view raw, const auth::AuthContext& auth,
       !payload["limit"].is_number_integer() ||
       payload["limit"] != query.limit ||
       payload["platform_profile"] != query.platform_profile ||
-      !exact(payload["position"],
-             {"logical_install_order", "application_id", "panel_id"}))
+      !(query.kind == SurfaceKind::FLOAT
+            ? exact(payload["position"],
+                    {"logical_install_order", "application_id", "panel_id"})
+            : exact(payload["position"], {"application_id", "panel_id"})))
     return std::unexpected(Error::INVALID);
   const auto issued = unsigned_seconds(payload["issued"]),
              expires = unsigned_seconds(payload["expires"]);
@@ -543,15 +690,19 @@ auto CursorCodec::decode(std::string_view raw, const auth::AuthContext& auth,
       *expires != *issued + 60 || now < *issued || now >= *expires)
     return std::unexpected(Error::INVALID);
   const auto& position = payload["position"];
-  if (!position["logical_install_order"].is_string() ||
+  if ((query.kind == SurfaceKind::FLOAT &&
+       !position["logical_install_order"].is_string()) ||
       !position["application_id"].is_string() ||
       !position["panel_id"].is_string())
     return std::unexpected(Error::INVALID);
   authority::Position result{
-      position["logical_install_order"].get<std::string>(),
+      query.kind == SurfaceKind::FLOAT
+          ? std::optional{position["logical_install_order"].get<std::string>()}
+          : std::nullopt,
       position["application_id"].get<std::string>(),
       position["panel_id"].get<std::string>()};
-  if (!position_valid(result)) return std::unexpected(Error::INVALID);
+  if (!position_valid(result, query.kind))
+    return std::unexpected(Error::INVALID);
   return result;
 } catch (const WireJson::exception&) {
   return std::unexpected(Error::INVALID);
