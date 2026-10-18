@@ -9,6 +9,8 @@ import { chromium } from 'playwright';
 import { installFailureSummary, emitJourneyFailure, createJourneyFailureSteps, observeSelectedBody } from './installed-float-diagnostics.mjs';
 import { boundedStep, createResponseBodyRegistry, observeReadLane, withFrozenReadLane,
     observeAuthorityRecovery } from './installed-float-coordination.mjs';
+import { snapshotTypedSurfaceTargets, verifyTypedSurfaceUnavailable,
+    verifyTypedSurfaceFoundation } from './installed-typed-surface-foundation.mjs';
 
 const phase = process.argv[2];
 assert(['install', 'verify'].includes(phase), 'owned supervisor phase required');
@@ -658,6 +660,7 @@ try {
         assert.equal(live.persistence_contract, null, 'required unapproved reopen field is live-only');
         assert.deepEqual(await surfaces(denied), [], 'authorization filters before exposure');
         completed.push('real protected policy, captured profile, authorized/denied surface filtering');
+        const originalTypedTargets = await snapshotTypedSurfaceTargets(b, preview.generation);
         await failureSteps.run('initial-caller', () => openCaller(a));
         const personalWhere = `user_id=${literal(state.accounts.a.id)} AND key='shell.handler_defaults'`;
         const adminWhere = `content_type=${literal(fixtureContentType)}`;
@@ -891,6 +894,7 @@ try {
             assert.equal(disabledAdmission.status, 200);
             assert.deepEqual(disabledAdmission.value.results, [{ index: 0, status: 'unavailable' }]);
             assert.equal((await request(b, modulePath)).status, 404);
+            await verifyTypedSurfaceUnavailable(b, originalTypedTargets, disableDeadline);
         } finally { disabledRecovery.stop(); }
         const enableDeadline = performance.now() + 15000;
         const enabledRecovery = authorityRecoveries.get(b).arm(enableDeadline);
@@ -910,6 +914,7 @@ try {
         const enabledInstance = await enabledFloat.provider.getAttribute('data-instance');
         assert.notEqual(enabledInstance, bOriginalInstance);
         assert.equal((await surfaces(b)).find(target => target.panel_id === 'preview').generation, preview.generation);
+        assert.deepEqual(await snapshotTypedSurfaceTargets(b, preview.generation), originalTypedTargets);
         completed.push('ordinary disable and enable retire old owners without automatic resurrection');
 
         const failedUpgrade = await uploadVariant(operator, '0.2.0');
@@ -933,6 +938,7 @@ try {
         assert.deepEqual(fencedAdmission.value.results, [{ index: 0, status: 'unavailable' }]);
         assert.equal((await request(b, modulePath)).status, 404);
         state.retiredPackages = [{ id: attempted.id, version: attempted.version, state: 'INSTALL_FAILED' }];
+        await verifyTypedSurfaceUnavailable(b, originalTypedTargets);
         completed.push('failed migration upgrade preserves the old generation fence without rollback claims');
 
         const upgraded = await uploadVariant(operator, '0.3.0');
@@ -988,6 +994,10 @@ try {
         assert.equal(saved(state.accounts.b).floats.length, 0, 'unapproved replacement remains excluded from explicit snapshot');
         assert.equal(await current.provider.getAttribute('data-instance'), currentInstance, 'save does not replace live-only UI');
         completed.push('successful replacement recovers through new native bytes without inherited persistence approval');
+        await verifyTypedSurfaceFoundation({ page: b, denied, request, sql, literal,
+            account: state.accounts.b, generation: replacement.id, retiredGeneration: originalPackage.id,
+            retiredTargets: originalTypedTargets,
+            floatTargets: replacementTargets, completed });
     }
 } catch (error) {
     failure = error;
@@ -1059,12 +1069,12 @@ if (failure || cleanupFailures.length) {
     throw new AggregateError([...(failure ? [failure] : []), ...cleanupFailures], 'installed float journey/cleanup failed');
 }
 if (phase === 'verify') {
-    assert.equal(completed.length, 12);
+    assert.equal(completed.length, 15);
     assert.deepEqual(recoveryEvidence, Array.from({ length: 3 }, () =>
         ({ terminal: 1, new_socket_ack: 1, fresh_catalog: 1, home_empty: 1 })));
-    console.log(JSON.stringify({ phase, expectedCases: 12, completed, actualAuth: true,
+    console.log(JSON.stringify({ phase, expectedCases: 15, completed, actualAuth: true,
         packageProvenance: 'user', archiveHashes: state.archiveHashes,
         protectedPolicy: true, normalUninstall: true,
         authorityRecovery: { barriers: 3, terminals: 3, newSocketAcks: 3, freshCatalogs: 3, emptyPrimary: 3 },
-        scope: 'native ordinary ZIP/API/auth/RBAC/SDK/import/protected policy/guarded SQL/reload/component recovery/revocation/package lifecycle; no process-crash or lost-ACK proof' }));
+        scope: 'native ordinary ZIP/API/auth/RBAC/SDK/import/protected policy/guarded SQL/reload/component recovery/revocation/package lifecycle plus primary/tray typed transport; no tray-UI/navigation/process-crash or lost-ACK proof' }));
 }

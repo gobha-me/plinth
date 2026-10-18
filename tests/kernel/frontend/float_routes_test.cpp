@@ -149,6 +149,17 @@ TEST_CASE("float routes: strict raw facade and one-shot redacted responses",
     REQUIRE_FALSE(parsed->filters.content_type);
     REQUIRE_FALSE(parsed->filters.include_admin_default);
     REQUIRE(parsed->filters.platform_profile.empty());
+    REQUIRE(parsed->filters.kind == plinth::frontend::SurfaceKind::FLOAT);
+    for (const auto& [name, kind] :
+         {std::pair{"primary", plinth::frontend::SurfaceKind::PRIMARY},
+          std::pair{"tray", plinth::frontend::SurfaceKind::TRAY}}) {
+      const auto typed = seam::parse_float_catalog_query(
+          std::string{"kind="} + name + "&limit=1&include_admin_default=0");
+      REQUIRE(typed);
+      REQUIRE(typed->filters.kind == kind);
+      REQUIRE_FALSE(typed->filters.content_type);
+      REQUIRE_FALSE(typed->filters.include_admin_default);
+    }
     parsed = seam::parse_float_catalog_query(
         "kind=float&limit=1&content_type=text%2Fx-c%2B%2B&include_admin_"
         "default=1&cursor=opaque-token.signature");
@@ -164,7 +175,12 @@ TEST_CASE("float routes: strict raw facade and one-shot redacted responses",
             "%2e"); // Later real MAC rejects; never a second decode.
     for (const auto raw : {"",
                            "limit=2",
-                           "kind=tray",
+                           "kind=settings",
+                           "kind=primary&content_type=text%2Fplain",
+                           "kind=tray&content_type=text%2Fplain",
+                           "kind=primary&include_admin_default=1",
+                           "kind=tray&include_admin_default=1",
+                           "kind=tray&include_admin_default=true",
                            "kind=float&kind=float",
                            "kind=float&k%69nd=float",
                            "kind=float&extra=x",

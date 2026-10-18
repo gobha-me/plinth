@@ -31,7 +31,8 @@ struct SurfaceTarget {
 };
 
 struct Position {
-  std::string logical_install_order;
+  // Present only for FLOAT. Primary/tray pagination has no fabricated rank.
+  std::optional<std::string> logical_install_order;
   std::string application_id;
   std::string panel_id;
   auto operator==(const Position&) const -> bool = default;
@@ -84,6 +85,14 @@ struct SurfacePage {
     PGconn& connection, const auth::AuthContext& auth,
     std::string_view content_type, std::size_t limit,
     const std::optional<Position>& after = std::nullopt)
+    -> std::expected<SurfacePage, Error>;
+
+// PRIMARY/TRAY only: exact application-byte/panel-byte prefix, fresh effective
+// permission filtering before LIMIT and one lookahead. FLOAT callers retain
+// the separate numeric-rank overloads above.
+[[nodiscard]] auto catalog_surface_prefix(
+    PGconn& connection, const auth::AuthContext& auth, SurfaceKind kind,
+    std::size_t limit, const std::optional<Position>& after = std::nullopt)
     -> std::expected<SurfacePage, Error>;
 [[nodiscard]] auto catalog_float_prefix(
     PGconn& connection, const auth::AuthContext& auth,

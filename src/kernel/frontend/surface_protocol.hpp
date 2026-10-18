@@ -47,12 +47,24 @@ struct AssetSelector {
     const packages::generation::CapturedArtifact& artifact,
     const std::optional<PersistenceProjection>& projection,
     std::string_view trusted_origin) -> std::expected<nlohmann::json, Error>;
+[[nodiscard]] auto encode_primary_target(
+    const authority::SurfaceTarget& target,
+    const packages::generation::CapturedArtifact& artifact,
+    std::string_view trusted_origin) -> std::expected<nlohmann::json, Error>;
+// chrome_essential is supplied by the service AFTER fresh guarded active-shell
+// identity proof. The declaration flag is never used by this serializer.
+[[nodiscard]] auto encode_tray_target(
+    const authority::SurfaceTarget& target,
+    const packages::generation::CapturedArtifact& artifact,
+    bool chrome_essential, std::string_view trusted_origin)
+    -> std::expected<nlohmann::json, Error>;
 
 struct CursorQuery {
   std::optional<std::string> content_type;
   std::size_t limit = 64;
   bool include_admin_default = false;
   std::string platform_profile;
+  SurfaceKind kind = SurfaceKind::FLOAT;
   auto operator==(const CursorQuery&) const -> bool = default;
 };
 

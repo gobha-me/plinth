@@ -273,6 +273,225 @@ TEST_CASE(
     REQUIRE(random_cursor);
     REQUIRE_FALSE(random_second.decode(*random_cursor, owner(), query(), 1000));
   }
+  SECTION("primary and tray cursors bind kind and exact rank-free positions") {
+    using enum plinth::frontend::SurfaceKind;
+    const auto codec = protocol::test_seam::cursor_codec(secret());
+    const plinth::frontend::authority::Position start{std::nullopt, "notes",
+                                                      "preview"};
+    for (const auto kind : {PRIMARY, TRAY}) {
+      auto selected = query();
+      selected.kind = kind;
+      selected.content_type.reset();
+      selected.include_admin_default = false;
+      auto payload = ProtocolJson::parse(PAYLOAD);
+      payload["kind"] = kind == PRIMARY ? "primary" : "tray";
+      payload["content_type"] = nullptr;
+      payload["include_admin_default"] = false;
+      payload["position"].erase("logical_install_order");
+      const auto encoded = codec.encode(owner(), selected, start, 1000);
+      REQUIRE(encoded);
+      // Expected bytes are independently framed/signed, not production encoded.
+      REQUIRE(*encoded == sign(payload.dump()));
+      REQUIRE(codec.decode(*encoded, owner(), selected, 1059) == start);
+      REQUIRE_FALSE(codec.decode(*encoded, owner(), selected, 1060));
+      auto changed = selected;
+      changed.kind = kind == PRIMARY ? TRAY : PRIMARY;
+      REQUIRE_FALSE(codec.decode(*encoded, owner(), changed, 1000));
+      REQUIRE_FALSE(codec.decode(*encoded, owner(), query(), 1000));
+      REQUIRE_FALSE(codec.encode(owner(), selected, position(), 1000));
+      for (const auto& rank :
+           {ProtocolJson(nullptr), ProtocolJson(""), ProtocolJson("1")}) {
+        auto forged = payload;
+        forged["position"]["logical_install_order"] = rank;
+        REQUIRE_FALSE(
+            codec.decode(sign(forged.dump()), owner(), selected, 1000));
+      }
+      for (const auto key : {"application_id", "panel_id"}) {
+        auto forged = payload;
+        forged["position"].erase(key);
+        REQUIRE_FALSE(
+            codec.decode(sign(forged.dump()), owner(), selected, 1000));
+      }
+      changed = selected;
+      changed.content_type = "text/plain";
+      REQUIRE_FALSE(codec.encode(owner(), changed, start, 1000));
+      REQUIRE_FALSE(codec.decode(*encoded, owner(), changed, 1000));
+      changed = selected;
+      changed.include_admin_default = true;
+      REQUIRE_FALSE(codec.encode(owner(), changed, start, 1000));
+      changed = selected;
+      changed.platform_profile.back() = 'c';
+      REQUIRE_FALSE(codec.decode(*encoded, owner(), changed, 1000));
+      changed = selected;
+      changed.limit = 1;
+      REQUIRE_FALSE(codec.decode(*encoded, owner(), changed, 1000));
+      auto wrong_owner = owner();
+      wrong_owner.token_hash = std::string(64, 'd');
+      REQUIRE_FALSE(codec.decode(*encoded, wrong_owner, selected, 1000));
+    }
+    REQUIRE_FALSE(codec.encode(owner(), query(), start, 1000));
+    auto invalid = query();
+    invalid.kind = static_cast<plinth::frontend::SurfaceKind>(99);
+    REQUIRE_FALSE(codec.encode(owner(), invalid, position(), 1000));
+  }
+  SECTION("primary and tray target shapes are closed and bound to captured "
+          "members") {
+    using enum plinth::frontend::SurfaceKind;
+    CaptureFixture fixture;
+    auto primary = fixture.target;
+    primary.kind = PRIMARY;
+    primary.logical_install_order.reset();
+    primary.declaration.type = plinth::packages::PanelType::PRIMARY;
+    primary.declaration.capability.reset();
+    primary.declaration.content_types.clear();
+    primary.declaration.accepts_navigation_intent = true;
+    const auto encoded =
+        protocol::encode_primary_target(primary, *fixture.artifact, ORIGIN);
+    REQUIRE(encoded);
+    const std::string expected_url =
+        "/_plinth/typed/" + std::string{GENERATION} + "/" +
+        fixture.artifact->digest() +
+        "/preview/client/panels/%C3%A9%252e%3F%23.js";
+    const ProtocolJson expected_primary{
+        {"application_id", "notes"},
+        {"panel_id", "preview"},
+        {"type", "primary"},
+        {"generation", GENERATION},
+        {"version", "1.0.0"},
+        {"title", "preview"},
+        {"icon", "square"},
+        {"module_url", expected_url},
+        {"accepts_navigation_intent", true},
+        {"context_schema",
+         {{"version", 1},
+          {"fields",
+           {{"record_id",
+             {{"required", true},
+              {"max_bytes", 64},
+              {"meaning", "Stable fake ID"}}}}},
+          {"persist_keys", ProtocolJson::array({"record_id"})}}}};
+    REQUIRE(*encoded == expected_primary);
+    REQUIRE(encoded->size() == 10);
+    auto tray = primary;
+    tray.kind = TRAY;
+    tray.declaration.type = plinth::packages::PanelType::TRAY;
+    tray.declaration.accepts_navigation_intent = false;
+    tray.declaration.context_schema.reset();
+    tray.declaration.tray_states = {{"idle", "circle"}, {"busy", "clock"}};
+    tray.declaration.tray_initial_state = "idle";
+    tray.declaration.preferred_width = 320;
+    tray.declaration.chrome_essential =
+        true; // Foreign claim cannot set output.
+    auto expected_tray = expected_primary;
+    expected_tray.erase("accepts_navigation_intent");
+    expected_tray.erase("context_schema");
+    expected_tray["type"] = "tray";
+    expected_tray["tray_states"] = {{"idle", "circle"}, {"busy", "clock"}};
+    expected_tray["tray_initial_state"] = "idle";
+    expected_tray["preferred_width"] = 320;
+    expected_tray["chrome_essential"] = false;
+    auto tray_wire =
+        protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN);
+    REQUIRE(tray_wire);
+    REQUIRE(*tray_wire == expected_tray);
+    REQUIRE(tray_wire->size() == 12);
+    expected_tray["chrome_essential"] = true;
+    tray_wire =
+        protocol::encode_tray_target(tray, *fixture.artifact, true, ORIGIN);
+    REQUIRE(tray_wire);
+    REQUIRE(*tray_wire == expected_tray);
+    tray.declaration.chrome_essential = false;
+    tray_wire =
+        protocol::encode_tray_target(tray, *fixture.artifact, true, ORIGIN);
+    REQUIRE(tray_wire);
+    REQUIRE(*tray_wire == expected_tray);
+    // This tests pure serialization of a service-derived boolean, NOT authority
+    // to become essential. Real active-shell proof belongs to the service.
+    tray.declaration.context_schema = primary.declaration.context_schema;
+    REQUIRE(
+        protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN));
+    auto invalid_schema = tray;
+    invalid_schema.declaration.context_schema->fields["record_id"].max_bytes =
+        513;
+    REQUIRE_FALSE(protocol::encode_tray_target(
+        invalid_schema, *fixture.artifact, false, ORIGIN));
+    for (unsigned int variant = 0; variant < 12; ++variant) {
+      auto forged = primary;
+      if (variant == 0) forged.declaration.accepts_navigation_intent = false;
+      if (variant == 1) forged.declaration.context_schema.reset();
+      if (variant == 2) forged.logical_install_order = "1";
+      if (variant == 3) forged.declaration.capability = "notes:1:preview";
+      if (variant == 4) forged.declaration.content_types = {"text/plain"};
+      if (variant == 5) forged.declaration.tray_states = {{"idle", "circle"}};
+      if (variant == 6) forged.kind = TRAY;
+      if (variant == 7)
+        forged.declaration.type = plinth::packages::PanelType::TRAY;
+      if (variant == 8) forged.generation[0] = '2';
+      if (variant == 9) forged.declaration.client_path = "missing.js";
+      if (variant == 10) forged.declaration.client_path = "../server/main.js";
+      if (variant == 11) forged.version = "2.0.0";
+      REQUIRE_FALSE(
+          protocol::encode_primary_target(forged, *fixture.artifact, ORIGIN));
+    }
+    for (unsigned int variant = 0; variant < 12; ++variant) {
+      auto forged = tray;
+      if (variant == 0) forged.declaration.accepts_navigation_intent = true;
+      if (variant == 1) forged.logical_install_order = "1";
+      if (variant == 2) forged.declaration.capability = "notes:1:preview";
+      if (variant == 3) forged.declaration.content_types = {"text/plain"};
+      if (variant == 4) forged.declaration.tray_states.clear();
+      if (variant == 5) forged.declaration.tray_initial_state.reset();
+      if (variant == 6) forged.declaration.tray_initial_state = "missing";
+      if (variant == 7) forged.declaration.preferred_width.reset();
+      if (variant == 8) forged.declaration.preferred_width = 279;
+      if (variant == 9) forged.declaration.preferred_width = 481;
+      if (variant == 10) forged.declaration.tray_states["Bad State"] = "circle";
+      if (variant == 11) forged.declaration.tray_states["idle"] = "Bad Icon";
+      REQUIRE_FALSE(protocol::encode_tray_target(forged, *fixture.artifact,
+                                                 false, ORIGIN));
+    }
+    for (const auto width : {280U, 480U}) {
+      tray.declaration.preferred_width = width;
+      REQUIRE(
+          protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN));
+    }
+    tray.declaration.tray_states.clear();
+    for (unsigned int index = 0; index < 16; ++index)
+      tray.declaration.tray_states["state" + std::to_string(index)] = "circle";
+    tray.declaration.tray_initial_state = "state0";
+    REQUIRE(
+        protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN));
+    tray.declaration.tray_states["excess"] = "circle";
+    REQUIRE_FALSE(
+        protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN));
+    std::string emoji;
+    for (unsigned int index = 0; index < 256; ++index)
+      emoji += "😀";
+    for (const auto kind : {PRIMARY, TRAY}) {
+      auto target = kind == PRIMARY ? primary : tray;
+      if (kind == TRAY) target.declaration.tray_states.erase("excess");
+      auto encode = [&] {
+        return kind == PRIMARY
+                   ? protocol::encode_primary_target(target, *fixture.artifact,
+                                                     ORIGIN)
+                   : protocol::encode_tray_target(target, *fixture.artifact,
+                                                  false, ORIGIN);
+      };
+      target.declaration.title = emoji;
+      REQUIRE(encode());
+      target.declaration.title = emoji + "😀";
+      REQUIRE_FALSE(encode());
+      target.declaration.title = std::string(1, static_cast<char>(0xff));
+      REQUIRE_FALSE(encode());
+      target.declaration.title = "Valid title";
+      target.declaration.icon = "Bad Icon";
+      REQUIRE_FALSE(encode());
+    }
+    REQUIRE_FALSE(protocol::encode_primary_target(primary, *fixture.artifact,
+                                                  "http://example.test/"));
+    REQUIRE_FALSE(protocol::encode_tray_target(tray, *fixture.artifact, false,
+                                               "https://user@example.test"));
+  }
   SECTION("authentic malformed or noncanonical cursor bytes never reach a "
           "position") {
     const auto codec = protocol::test_seam::cursor_codec(secret());
@@ -468,6 +687,30 @@ TEST_CASE(
     REQUIRE(ORIGIN.size() +
                 (*exact)["module_url"].get_ref<const std::string&>().size() ==
             2048);
+    auto nonfloat = fixture.target;
+    nonfloat.logical_install_order.reset();
+    nonfloat.declaration.capability.reset();
+    nonfloat.declaration.content_types.clear();
+    nonfloat.kind = plinth::frontend::SurfaceKind::PRIMARY;
+    nonfloat.declaration.type = plinth::packages::PanelType::PRIMARY;
+    nonfloat.declaration.accepts_navigation_intent = true;
+    REQUIRE(
+        protocol::encode_primary_target(nonfloat, *fixture.artifact, ORIGIN));
+    auto tray = nonfloat;
+    tray.kind = plinth::frontend::SurfaceKind::TRAY;
+    tray.declaration.type = plinth::packages::PanelType::TRAY;
+    tray.declaration.accepts_navigation_intent = false;
+    tray.declaration.tray_states = {{"idle", "circle"}};
+    tray.declaration.tray_initial_state = "idle";
+    tray.declaration.preferred_width = 320;
+    REQUIRE(
+        protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN));
+    nonfloat.declaration.client_path = path + "x";
+    tray.declaration.client_path = path + "x";
+    REQUIRE_FALSE(
+        protocol::encode_primary_target(nonfloat, *fixture.artifact, ORIGIN));
+    REQUIRE_FALSE(
+        protocol::encode_tray_target(tray, *fixture.artifact, false, ORIGIN));
     fixture.target.declaration.client_path = path + "x";
     REQUIRE_FALSE(protocol::encode_float_target(
         fixture.target, *fixture.artifact, std::nullopt, ORIGIN));

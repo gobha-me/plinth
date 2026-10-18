@@ -41,6 +41,9 @@ EXPECTED_CASES = [
     'ordinary disable and enable retire old owners without automatic resurrection',
     'failed migration upgrade preserves the old generation fence without rollback claims',
     'successful replacement recovers through new native bytes without inherited persistence approval',
+    'ordinary installed primary and tray catalogs, exact typed wire and isolated cursors',
+    'indexed mixed-kind admission, cookie CSRF, PAT access and denied no-metadata',
+    'captured primary and tray imports, foreign essential refusal and fresh rule fencing',
     'normal authenticated package uninstall after consumer contexts close',
 ]
 
