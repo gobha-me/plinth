@@ -357,6 +357,17 @@ jobs:
           ctest --test-dir build --output-on-failure -R \
             '^plinth_tests_host_string_boundary$'
 
+      - name: Focused QuickJS synchronous evaluation conversion sanitizer corpus
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_sync_conversion_corpus$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_sync_conversion_corpus$'
+
       - name: Focused QuickJS audit authority sanitizer regression
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
@@ -584,6 +595,16 @@ jobs:
             grep -Ex 'Total Tests: 1'
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_db_batch_corpus$'
+
+      - name: Focused QuickJS synchronous evaluation ownership TSan corpus
+        env:
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_sync_conversion_corpus$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_sync_conversion_corpus$'
 
       - name: Installed float generation, ownership and admin-default TSan tests
         env:
