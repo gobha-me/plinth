@@ -16,9 +16,10 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Pubsub (#148) | `plinth_tests_pubsub_corpus` | Publish/subscribe admission, callback replacement/invocation, returned unsubscribe enqueue and runtime ownership |
 | Capability (#150) | `plinth_tests_cap_corpus` | Call/batch admission, owned snapshots, real Promise.all composition with simulated host settlement and runtime ownership |
 | Ordinary database (#151) | `plinth_tests_db_admission_corpus` | Query/exec admission, parameter and client-manager snapshots, simulated host settlement and runtime ownership; no SQL execution |
+| Public database batch (#174, parent #90) | `plinth_tests_db_batch_corpus` | Public callback admission and installed batch orchestration with simulated host completion/reset; no SQL execution |
 
-These are bounded slices, not comprehensive coverage claims. DB batch and
-internal transaction callbacks, real DB dispatch/driver/result conversion,
+These are bounded slices, not comprehensive coverage claims. Broader direct
+internal transaction callback denial/coercion policy, real DB dispatch/driver/result conversion,
 capability resolver/dispatch, extension
 module import, distinct conversion implementations and broader async dispatch
 remain separate requested targets. The separate JS/JSON implementations in
@@ -62,7 +63,8 @@ DB-free process without initialized logging, Drogon or broker background work,
 and is tagged `[isolated-pubsub]`. It is excluded only from the shared JS
 fixture process, not the full test suite. The independent isolation inventory
 requires exactly five known logger fixtures, this one exact pubsub case and
-the one exact capability corpus and the one exact ordinary DB admission corpus,
+the one exact capability corpus, the one exact ordinary DB admission corpus,
+the one exact public DB batch corpus and the existing isolated audit-drain fixture,
 preserves all other ordinary JS fixtures and pins the required strict gate.
 
 `plinth_tests_pubsub_corpus` uses `tests/tools/verify_catch_case.py` with the
@@ -109,8 +111,8 @@ survives its context or is used after destruction.
 assertions, zero failures/skips, a zero child exit, and 60/75-second inner/outer
 deadlines. `[isolated-cap]` separates it from the grouped dispatcher/DB fixture,
 not from full CTest. The independent known-case inventory requires exactly
-five logger fixtures, one pubsub case, one capability case and one ordinary DB
-admission case and retains every
+five logger fixtures, one pubsub case, one capability case, one ordinary DB
+admission case, one public DB batch case and the audit-drain fixture, retaining every
 ordinary JS fixture. Both sanitizer lanes explicitly discover and execute this
 gate; compiler and image suites keep the complete CTest inventory.
 
@@ -138,9 +140,10 @@ mapping, not how a database driver accepts or persists nonfinite parameters.
 Results and rejections are deliberately settled through the host seam as a
 simulation. This does not prove driver parameter binding, SQL authorization,
 PostgreSQL result/OID conversion, SQLSTATE fidelity, durable commits, production
-dispatch/backpressure or the production cancellation cascade. Transaction
-state, public/internal batch orchestration and denial ownership remain separate
-targets. Exotic accessors/proxies, allocation failure and broader coercion
+dispatch/backpressure or the production cancellation cascade. Public batch
+orchestration has the separate bounded slice below; broader transaction
+dispatch and denial ownership remain separate targets. Exotic accessors/proxies,
+allocation failure and broader coercion
 policy are outside this bounded slice; no production limits or policies change.
 
 Fresh replays, explicit family counts, corrupted-observation controls and bounded
@@ -152,7 +155,49 @@ real ownership without fake transactions or dangling-context calls.
 positive assertions, zero failures/expected failures/skips and a zero child exit,
 with 60/75-second inner/outer deadlines. `[isolated-db-admission]` isolates it
 from the grouped DB/dispatcher fixture, not from full CTest. The independent
-inventory keeps exactly five logger fixtures and one each of pubsub, capability
-and ordinary DB admission, preserving every ordinary JS fixture. Both sanitizer
+inventory keeps exactly five logger fixtures and one each of pubsub, capability,
+ordinary DB admission, public DB batch and audit drain, preserving every ordinary
+JS fixture. Both sanitizer
 lanes explicitly discover and execute it; full compiler/image suites remain
 required. Coverage is delivered only after candidate and exact-merge CI pass.
+
+## Public database batch admission and installed orchestration
+
+The batch corpus calls the actual registered `db.batch` and its unmodified
+installed JavaScript orchestrator. Fixed seeds, explicit semantic families,
+two fresh-runtime replays per generated case, finite input/job/shrink budgets
+and corrupted-observation controls prevent a missing or vacuous target from
+being accepted. Expected public argument and error precedence, operation
+sequence, owned metadata, callback inventory and result/error identity come
+from literal test expectations rather than production conversion helpers.
+
+The public admission matrix distinguishes synchronous invalid-callback and
+unavailable-context errors from cancellation and nesting Promise rejections.
+Orchestration covers BEGIN failure, immediate and Promise body results,
+synchronous throws and rejected bodies, COMMIT success/errors, timeout-triggered
+rollback, and both rollback outcomes. Observations precede simulated settlement
+and check body/outer-settlement counts. Duplicate late completions cannot
+settle an outer result again. The transaction and rollback-owner control blocks
+are observed before and after their transfer into a terminal operation; the
+alias-null transaction token is never dispatched or invoked as a database.
+
+Host completions and terminal `batch_state` cleanup are deliberately simulated.
+Pool release/reuse checks occur only after that explicit fixture cleanup;
+they do not establish that clean release itself resets a transaction. Dirty
+release, held-owner rebuild and bounded/idempotent shutdown keep all JS values
+within a live owned context. This is not proof of real BEGIN/COMMIT/ROLLBACK,
+driver/result conversion, authorization, timers, transaction durability or
+the production cancellation cascade. Direct internal-helper coercion and
+denial policy, exotic accessors/global replacements and remaining parent #90
+targets stay outstanding; no production policy or limit changes.
+
+`plinth_tests_db_batch_corpus` requires exactly its named case, fresh Catch/XML,
+positive assertions, zero failures/expected failures/skips and successful child
+teardown, with 60/75-second inner/outer bounds. `[isolated-db-batch]` keeps it
+DB-free and separate from grouped DB/dispatcher fixtures, not out of full
+CTest. Independent targeted and baseline discovery require its one exact
+case/tag and the strict gate while retaining every ordinary fixture. Both
+ASan/UBSan lanes and the TSan lane explicitly discover and execute this target;
+the unchanged retained 16 and generation/installed/admin 43 TSan selections
+remain separate. Normal compiler and image suites keep the full inventory.
+Candidate and exact-merge CI remain delivery gates, not release authority.
