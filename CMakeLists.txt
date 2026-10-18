@@ -767,6 +767,7 @@ add_executable(plinth_tests
   tests/kernel/js/crypto_numeric_regression_test.cpp
   tests/kernel/js/json_nul_preservation_test.cpp
   tests/kernel/js/conversion_corpus_test.cpp
+  tests/kernel/js/sync_conversion_corpus_test.cpp
   tests/kernel/js/host_string_boundary_test.cpp
   tests/kernel/js/audit_authority_regression_test.cpp
   tests/kernel/js/audit_corpus_test.cpp
@@ -1219,7 +1220,7 @@ add_test(NAME plinth_tests_ws_close_ownership
 set_tests_properties(plinth_tests_ws_close_ownership PROPERTIES TIMEOUT 40)
 
 set(PLINTH_GROUPED_JS_SELECTOR
-    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-db-batch] ~[isolated-audit-drain]")
+    "[js] ~[batch-transaction] ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-db-batch] ~[isolated-audit-drain] ~[isolated-sync-conversion]")
 
 # spdlog's default free APIs cannot overlap a default-logger replacement.
 # These five synchronous capture fixtures must run before any background
@@ -1282,9 +1283,20 @@ add_test(NAME plinth_tests_json_nul_regression
 set_tests_properties(plinth_tests_json_nul_regression PROPERTIES TIMEOUT 30)
 
 add_test(NAME plinth_tests_conversion_corpus
-  COMMAND plinth_tests "[js][conversion][corpus]"
+  COMMAND plinth_tests "[js][conversion][corpus] ~[isolated-sync-conversion]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_conversion_corpus PROPERTIES TIMEOUT 90)
+
+# The one-shot and pooled synchronous helpers have distinct private conversion
+# paths. Exercise both in one DB-free process with exact fresh-XML verification.
+add_test(NAME plinth_tests_sync_conversion_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS synchronous evaluation has bounded deterministic conversion corpora"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_sync_conversion_corpus PROPERTIES TIMEOUT 75)
 
 add_test(NAME plinth_tests_host_string_boundary
   COMMAND plinth_tests "[js][stdlib][host-string-boundary]"

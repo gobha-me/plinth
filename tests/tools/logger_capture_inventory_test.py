@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Fail closed if logger captures or pubsub/cap/database corpora lose isolation."""
+"""Fail closed if logger captures or named QuickJS corpora lose isolation."""
 
 from __future__ import annotations
 
 import argparse
 import copy
+import fnmatch
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -38,18 +40,92 @@ DB_ADMISSION_GATE = "plinth_tests_db_admission_corpus"
 DB_BATCH_TAG = "[isolated-db-batch]"
 DB_BATCH_CASE = "QuickJS db.batch has a bounded deterministic admission and orchestration corpus"
 DB_BATCH_GATE = "plinth_tests_db_batch_corpus"
+SYNC_CONVERSION_TAG = "[isolated-sync-conversion]"
+SYNC_CONVERSION_CASE = "QuickJS synchronous evaluation has bounded deterministic conversion corpora"
+SYNC_CONVERSION_GATE = "plinth_tests_sync_conversion_corpus"
+SHARED_CONVERSION_GATE = "plinth_tests_conversion_corpus"
+SHARED_CONVERSION_SELECTOR = "[js][conversion][corpus] ~[isolated-sync-conversion]"
 INVENTORY_GATE = "plinth_tests_logger_capture_inventory"
 AUDIT_DRAIN_TAG = "[isolated-audit-drain]"
 AUDIT_DRAIN_CASE = "audit drain retains blocked writes before Drogon shutdown and retries"
 AUDIT_DRAIN_GATE = "plinth_tests_audit_drain"
 GROUPED_JS_BASELINE = "[js] ~[batch-transaction]"
-GROUPED_JS_SELECTOR = GROUPED_JS_BASELINE + " ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-db-batch] ~[isolated-audit-drain]"
+GROUPED_JS_SELECTOR = GROUPED_JS_BASELINE + " ~[isolated-logger] ~[isolated-pubsub] ~[isolated-cap] ~[isolated-db-admission] ~[isolated-db-batch] ~[isolated-audit-drain] ~[isolated-sync-conversion]"
 EXPECTED_GATES = {
     "plinth_tests_logger_capture_isolated": ISOLATION_TAG,
     "plinth_tests_log_regression": "[js][stdlib][log][regression]",
     "plinth_tests_log_corpus": "[js][stdlib][log][corpus]",
     "plinth_tests_log_oracle": "[js][stdlib][log][oracle]",
+    SHARED_CONVERSION_GATE: SHARED_CONVERSION_SELECTOR,
 }
+SYNC_CONVERSION_TAGS = frozenset({"[js]", "[conversion]", "[corpus]", SYNC_CONVERSION_TAG})
+
+
+def selects_sync_conversion(selector: str) -> bool:
+    """Conservatively match the simple Catch selectors used by direct gates."""
+    if not selector.isascii():
+        # Catch2 normalizes bytes with ASCII tolower, unlike Unicode casefold.
+        # Unsupported non-ASCII grammar cannot prove a safe tag/name nonmatch.
+        return True
+    for alternative in selector.split(","):
+        # Catch2 compares both tags and names without ASCII case sensitivity.
+        alternative = alternative.strip().casefold()
+        if '"' in alternative or "\\" in alternative or alternative.startswith("exclude:"):
+            # Catch2 removes quotes in its separate quoted-name grammar. Do
+            # not let unsupported quotes, escapes, or exclusion prefixes prove
+            # that execution is safe.
+            return True
+        terms = re.findall(r"(~?)\[([^\[\]]+)\]", alternative)
+        remainder = re.sub(r"~?\[[^\[\]]+\]", "", alternative).strip()
+        if terms:
+            if remainder or any(tag.startswith("@") for _, tag in terms):
+                # A nonmatching tag proves safety only when the entire
+                # alternative is plain conjunctive tags. Mixed grammar and
+                # registered aliases require Catch2's parser, so fail closed.
+                return True
+            if not all((f"[{tag}]" not in SYNC_CONVERSION_TAGS) if excluded
+                       else (f"[{tag}]" in SYNC_CONVERSION_TAGS)
+                       for excluded, tag in terms):
+                continue
+            return True
+        if not alternative or any(char in remainder for char in "[]\\"):
+            return True
+        if alternative.startswith("~"):
+            # Catch2 supports a narrower wildcard grammar than fnmatch. An
+            # overmatching raw-name exclusion would incorrectly prove safety;
+            # only the plain tag exclusions above can prove a nonmatch.
+            return True
+        if fnmatch.fnmatchcase(SYNC_CONVERSION_CASE.casefold(), alternative):
+            return True
+    return False
+
+
+def commands_sync_conversion(command: list, binary: Path) -> bool:
+    """Inspect actual binary/verifier execution, never arbitrary string mentions."""
+    if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
+        return False
+    if Path(command[0]).resolve() == binary.resolve():
+        if len(command) == 1:
+            return True
+        for selector in command[1:]:
+            folded = selector.casefold()
+            if (SYNC_CONVERSION_TAG.casefold() in folded
+                    or SYNC_CONVERSION_CASE.casefold() in folded):
+                # Exclusion-bearing commands need a fully validated identity,
+                # just like the shared and metadata gates checked above.
+                return True
+            if selector.startswith("--"):
+                # Unknown options can change selection; existing direct gates
+                # use exactly one selector, already independently validated.
+                return True
+            if selects_sync_conversion(selector):
+                return True
+    elif (len(command) > 1 and Path(command[1]).resolve() ==
+          Path(__file__).with_name("verify_catch_case.py").resolve()):
+        return any(SYNC_CONVERSION_CASE.casefold() in arg.casefold()
+                   or SYNC_CONVERSION_TAG.casefold() in arg.casefold()
+                   for arg in command[2:])
+    return False
 
 
 def parse_cases(document: str) -> dict[str, str]:
@@ -77,6 +153,7 @@ def validate_inventory(
     cap: dict[str, str],
     db_admission: dict[str, str],
     db_batch: dict[str, str],
+    sync_conversion: dict[str, str],
 ) -> None:
     if grouped_selector != GROUPED_JS_SELECTOR:
         raise AssertionError("grouped JS selector must preserve its broad baseline and exact exclusions")
@@ -87,30 +164,37 @@ def validate_inventory(
         )
     if any(ISOLATION_TAG not in tags for tags in isolated.values()):
         raise AssertionError("capture fixture lacks its isolation tag")
-    if any(any(tag in tags for tag in (PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG))
+    if any(any(tag in tags for tag in (PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG, SYNC_CONVERSION_TAG))
            for tags in isolated.values()):
         raise AssertionError("logger fixtures must not enter another isolation group")
     if set(pubsub) != {PUBSUB_CASE} or PUBSUB_TAG not in pubsub[PUBSUB_CASE]:
         raise AssertionError("pubsub isolation requires exactly its named tagged corpus")
-    if any(tag in pubsub[PUBSUB_CASE] for tag in (ISOLATION_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG)):
+    if any(tag in pubsub[PUBSUB_CASE] for tag in (ISOLATION_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG, SYNC_CONVERSION_TAG)):
         raise AssertionError("pubsub corpus must not enter another isolation group")
     if set(cap) != {CAP_CASE} or CAP_TAG not in cap[CAP_CASE]:
         raise AssertionError("cap isolation requires exactly its named tagged corpus")
-    if any(tag in cap[CAP_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG)):
+    if any(tag in cap[CAP_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG, SYNC_CONVERSION_TAG)):
         raise AssertionError("cap corpus must not enter another isolation group")
     if set(db_admission) != {DB_ADMISSION_CASE} or DB_ADMISSION_TAG not in db_admission[DB_ADMISSION_CASE]:
         raise AssertionError("database admission isolation requires exactly its named tagged corpus")
-    if any(tag in db_admission[DB_ADMISSION_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_BATCH_TAG)):
+    if any(tag in db_admission[DB_ADMISSION_CASE] for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_BATCH_TAG, SYNC_CONVERSION_TAG)):
         raise AssertionError("database admission corpus must not enter another isolation group")
     if set(db_batch) != {DB_BATCH_CASE} or db_batch[DB_BATCH_CASE].count(DB_BATCH_TAG) != 1:
         raise AssertionError("database batch isolation requires exactly its named tagged corpus")
     if any(tag in db_batch[DB_BATCH_CASE] for tag in
-           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, AUDIT_DRAIN_TAG)):
+           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, AUDIT_DRAIN_TAG, SYNC_CONVERSION_TAG)):
         raise AssertionError("database batch corpus must not enter another isolation group")
+    if set(sync_conversion) != {SYNC_CONVERSION_CASE}:
+        raise AssertionError("synchronous conversion requires exactly its independently named corpus")
+    sync_tags = sync_conversion[SYNC_CONVERSION_CASE]
+    parsed_sync_tags = re.findall(r"\[[^\[\]]+\]", sync_tags)
+    if (set(parsed_sync_tags) != SYNC_CONVERSION_TAGS or len(parsed_sync_tags) != 4
+            or "".join(parsed_sync_tags) != sync_tags):
+        raise AssertionError("synchronous conversion requires its exact semantic and isolation tags")
     if EXPECTED_NAMES.intersection(grouped) or any(
-        name in grouped for name in (PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, DB_BATCH_CASE)
+        name in grouped for name in (PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, DB_BATCH_CASE, SYNC_CONVERSION_CASE)
     ) or any(
-        any(tag in tags for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG))
+        any(tag in tags for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG, SYNC_CONVERSION_TAG))
         for tags in grouped.values()
     ):
         raise AssertionError("grouped JS selector contains an isolated fixture")
@@ -138,13 +222,18 @@ def validate_inventory(
     }
     if baseline_db_batch != db_batch:
         raise AssertionError("baseline JS discovery lost or changed the database batch corpus")
+    baseline_sync_conversion = {
+        name: tags for name, tags in baseline.items() if SYNC_CONVERSION_TAG in tags
+    }
+    if baseline_sync_conversion != sync_conversion:
+        raise AssertionError("baseline JS discovery lost or changed the synchronous conversion corpus")
     audit_drain = {name: tags for name, tags in baseline.items() if AUDIT_DRAIN_TAG in tags}
     if set(audit_drain) != {AUDIT_DRAIN_CASE}:
         raise AssertionError("audit drain requires exactly its named isolated fixture")
     if any(tag in audit_drain[AUDIT_DRAIN_CASE] for tag in
-           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG)):
+           (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG, DB_BATCH_TAG, SYNC_CONVERSION_TAG)):
         raise AssertionError("audit drain must not enter another isolation group")
-    exclusions = EXPECTED_NAMES | {PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, DB_BATCH_CASE, AUDIT_DRAIN_CASE}
+    exclusions = EXPECTED_NAMES | {PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE, DB_BATCH_CASE, AUDIT_DRAIN_CASE, SYNC_CONVERSION_CASE}
     expected_grouped = {
         name: tags for name, tags in baseline.items() if name not in exclusions
     }
@@ -157,7 +246,9 @@ def validate_inventory(
             raise AssertionError(f"named logger gate must occur once: {name}")
         command = matches[0].get("command", [])
         if (
-            len(command) != 2
+            not isinstance(command, list)
+            or len(command) != 2
+            or not all(isinstance(argument, str) for argument in command)
             or Path(command[0]).resolve() != binary.resolve()
             or command[1:] != [selector]
         ):
@@ -166,6 +257,7 @@ def validate_inventory(
         (PUBSUB_GATE, PUBSUB_CASE), (CAP_GATE, CAP_CASE),
         (DB_ADMISSION_GATE, DB_ADMISSION_CASE),
         (DB_BATCH_GATE, DB_BATCH_CASE),
+        (SYNC_CONVERSION_GATE, SYNC_CONVERSION_CASE),
     ):
         validate_strict_gate(gates, gate_name, case_name, binary)
     validate_strict_gate(gates, AUDIT_DRAIN_GATE, AUDIT_DRAIN_CASE, binary, 30, 40)
@@ -173,6 +265,18 @@ def validate_inventory(
     if len(metadata) != 1:
         raise AssertionError("inventory metadata gate must occur exactly once")
     validate_metadata_gate(metadata[0], binary, grouped_selector)
+    shared_conversion = next(gate for gate in gates if gate.get("name") == SHARED_CONVERSION_GATE)
+    shared_deadlines = [prop.get("value") for prop in shared_conversion.get("properties", [])
+                        if prop.get("name") == "TIMEOUT"]
+    if (len(shared_deadlines) != 1 or type(shared_deadlines[0]) not in (int, float)
+            or shared_deadlines[0] != 90):
+        raise AssertionError("shared conversion must preserve its existing outer deadline")
+    sync_gate = next(gate for gate in gates if gate.get("name") == SYNC_CONVERSION_GATE)
+    for gate in (shared_conversion, sync_gate):
+        working_directories = [prop.get("value") for prop in gate.get("properties", [])
+                               if prop.get("name") == "WORKING_DIRECTORY"]
+        if working_directories != [str(binary.resolve().parent)]:
+            raise AssertionError("conversion gates must retain their exact working directory")
     for gate in gates:
         for gate_name, case_name, isolation_tag in (
             (CAP_GATE, CAP_CASE, CAP_TAG),
@@ -184,6 +288,11 @@ def validate_inventory(
                 for argument in gate.get("command", [])
             ):
                 raise AssertionError("isolated corpus must not have an extra discovery or execution gate")
+        if gate.get("name") not in (SYNC_CONVERSION_GATE, SHARED_CONVERSION_GATE,
+                                    "plinth_tests_js", INVENTORY_GATE) and commands_sync_conversion(
+            gate.get("command", []), binary
+        ):
+            raise AssertionError("synchronous conversion must not have an extra discovery or execution gate")
 
 
 def validate_metadata_gate(gate: dict, binary: Path, grouped_selector: str) -> None:
@@ -252,11 +361,16 @@ def self_test() -> int:
     cap = {CAP_CASE: f"[js][cap][corpus]{CAP_TAG}"}
     db_admission = {DB_ADMISSION_CASE: f"[js][db][corpus]{DB_ADMISSION_TAG}"}
     db_batch = {DB_BATCH_CASE: f"[js][db][corpus]{DB_BATCH_TAG}"}
+    sync_conversion = {SYNC_CONVERSION_CASE: f"[js][conversion][corpus]{SYNC_CONVERSION_TAG}"}
     audit_drain = {AUDIT_DRAIN_CASE: "[js][audit]" + AUDIT_DRAIN_TAG}
-    baseline = {**isolated, **grouped, **pubsub, **cap, **db_admission, **db_batch, **audit_drain}
+    baseline = {**isolated, **grouped, **pubsub, **cap, **db_admission, **db_batch, **audit_drain, **sync_conversion}
     gates = [
         {"name": name, "command": ["plinth_tests", selector]}
         for name, selector in {**EXPECTED_GATES, "plinth_tests_js": grouped_selector}.items()
+    ]
+    next(gate for gate in gates if gate["name"] == SHARED_CONVERSION_GATE)["properties"] = [
+        {"name": "TIMEOUT", "value": 90.0},
+        {"name": "WORKING_DIRECTORY", "value": str(binary.resolve().parent)},
     ]
     pubsub_gate = {
         "name": PUBSUB_GATE,
@@ -287,6 +401,12 @@ def self_test() -> int:
     db_batch_gate["command"][5] = DB_BATCH_CASE
     # Add near the front: existing positional cap/pubsub/grouped controls stay intact.
     gates.insert(1, db_batch_gate)
+    sync_gate = copy.deepcopy(pubsub_gate)
+    sync_gate["name"] = SYNC_CONVERSION_GATE
+    sync_gate["command"][5] = SYNC_CONVERSION_CASE
+    sync_gate["properties"].append({"name": "WORKING_DIRECTORY", "value": str(binary.resolve().parent)})
+    # All historical positional controls still target cap/pubsub/grouped gates.
+    gates.insert(1, sync_gate)
     ctest = shutil.which("ctest")
     if ctest is None:
         raise AssertionError("inventory self-test requires the CTest metadata tool")
@@ -299,7 +419,7 @@ def self_test() -> int:
                        {"name": "WORKING_DIRECTORY", "value": str(binary.resolve().parent)}],
     }
     gates.insert(1, metadata_gate)
-    validate_inventory(isolated, grouped, gates, grouped_selector, binary, baseline, pubsub, cap, db_admission, db_batch)
+    validate_inventory(isolated, grouped, gates, grouped_selector, binary, baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
     malformed = [
         ({}, grouped, gates),
         ({**isolated, "unexpected": ISOLATION_TAG}, grouped, gates),
@@ -324,7 +444,7 @@ def self_test() -> int:
     ]
     for candidate in malformed:
         try:
-            validate_inventory(*candidate, grouped_selector, binary, baseline, pubsub, cap, db_admission, db_batch)
+            validate_inventory(*candidate, grouped_selector, binary, baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
         except AssertionError:
             continue
         raise AssertionError("inventory negative control was not rejected")
@@ -342,7 +462,7 @@ def self_test() -> int:
     for candidate_baseline, candidate_pubsub in extended:
         try:
             validate_inventory(isolated, grouped, gates, grouped_selector, binary,
-                               candidate_baseline, candidate_pubsub, cap, db_admission, db_batch)
+                               candidate_baseline, candidate_pubsub, cap, db_admission, db_batch, sync_conversion)
         except AssertionError:
             rejected += 1
             continue
@@ -368,7 +488,7 @@ def self_test() -> int:
     for candidate_gates in bad_gates:
         try:
             validate_inventory(isolated, grouped, candidate_gates, grouped_selector,
-                               binary, baseline, pubsub, cap, db_admission, db_batch)
+                               binary, baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
         except AssertionError:
             rejected += 1
             continue
@@ -377,22 +497,22 @@ def self_test() -> int:
                               {**grouped, "unexpected isolated": PUBSUB_TAG}):
         try:
             validate_inventory(isolated, candidate_grouped, gates, grouped_selector,
-                               binary, baseline, pubsub, cap, db_admission, db_batch)
+                               binary, baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
         except AssertionError:
             rejected += 1
             continue
         raise AssertionError("pubsub grouped leakage was not rejected")
 
     # These ordinary fixtures share descriptive tags with the isolated corpora;
-    # only the explicit, independently named ten-case exclusion set may leave.
+    # only the explicit, independently named eleven-case exclusion set may leave.
     ordinary = {
         **grouped,
         "ordinary pubsub integration fixture": "[js][pubsub][integration]",
         "ordinary capability fixture": "[js][cap]",
     }
-    ordinary_baseline = {**isolated, **ordinary, **pubsub, **cap, **db_admission, **db_batch, **audit_drain}
+    ordinary_baseline = {**isolated, **ordinary, **pubsub, **cap, **db_admission, **db_batch, **audit_drain, **sync_conversion}
     validate_inventory(isolated, ordinary, gates, grouped_selector, binary,
-                       ordinary_baseline, pubsub, cap, db_admission, db_batch)
+                       ordinary_baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
 
     def reject_cap_control(**changes) -> None:
         nonlocal rejected
@@ -401,6 +521,7 @@ def self_test() -> int:
             "grouped_selector": grouped_selector, "binary": binary,
             "baseline": ordinary_baseline, "pubsub": pubsub, "cap": cap,
             "db_admission": db_admission, "db_batch": db_batch,
+            "sync_conversion": sync_conversion,
         }
         arguments.update(changes)
         try:
@@ -495,9 +616,9 @@ def self_test() -> int:
     # Keep the independent logger/pubsub/cap names, rather than subtracting
     # whatever an isolated discovery happens to return from the baseline.
     ordinary_db = {**ordinary, "ordinary database fixture": "[js][db]"}
-    db_baseline = {**isolated, **ordinary_db, **pubsub, **cap, **db_admission, **db_batch, **audit_drain}
+    db_baseline = {**isolated, **ordinary_db, **pubsub, **cap, **db_admission, **db_batch, **audit_drain, **sync_conversion}
     validate_inventory(isolated, ordinary_db, gates, grouped_selector, binary,
-                       db_baseline, pubsub, cap, db_admission, db_batch)
+                       db_baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
 
     def reject_db_control(**changes) -> None:
         nonlocal rejected
@@ -506,6 +627,7 @@ def self_test() -> int:
             "grouped_selector": grouped_selector, "binary": binary,
             "baseline": db_baseline, "pubsub": pubsub, "cap": cap,
             "db_admission": db_admission, "db_batch": db_batch,
+            "sync_conversion": sync_conversion,
         }
         arguments.update(changes)
         try:
@@ -627,7 +749,7 @@ def self_test() -> int:
     ordinary_batch = {**ordinary_db, "ordinary batch fixture": "[js][db][batch]"}
     batch_baseline = {**db_baseline, **ordinary_batch}
     validate_inventory(isolated, ordinary_batch, gates, grouped_selector, binary,
-                       batch_baseline, pubsub, cap, db_admission, db_batch)
+                       batch_baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
 
     def reject_batch_control(**changes) -> None:
         nonlocal rejected
@@ -636,6 +758,7 @@ def self_test() -> int:
             "grouped_selector": grouped_selector, "binary": binary,
             "baseline": batch_baseline, "pubsub": pubsub, "cap": cap,
             "db_admission": db_admission, "db_batch": db_batch,
+            "sync_conversion": sync_conversion,
         }
         arguments.update(changes)
         try:
@@ -808,6 +931,237 @@ def self_test() -> int:
                     rejected += 1
                     continue
             raise AssertionError("unavailable or nonzero discovery did not fail closed")
+    if rejected != 267:
+        raise AssertionError("the original 267 isolation controls must remain present")
+
+    # The new exclusion removes one independently named case, never an ordinary
+    # conversion/corpus fixture or whatever a targeted discovery happens to list.
+    ordinary_sync = {
+        **ordinary_batch,
+        "ordinary conversion fixture": "[js][conversion]",
+        "ordinary conversion corpus fixture": "[js][conversion][corpus]",
+    }
+    sync_baseline = {**batch_baseline, **ordinary_sync}
+    validate_inventory(isolated, ordinary_sync, gates, grouped_selector, binary,
+                       sync_baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
+    for command in (
+        [str(binary), "[js][ordinary]"], [str(binary), "[conversion][unrelated]"],
+        [str(binary), "[js] ~[conversion]"], [str(binary), "[unrelated],[js][ordinary]"],
+        [str(binary), "ordinary conversion*"], [str(binary), "~[js]"],
+        ["echo", SYNC_CONVERSION_CASE], ["metadata-tool", "--label", SYNC_CONVERSION_TAG],
+    ):
+        validate_inventory(isolated, ordinary_sync,
+                           gates + [{"name": "ordinary_nonmatching_gate", "command": command}],
+                           grouped_selector, binary, sync_baseline, pubsub, cap,
+                           db_admission, db_batch, sync_conversion)
+
+    def reject_sync_control(**changes) -> None:
+        nonlocal rejected
+        arguments = {
+            "isolated": isolated, "grouped": ordinary_sync, "gates": gates,
+            "grouped_selector": grouped_selector, "binary": binary,
+            "baseline": sync_baseline, "pubsub": pubsub, "cap": cap,
+            "db_admission": db_admission, "db_batch": db_batch,
+            "sync_conversion": sync_conversion,
+        }
+        arguments.update(changes)
+        try:
+            validate_inventory(**arguments)
+        except AssertionError:
+            rejected += 1
+            return
+        raise AssertionError("synchronous conversion inventory negative control was not rejected")
+
+    for candidate in (
+        {}, {**sync_conversion, "unexpected synchronous conversion": SYNC_CONVERSION_TAG},
+        {"renamed synchronous conversion": sync_conversion[SYNC_CONVERSION_CASE]},
+        {SYNC_CONVERSION_CASE: "[js][conversion][corpus]"},
+        {SYNC_CONVERSION_CASE: sync_conversion[SYNC_CONVERSION_CASE] + SYNC_CONVERSION_TAG},
+        *({SYNC_CONVERSION_CASE: sync_conversion[SYNC_CONVERSION_CASE].replace(tag, "")}
+          for tag in ("[js]", "[conversion]", "[corpus]")),
+        *({SYNC_CONVERSION_CASE: sync_conversion[SYNC_CONVERSION_CASE] + tag}
+          for tag in (ISOLATION_TAG, PUBSUB_TAG, CAP_TAG, DB_ADMISSION_TAG,
+                      DB_BATCH_TAG, AUDIT_DRAIN_TAG, "[unknown]", "[batch-transaction]")),
+        {SYNC_CONVERSION_CASE: sync_conversion[SYNC_CONVERSION_CASE] + "unparsed"},
+    ):
+        reject_sync_control(sync_conversion=candidate)
+    reject_sync_control(isolated={**isolated, logger_name: isolated[logger_name] + SYNC_CONVERSION_TAG})
+    reject_sync_control(pubsub={PUBSUB_CASE: pubsub[PUBSUB_CASE] + SYNC_CONVERSION_TAG})
+    reject_sync_control(cap={CAP_CASE: cap[CAP_CASE] + SYNC_CONVERSION_TAG})
+    reject_sync_control(db_admission={DB_ADMISSION_CASE: db_admission[DB_ADMISSION_CASE] + SYNC_CONVERSION_TAG})
+    reject_sync_control(db_batch={DB_BATCH_CASE: db_batch[DB_BATCH_CASE] + SYNC_CONVERSION_TAG})
+    reject_sync_control(baseline={**sync_baseline, AUDIT_DRAIN_CASE: audit_drain[AUDIT_DRAIN_CASE] + SYNC_CONVERSION_TAG})
+    for candidate in (
+        {},
+        *({name: tags for name, tags in sync_baseline.items() if name != removed}
+          for removed in (*EXPECTED_NAMES, PUBSUB_CASE, CAP_CASE, DB_ADMISSION_CASE,
+                          DB_BATCH_CASE, AUDIT_DRAIN_CASE, SYNC_CONVERSION_CASE)),
+        {**sync_baseline, SYNC_CONVERSION_CASE: "[js][conversion][corpus]"},
+        {**sync_baseline, SYNC_CONVERSION_CASE: sync_conversion[SYNC_CONVERSION_CASE] + "[changed]"},
+        {**sync_baseline, "unexpected synchronous conversion": SYNC_CONVERSION_TAG},
+    ):
+        reject_sync_control(baseline=candidate)
+    for candidate in (
+        {**ordinary_sync, **sync_conversion},
+        {**ordinary_sync, SYNC_CONVERSION_CASE: "[js]"},
+        {**ordinary_sync, "unknown isolated synchronous conversion": SYNC_CONVERSION_TAG},
+        *({name: tags for name, tags in ordinary_sync.items() if name != removed}
+          for removed in ordinary_sync),
+        {**ordinary_sync, "ordinary conversion fixture": "[js][changed]"},
+        {**ordinary_sync, "unexpected ordinary conversion": "[js][conversion]"},
+    ):
+        reject_sync_control(grouped=candidate)
+    for selector in (
+        grouped_selector.replace(" ~[isolated-sync-conversion]", ""),
+        grouped_selector + " ~[conversion]", grouped_selector + " ~[corpus]",
+        grouped_selector.replace("[js] ~[batch-transaction]", "[js][conversion]"),
+        grouped_selector + " ~[isolated-sync-conversion]",
+        grouped_selector.replace(" ~[isolated-audit-drain] ~[isolated-sync-conversion]",
+                                 " ~[isolated-sync-conversion] ~[isolated-audit-drain]"),
+    ):
+        reject_sync_control(grouped_selector=selector)
+
+    sync_index = next(index for index, gate in enumerate(gates) if gate["name"] == SYNC_CONVERSION_GATE)
+    shared_index = next(index for index, gate in enumerate(gates) if gate["name"] == SHARED_CONVERSION_GATE)
+    for gate_index, expected_name, replacements in (
+        (sync_index, SYNC_CONVERSION_GATE,
+         ((0, "true"), (1, "stale-verifier.py"), (2, "--wrong-binary"),
+          (3, "stale-tests"), (4, "--wrong-case"), (5, DB_BATCH_CASE),
+          (5, SYNC_CONVERSION_TAG), (5, SYNC_CONVERSION_CASE + "*"),
+          (6, "--wrong-timeout"), (7, "61"))),
+        (shared_index, SHARED_CONVERSION_GATE,
+         ((0, "true"), (0, "stale-tests"), (1, "[js][conversion][corpus]"),
+          (1, "[js][conversion][corpus] ~[corpus]"),
+          (1, SHARED_CONVERSION_SELECTOR + " ~[conversion]"),
+          (1, SYNC_CONVERSION_TAG), (1, SYNC_CONVERSION_CASE))),
+    ):
+        expected_gate = gates[gate_index]
+        reject_sync_control(gates=[gate for gate in gates if gate["name"] != expected_name])
+        reject_sync_control(gates=gates + [copy.deepcopy(expected_gate)])
+        for replacement in ("unexpected_conversion_gate", DB_BATCH_GATE, INVENTORY_GATE):
+            mutated = copy.deepcopy(gates)
+            mutated[gate_index]["name"] = replacement
+            reject_sync_control(gates=mutated)
+        for index, replacement in replacements:
+            mutated = copy.deepcopy(gates)
+            mutated[gate_index]["command"][index] = replacement
+            reject_sync_control(gates=mutated)
+        for command in ([], "unavailable", [None] * len(expected_gate["command"]),
+                        expected_gate["command"] + ["--extra"], expected_gate["command"][:-1]):
+            mutated = copy.deepcopy(gates)
+            mutated[gate_index]["command"] = command
+            reject_sync_control(gates=mutated)
+        deadline = 75 if expected_name == SYNC_CONVERSION_GATE else 90
+        for properties in (
+            [], expected_gate["properties"] * 2,
+            [{"name": "TIMEOUT", "value": deadline}],
+            [{"name": "TIMEOUT", "value": deadline},
+             {"name": "WORKING_DIRECTORY", "value": "/wrong/build-dir"}],
+            *([{"name": "TIMEOUT", "value": value}, expected_gate["properties"][1]]
+              for value in (deadline - 1, str(deadline), True, None,
+                            float("nan"), float("inf"))),
+        ):
+            mutated = copy.deepcopy(gates)
+            mutated[gate_index]["properties"] = properties
+            reject_sync_control(gates=mutated)
+    mutated = copy.deepcopy(gates)
+    mutated[sync_index]["command"], mutated[shared_index]["command"] = (
+        mutated[shared_index]["command"], mutated[sync_index]["command"]
+    )
+    reject_sync_control(gates=mutated)
+    for command in (
+        sync_gate["command"], [str(binary), SYNC_CONVERSION_TAG],
+        [str(binary), SYNC_CONVERSION_CASE + "*"],
+        [str(binary), "[js][conversion][corpus]"], [str(binary), "[conversion]"],
+        [str(binary), "[js] ~[other]"], [str(binary), "*"],
+        [str(binary), "[unrelated],[conversion][corpus]"],
+        [str(binary), "[js]*"], [str(binary), "[js"],
+        [str(binary)], [str(binary), "--list-tests"],
+        [str(binary), SHARED_CONVERSION_SELECTOR],
+    ):
+        reject_sync_control(gates=gates + [{"name": "unexpected_sync_conversion_gate", "command": command}])
+    # Exemption names must carry the fully validated metadata/selector, never a
+    # new execution command hidden behind an inventory or old shared gate name.
+    for gate_index in (metadata_index, shared_index):
+        mutated = copy.deepcopy(gates)
+        mutated[gate_index]["command"] = [str(binary), SYNC_CONVERSION_TAG]
+        reject_sync_control(gates=mutated)
+    for failure in (FileNotFoundError("synthetic unavailable"),
+                    subprocess.CalledProcessError(7, ["synthetic"]),
+                    subprocess.TimeoutExpired(["synthetic"], 30)):
+        with mock.patch.object(subprocess, "run", side_effect=failure):
+            try:
+                discover(binary, SYNC_CONVERSION_TAG)
+            except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                rejected += 1
+                continue
+        raise AssertionError("synchronous conversion discovery failure did not fail closed")
+    if rejected != 399:
+        raise AssertionError("the original 267 and initial 132 synchronous controls must remain present")
+    # Pinned Catch2 tag equality and name matching are case-insensitive. A
+    # literal quote survives argv and Catch2 then strips it in quoted-name mode.
+    for selector in (
+        "[JS]", "[CONVERSION]", "[CORPUS]", "[ISOLATED-SYNC-CONVERSION]",
+        "[Js][CoNvErSiOn][CoRpUs]", "[unrelated],[CONVERSION][CORPUS]",
+        "[JS] ~[OTHER]", "[CoNvErSiOn]*",
+        '"' + SYNC_CONVERSION_CASE.swapcase() + '"',
+        '"' + SYNC_CONVERSION_CASE.lower() + '"',
+        '"quickjs synchronous evaluation*"',
+    ):
+        reject_sync_control(gates=gates + [{
+            "name": "unexpected_case_insensitive_sync_gate",
+            "command": [str(binary), selector],
+        }])
+    upper_verifier = copy.deepcopy(sync_gate["command"])
+    upper_verifier[5] = SYNC_CONVERSION_CASE.upper()
+    reject_sync_control(gates=gates + [{
+        "name": "unexpected_case_insensitive_sync_verifier", "command": upper_verifier,
+    }])
+    for command in (
+        [str(binary), "[JS][ORDINARY]"], [str(binary), "[JS] ~[CONVERSION]"],
+        [str(binary), "[UNRELATED],[JS][ORDINARY]"],
+        ["echo", '"' + SYNC_CONVERSION_CASE.swapcase() + '"'],
+        ["metadata-tool", "--label", SYNC_CONVERSION_TAG.upper()],
+    ):
+        validate_inventory(isolated, ordinary_sync,
+                           gates + [{"name": "ordinary_case_insensitive_gate", "command": command}],
+                           grouped_selector, binary, sync_baseline, pubsub, cap,
+                           db_admission, db_batch, sync_conversion)
+    if rejected != 411:
+        raise AssertionError("all 411 existing isolation controls must remain present")
+    for selector in (
+        "exclude:[not-a-sync-tag]", "EXCLUDE:[not-a-sync-tag]",
+        "exclude:ordinary conversion*", "exclude:not-the-sync-case",
+        "[unrelated]mixed name", "ordinary name [unrelated]",
+        "~~[unrelated]", r"[unrelated]\escaped", r"\[unrelated]",
+        "[@sync-alias]", "[unrelated][@sync-alias]",
+        "[unrelated],exclude:[not-a-sync-tag]",
+    ):
+        reject_sync_control(gates=gates + [{
+            "name": "unexpected_unsupported_sync_selector",
+            "command": [str(binary), selector],
+        }])
+    if rejected != 423:
+        raise AssertionError("all 423 existing isolation controls must remain present")
+    for selector in ("~[j\u017f]", "~[conver\u017fion]", "~[corpu\u017f]",
+                     "~QuickJ\u017f synchronous evaluation*"):
+        reject_sync_control(gates=gates + [{
+            "name": "unexpected_unicode_sync_selector",
+            "command": [str(binary), selector],
+        }])
+    for command in (["echo", "~[j\u017f]"],
+                    ["metadata-tool", "--label", "~[conver\u017fion]"]):
+        validate_inventory(isolated, ordinary_sync,
+                           gates + [{"name": "ordinary_unicode_mention", "command": command}],
+                           grouped_selector, binary, sync_baseline, pubsub, cap,
+                           db_admission, db_batch, sync_conversion)
+    if rejected != 427:
+        raise AssertionError("all 427 existing isolation controls must remain present")
+    for selector in ("~QuickJS*corpora",
+                     "~?uickJS synchronous evaluation has bounded deterministic conversion corpora"):
+        reject_sync_control(gates=gates + [{
+            "name": "unexpected_raw_name_exclusion", "command": [str(binary), selector],
+        }])
     return rejected
 
 
@@ -846,16 +1200,18 @@ def main() -> int:
     cap = discover(args.binary, CAP_TAG)
     db_admission = discover(args.binary, DB_ADMISSION_TAG)
     db_batch = discover(args.binary, DB_BATCH_TAG)
+    sync_conversion = discover(args.binary, SYNC_CONVERSION_TAG)
     grouped = discover(args.binary, args.grouped_selector)
     baseline = discover(args.binary, GROUPED_JS_BASELINE)
     gates = run_json(
         [args.ctest_command, "--test-dir", str(args.build_dir), "--show-only=json-v1"]
     )["tests"]
     validate_inventory(isolated, grouped, gates, args.grouped_selector, args.binary,
-                       baseline, pubsub, cap, db_admission, db_batch)
+                       baseline, pubsub, cap, db_admission, db_batch, sync_conversion)
     print(
         "logger/pubsub/cap/database inventory: exactly 5 logger fixtures, 1 pubsub corpus, 1 cap corpus, "
-        "1 database admission corpus, 1 database batch corpus and 1 audit drain isolated, 0 grouped, "
+        "1 database admission corpus, 1 database batch corpus, 1 audit drain and "
+        "1 synchronous conversion corpus isolated, 0 grouped, "
         f"{len(grouped)} ordinary JS fixtures retained, one of each named gate"
     )
     return 0
