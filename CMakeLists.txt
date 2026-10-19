@@ -1363,6 +1363,18 @@ add_test(NAME plinth_tests_db_batch_corpus
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_db_batch_corpus PROPERTIES TIMEOUT 75)
 
+# Exercise the actual registered module loader and original host bytes. A
+# missing database, skipped case or failed teardown cannot satisfy this gate.
+add_test(NAME plinth_tests_module_source_gate
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "Extension module loading enforces the original source gate"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_module_source_gate PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

@@ -239,6 +239,15 @@ auto set_pool_creation_hook_for_test(PoolCreationHook hook) -> void;
 [[nodiscard]] auto pending_pool_constructions_for_test() -> std::size_t;
 [[nodiscard]] auto fixed_storage_retained_bytes_for_test() -> std::size_t;
 
+enum class ModuleEngineStage { COMPILE, EVALUATE };
+// Trusted C++ observation only, immediately before the actual engine calls.
+// Observers must not throw, block, re-enter the registry, or retain borrowed
+// module-id bytes. Invoked outside the observer mutex; no JS registration or
+// authority surface is added. Captured state must have independent ownership.
+using ModuleEngineObserver =
+    std::function<void(std::string_view, ModuleEngineStage)>;
+auto set_module_engine_observer_for_test(ModuleEngineObserver observer) -> void;
+
 // The Tier 2 extension dispatch entry — invoked from
 // `capabilities::call_capability_async` after resolve + RBAC for an
 // entry whose `provider_type == "extension"`. Looks up the pool,
