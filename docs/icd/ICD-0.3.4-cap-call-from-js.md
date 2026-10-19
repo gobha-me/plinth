@@ -406,6 +406,19 @@ existing ns → code map in `run_on_context.cpp`.
 - **`Json::Value` → JS for `cap.call` result.** Reuses
   `detail::json_to_js`. Returns whatever shape the handler returned;
   the opacity invariant is preserved.
+  **Scoped implementation amendment (2026-10-19):** admitted JSON object
+  member names retain their complete string length, including embedded
+  U+0000, in both extension argument injection and capability Promise
+  settlement. A name and its NUL-terminated prefix remain distinct; this
+  applies recursively through objects and arrays. The two current reverse
+  helpers are local to the runtime registry and `BridgeContext`, rather
+  than a single shared helper. Ordinary property-assignment semantics,
+  scalar/value mappings, the existing BYTEA special case, admission limits,
+  ownership and error policy are unchanged. This amendment does not decide
+  DB JSON/JSONB structural-versus-text compatibility or admit malformed UTF-8
+  member names. Independent exact-case regressions exercise actual registry
+  injection and an actual `cap.call` result delivered through `bc.resolve`;
+  copied converters or manually chosen settlement are not substitutes.
 - **Array unpacking for `cap.batch` inputs.** One 2-element JS Array
   per call. The outer array's length is bounded only by
   `max_concurrent_async_ops` (back-pressure, not rejection — the
