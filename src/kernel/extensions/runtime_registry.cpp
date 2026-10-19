@@ -13,6 +13,7 @@
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/js/conversion.hpp"
 #include "kernel/js/eval.hpp"
+#include "kernel/js/eval_guard.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
 #include "kernel/logging.hpp"
@@ -74,6 +75,7 @@ namespace fs = std::filesystem;
 // handler deliberately blowing up the audit/log pipeline cannot cause
 // unbounded growth downstream.
 constexpr std::size_t HANDLER_MSG_MAX = 1024;
+constexpr std::string_view MODULE_SOURCE_LABEL = "<module>";
 constexpr std::size_t PREFERENCE_VALUE_MAX = 64ULL * 1024ULL;
 constexpr std::size_t PREFERENCE_AUDIT_WINDOWS_MAX = 4096;
 constexpr auto PREFERENCE_AUDIT_WINDOW = std::chrono::seconds(60);
@@ -328,6 +330,8 @@ std::uint64_t shutdown_epoch = 0;
 std::uint64_t next_pool_serial = 0;
 std::mutex construction_hook_mutex;
 PoolCreationHook construction_hook;
+std::mutex module_engine_observer_mutex;
+std::shared_ptr<const ModuleEngineObserver> module_engine_observer;
 // A pool whose bounded close could not finish stays owned for the coordinator
 // to retry. Successful replacement/disable never accumulates pools here.
 std::vector<std::shared_ptr<plinth::js::RuntimePool>> failed_pools;
@@ -537,9 +541,12 @@ class CStrGuard {
   CStrGuard(CStrGuard&&) = delete;
   auto operator=(const CStrGuard&) -> CStrGuard& = delete;
   auto operator=(CStrGuard&&) -> CStrGuard& = delete;
-  ~CStrGuard() {
+  ~CStrGuard() { reset(); }
+
+  auto reset() -> void {
     if (s != nullptr) {
       JS_FreeCString(ctx, s);
+      s = nullptr;
     }
   }
 
@@ -547,6 +554,18 @@ class CStrGuard {
   JSContext* ctx;
   const char* s;
 };
+
+auto observe_module_engine(std::string_view module_id,
+                           ModuleEngineStage stage) noexcept -> void {
+  std::shared_ptr<const ModuleEngineObserver> observer;
+  {
+    std::lock_guard lock(module_engine_observer_mutex);
+    observer = module_engine_observer;
+  }
+  if (observer) {
+    (*observer)(module_id, stage);
+  }
+}
 
 // bookkeeping across early returns is structurally linear and documented;
 // splitting would hide invariants.
@@ -563,18 +582,25 @@ extern "C" auto import_from_src_intrinsic(JSContext* ctx,
   if (src_ptr == nullptr) {
     return JS_EXCEPTION;
   }
+  CStrGuard source_guard(ctx, src_ptr);
   // above; argv[1] is bounded by the same argc check.
   const char* id_ptr = JS_ToCString(ctx, argv[1]);
   if (id_ptr == nullptr) {
-    JS_FreeCString(ctx, src_ptr);
     return JS_EXCEPTION;
   }
+  CStrGuard id_guard(ctx, id_ptr);
 
+  // Coerce source, then id, before checking the full converted byte span.
+  // A denial is an ordinary catchable JS exception, not a host-kind latch.
+  if (auto error = plinth::js::pre_eval_scan(std::string_view{src_ptr, src_len},
+                                             MODULE_SOURCE_LABEL)) {
+    return JS_ThrowInternalError(ctx, "%s", error->message.c_str());
+  }
+
+  observe_module_engine(id_ptr, ModuleEngineStage::COMPILE);
   JSValue compiled = JS_Eval(ctx, src_ptr, src_len, id_ptr,
                              JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-  JS_FreeCString(ctx, src_ptr);
-  // id_ptr freed at function exit so every return path is covered.
-  CStrGuard id_guard(ctx, id_ptr);
+  source_guard.reset();
 
   if (JS_IsException(compiled)) {
     // Compile failed; propagate the SyntaxError / internal error up.
@@ -591,6 +617,7 @@ extern "C" auto import_from_src_intrinsic(JSContext* ctx,
   // JS_EvalFunction transfers ownership of the JSValue.
   auto* mdef = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(compiled));
 
+  observe_module_engine(id_ptr, ModuleEngineStage::EVALUATE);
   JSValue eval_result = JS_EvalFunction(ctx, compiled);
   if (JS_IsException(eval_result)) {
     return JS_EXCEPTION;
@@ -756,6 +783,77 @@ auto emit_extension_error_audit(std::string_view extension_name,
   }
 }
 
+auto handler_error_rejection(const plinth::js::EvalError& error, bool entered,
+                             std::string_view extension_name,
+                             std::string_view function,
+                             const plinth::capabilities::UserContext& caller)
+    -> plinth::js::PromiseRejection {
+  using plinth::js::EvalErrorKind;
+  using plinth::js::PromiseRejection;
+
+  std::string ident;
+  ident.reserve(extension_name.size() + 1 + function.size());
+  ident.append(extension_name);
+  ident.push_back(':');
+  ident.append(function);
+
+  // Cancellation retains its own taxonomy and never emits a handler audit.
+  if (error.kind == EvalErrorKind::CANCELLED) {
+    return PromiseRejection{.code = "cap.cancelled",
+                            .message = ident + ": cancelled",
+                            .sqlstate = std::nullopt};
+  }
+
+  const char* code = entered ? "cap.handler_threw" : "cap.handler_load_failed";
+  // Keep the existing kind prefix, message cap and audit projection identical
+  // for engine failures and original-source denials before JS string injection.
+  std::string_view kind_tag = "error";
+  switch (error.kind) {
+    case EvalErrorKind::SYNTAX_ERROR: kind_tag = "syntax_error"; break;
+    case EvalErrorKind::RUNTIME_ERROR: kind_tag = "runtime_error"; break;
+    case EvalErrorKind::MEMORY_LIMIT: kind_tag = "memory_limit"; break;
+    case EvalErrorKind::CPU_TIME_EXCEEDED:
+      kind_tag = "cpu_time_exceeded";
+      break;
+    case EvalErrorKind::WALL_CLOCK_EXCEEDED:
+      kind_tag = "wall_clock_exceeded";
+      break;
+    case EvalErrorKind::STACK_OVERFLOW: kind_tag = "stack_overflow"; break;
+    case EvalErrorKind::ASYNC_CONCURRENCY_LIMIT:
+      kind_tag = "async_concurrency_limit";
+      break;
+    case EvalErrorKind::PROMISE_REJECTED_UNHANDLED:
+      kind_tag = "promise_rejected";
+      break;
+    case EvalErrorKind::PROMISE_RESOLVE_AFTER_CANCEL:
+      kind_tag = "promise_resolve_after_cancel";
+      break;
+    case EvalErrorKind::INTERNAL: kind_tag = "internal"; break;
+    case EvalErrorKind::INTERNAL_ASYNC: kind_tag = "internal_async"; break;
+    case EvalErrorKind::ASYNC_RESULT_SIZE_EXCEEDED:
+      kind_tag = "async_result_size_exceeded";
+      break;
+    case EvalErrorKind::UNICODE_SMUGGLE_DETECTED:
+      kind_tag = "unicode_smuggle_detected";
+      break;
+    case EvalErrorKind::CANCELLED:
+      // Returned above; keep exhaustive enum coverage.
+      break;
+  }
+
+  std::string msg_raw;
+  msg_raw.reserve(ident.size() + 4 + kind_tag.size() + error.message.size());
+  msg_raw.append(ident);
+  msg_raw.append(": ");
+  msg_raw.append(kind_tag);
+  msg_raw.append(": ");
+  msg_raw.append(error.message);
+  std::string msg = clamp_message(std::move(msg_raw));
+  emit_extension_error_audit(extension_name, function, code, msg, caller);
+  return PromiseRejection{
+      .code = code, .message = std::move(msg), .sqlstate = std::nullopt};
+}
+
 // ── invoke_handler ──────────────────────────────────────────────────
 //
 // Drives the handler-invocation pipeline per ICD §Handler invocation:
@@ -779,13 +877,12 @@ auto invoke_owned_source(
     std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>> {
 
-  using plinth::js::PromiseRejection;
-
-  std::string ident;
-  ident.reserve(extension_name.size() + 1 + function.size());
-  ident.append(extension_name);
-  ident.push_back(':');
-  ident.append(function);
+  // Inspect original host bytes before JS_NewStringLen can normalize malformed
+  // UTF-8. No module entry or old __handler_entered state decides this failure.
+  if (auto error = plinth::js::pre_eval_scan(src, MODULE_SOURCE_LABEL)) {
+    co_return std::unexpected(handler_error_rejection(
+        *error, false, extension_name, function, bc.user));
+  }
 
   // Step 3 — install the import_from_src intrinsic + set the wrapper
   // globals. These are per-dispatch — release() clears globalThis on
@@ -835,88 +932,10 @@ auto invoke_owned_source(
   }
 
   const auto& err = eval_outcome.value.error();
-
-  // CANCELLED has its own taxonomy slot — caller-initiated, not a
-  // handler failure; no audit.
-  if (err.kind == plinth::js::EvalErrorKind::CANCELLED) {
-    co_return std::unexpected(PromiseRejection{
-        .code = "cap.cancelled",
-        .message = ident + ": cancelled",
-        .sqlstate = std::nullopt,
-    });
-  }
-
-  bool entered = read_handler_entered_flag(bc.ctx);
-  const char* code = entered ? "cap.handler_threw" : "cap.handler_load_failed";
-
-  // Kind-prefix the message so operators can distinguish memory/
-  // wall-clock/etc. without a new taxonomy axis (ICD §Error Mapping
-  // "folded into one cap.handler_threw variant").
-  std::string_view kind_tag = "error";
-  switch (err.kind) {
-    case plinth::js::EvalErrorKind::SYNTAX_ERROR:
-      kind_tag = "syntax_error";
-      break;
-    case plinth::js::EvalErrorKind::RUNTIME_ERROR:
-      kind_tag = "runtime_error";
-      break;
-    case plinth::js::EvalErrorKind::MEMORY_LIMIT:
-      kind_tag = "memory_limit";
-      break;
-    case plinth::js::EvalErrorKind::CPU_TIME_EXCEEDED:
-      kind_tag = "cpu_time_exceeded";
-      break;
-    case plinth::js::EvalErrorKind::WALL_CLOCK_EXCEEDED:
-      kind_tag = "wall_clock_exceeded";
-      break;
-    case plinth::js::EvalErrorKind::STACK_OVERFLOW:
-      kind_tag = "stack_overflow";
-      break;
-    case plinth::js::EvalErrorKind::ASYNC_CONCURRENCY_LIMIT:
-      kind_tag = "async_concurrency_limit";
-      break;
-    case plinth::js::EvalErrorKind::PROMISE_REJECTED_UNHANDLED:
-      kind_tag = "promise_rejected";
-      break;
-    case plinth::js::EvalErrorKind::PROMISE_RESOLVE_AFTER_CANCEL:
-      kind_tag = "promise_resolve_after_cancel";
-      break;
-    case plinth::js::EvalErrorKind::INTERNAL: kind_tag = "internal"; break;
-    case plinth::js::EvalErrorKind::INTERNAL_ASYNC:
-      kind_tag = "internal_async";
-      break;
-    case plinth::js::EvalErrorKind::ASYNC_RESULT_SIZE_EXCEEDED:
-      kind_tag = "async_result_size_exceeded";
-      break;
-    case plinth::js::EvalErrorKind::UNICODE_SMUGGLE_DETECTED:
-      kind_tag = "unicode_smuggle_detected";
-      break;
-    case plinth::js::EvalErrorKind::CANCELLED:
-      // Handled above — pacify the switch coverage linter.
-      break;
-  }
-
-  std::string msg_raw;
-  msg_raw.reserve(ident.size() + 4 + kind_tag.size() + err.message.size());
-  msg_raw.append(ident);
-  msg_raw.append(": ");
-  msg_raw.append(kind_tag);
-  msg_raw.append(": ");
-  msg_raw.append(err.message);
-  std::string msg = clamp_message(std::move(msg_raw));
-
-  // Audit only the handler-threw / handler-load-failed outcomes
-  // (ICD §Audit). `cap.cancelled` + `cap.handler_not_found` +
-  // `cap.extension_not_loaded` already return above without auditing.
-  // Caller identity lives on `bc.user` (the pool copied it in at
-  // dispatch() time).
-  emit_extension_error_audit(extension_name, function, code, msg, bc.user);
-
-  co_return std::unexpected(PromiseRejection{
-      .code = code,
-      .message = std::move(msg),
-      .sqlstate = std::nullopt,
-  });
+  const bool entered = err.kind != plinth::js::EvalErrorKind::CANCELLED &&
+                       read_handler_entered_flag(bc.ctx);
+  co_return std::unexpected(
+      handler_error_rejection(err, entered, extension_name, function, bc.user));
 }
 
 // Ordinary dispatch deliberately preserves the ICD's fresh-per-call read.
@@ -1499,6 +1518,15 @@ auto failed_pool_count_for_test() -> std::size_t {
 auto set_pool_creation_hook_for_test(PoolCreationHook hook) -> void {
   std::lock_guard lock(construction_hook_mutex);
   construction_hook = std::move(hook);
+}
+auto set_module_engine_observer_for_test(ModuleEngineObserver observer)
+    -> void {
+  auto next =
+      observer
+          ? std::make_shared<const ModuleEngineObserver>(std::move(observer))
+          : nullptr;
+  std::lock_guard lock(module_engine_observer_mutex);
+  module_engine_observer = std::move(next);
 }
 auto pending_pool_constructions_for_test() -> std::size_t {
   std::shared_lock lock(registry_mutex);

@@ -11,6 +11,38 @@
 
 ## Overview
 
+### Module-source gate amendment (2026-10-19)
+
+The source-load rule also applies to the extension registry's registered
+`import_from_src` intrinsic. Scanning the fixed async wrapper is not scanning
+the handler module. The registry checks original host source bytes before
+creating their JavaScript string, preserving strict UTF-8 rejection before
+string decoding can normalize those bytes. The intrinsic independently checks
+its full converted source bytes, after the existing source-then-id coercions
+and before `JS_EVAL_FLAG_COMPILE_ONLY`. This includes direct or nested calls to
+the registered intrinsic; rejected source must reach neither module compilation
+nor module evaluation.
+
+Both checks reuse the process-wide scanner policy with source label `<module>`.
+Disabled scanning remains an operator-controlled bypass; muted findings do not
+disable enforcement. Original host-source denial uses the existing
+`cap.handler_load_failed` projection and `unicode_smuggle_detected` kind tag,
+with existing message clamping and audit behavior. An intrinsic denial is an
+ordinary JavaScript exception that a running handler may catch; it does not
+introduce a new promise-rejection classifier or sticky execution-failure state.
+The module coercion order, namespace/default-export behavior, ownership,
+top-level-await policy and cache policy are unchanged.
+
+The strict module-source regression exercises the real registry and registered
+intrinsic with a real database-backed fixture. An observational host-only test
+hook counts the actual compile/evaluate entry points; blocked inputs require
+zero entries, while same-source disabled-policy controls require execution.
+Exact-case fresh-XML/no-skip checks and explicit sanitizer execution accompany
+the existing full suites. This amendment adds no SDK method, permission,
+per-extension override, production quota, asset or version change.
+
+### Historical overview
+
 GlassWorm (observed Oct 2025–present) smuggles executable JavaScript inside invisible Unicode ranges — variation selectors, bidi overrides, zero-width characters — that render as whitespace in editors but reach `eval`-family execution surfaces verbatim. Plinth runs QuickJS (ES2023) and exposes `JS_Eval` as the kernel-to-runtime source-submission primitive: the C++ host passes UTF-8 source bytes in, QuickJS parses and executes them. 0.3.5 closed the in-runtime `eval` / `Function` surface (`globalThis.eval` deleted at `inject_kernel_stdlib`), but the upstream `JS_Eval` entry — which runs before any in-runtime gate — remained open. 0.4.0's `plinth validate` inspects package structure but does not inspect source bytes for encoding-level attacks. Both entries are the attack surface this milestone closes.
 
 0.4.1 introduces one primitive and two policy layers:

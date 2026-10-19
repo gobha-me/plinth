@@ -20,6 +20,7 @@
 #include "kernel/db/connection_info.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/js/async_op.hpp"
+#include "kernel/js/eval_guard.hpp"
 #include "kernel/logging.hpp"
 
 #include "../js/async_bridge_fixture.hpp"
@@ -37,10 +38,12 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <utility>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -159,23 +162,29 @@ auto admin_ctx() -> plinth::capabilities::UserContext {
 }
 
 auto require_persisted_audit(std::string_view action, std::string_view user,
-                             std::string_view code = {}) -> void {
+                             std::string_view code = {},
+                             std::string_view extension = {},
+                             std::string_view function = {}) -> void {
   REQUIRE(plinth::log::wait_for_audits(2s));
   const auto conninfo =
       plinth::db::connection_info(test_config().db) + " connect_timeout=3";
   std::unique_ptr<PGconn, decltype(&PQfinish)> connection{
       PQconnectdb(conninfo.c_str()), PQfinish};
   REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
-  const std::array<std::string, 3> values{std::string{action},
-                                          std::string{user}, std::string{code}};
-  const std::array<const char*, 3> params{values[0].c_str(), values[1].c_str(),
-                                          values[2].c_str()};
+  const std::array<std::string, 5> values{
+      std::string{action}, std::string{user}, std::string{code},
+      std::string{extension}, std::string{function}};
+  const std::array<const char*, 5> params{values[0].c_str(), values[1].c_str(),
+                                          values[2].c_str(), values[3].c_str(),
+                                          values[4].c_str()};
   std::unique_ptr<PGresult, decltype(&PQclear)> result{
       PQexecParams(connection.get(),
                    "SELECT count(*) FROM plinth.audit_log "
                    "WHERE action=$1 AND user_id=$2::uuid "
-                   "AND ($3='' OR detail->>'code'=$3)",
-                   3, nullptr, params.data(), nullptr, nullptr, 0),
+                   "AND ($3='' OR detail->>'code'=$3) "
+                   "AND ($4='' OR detail->>'extension'=$4) "
+                   "AND ($5='' OR detail->>'function'=$5)",
+                   5, nullptr, params.data(), nullptr, nullptr, 0),
       PQclear};
   REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
   REQUIRE(PQntuples(result.get()) == 1);
@@ -217,24 +226,531 @@ auto run_resolver(std::string_view signature, const Json::Value& args,
       std::move(call), admin_ctx(), ext_code_out, ext_msg_out));
 }
 
+class ModuleGatePolicy {
+ public:
+  ModuleGatePolicy() {
+    plinth::js::set_unicode_scanner_policy(true, 50, false);
+  }
+  ~ModuleGatePolicy() {
+    plinth::extensions::set_module_engine_observer_for_test({});
+    plinth::js::set_unicode_scanner_policy(true, 50, false);
+  }
+  ModuleGatePolicy(const ModuleGatePolicy&) = delete;
+  auto operator=(const ModuleGatePolicy&) -> ModuleGatePolicy& = delete;
+  ModuleGatePolicy(ModuleGatePolicy&&) = delete;
+  auto operator=(ModuleGatePolicy&&) -> ModuleGatePolicy& = delete;
+};
+
+struct ModuleEngineCounts {
+  int compiled = 0;
+  int evaluated = 0;
+  int outer_compiled = 0;
+  int outer_evaluated = 0;
+};
+
+class ModuleEngineWatch {
+ public:
+  ModuleEngineWatch(std::string target, std::string outer)
+      : state(std::make_shared<State>(std::move(target), std::move(outer))) {
+    // Independent shared ownership survives an already copied observer. The
+    // callback performs only fixed string comparisons and atomic increments.
+    plinth::extensions::set_module_engine_observer_for_test(
+        [owned = state](std::string_view id,
+                        plinth::extensions::ModuleEngineStage stage) noexcept {
+          const bool compile =
+              stage == plinth::extensions::ModuleEngineStage::COMPILE;
+          if (id == owned->target) {
+            (compile ? owned->compiled : owned->evaluated)
+                .fetch_add(1, std::memory_order_relaxed);
+          }
+          if (id == owned->outer) {
+            (compile ? owned->outer_compiled : owned->outer_evaluated)
+                .fetch_add(1, std::memory_order_relaxed);
+          }
+        });
+  }
+  ~ModuleEngineWatch() {
+    plinth::extensions::set_module_engine_observer_for_test({});
+  }
+  ModuleEngineWatch(const ModuleEngineWatch&) = delete;
+  auto operator=(const ModuleEngineWatch&) -> ModuleEngineWatch& = delete;
+  ModuleEngineWatch(ModuleEngineWatch&&) = delete;
+  auto operator=(ModuleEngineWatch&&) -> ModuleEngineWatch& = delete;
+
+  auto counts() const -> ModuleEngineCounts {
+    return {.compiled = state->compiled.load(std::memory_order_relaxed),
+            .evaluated = state->evaluated.load(std::memory_order_relaxed),
+            .outer_compiled =
+                state->outer_compiled.load(std::memory_order_relaxed),
+            .outer_evaluated =
+                state->outer_evaluated.load(std::memory_order_relaxed)};
+  }
+
+ private:
+  struct State {
+    State(std::string target_in, std::string outer_in)
+        : target(std::move(target_in)), outer(std::move(outer_in)) {}
+    const std::string target;
+    const std::string outer;
+    std::atomic<int> compiled{0};
+    std::atomic<int> evaluated{0};
+    std::atomic<int> outer_compiled{0};
+    std::atomic<int> outer_evaluated{0};
+  };
+  std::shared_ptr<State> state;
+};
+
+struct ModuleDispatchObservation {
+  std::expected<Json::Value, plinth::js::PromiseRejection> result;
+  ModuleEngineCounts counts;
+};
+
+auto observe_module_dispatch(std::string_view function, const Json::Value& args,
+                             std::string target, bool nested = false)
+    -> ModuleDispatchObservation {
+  ModuleEngineWatch watch{std::move(target),
+                          nested ? "modulegate/" + std::string{function} : ""};
+  auto result = run_dispatch("modulegate", function, args);
+  return {.result = std::move(result), .counts = watch.counts()};
+}
+
+auto check_module_entries(const ModuleDispatchObservation& observed,
+                          int compiled, int evaluated, bool nested = false)
+    -> void {
+  CHECK(observed.counts.compiled == compiled);
+  CHECK(observed.counts.evaluated == evaluated);
+  if (nested) {
+    // A zero targeted count is meaningful only with a live outer observer.
+    CHECK(observed.counts.outer_compiled == 1);
+    CHECK(observed.counts.outer_evaluated == 1);
+  }
+}
+
+auto module_args(std::string source, std::string id, bool caught = true)
+    -> Json::Value {
+  REQUIRE(source.size() <= 4096);
+  REQUIRE(id.size() <= 128);
+  Json::Value args{Json::objectValue};
+  args["src"] = source;
+  args["id"] = id;
+  args["caught"] = caught;
+  return args;
+}
+
+auto marked_module(std::size_t findings, bool async_default = false)
+    -> std::string {
+  REQUIRE(findings <= 50);
+  std::string source{"// "};
+  for (std::size_t index = 0; index < findings; ++index) {
+    source += "\xEF\xB8\x8F"; // literal UTF-8 U+FE0F, not a scanner oracle
+  }
+  source += "\nglobalThis.module_body=(globalThis.module_body||0)+1;"
+            "export default ";
+  if (async_default) {
+    source += "async ";
+  }
+  source += "function(){globalThis.module_called="
+            "(globalThis.module_called||0)+1;return 42;}";
+  return source;
+}
+
+auto check_nested_value(const ModuleDispatchObservation& observed) -> void {
+  REQUIRE(observed.result.has_value());
+  const auto& value = *observed.result;
+  REQUIRE(value.isObject());
+  CHECK(value.size() == 4);
+  CHECK(value["caught"].type() == Json::booleanValue);
+  CHECK_FALSE(value["caught"].asBool());
+  CHECK(value["value"].type() == Json::intValue);
+  CHECK(value["value"].asInt() == 42);
+  CHECK(value["body"].type() == Json::intValue);
+  CHECK(value["body"].asInt() == 1);
+  CHECK(value["called"].type() == Json::intValue);
+  CHECK(value["called"].asInt() == 1);
+}
+
+auto check_nested_caught(const ModuleDispatchObservation& observed,
+                         std::string_view name, std::string_view message,
+                         int body = 0, int called = 0) -> void {
+  REQUIRE(observed.result.has_value());
+  const auto& value = *observed.result;
+  REQUIRE(value.isObject());
+  CHECK(value["caught"].type() == Json::booleanValue);
+  CHECK(value["caught"].asBool());
+  CHECK(value["name"].type() == Json::stringValue);
+  CHECK(value["name"].asString() == name);
+  CHECK(value["message"].type() == Json::stringValue);
+  CHECK_FALSE(value["message"].asString().empty());
+  CHECK(value["message"].asString().find(message) != std::string::npos);
+  CHECK(value["body"].type() == Json::intValue);
+  CHECK(value["body"].asInt() == body);
+  CHECK(value["called"].type() == Json::intValue);
+  CHECK(value["called"].asInt() == called);
+}
+
+auto check_module_error(const ModuleDispatchObservation& observed,
+                        std::string_view code, std::string_view message)
+    -> void {
+  CHECK_FALSE(observed.result.has_value());
+  if (!observed.result) {
+    CHECK(observed.result.error().code == code);
+    CHECK_FALSE(observed.result.error().message.empty());
+    CHECK(observed.result.error().message.find(message) != std::string::npos);
+    CHECK_FALSE(observed.result.error().sqlstate.has_value());
+    CHECK(observed.result.error().message.size() <= 1024);
+  }
+}
+
 } // namespace
 
-// Sentinel for early-skip when PG isn't available. Every TEST_CASE
-// in this file starts with `SKIP_WITHOUT_PG();` so `plinth_tests_pg`
-// SKIPs cleanly when the env is absent instead of tripping the
-// DbClientManager assert via ExtScratch's Drogon bring-up.
-// Must remain a function-like macro rather than a helper function:
-// Catch2's `SKIP(...)` relies on exception-based flow from within the
-// test body; a wrapper function works at runtime but confuses the
-// compiler's reachability analysis for tests that touch objects whose
-// RAII teardown races with Catch2's SKIP handler — this bit
-// repeatedly in 0.5.0.4 pre-merge. Keep the macro; suppress the lint.
+// Sentinel for ordinary cases when PG isn't available. The strict module gate
+// case requires PG; ordinary cases use `SKIP_WITHOUT_PG();` so
+// `plinth_tests_pg` SKIPs cleanly when the env is absent instead of tripping
+// the DbClientManager assert via ExtScratch's Drogon bring-up. Must remain a
+// function-like macro rather than a helper function: Catch2's `SKIP(...)`
+// relies on exception-based flow from within the test body; a wrapper function
+// works at runtime but confuses the compiler's reachability analysis for tests
+// that touch objects whose RAII teardown races with Catch2's SKIP handler —
+// this bit repeatedly in 0.5.0.4 pre-merge. Keep the macro; suppress the lint.
 #define SKIP_WITHOUT_PG()                                                      \
   do {                                                                         \
     if (!pg_available()) {                                                     \
       SKIP("PG not available");                                                \
     }                                                                          \
   } while (false)
+
+TEST_CASE("Extension module loading enforces the original source gate",
+          "[cap][ext][integration][module-source-gate]") {
+  REQUIRE(pg_available());
+  ModuleGatePolicy policy;
+  ExtScratch scratch;
+  constexpr std::string_view LOAD = R"(
+    export default async function(args) {
+      globalThis.module_body = 0;
+      globalThis.module_called = 0;
+      if (!args.caught) {
+        const mod = globalThis.import_from_src(args.src, args.id);
+        return await mod.default();
+      }
+      try {
+        const mod = globalThis.import_from_src(args.src, args.id);
+        const value = await mod.default();
+        return {caught:false, value, body:globalThis.module_body,
+                called:globalThis.module_called};
+      } catch (e) {
+        return {caught:true, name:e.name, message:e.message,
+                body:globalThis.module_body, called:globalThis.module_called};
+      }
+    }
+  )";
+  constexpr std::string_view COERCION = R"(
+    export default function(args) {
+      const trace = [];
+      const source = {toString() {
+        trace.push('source');
+        if (args.fail === 'source') throw new Error('source-marker');
+        return args.src;
+      }};
+      const id = {toString() {
+        trace.push('id');
+        if (args.fail === 'id') throw new Error('id-marker');
+        return args.id;
+      }};
+      try {
+        const mod = args.fail === 'arity'
+          ? globalThis.import_from_src(source)
+          : globalThis.import_from_src(source, id);
+        return {caught:false, trace:trace.join(','), value:mod.default()};
+      } catch (e) {
+        return {caught:true, trace:trace.join(','), name:e.name, message:e.message};
+      }
+    }
+  )";
+  const auto below = marked_module(49);
+  const auto blocked = marked_module(50);
+  std::string malformed{"// original bytes: "};
+  malformed += std::string{"\xC0\x80", 2}; // explicit overlong UTF-8 encoding
+  malformed += "\nexport default function(){return 42;}";
+  scratch.stage_extension(
+      "modulegate",
+      {{"load", LOAD},
+       {"coercion", COERCION},
+       {"host49", below},
+       {"host50", blocked},
+       {"badutf8", "export default function(){return 42;}"},
+       {"syntax", "export default function() {"},
+       {"importthrow", "throw new Error('import-marker');export default "
+                       "function(){return 42;}"},
+       {"defaultthrow",
+        "export default function(){throw new Error('default-marker');}"},
+       {"missingdefault", "export const value=42;"},
+       {"noncallable", "export default 17;"},
+       {"tla", "await 0;export default function(){return 42;}"},
+       {"fresh", "export default function(){return 41;}"}});
+  REQUIRE(plinth::extensions::create_pool("modulegate"));
+
+  constexpr std::string_view GATE_MESSAGE =
+      "unicode-smuggle: <module> contains 50 invisible Unicode characters "
+      "(threshold 50)";
+
+  // Both engine-stage counters are causally live before zero-entry assertions.
+  const auto clean = observe_module_dispatch(
+      "load", module_args(marked_module(0), "nested/clean"), "nested/clean",
+      true);
+  check_nested_value(clean);
+  check_module_entries(clean, 1, 1, true);
+  const auto async_default = observe_module_dispatch(
+      "load", module_args(marked_module(0, true), "nested/async"),
+      "nested/async", true);
+  check_nested_value(async_default);
+  check_module_entries(async_default, 1, 1, true);
+
+  const auto permitted = observe_module_dispatch(
+      "load", module_args(below, "nested/threshold"), "nested/threshold", true);
+  check_nested_value(permitted);
+  check_module_entries(permitted, 1, 1, true);
+  const auto denied =
+      observe_module_dispatch("load", module_args(blocked, "nested/threshold"),
+                              "nested/threshold", true);
+  check_nested_caught(denied, "InternalError", GATE_MESSAGE);
+  check_module_entries(denied, 0, 0, true);
+
+  // Replay identical source/id with scanning disabled. This must execute the
+  // actual module, rather than satisfy the denial checks through a dead hook.
+  plinth::js::set_unicode_scanner_policy(false, 50, false);
+  const auto disabled =
+      observe_module_dispatch("load", module_args(blocked, "nested/threshold"),
+                              "nested/threshold", true);
+  check_nested_value(disabled);
+  check_module_entries(disabled, 1, 1, true);
+  plinth::js::set_unicode_scanner_policy(true, 50, false);
+  const auto muted =
+      observe_module_dispatch("load", module_args(blocked, "nested/threshold"),
+                              "nested/threshold", true);
+  check_nested_caught(muted, "InternalError", GATE_MESSAGE);
+  check_module_entries(muted, 0, 0, true);
+  plinth::js::set_unicode_scanner_policy(true, 50, true);
+  const auto logging =
+      observe_module_dispatch("load", module_args(blocked, "nested/threshold"),
+                              "nested/threshold", true);
+  check_nested_caught(logging, "InternalError", GATE_MESSAGE);
+  check_module_entries(logging, 0, 0, true);
+  plinth::js::set_unicode_scanner_policy(true, 50, false);
+
+  std::string invalid_noisy{"// "};
+  for (int index = 0; index < 50; ++index) {
+    invalid_noisy += "\xEF\xB8\x8F";
+  }
+  invalid_noisy += "\nexport default function( {";
+  const auto gate_before_syntax = observe_module_dispatch(
+      "load", module_args(invalid_noisy, "nested/threshold"),
+      "nested/threshold", true);
+  check_nested_caught(gate_before_syntax, "InternalError", GATE_MESSAGE);
+  check_module_entries(gate_before_syntax, 0, 0, true);
+  const auto ordinary_syntax = observe_module_dispatch(
+      "load", module_args("export default function( {", "nested/syntax"),
+      "nested/syntax", true);
+  check_nested_caught(ordinary_syntax, "SyntaxError", "");
+  check_module_entries(ordinary_syntax, 1, 0, true);
+
+  // The parser's acceptance of NUL is not the oracle. Findings after that byte
+  // must be rejected before either engine call, using the full source length.
+  std::string after_nul{"export default function(){return 42;}"};
+  after_nul.push_back('\0');
+  after_nul += invalid_noisy;
+  const auto nul = observe_module_dispatch(
+      "load", module_args(after_nul, "nested/threshold"), "nested/threshold",
+      true);
+  check_nested_caught(nul, "InternalError", GATE_MESSAGE);
+  check_module_entries(nul, 0, 0, true);
+
+  const auto uncaught = observe_module_dispatch(
+      "load", module_args(blocked, "nested/threshold", false),
+      "nested/threshold", true);
+  check_module_error(uncaught, "cap.handler_threw", GATE_MESSAGE);
+  if (!uncaught.result) {
+    CHECK(uncaught.result.error().message.find("promise_rejected:") !=
+          std::string::npos);
+    CHECK(uncaught.result.error().message.find("unicode_smuggle_detected:") ==
+          std::string::npos);
+  }
+  check_module_entries(uncaught, 0, 0, true);
+
+  const auto host_below =
+      observe_module_dispatch("host49", Json::Value{}, "modulegate/host49");
+  REQUIRE(host_below.result.has_value());
+  CHECK(host_below.result->type() == Json::intValue);
+  CHECK(host_below.result->asInt() == 42);
+  check_module_entries(host_below, 1, 1);
+  plinth::js::set_unicode_scanner_policy(false, 50, false);
+  const auto host_disabled =
+      observe_module_dispatch("host50", Json::Value{}, "modulegate/host50");
+  REQUIRE(host_disabled.result.has_value());
+  CHECK(host_disabled.result->type() == Json::intValue);
+  CHECK(host_disabled.result->asInt() == 42);
+  check_module_entries(host_disabled, 1, 1);
+  plinth::js::set_unicode_scanner_policy(true, 50, false);
+  const auto host_denied =
+      observe_module_dispatch("host50", Json::Value{}, "modulegate/host50");
+  check_module_error(host_denied, "cap.handler_load_failed", GATE_MESSAGE);
+  if (!host_denied.result) {
+    CHECK(host_denied.result.error().message.find(
+              "unicode_smuggle_detected:") != std::string::npos);
+  }
+  check_module_entries(host_denied, 0, 0);
+  const auto valid_original =
+      observe_module_dispatch("badutf8", Json::Value{}, "modulegate/badutf8");
+  REQUIRE(valid_original.result.has_value());
+  CHECK(valid_original.result->type() == Json::intValue);
+  CHECK(valid_original.result->asInt() == 42);
+  check_module_entries(valid_original, 1, 1);
+  scratch.stage_extension("modulegate", {{"badutf8", malformed}});
+  const auto original_bytes =
+      observe_module_dispatch("badutf8", Json::Value{}, "modulegate/badutf8");
+  check_module_error(original_bytes, "cap.handler_load_failed",
+                     "unicode-smuggle: <module> failed UTF-8 decode");
+  check_module_entries(original_bytes, 0, 0);
+
+  seed_tier2("modulegate:1:host50", "modulegate");
+  {
+    ModuleEngineWatch watch{"modulegate/host50", ""};
+    std::string code;
+    std::string message;
+    const auto resolved =
+        run_resolver("modulegate:1:host50", Json::Value{}, &code, &message);
+    CHECK_FALSE(resolved.has_value());
+    if (!resolved) {
+      CHECK(resolved.error() ==
+            plinth::capabilities::CapabilityError::EXTENSION_DISPATCH_FAILED);
+      CHECK(code == "cap.handler_load_failed");
+      CHECK(message.find("unicode_smuggle_detected:") != std::string::npos);
+      CHECK(message.find(GATE_MESSAGE) != std::string::npos);
+    }
+    CHECK(watch.counts().compiled == 0);
+    CHECK(watch.counts().evaluated == 0);
+  }
+
+  struct CoercionCase {
+    std::string_view fail;
+    std::string_view id;
+    std::string_view trace;
+    std::string_view name;
+    std::string_view message;
+    bool noisy;
+  };
+  constexpr std::array<CoercionCase, 5> COERCIONS{{
+      {"", "nested/coercion", "source,id", "", "", false},
+      {"source", "nested/coercion", "source", "Error", "source-marker", true},
+      {"id", "nested/coercion", "source,id", "Error", "id-marker", true},
+      {"arity", "nested/coercion", "", "TypeError", "expected (src, id) args",
+       false},
+      {"", "nested/coercion", "source,id", "InternalError", GATE_MESSAGE, true},
+  }};
+  for (const auto& item : COERCIONS) {
+    INFO("coercion id=" << item.id << " fail=" << item.fail);
+    auto args = module_args(item.noisy ? blocked : marked_module(0),
+                            std::string{item.id});
+    args["fail"] = std::string{item.fail};
+    const auto observed =
+        observe_module_dispatch("coercion", args, std::string{item.id}, true);
+    REQUIRE(observed.result.has_value());
+    const auto& value = *observed.result;
+    REQUIRE(value.isObject());
+    CHECK(value["trace"].type() == Json::stringValue);
+    CHECK(value["trace"].asString() == item.trace);
+    CHECK(value["caught"].type() == Json::booleanValue);
+    CHECK(value["caught"].asBool() == !item.name.empty());
+    if (item.name.empty()) {
+      CHECK(value["value"].type() == Json::intValue);
+      CHECK(value["value"].asInt() == 42);
+      check_module_entries(observed, 1, 1, true);
+    } else {
+      CHECK(value["name"].asString() == item.name);
+      CHECK(value["message"].asString().find(item.message) !=
+            std::string::npos);
+      check_module_entries(observed, 0, 0, true);
+    }
+  }
+
+  const auto import_throw = observe_module_dispatch(
+      "load",
+      module_args("globalThis.module_body=1;"
+                  "throw new Error('nested-import-marker');"
+                  "export default function(){return 42;}",
+                  "nested/import-throw"),
+      "nested/import-throw", true);
+  check_nested_caught(import_throw, "Error", "nested-import-marker", 1);
+  check_module_entries(import_throw, 1, 1, true);
+  const auto default_throw = observe_module_dispatch(
+      "load",
+      module_args("globalThis.module_body=1;export default function(){"
+                  "globalThis.module_called=1;"
+                  "throw new Error('nested-default-marker');}",
+                  "nested/default-throw"),
+      "nested/default-throw", true);
+  check_nested_caught(default_throw, "Error", "nested-default-marker", 1, 1);
+  check_module_entries(default_throw, 1, 1, true);
+  const auto uncaught_import = observe_module_dispatch(
+      "load",
+      module_args("throw new Error('uncaught-import-marker');"
+                  "export default function(){return 42;}",
+                  "nested/uncaught-import", false),
+      "nested/uncaught-import", true);
+  check_module_error(uncaught_import, "cap.handler_threw",
+                     "uncaught-import-marker");
+  check_module_entries(uncaught_import, 1, 1, true);
+  const auto uncaught_default = observe_module_dispatch(
+      "load",
+      module_args("export default function(){"
+                  "throw new Error('uncaught-default-marker');}",
+                  "nested/uncaught-default", false),
+      "nested/uncaught-default", true);
+  check_module_error(uncaught_default, "cap.handler_threw",
+                     "uncaught-default-marker");
+  check_module_entries(uncaught_default, 1, 1, true);
+
+  struct HostErrorCase {
+    std::string_view function;
+    std::string_view code;
+    std::string_view marker;
+    int evaluated;
+  };
+  constexpr std::array<HostErrorCase, 6> HOST_ERRORS{{
+      {"syntax", "cap.handler_load_failed", "SyntaxError", 0},
+      {"importthrow", "cap.handler_load_failed", "import-marker", 1},
+      {"defaultthrow", "cap.handler_threw", "default-marker", 1},
+      {"missingdefault", "cap.handler_threw", "", 1},
+      {"noncallable", "cap.handler_threw", "", 1},
+      {"tla", "cap.handler_load_failed", "top-level await (not supported)", 1},
+  }};
+  for (const auto& item : HOST_ERRORS) {
+    INFO("host module=" << item.function);
+    const auto observed =
+        observe_module_dispatch(item.function, Json::Value{},
+                                "modulegate/" + std::string{item.function});
+    check_module_error(observed, item.code, item.marker);
+    check_module_entries(observed, 1, item.evaluated);
+  }
+
+  const auto first_fresh =
+      observe_module_dispatch("fresh", Json::Value{}, "modulegate/fresh");
+  REQUIRE(first_fresh.result.has_value());
+  CHECK(first_fresh.result->type() == Json::intValue);
+  CHECK(first_fresh.result->asInt() == 41);
+  check_module_entries(first_fresh, 1, 1);
+  scratch.stage_extension("modulegate",
+                          {{"fresh", "export default function(){return 42;}"}});
+  const auto second_fresh =
+      observe_module_dispatch("fresh", Json::Value{}, "modulegate/fresh");
+  REQUIRE(second_fresh.result.has_value());
+  CHECK(second_fresh.result->type() == Json::intValue);
+  CHECK(second_fresh.result->asInt() == 42);
+  check_module_entries(second_fresh, 1, 1);
+
+  REQUIRE(plinth::extensions::shutdown_registry(5s));
+  REQUIRE(plinth::extensions::inflight_dispatch_count_for_test() == 0);
+  REQUIRE(plinth::extensions::shutdown_registry(0ms));
+}
 
 // ─── Group R — Resolve (happy paths) ─────────────────────────────
 
@@ -342,7 +858,7 @@ TEST_CASE("E.01: handler_throw_maps_to_cap_handler_threw",
   REQUIRE(code == "cap.handler_threw");
   REQUIRE(msg.find("boom") != std::string::npos);
   require_persisted_audit("capability.extension.error", admin_ctx().user_id,
-                          "cap.handler_threw");
+                          "cap.handler_threw", "extdispatch", "thrower");
 }
 
 TEST_CASE("E.02: unknown_signature_rejects_at_resolver",
@@ -409,7 +925,7 @@ TEST_CASE("E.04: handler_syntax_error_rejects_cap_handler_load_failed",
   REQUIRE_FALSE(r.has_value());
   REQUIRE(code == "cap.handler_load_failed");
   require_persisted_audit("capability.extension.error", admin_ctx().user_id,
-                          "cap.handler_load_failed");
+                          "cap.handler_load_failed", "extdispatch", "broken");
 }
 
 TEST_CASE("E.05: destroyed_pool_rejects_extension_not_loaded",

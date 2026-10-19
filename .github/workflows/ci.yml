@@ -368,6 +368,22 @@ jobs:
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_sync_conversion_corpus$'
 
+      - name: Focused extension module source gate sanitizer regression
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_module_source_gate$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_module_source_gate$'
+
       - name: Focused QuickJS audit authority sanitizer regression
         env:
           ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
@@ -605,6 +621,21 @@ jobs:
             grep -Ex 'Total Tests: 1'
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_sync_conversion_corpus$'
+
+      - name: Focused extension module source gate TSan regression
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_module_source_gate$' |
+            grep -Ex 'Total Tests: 1'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_module_source_gate$'
 
       - name: Installed float generation, ownership and admin-default TSan tests
         env:
