@@ -103,7 +103,7 @@ async function run() {
     check(isAbsolute(moduleDirectory));
     const modulePath = await realpath(moduleDirectory);
     const packageInfo = JSON.parse(await readFile(resolve(modulePath, 'package.json'), 'utf8'));
-    check(packageInfo.name === 'playwright' && packageInfo.version === '1.64.0');
+    check(packageInfo.name === 'playwright' && packageInfo.version === '1.64.1');
     // Do not let inherited debug settings log transport headers or fill values.
     delete process.env.DEBUG;
     delete process.env.PWDEBUG;
