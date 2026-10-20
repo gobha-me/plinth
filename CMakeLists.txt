@@ -1375,6 +1375,16 @@ add_test(NAME plinth_tests_module_source_gate
 set_tests_properties(plinth_tests_module_source_gate PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
 
+add_test(NAME plinth_tests_module_import_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "Extension module imports have a bounded deterministic corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_module_import_corpus PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
 # Keep the two reverse JSON boundaries independent: actual registry argument
 # injection and actual cap.call Promise settlement, not a shared-helper oracle.
 add_test(NAME plinth_tests_reverse_json_registry_arguments

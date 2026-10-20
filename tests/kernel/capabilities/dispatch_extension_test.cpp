@@ -46,6 +46,7 @@
 #include <system_error>
 #include <thread>
 #include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
@@ -401,6 +402,274 @@ auto check_module_error(const ModuleDispatchObservation& observed,
     CHECK_FALSE(observed.result.error().sqlstate.has_value());
     CHECK(observed.result.error().message.size() <= 1024);
   }
+}
+
+// This corpus observes the registered loader and both actual engine stages.
+// Source construction is not a scanner/parser oracle; expectations below are
+// literal values, error names, diagnostics and entry counts.
+constexpr std::string_view IMPORT_CORPUS_LOAD = R"(
+  export default async function(args) {
+    globalThis.module_body = 0;
+    globalThis.module_called = 0;
+    try {
+      const namespace = globalThis.import_from_src(args.src, args.id);
+      const value = await namespace.default();
+      return {caught:false, value, name:'', message:'',
+        body:globalThis.module_body, called:globalThis.module_called};
+    } catch (error) {
+      return {caught:true, value:null, name:error.name,
+        message:(error.name === 'Error' || error.name === 'InternalError')
+          ? error.message : '',
+        body:globalThis.module_body, called:globalThis.module_called};
+    }
+  }
+)";
+constexpr std::string_view IMPORT_GATE_MESSAGE =
+    "unicode-smuggle: <module> contains 50 invisible Unicode characters "
+    "(threshold 50)";
+
+enum class ImportFamily : std::size_t {
+  HOST,
+  NESTED,
+  COMPILE,
+  DEFAULT,
+  REPLAY
+};
+
+struct ImportCorpusRow {
+  ImportFamily family;
+  std::string entry;
+  std::string source;
+  bool nested = false;
+  Json::Value expected;
+  std::string error_code{};
+  std::string error_fragment{};
+  int compiled = 1;
+  int evaluated = 1;
+};
+
+auto import_expected(bool caught, int value, std::string_view name = {},
+                     std::string_view message = {}, int body = 1,
+                     int called = 1) -> Json::Value {
+  Json::Value expected{Json::objectValue};
+  expected["caught"] = caught;
+  expected["value"] = caught ? Json::Value{} : Json::Value{value};
+  expected["name"] = std::string{name};
+  expected["message"] = std::string{message};
+  expected["body"] = body;
+  expected["called"] = called;
+  return expected;
+}
+
+auto import_typed_equal(const Json::Value& actual, const Json::Value& expected)
+    -> bool {
+  if (actual.type() != expected.type()) {
+    return false;
+  }
+  if (actual.isObject()) {
+    if (actual.getMemberNames() != expected.getMemberNames()) {
+      return false;
+    }
+    for (const auto& name : expected.getMemberNames()) {
+      if (!import_typed_equal(actual[name], expected[name])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return actual == expected;
+}
+
+auto import_matches(const ModuleDispatchObservation& actual,
+                    const ImportCorpusRow& expected) -> bool {
+  if (actual.counts.compiled != expected.compiled ||
+      actual.counts.evaluated != expected.evaluated ||
+      actual.counts.outer_compiled != (expected.nested ? 1 : 0) ||
+      actual.counts.outer_evaluated != (expected.nested ? 1 : 0)) {
+    return false;
+  }
+  if (expected.error_code.empty()) {
+    return actual.result &&
+           import_typed_equal(*actual.result, expected.expected);
+  }
+  return !actual.result && actual.result.error().code == expected.error_code &&
+         actual.result.error().message.size() <= 1024 &&
+         !actual.result.error().sqlstate &&
+         actual.result.error().message.find(expected.error_fragment) !=
+             std::string::npos;
+}
+
+auto import_markers(std::size_t count, int seed, std::string source)
+    -> std::string {
+  REQUIRE(count <= 50);
+  std::string comment{"/*"};
+  for (std::size_t index = 0; index < count; ++index) {
+    comment += "\xEF\xB8\x8F";
+  }
+  comment += "*/";
+  // All four placements are finite and valid for the no-NUL success row.
+  switch (seed) {
+    case 0: return comment + "\n" + source;
+    case 1: return " \n" + comment + "\n" + source;
+    case 2: return source + "\n" + comment;
+    default: return "/*seed-three*/\n" + source + "\n " + comment + "\n";
+  }
+}
+
+auto import_rows(int seed) -> std::vector<ImportCorpusRow> {
+  constexpr std::array<std::string_view, 4> SOURCE_VALUES{"101", "211", "307",
+                                                          "419"};
+  constexpr std::array<int, 4> EXPECTED_VALUES{101, 211, 307, 419};
+  constexpr std::array<std::string_view, 4> RESTORED_SOURCES{
+      "export default function(){return 102;}",
+      "export default function(){return 212;}",
+      "export default function(){return 308;}",
+      "export default function(){return 420;}"};
+  constexpr std::array<int, 4> RESTORED_VALUES{102, 212, 308, 420};
+  constexpr std::array<std::string_view, 4> MARKERS{
+      "import-seed-zero", "import-seed-one", "import-seed-two",
+      "import-seed-three"};
+  // Literal byte offsets derived independently from the fixed ASCII programs
+  // and comment placements, never from a scanner or the observed diagnostic.
+  constexpr std::array<std::string_view, 4> CALLABLE_FINDINGS{
+      "; first finding at offset 2 \xE2\x80\x94 range 'variation-selector'",
+      "; first finding at offset 4 \xE2\x80\x94 range 'variation-selector'",
+      "; first finding at offset 151 \xE2\x80\x94 range 'variation-selector'",
+      "; first finding at offset 167 \xE2\x80\x94 range 'variation-selector'"};
+  constexpr std::array<std::string_view, 4> AFTER_NUL_FINDINGS{
+      "; first finding at offset 151 \xE2\x80\x94 range 'variation-selector'",
+      "; first finding at offset 153 \xE2\x80\x94 range 'variation-selector'",
+      "; first finding at offset 178 \xE2\x80\x94 range 'variation-selector'",
+      "; first finding at offset 194 \xE2\x80\x94 range 'variation-selector'"};
+  const auto index = static_cast<std::size_t>(seed);
+  const auto literal = std::string{SOURCE_VALUES[index]};
+  const auto marker = std::string{MARKERS[index]};
+  const auto callable = "globalThis.module_body=(globalThis.module_body||0)+1;"
+                        "export default function(){globalThis.module_called="
+                        "(globalThis.module_called||0)+1;return " +
+                        literal + ";}";
+  const auto host = "export default function(){return " + literal + ";}";
+  const auto success = import_expected(false, EXPECTED_VALUES[index]);
+  const auto gate = import_expected(true, 0, "InternalError",
+                                    std::string{IMPORT_GATE_MESSAGE} +
+                                        std::string{CALLABLE_FINDINGS[index]},
+                                    0, 0);
+  const auto after_nul_gate = import_expected(
+      true, 0, "InternalError",
+      std::string{IMPORT_GATE_MESSAGE} + std::string{AFTER_NUL_FINDINGS[index]},
+      0, 0);
+  std::vector<ImportCorpusRow> rows;
+  rows.push_back({ImportFamily::HOST,
+                  "clean",
+                  host,
+                  false,
+                  Json::Value{EXPECTED_VALUES[index]},
+                  {},
+                  {},
+                  1,
+                  1});
+  rows.push_back({ImportFamily::HOST,
+                  "blocked",
+                  import_markers(50, seed, host),
+                  false,
+                  {},
+                  "cap.handler_load_failed",
+                  "unicode_smuggle_detected: unicode-smuggle: <module> "
+                  "contains 50 invisible Unicode characters (threshold 50)",
+                  0,
+                  0});
+  rows.push_back({ImportFamily::HOST,
+                  "restored",
+                  std::string{RESTORED_SOURCES[index]},
+                  false,
+                  Json::Value{RESTORED_VALUES[index]},
+                  {},
+                  {},
+                  1,
+                  1});
+  // One fixed invalid UTF-8 form, kept separate from marker thresholds.
+  rows.push_back({ImportFamily::HOST,
+                  "malformed-original",
+                  std::string{"// \xC0\x80\n"} + host,
+                  false,
+                  {},
+                  "cap.handler_load_failed",
+                  "unicode-smuggle: <module> failed UTF-8 decode",
+                  0,
+                  0});
+  rows.push_back({ImportFamily::NESTED, "49-valid",
+                  import_markers(49, seed, callable), true, success});
+  rows.push_back({ImportFamily::NESTED,
+                  "50-valid",
+                  import_markers(50, seed, callable),
+                  true,
+                  gate,
+                  {},
+                  {},
+                  0,
+                  0});
+  rows.push_back({ImportFamily::NESTED,
+                  "50-before-NUL",
+                  import_markers(50, seed, callable) + std::string(1, '\0'),
+                  true,
+                  gate,
+                  {},
+                  {},
+                  0,
+                  0});
+  rows.push_back({ImportFamily::NESTED,
+                  "50-after-NUL-invalid",
+                  callable + std::string(1, '\0') +
+                      import_markers(50, seed, "export default function( {"),
+                  true,
+                  after_nul_gate,
+                  {},
+                  {},
+                  0,
+                  0});
+  rows.push_back({ImportFamily::COMPILE, "valid", callable, true, success});
+  rows.push_back({ImportFamily::COMPILE,
+                  "syntax",
+                  "export default function( {",
+                  true,
+                  import_expected(true, 0, "SyntaxError", {}, 0, 0),
+                  {},
+                  {},
+                  1,
+                  0});
+  rows.push_back({ImportFamily::COMPILE, "body-throw",
+                  "globalThis.module_body=(globalThis.module_body||0)+1;"
+                  "throw new Error('" +
+                      marker + "');export default function(){return " +
+                      literal + ";}",
+                  true, import_expected(true, 0, "Error", marker, 1, 0)});
+  rows.push_back({ImportFamily::DEFAULT, "missing",
+                  "globalThis.module_body=1;"
+                  "export const value=7;",
+                  true, import_expected(true, 0, "TypeError", {}, 1, 0)});
+  rows.push_back({ImportFamily::DEFAULT, "noncallable",
+                  "globalThis.module_body=1;export default 7;", true,
+                  import_expected(true, 0, "TypeError", {}, 1, 0)});
+  rows.push_back({ImportFamily::DEFAULT, "default-throw",
+                  "globalThis.module_body=(globalThis.module_body||0)+1;"
+                  "export default function(){globalThis.module_called="
+                  "(globalThis.module_called||0)+1;throw new Error('" +
+                      marker + "');}",
+                  true, import_expected(true, 0, "Error", marker)});
+  return rows;
+}
+
+using ImportCoverage = std::array<std::array<int, 62>, 2>;
+
+auto import_coverage_complete(const ImportCoverage& coverage) -> bool {
+  for (const auto& replay : coverage) {
+    for (const auto count : replay) {
+      if (count != 1) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 // These regressions isolate two real reverse-conversion entry points. The JS
@@ -1094,6 +1363,200 @@ TEST_CASE("Extension module loading enforces the original source gate",
   REQUIRE(plinth::extensions::shutdown_registry(5s));
   REQUIRE(plinth::extensions::inflight_dispatch_count_for_test() == 0);
   REQUIRE(plinth::extensions::shutdown_registry(0ms));
+}
+
+TEST_CASE("Extension module imports have a bounded deterministic corpus",
+          "[cap][ext][integration][module-import-corpus]") {
+  REQUIRE(pg_available());
+  ModuleGatePolicy policy;
+  const auto deadline = std::chrono::steady_clock::now() + 60s;
+  ImportCoverage coverage{};
+  std::array<int, 5> families{};
+  int observations = 0;
+  int stage_controls = 0;
+  int outer_controls = 0;
+  int result_controls = 0;
+  int value_controls = 0;
+  int type_controls = 0;
+  int name_controls = 0;
+  int marker_controls = 0;
+  int shutdowns = 0;
+
+  const auto shutdown = [&] {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    REQUIRE(plinth::extensions::shutdown_registry(5s));
+    REQUIRE(plinth::extensions::inflight_dispatch_count_for_test() == 0);
+    REQUIRE(plinth::extensions::shutdown_registry(0ms));
+    ++shutdowns;
+  };
+  const auto observe = [&](const ImportCorpusRow& row, int replay, int seed,
+                           std::size_t entry, const ExtScratch& scratch,
+                           std::string_view function) {
+    INFO("module-import family=" << static_cast<std::size_t>(row.family)
+                                 << " seed=" << seed << " replay=" << replay
+                                 << " entry=" << row.entry
+                                 << " bytes=" << row.source.size());
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    REQUIRE(row.source.size() <= 4096);
+    REQUIRE(entry < 62);
+    const auto target =
+        row.nested ? "corpus/seed-" + std::to_string(seed) + "/" + row.entry
+                   : "modulegate/" + std::string{function};
+    REQUIRE(target.size() <= 128);
+    if (!row.nested) {
+      scratch.stage_extension("modulegate", {{function, row.source}});
+    }
+    const auto actual = observe_module_dispatch(
+        row.nested ? "load" : function,
+        row.nested ? module_args(row.source, target) : Json::Value{}, target,
+        row.nested);
+    INFO("actual stages=" << actual.counts.compiled << "/"
+                          << actual.counts.evaluated
+                          << " outer=" << actual.counts.outer_compiled << "/"
+                          << actual.counts.outer_evaluated);
+    INFO("actual result=" << (actual.result
+                                  ? actual.result->toStyledString()
+                                  : actual.result.error().code + ": " +
+                                        actual.result.error().message));
+    // Validate the unmodified actual observation before causal corruptions.
+    REQUIRE(import_matches(actual, row));
+    auto wrong_stage = actual;
+    ++wrong_stage.counts.compiled;
+    REQUIRE_FALSE(import_matches(wrong_stage, row));
+    ++stage_controls;
+    if (row.nested) {
+      auto wrong_outer = actual;
+      --wrong_outer.counts.outer_evaluated;
+      REQUIRE_FALSE(import_matches(wrong_outer, row));
+      ++outer_controls;
+    }
+    auto wrong_result = actual;
+    if (wrong_result.result) {
+      if (wrong_result.result->isObject()) {
+        (*wrong_result.result)["called"] = 99;
+      } else {
+        wrong_result.result = Json::Value{};
+      }
+    } else {
+      wrong_result.result.error().code = "corrupted-corpus-code";
+    }
+    REQUIRE_FALSE(import_matches(wrong_result, row));
+    ++result_controls;
+    if (row.family == ImportFamily::COMPILE && row.entry == "valid") {
+      auto wrong_value = actual;
+      (*wrong_value.result)["value"] = -999;
+      REQUIRE_FALSE(import_matches(wrong_value, row));
+      ++value_controls;
+      auto wrong_type = actual;
+      const int value = (*actual.result)["value"].asInt();
+      // Keep the exact numeric value while changing only its JSON type.
+      (*wrong_type.result)["value"] = static_cast<double>(value);
+      REQUIRE_FALSE(import_matches(wrong_type, row));
+      ++type_controls;
+    }
+    if (row.family == ImportFamily::COMPILE && row.entry == "syntax") {
+      auto wrong_name = actual;
+      (*wrong_name.result)["name"] = "Error";
+      REQUIRE_FALSE(import_matches(wrong_name, row));
+      ++name_controls;
+    }
+    if (row.family == ImportFamily::COMPILE && row.entry == "body-throw") {
+      auto wrong_marker = actual;
+      (*wrong_marker.result)["message"] = "corrupted-import-marker";
+      REQUIRE_FALSE(import_matches(wrong_marker, row));
+      ++marker_controls;
+    }
+    ++coverage[static_cast<std::size_t>(replay)][entry];
+    ++families[static_cast<std::size_t>(row.family)];
+    ++observations;
+  };
+
+  for (int replay = 0; replay < 2; ++replay) {
+    for (int seed = 0; seed < 4; ++seed) {
+      const auto rows = import_rows(seed);
+      REQUIRE(rows.size() == 14);
+      const bool has_replacement = seed == 0 || seed == 3;
+      Json::Value replacement_expected{Json::objectValue};
+      replacement_expected["value"] = seed == 0 ? 503 : 907;
+      replacement_expected["prior"] = 0;
+      const ImportCorpusRow replacement{
+          ImportFamily::REPLAY, "replacement-B",
+          seed == 0 ? "export default function(){return {value:503,"
+                      "prior:globalThis.old_import||0};}"
+                    : "export default function(){return {value:907,"
+                      "prior:globalThis.old_import||0};}",
+          false, replacement_expected};
+      const std::size_t replacement_entry = seed == 0 ? 56 : 59;
+      {
+        // Every seed/replay has a fresh registry/config/pool owner. Its first
+        // clean row makes both observer stages live before any zero assertion.
+        ExtScratch scratch;
+        scratch.stage_extension("modulegate", {{"load", IMPORT_CORPUS_LOAD}});
+        REQUIRE(plinth::extensions::create_pool("modulegate"));
+        for (std::size_t row = 0; row < rows.size(); ++row) {
+          observe(rows[row], replay, seed,
+                  static_cast<std::size_t>(seed) * 14 + row, scratch, "host");
+        }
+        if (has_replacement) {
+          Json::Value first_expected{Json::objectValue};
+          first_expected["value"] = 901;
+          first_expected["prior"] = 1;
+          const ImportCorpusRow first{
+              ImportFamily::REPLAY,
+              "replacement-A",
+              seed == 0
+                  ? import_markers(50, seed,
+                                   "globalThis.old_import=1;export default "
+                                   "function(){return -1;}")
+                  : "globalThis.old_import=1;export default function(){"
+                    "return {value:901,prior:globalThis.old_import};}",
+              false,
+              seed == 0 ? Json::Value{} : first_expected,
+              seed == 0 ? "cap.handler_load_failed" : "",
+              seed == 0 ? std::string{IMPORT_GATE_MESSAGE} : "",
+              seed == 0 ? 0 : 1,
+              seed == 0 ? 0 : 1};
+          observe(first, replay, seed, replacement_entry, scratch, "replay");
+          // Same owner, handler and module id; B must not reuse A's source.
+          // Seed 3's successful A also makes the cleared-global oracle live.
+          observe(replacement, replay, seed, replacement_entry + 1, scratch,
+                  "replay");
+        }
+        shutdown();
+      }
+      if (has_replacement) {
+        ExtScratch scratch;
+        scratch.stage_extension("modulegate", {{"replay", replacement.source}});
+        REQUIRE(plinth::extensions::create_pool("modulegate"));
+        // A new owner replays B without carrying any JS value or namespace.
+        observe(replacement, replay, seed, replacement_entry + 2, scratch,
+                "replay");
+        shutdown();
+      }
+    }
+  }
+  REQUIRE(import_coverage_complete(coverage));
+  REQUIRE(families == std::array<int, 5>{32, 32, 24, 24, 12});
+  REQUIRE(observations == 124);
+  REQUIRE(stage_controls == 124);
+  REQUIRE(outer_controls == 80);
+  REQUIRE(result_controls == 124);
+  REQUIRE(value_controls == 8);
+  REQUIRE(type_controls == 8);
+  REQUIRE(name_controls == 8);
+  REQUIRE(marker_controls == 8);
+  REQUIRE(shutdowns == 12);
+  int coverage_controls = 0;
+  for (std::size_t replay = 0; replay < coverage.size(); ++replay) {
+    for (std::size_t entry = 0; entry < coverage[replay].size(); ++entry) {
+      auto missing = coverage;
+      --missing[replay][entry];
+      REQUIRE_FALSE(import_coverage_complete(missing));
+      ++coverage_controls;
+    }
+  }
+  REQUIRE(coverage_controls == 124);
+  REQUIRE(std::chrono::steady_clock::now() < deadline);
 }
 
 // ─── Group R — Resolve (happy paths) ─────────────────────────────
