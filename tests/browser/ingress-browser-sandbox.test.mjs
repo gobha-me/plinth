@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 import { cleanup, namespaceFailure, prepare, probe, profileText, runnerIdentity } from
     '../../.github/scripts/prepare-ingress-browser.mjs';
 
@@ -8,7 +12,7 @@ const osRelease = 'ID=ubuntu\nVERSION_ID="24.04"\n';
 const executablePath = '/home/runner/.cache/ms-playwright/chromium-1243/chrome-linux64/chrome';
 function fixture(probes = [null]) {
     const context = { platform: 'linux', uid, home: '/home/runner', repo: '/work/plinth',
-        playwrightVersion: '1.64.0', executablePath,
+        playwrightVersion: '1.64.1', executablePath,
         env: { GITHUB_ACTIONS: 'true', RUNNER_ENVIRONMENT: 'github-hosted', RUNNER_OS: 'Linux',
             GITHUB_RUN_ID: '123456', GITHUB_RUN_ATTEMPT: '2', RUNNER_TEMP: '/runner/temp',
             GITHUB_WORKSPACE: '/work/plinth', GITHUB_ENV: '/runner/temp/env' } };
@@ -103,6 +107,101 @@ function fixture(probes = [null]) {
     return { context, identity, files, add, io, commands, announcements, observedProbes, loaded };
 }
 const policyCommands = f => f.commands.filter(argv => argv[2] !== '/usr/bin/cat');
+
+test('sandbox prerequisite admits pinned Playwright 1.64.1 before its owned probe', async () => {
+    const f = fixture();
+    f.context.playwrightVersion = '1.64.1';
+    await prepare(f.context, f.io);
+    assert.deepEqual(f.observedProbes, [executablePath]);
+    assert.deepEqual(policyCommands(f), []);
+    await cleanup(f.context, f.io);
+    assert.equal(f.files.has(f.identity.directory), false);
+});
+
+async function ingressVersionFixture(version, name = 'playwright') {
+    const directory = await mkdtemp('/tmp/plinth-issue40-version-');
+    try {
+        const loaded = join(directory, 'module-loaded');
+        const launched = join(directory, 'unexpected-launch');
+        const output = join(directory, 'receipt.json');
+        await writeFile(join(directory, 'package.json'),
+            JSON.stringify({ name, version, main: 'index.cjs' }), { flag: 'wx', mode: 0o600 });
+        // Evaluate the ACTUAL ingress guard, then stop before any browser launch.
+        // This fake package has no Playwright dependency and cannot launch Chromium.
+        await writeFile(join(directory, 'index.cjs'), `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(loaded)}, 'loaded', { flag: 'wx' });
+module.exports = { chromium: {
+    executablePath() { throw new Error('fixture stops before browser launch'); },
+    launch() { fs.writeFileSync(${JSON.stringify(launched)}, 'unexpected', { flag: 'wx' });
+        throw new Error('fixture must not launch'); }
+} };
+`, { flag: 'wx', mode: 0o600 });
+        const result = spawnSync(process.execPath,
+            [fileURLToPath(new URL('./ingress-dast.mjs', import.meta.url))], {
+                env: { PLINTH_DAST_RESULT_FILE: output,
+                    PLINTH_DAST_ORIGIN: 'https://plinth.test:8443',
+                    PLINTH_DAST_PROXY: 'http://127.0.0.1:8080',
+                    PLINTH_DAST_USERNAME: 'issue36-admin',
+                    PLINTH_DAST_PASSWORD: 'fake-version-fixture-password',
+                    PLINTH_PLAYWRIGHT_MODULE_PATH: directory },
+                timeout: 5000, maxBuffer: 65536, encoding: 'utf8',
+            });
+        assert.equal(result.error, undefined);
+        assert.equal(result.signal, null);
+        assert.equal(result.status, 1); // Deliberate fixture stop, never a completed journey.
+        assert.equal(result.stdout, '');
+        assert.equal(result.stderr, 'CASE INGRESS_BROWSER failed; private triage required\n');
+        const optionalRead = async path => {
+            try { return await readFile(path, 'utf8'); }
+            catch (error) { if (error.code === 'ENOENT') return null; throw error; }
+        };
+        assert.equal(await optionalRead(launched), null);
+        const receipt = JSON.parse(await readFile(output, 'utf8'));
+        assert.equal(receipt.completed, false);
+        assert.deepEqual(receipt.controls, { BROWSER_AUTH: false, WS_UPGRADE: false });
+        assert.deepEqual(receipt.cleanup, { contextClosed: false, browserClosed: false });
+        return { receipt, loaded: await optionalRead(loaded) };
+    } finally {
+        await rm(directory, { recursive: true, force: true });
+    }
+}
+
+test('ingress journey admits pinned Playwright 1.64.1 before browser launch', async () => {
+    const observed = await ingressVersionFixture('1.64.1');
+    assert.equal(observed.receipt.stage, 'BROWSER_START');
+    assert.equal(observed.loaded, 'loaded');
+});
+
+test('both ingress gates reject prior, future and malformed Playwright versions before launch', async () => {
+    for (const version of ['1.62.0', '1.63.0', '1.64.0', '1.64.2', '1.65.0',
+        '1.64', 'v1.64.1', '1.64.1-beta.0', '1.64.1\n', ' 1.64.1', '', null, 1641, undefined]) {
+        const f = fixture();
+        f.context.playwrightVersion = version;
+        await assert.rejects(prepare(f.context, f.io));
+        assert.deepEqual(f.observedProbes, []);
+        assert.deepEqual(f.commands, []);
+        assert.equal(f.files.has(f.identity.directory), false);
+        assert.equal(f.files.get(f.context.env.GITHUB_ENV).text, '');
+        const observed = await ingressVersionFixture(version);
+        assert.equal(observed.receipt.stage, 'CONFIG');
+        assert.equal(observed.loaded, null);
+    }
+    const wrongPackage = await ingressVersionFixture('1.64.1', 'playwright-core');
+    assert.equal(wrongPackage.receipt.stage, 'CONFIG');
+    assert.equal(wrongPackage.loaded, null);
+});
+
+test('browser package and lock retain the same exact version exercised by both ingress gates', async () => {
+    const manifest = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
+    const lock = JSON.parse(await readFile(new URL('./package-lock.json', import.meta.url), 'utf8'));
+    const pinned = '1.64.1';
+    assert.equal(manifest.devDependencies.playwright, pinned);
+    assert.equal(lock.packages[''].devDependencies.playwright, pinned);
+    assert.equal(lock.packages['node_modules/playwright'].version, pinned);
+    assert.equal(lock.packages['node_modules/playwright'].dependencies['playwright-core'], pinned);
+    assert.equal(lock.packages['node_modules/playwright-core'].version, pinned);
+});
 
 test('successful first sandbox probe needs no policy change and exact cleanup is idempotent', async () => {
     const f = fixture();
