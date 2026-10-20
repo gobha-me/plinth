@@ -66,10 +66,12 @@
 #include <expected>
 #include <json/value.h>
 #include <json/writer.h>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <quickjs.h>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <trantor/net/EventLoop.h>
@@ -220,10 +222,16 @@ auto bind_param(Binder& binder, const Json::Value& v) -> void {
     return;
   }
   if (v.isObject() && v.isMember("__bytea__")) {
-    // Tag-encoded bytea from the binding side; bind as raw bytes
-    // via Drogon's binary-data handling.
-    const auto& raw = v["__bytea__"].asString();
-    binder << raw; // Drogon will treat std::string as text/bytea
+    // Own binary bytes until the driver completes, including a nonnull
+    // pointer for an empty payload so it remains distinct from SQL NULL.
+    auto owner = std::make_shared<std::string>(v["__bytea__"].asString());
+    if (owner->size() >
+        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+      throw std::length_error("BYTEA parameter exceeds driver length range");
+    }
+    const auto* bytes = owner->c_str();
+    const auto length = static_cast<int>(owner->size());
+    binder << drogon::orm::RawParameter{std::move(owner), bytes, length, 1};
     return;
   }
   // Strings + fallback.

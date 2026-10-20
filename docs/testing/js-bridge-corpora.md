@@ -19,9 +19,10 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Capability (#150) | `plinth_tests_cap_corpus` | Call/batch admission, owned snapshots, real Promise.all composition with simulated host settlement and runtime ownership |
 | Ordinary database (#151) | `plinth_tests_db_admission_corpus` | Query/exec admission, parameter and client-manager snapshots, simulated host settlement and runtime ownership; no SQL execution |
 | Public database batch (#174, parent #90) | `plinth_tests_db_batch_corpus` | Public callback admission and installed batch orchestration with simulated host completion/reset; no SQL execution |
+| Native binary database parameters (parent #90) | `plinth_tests_native_bytea_query`, `plinth_tests_native_bytea_exec`, `plinth_tests_native_bytea_batch` | Real registered query/exec and installed batch dispatch, typed PostgreSQL bytes, durable storage, rollback and owned teardown |
 
 These are bounded slices, not comprehensive coverage claims. Broader direct
-internal transaction callback denial/coercion policy, real DB dispatch/driver/result conversion,
+internal transaction callback denial/coercion policy, broader DB dispatch/driver/result conversion,
 capability resolver/dispatch, broader extension
 module import, remaining conversion implementations and broader async dispatch
 remain separate requested targets. The separate JS/JSON implementations in
@@ -362,3 +363,55 @@ production cancellation or unbounded async behavior. Broader native dispatch,
 SQL/driver/result conversion, remaining conversion and SDK/HTTP obligations
 remain separate. Parent #90 stays open; no production policy, public API,
 asset/version, grant or release changes are made here.
+
+## Native PostgreSQL binary parameters
+
+Three separate strict gates exercise actual RuntimePool-injected `db.query`,
+`db.exec` and installed `db.batch` through `run_on_context` and the pinned native
+driver. Twelve fixed inputs are each attempted in two fresh pool epochs on
+every route: 72 primary observations, plus two separate rollback controls.
+Inputs distinguish empty from SQL NULL, ASCII, leading/interior NUL, high bytes,
+single backslash, bytea-hex/octal-looking text, nonempty/empty offset views and
+all 256 byte values. Independent literal hex, byte-array, length and null/type
+expectations are not generated from the production binder or observed output.
+Offset-view backing buffers are mutated after enqueue but before await; the
+observed SQL bytes must still equal the original snapshot, without sentinels.
+
+Each primary query checks SQL hex, octet length, nullness and complete returned
+Uint8Array bytes. Exec and batch insert into a fixture-owned table with
+`silent:true`, check affected rows and read actual stored data through the
+registered query path. Batch also observes the row inside its real transaction;
+after commit, an independent libpq connection checks durable values. Two
+user-throw rollbacks require their literal marker, the complete inside-byte
+observation, successful subsequent recovery and independent durable row absence.
+No mock callback, copied orchestrator or simulated driver result is used here.
+
+Every execution requires actual native/audit drain, retired execution lifetime,
+empty queues/callbacks/batch ownership and zero detached/native work before its
+context is destroyed. Each of six pool owners requires bounded successful and
+idempotent shutdown. The fixture resets schemas only in a task-owned disposable
+database; native/audit barriers precede table removal. This is real DDL/storage
+coverage, not a mutation-free or realtime-delivery test.
+
+Clean observations must pass before test-only corruption controls are applied.
+The complete suite requires 932 controls: query268, exec316 and batch348.
+These reject eight result corruptions per primary observation (including
+Uint8Array identity and empty/NULL substitution), cleanup/count corruption,
+durable/affected/inside mismatches, wrong rollback data and missing/duplicated
+ledger cells or replay epochs. An early failed baseline does not receive credit
+for later controls it never executed. Full two-epoch coverage and all counters
+are required; dropping rows cannot turn a failing corpus into a passing one.
+
+Each exact named case requires PG availability, fresh positive XML, zero
+failures/skips and a successful process exit after teardown. All three gates
+use the PG schema lock and `needs_pg`; the inner/outer bounds are 60/75 seconds.
+Both ASan/UBSan lanes and TSan explicitly discover exactly three and execute
+them verbosely, without removing prior selections. Ordinary full suites retain
+the real cases as well. Wiring alone is not actual sanitizer or CI evidence.
+
+This finite binary-parameter slice does not cover all SQLSTATE/result types,
+arbitrary coercions, allocator failure, the driver's maximum int-sized payload,
+untyped parameter inference, other database backends, production cancellation
+under every interleaving or complete #90 coverage. Ordinary TEXT/NUL admission
+and existing native ownership/setup/lifecycle regressions remain separate
+required gates. No new public method, permission, quota or release is introduced.
