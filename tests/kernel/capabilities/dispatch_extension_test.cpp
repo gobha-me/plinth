@@ -38,7 +38,9 @@
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <initializer_list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -401,6 +403,336 @@ auto check_module_error(const ModuleDispatchObservation& observed,
   }
 }
 
+// These regressions isolate two real reverse-conversion entry points. The JS
+// observer returns ASCII-key metadata only; it never echoes the problematic
+// object through the forward converter to manufacture an expected round trip.
+constexpr std::string_view REVERSE_NAME_OBSERVER = R"(
+  function observeNames(value) {
+    const own = (object, name) =>
+      Object.prototype.hasOwnProperty.call(object, name);
+    const units = name => Array.from({length:name.length},
+      (_, index) => name.charCodeAt(index));
+    const snapshot = (object, names) => {
+      const actual = Object.getOwnPropertyNames(object).sort();
+      return {count:actual.length, names:actual.map(units),
+        members:names.map(name => {
+          const owned = own(object, name);
+          return {owned, kind:owned ? typeof object[name] : 'missing',
+            value:owned ? object[name] : null};
+        })};
+    };
+    globalThis.reverse_name_visits = (globalThis.reverse_name_visits || 0) + 1;
+    return {entered:true, visits:globalThis.reverse_name_visits,
+      ordinary:{plainOwn:own(value, 'plain'), plain:value.plain,
+        numberOwn:own(value, '7'), number:value['7'],
+        unicodeOwn:own(value, '\u00e9'), unicode:value['\u00e9'],
+        prefixOwn:own(value, 'p'), prefix:value.p,
+        prototypeOwn:own(value, '__proto__'),
+        prototypeOrdinary:Object.getPrototypeOf(value) === Object.prototype,
+        prototypeMarker:Object.getPrototypeOf(value).prototypeMarker,
+        prototypeParentOrdinary:
+          Object.getPrototypeOf(Object.getPrototypeOf(value)) === Object.prototype},
+      root:snapshot(value, ['', '\0', 'plain', '7', '\u00e9', 'p',
+        'p\0suffix', 'p\0', '\0lead', 'm\0n\0z', '\u00e9\0\u03a9',
+        'q'.repeat(64) + '\0tail']),
+      nested:snapshot(value.nested, ['n', 'n\0x', '', '\0']),
+      items:[snapshot(value.items[0], ['a', 'a\0']),
+             snapshot(value.items[1], ['\u00e9', '\u00e9\0x'])]};
+  }
+)";
+
+auto reverse_name_payload(bool full, bool prototype_object) -> Json::Value {
+  Json::Value value{Json::objectValue};
+  value["plain"] = 103;
+  value["7"] = 104;
+  value["\xC3\xA9"] = 105;
+  value["p"] = 201;
+  // End-state controls for ordinary setter semantics, not DefineProperty or
+  // null-prototype policy. Registry input uses a primitive; native settlement
+  // uses an object. The primitive's unchanged prototype is not proof that its
+  // setter executed. Neither input mutates Object.prototype itself.
+  if (prototype_object) {
+    value["__proto__"]["prototypeMarker"] = 901;
+  } else {
+    value["__proto__"] = 901;
+  }
+  value["nested"]["n"] = 301;
+  value["items"] = Json::Value{Json::arrayValue};
+  Json::Value first{Json::objectValue};
+  first["a"] = 401;
+  Json::Value second{Json::objectValue};
+  second["\xC3\xA9"] = 403;
+  if (full) {
+    value[""] = 101;
+    value[std::string{"\0", 1}] = 102;
+    value[std::string{"p\0suffix", 8}] = 202;
+    value[std::string{"p\0", 2}] = 203;
+    value[std::string{"\0lead", 5}] = 204;
+    value[std::string{"m\0n\0z", 5}] = 205;
+    value[std::string{"\xC3\xA9\0\xCE\xA9", 5}] = 206;
+    value[std::string(64, 'q') + std::string{"\0tail", 5}] = 207;
+    value["nested"][std::string{"n\0x", 3}] = 302;
+    value["nested"][""] = 303;
+    value["nested"][std::string{"\0", 1}] = 304;
+    first[std::string{"a\0", 2}] = 402;
+    second[std::string{"\xC3\xA9\0x", 4}] = 404;
+  }
+  value["items"].append(first);
+  value["items"].append(second);
+  return value;
+}
+
+auto literal_name_units(std::initializer_list<std::initializer_list<int>> names)
+    -> Json::Value {
+  Json::Value result{Json::arrayValue};
+  for (const auto& name : names) {
+    Json::Value units{Json::arrayValue};
+    for (const int unit : name) {
+      units.append(unit);
+    }
+    result.append(units);
+  }
+  return result;
+}
+
+auto literal_name_snapshot(const Json::Value& names, int count,
+                           std::initializer_list<std::optional<int>> values)
+    -> Json::Value {
+  Json::Value result{Json::objectValue};
+  result["count"] = count;
+  result["names"] = names;
+  result["members"] = Json::Value{Json::arrayValue};
+  for (const auto value : values) {
+    Json::Value member{Json::objectValue};
+    member["owned"] = value.has_value();
+    member["kind"] = value.has_value() ? "number" : "missing";
+    member["value"] = value.has_value() ? Json::Value{*value} : Json::Value{};
+    result["members"].append(member);
+  }
+  return result;
+}
+
+auto reverse_name_expected(bool full, bool prototype_object) -> Json::Value {
+  // UTF-16 units and values below are literal oracles, independent of the
+  // payload's UTF-8 names and the production converters. Names use JS's
+  // lexicographic order, including empty, NUL-only and prefix distinctions.
+  Json::Value expected{Json::objectValue};
+  expected["entered"] = true;
+  expected["visits"] = 1;
+  auto& ordinary = expected["ordinary"];
+  ordinary["plainOwn"] = true;
+  ordinary["plain"] = 103;
+  ordinary["numberOwn"] = true;
+  ordinary["number"] = 104;
+  ordinary["unicodeOwn"] = true;
+  ordinary["unicode"] = 105;
+  ordinary["prefixOwn"] = true;
+  ordinary["prefix"] = 201;
+  ordinary["prototypeOwn"] = false;
+  ordinary["prototypeOrdinary"] = !prototype_object;
+  ordinary["prototypeMarker"] =
+      prototype_object ? Json::Value{901} : Json::Value{};
+  ordinary["prototypeParentOrdinary"] = prototype_object;
+  expected["items"] = Json::Value{Json::arrayValue};
+  if (!full) {
+    expected["root"] = literal_name_snapshot(
+        literal_name_units({{55},
+                            {105, 116, 101, 109, 115},
+                            {110, 101, 115, 116, 101, 100},
+                            {112},
+                            {112, 108, 97, 105, 110},
+                            {233}}),
+        6,
+        {std::nullopt, std::nullopt, 103, 104, 105, 201, std::nullopt,
+         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt});
+    expected["nested"] =
+        literal_name_snapshot(literal_name_units({{110}}), 1,
+                              {301, std::nullopt, std::nullopt, std::nullopt});
+    expected["items"].append(literal_name_snapshot(literal_name_units({{97}}),
+                                                   1, {401, std::nullopt}));
+    expected["items"].append(literal_name_snapshot(literal_name_units({{233}}),
+                                                   1, {403, std::nullopt}));
+    return expected;
+  }
+  auto names = literal_name_units({{},
+                                   {0},
+                                   {0, 108, 101, 97, 100},
+                                   {55},
+                                   {105, 116, 101, 109, 115},
+                                   {109, 0, 110, 0, 122},
+                                   {110, 101, 115, 116, 101, 100},
+                                   {112},
+                                   {112, 0},
+                                   {112, 0, 115, 117, 102, 102, 105, 120},
+                                   {112, 108, 97, 105, 110}});
+  Json::Value long_units{Json::arrayValue};
+  for (int index = 0; index < 64; ++index) {
+    long_units.append(113);
+  }
+  for (const int unit : {0, 116, 97, 105, 108}) {
+    long_units.append(unit);
+  }
+  names.append(long_units);
+  names.append(literal_name_units({{233}})[0]);
+  names.append(literal_name_units({{233, 0, 937}})[0]);
+  expected["root"] = literal_name_snapshot(
+      names, 14, {101, 102, 103, 104, 105, 201, 202, 203, 204, 205, 206, 207});
+  expected["nested"] =
+      literal_name_snapshot(literal_name_units({{}, {0}, {110}, {110, 0, 120}}),
+                            4, {301, 302, 303, 304});
+  expected["items"].append(literal_name_snapshot(
+      literal_name_units({{97}, {97, 0}}), 2, {401, 402}));
+  expected["items"].append(literal_name_snapshot(
+      literal_name_units({{233}, {233, 0, 120}}), 2, {403, 404}));
+  return expected;
+}
+
+auto check_reverse_name_snapshot(const Json::Value& actual,
+                                 const Json::Value& expected,
+                                 std::string_view location) -> void {
+  INFO("member-name location=" << location);
+  REQUIRE(actual.isObject());
+  CHECK(actual.size() == 3);
+  CHECK(actual["count"] == expected["count"]);
+  // Complete unit arrays encode exact length, byte-independent names and
+  // membership; no substring or either-spelling acceptance is used.
+  CHECK(actual["names"] == expected["names"]);
+  REQUIRE(actual["members"].isArray());
+  CHECK(actual["members"].size() == expected["members"].size());
+  for (Json::ArrayIndex index = 0; index < expected["members"].size();
+       ++index) {
+    INFO("literal member index=" << index);
+    CHECK(actual["members"][index] == expected["members"][index]);
+  }
+}
+
+struct ReverseNativeEntries {
+  std::atomic<int> ordinary{0};
+  std::atomic<int> full{0};
+  std::atomic<int> invalid{0};
+};
+
+auto check_reverse_name_entrypoint(bool promise_settlement) -> void {
+  const auto deadline = std::chrono::steady_clock::now() + 60s;
+  for (int replay = 0; replay < 2; ++replay) {
+    INFO("reverse-name path=" << (promise_settlement ? "cap.call" : "arguments")
+                              << " fresh replay=" << replay);
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    ExtScratch scratch;
+    auto native = std::make_shared<ReverseNativeEntries>();
+    if (promise_settlement) {
+      plinth::capabilities::register_tier1_handler(
+          "kernel:1:reverse_properties", "kernel.admin",
+          [native](const Json::Value& args,
+                   const plinth::capabilities::UserContext& user,
+                   int depth) -> plinth::capabilities::HandlerOutcome {
+            if (!args.isObject() || args.size() != 1 ||
+                !args["mode"].isString() ||
+                user.user_id != "11111111-1111-1111-1111-111111111111" ||
+                user.username != "tester" || depth != 2) {
+              native->invalid.fetch_add(1, std::memory_order_relaxed);
+              return std::unexpected(
+                  plinth::capabilities::CapabilityError::INVALID_CAPABILITY);
+            }
+            const auto mode = args["mode"].asString();
+            if (mode == "ordinary") {
+              native->ordinary.fetch_add(1, std::memory_order_relaxed);
+              return reverse_name_payload(false, true);
+            }
+            if (mode == "full") {
+              native->full.fetch_add(1, std::memory_order_relaxed);
+              return reverse_name_payload(true, true);
+            }
+            native->invalid.fetch_add(1, std::memory_order_relaxed);
+            return std::unexpected(
+                plinth::capabilities::CapabilityError::INVALID_CAPABILITY);
+          });
+    }
+    const auto source =
+        std::string{REVERSE_NAME_OBSERVER} +
+        (promise_settlement
+             ? "export default async function(args) { const value = await "
+               "cap.call('kernel:1:reverse_properties', {mode:args.mode}); "
+               "return observeNames(value); }"
+             : "export default function(args) { return observeNames(args); }");
+    REQUIRE(source.size() <= 4096);
+    scratch.stage_extension("reverseprops", {{"inspect", source}});
+    seed_tier2("reverseprops:1:inspect", "reverseprops");
+    REQUIRE(plinth::extensions::create_pool("reverseprops"));
+    REQUIRE(plinth::extensions::has_pool("reverseprops"));
+    ModuleEngineWatch engines{"reverseprops/inspect", ""};
+    Json::Value ordinary_args = reverse_name_payload(false, false);
+    Json::Value full_args = reverse_name_payload(true, false);
+    if (promise_settlement) {
+      // Only clean ASCII mode arguments cross registry injection. The native
+      // literal payload reaches JS solely through actual owned cap.call
+      // delivery.
+      ordinary_args = Json::Value{Json::objectValue};
+      ordinary_args["mode"] = "ordinary";
+      full_args = Json::Value{Json::objectValue};
+      full_args["mode"] = "full";
+    }
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    const auto ordinary = run_resolver("reverseprops:1:inspect", ordinary_args);
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    const auto full = run_resolver("reverseprops:1:inspect", full_args);
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+
+    // Finish real ownership cleanup before the intentionally red member-name
+    // assertions. ExtScratch remains an unwinding fallback on earlier failures.
+    plinth::extensions::destroy_pool("reverseprops");
+    REQUIRE_FALSE(plinth::extensions::has_pool("reverseprops"));
+    REQUIRE(plinth::extensions::shutdown_registry(5s));
+    REQUIRE(plinth::extensions::inflight_dispatch_count_for_test() == 0);
+    REQUIRE(plinth::extensions::failed_pool_count_for_test() == 0);
+    REQUIRE(plinth::extensions::pending_pool_constructions_for_test() == 0);
+    REQUIRE(plinth::extensions::shutdown_registry(0ms));
+    REQUIRE(engines.counts().compiled == 2);
+    REQUIRE(engines.counts().evaluated == 2);
+    if (promise_settlement) {
+      REQUIRE(native->ordinary.load(std::memory_order_relaxed) == 1);
+      REQUIRE(native->full.load(std::memory_order_relaxed) == 1);
+      REQUIRE(native->invalid.load(std::memory_order_relaxed) == 0);
+    }
+    REQUIRE(ordinary.has_value());
+    REQUIRE(full.has_value());
+    CHECK(ordinary->resolved_tier == "tier2");
+    CHECK(ordinary->provider_type == "extension");
+    CHECK(full->resolved_tier == "tier2");
+    CHECK(full->provider_type == "extension");
+
+    const auto expected_ordinary =
+        reverse_name_expected(false, promise_settlement);
+    REQUIRE(ordinary->data == expected_ordinary);
+    // Causal controls mutate actual validated ordinary-path observations, not
+    // expected fixtures. Distinct prefix and member values must be detected.
+    auto wrong_prefix = ordinary->data;
+    wrong_prefix["ordinary"]["prefix"] = 202;
+    CHECK_FALSE(wrong_prefix == expected_ordinary);
+    auto wrong_member = ordinary->data;
+    wrong_member["root"]["members"][5]["value"] = 999;
+    CHECK_FALSE(wrong_member == expected_ordinary);
+
+    const auto expected_full = reverse_name_expected(true, promise_settlement);
+    REQUIRE(full->data.isObject());
+    CHECK(full->data.size() == 6);
+    CHECK(full->data["entered"] == expected_full["entered"]);
+    CHECK(full->data["visits"] == expected_full["visits"]);
+    CHECK(full->data["ordinary"] == expected_full["ordinary"]);
+    check_reverse_name_snapshot(full->data["root"], expected_full["root"],
+                                "root");
+    check_reverse_name_snapshot(full->data["nested"], expected_full["nested"],
+                                "nested");
+    REQUIRE(full->data["items"].isArray());
+    CHECK(full->data["items"].size() == 2);
+    check_reverse_name_snapshot(full->data["items"][0],
+                                expected_full["items"][0], "items[0]");
+    check_reverse_name_snapshot(full->data["items"][1],
+                                expected_full["items"][1], "items[1]");
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+  }
+}
+
 } // namespace
 
 // Sentinel for ordinary cases when PG isn't available. The strict module gate
@@ -418,6 +750,18 @@ auto check_module_error(const ModuleDispatchObservation& observed,
       SKIP("PG not available");                                                \
     }                                                                          \
   } while (false)
+
+TEST_CASE("Extension argument injection preserves JSON member names",
+          "[cap][ext][integration][argument-property-names]") {
+  REQUIRE(pg_available());
+  check_reverse_name_entrypoint(false);
+}
+
+TEST_CASE("Capability promise settlement preserves JSON member names",
+          "[cap][ext][integration][promise-property-names]") {
+  REQUIRE(pg_available());
+  check_reverse_name_entrypoint(true);
+}
 
 TEST_CASE("Extension module loading enforces the original source gate",
           "[cap][ext][integration][module-source-gate]") {
