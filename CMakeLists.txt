@@ -1363,6 +1363,26 @@ add_test(NAME plinth_tests_db_batch_corpus
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_db_batch_corpus PROPERTIES TIMEOUT 75)
 
+# Real PostgreSQL binary parameters, independently required for each public
+# route. Missing PG, a skipped case or failed native teardown must fail closed.
+function(add_plinth_native_bytea_case name selector)
+  add_test(NAME plinth_tests_native_bytea_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}"
+      --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_native_bytea_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+endfunction()
+add_plinth_native_bytea_case(query
+  "Native database queries preserve binary parameter bytes")
+add_plinth_native_bytea_case(exec
+  "Native database exec preserves stored binary parameter bytes")
+add_plinth_native_bytea_case(batch
+  "Native database batches preserve stored binary parameter bytes")
+
 # Exercise the actual registered module loader and original host bytes. A
 # missing database, skipped case or failed teardown cannot satisfy this gate.
 add_test(NAME plinth_tests_module_source_gate

@@ -33,19 +33,25 @@
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/capabilities/types.hpp"
 #include "kernel/config.hpp"
+#include "kernel/db/connection_info.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
 #include "kernel/js/stdlib/db_result_to_json.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
 #include <drogon/utils/coroutine.h>
 #include <json/value.h>
+#include <libpq-fe.h>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using plinth::async_bridge_test::ensure_drogon_running;
@@ -100,7 +106,626 @@ auto make_pool() -> RuntimePool {
   return {/*ext=*/nullptr, default_runtime_limits(), cfg, 1};
 }
 
+enum class ByteaRoute { QUERY, EXEC, BATCH };
+
+struct ByteaInput {
+  std::string_view name;
+  std::string_view setup;
+  std::string_view hex;
+  int length;
+  bool nil;
+  std::vector<int> bytes;
+};
+
+auto bytea_inputs() -> std::array<ByteaInput, 12> {
+  // Input programs and literal byte/hex oracles are separate. In particular,
+  // the all-byte expectation is not computed from its JS loop or SQL output.
+  return {
+      {{"empty", "const parameter=new Uint8Array([]);", "", 0, false, {}},
+       {"ASCII",
+        "const parameter=new Uint8Array([65,66,67]);",
+        "414243",
+        3,
+        false,
+        {65, 66, 67}},
+       {"NUL-suffix",
+        "const parameter=new Uint8Array([65,0,66]);",
+        "410042",
+        3,
+        false,
+        {65, 0, 66}},
+       {"leading-NUL",
+        "const parameter=new Uint8Array([0,65]);",
+        "0041",
+        2,
+        false,
+        {0, 65}},
+       {"high-bytes",
+        "const parameter=new Uint8Array([128,255]);",
+        "80ff",
+        2,
+        false,
+        {128, 255}},
+       {"backslash",
+        "const parameter=new Uint8Array([92]);",
+        "5c",
+        1,
+        false,
+        {92}},
+       {"hex-looking",
+        "const parameter=new Uint8Array([92,120,52,49]);",
+        "5c783431",
+        4,
+        false,
+        {92, 120, 52, 49}},
+       {"octal-looking",
+        "const parameter=new Uint8Array([92,49,48,49]);",
+        "5c313031",
+        4,
+        false,
+        {92, 49, 48, 49}},
+       {"offset-view",
+        "const backing=new Uint8Array([238,65,0,66,221]);"
+        "const parameter=backing.subarray(1,4);"
+        "mutate=()=>backing.fill(199);",
+        "410042",
+        3,
+        false,
+        {65, 0, 66}},
+       {"empty-offset-view",
+        "const backing=new Uint8Array([238,221]);"
+        "const parameter=new Uint8Array(backing.buffer,1,0);"
+        "mutate=()=>backing.fill(199);",
+        "",
+        0,
+        false,
+        {}},
+       {"all256",
+        "const parameter=new Uint8Array(256);"
+        "for(let index=0;index<256;++index)parameter[index]=index;",
+        "000102030405060708090a0b0c0d0e0f"
+        "101112131415161718191a1b1c1d1e1f"
+        "202122232425262728292a2b2c2d2e2f"
+        "303132333435363738393a3b3c3d3e3f"
+        "404142434445464748494a4b4c4d4e4f"
+        "505152535455565758595a5b5c5d5e5f"
+        "606162636465666768696a6b6c6d6e6f"
+        "707172737475767778797a7b7c7d7e7f"
+        "808182838485868788898a8b8c8d8e8f"
+        "909192939495969798999a9b9c9d9e9f"
+        "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+        "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+        "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+        "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+        "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+        "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff",
+        256,
+        false,
+        {0,   1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,
+         14,  15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,
+         28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,
+         42,  43,  44,  45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,
+         56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,
+         70,  71,  72,  73,  74,  75,  76,  77,  78,  79,  80,  81,  82,  83,
+         84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,
+         98,  99,  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+         112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+         126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+         140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153,
+         154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167,
+         168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181,
+         182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195,
+         196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
+         210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223,
+         224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+         238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251,
+         252, 253, 254, 255}},
+       {"SQL-NULL", "const parameter=null;", "", 0, true, {}}}};
+}
+
+auto bytea_typed_equal(const Json::Value& actual, const Json::Value& expected)
+    -> bool {
+  if (actual.type() != expected.type()) {
+    return false;
+  }
+  if (expected.isObject()) {
+    if (actual.getMemberNames() != expected.getMemberNames()) {
+      return false;
+    }
+    for (const auto& name : expected.getMemberNames()) {
+      if (!bytea_typed_equal(actual[name], expected[name])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  if (expected.isArray()) {
+    if (actual.size() != expected.size()) {
+      return false;
+    }
+    for (Json::ArrayIndex index = 0; index < expected.size(); ++index) {
+      if (!bytea_typed_equal(actual[index], expected[index])) {
+        return false;
+      }
+    }
+    return true;
+  }
+  return actual == expected;
+}
+
+auto bytea_snapshot_expected(const ByteaInput& input) -> Json::Value {
+  Json::Value value{Json::objectValue};
+  value["keys"] = Json::Value{Json::arrayValue};
+  for (const auto* name : {"row_count", "rows"}) {
+    value["keys"].append(name);
+  }
+  value["row_count"] = 1;
+  value["rows"] = 1;
+  value["columns"] = Json::Value{Json::arrayValue};
+  for (const auto* name : {"hex", "n", "nil", "payload"}) {
+    value["columns"].append(name);
+  }
+  value["hex"] =
+      input.nil ? Json::Value{} : Json::Value{std::string{input.hex}};
+  value["n"] = input.nil ? Json::Value{} : Json::Value{input.length};
+  value["nil"] = input.nil;
+  value["bytesNull"] = input.nil;
+  value["isU8"] = !input.nil;
+  value["length"] = input.nil ? Json::Value{} : Json::Value{input.length};
+  value["bytes"] = input.nil ? Json::Value{} : Json::Value{Json::arrayValue};
+  if (!input.nil) {
+    for (const int byte : input.bytes) {
+      value["bytes"].append(byte);
+    }
+  }
+  return value;
+}
+
+constexpr std::string_view BYTEA_OBSERVER = R"JS(
+  function snapshot(result) {
+    const row=result.rows[0], bytes=row.payload;
+    return {keys:Object.keys(result).sort(),row_count:result.row_count,
+      rows:result.rows.length,columns:Object.keys(row).sort(),hex:row.hex,
+      n:row.n,nil:row.nil,bytesNull:bytes===null,isU8:bytes instanceof Uint8Array,
+      length:bytes===null?null:bytes.length,
+      bytes:bytes===null?null:Array.from(bytes)};
+  }
+)JS";
+
+struct ByteaCleanup {
+  bool retired;
+  bool queues_empty;
+  bool callbacks_empty;
+  int concurrent;
+  int detached;
+  bool batch_empty;
+  bool drained;
+  bool audits_drained;
+  std::size_t native_active;
+};
+
+auto bytea_cleanup_matches(const ByteaCleanup& actual) -> bool {
+  return actual.retired && actual.queues_empty && actual.callbacks_empty &&
+         actual.concurrent == 0 && actual.detached == 0 && actual.batch_empty &&
+         actual.drained && actual.audits_drained && actual.native_active == 0;
+}
+
+struct ByteaExecution {
+  EvalResult result;
+  ByteaCleanup cleanup;
+};
+
+auto bytea_drive(RuntimePool& pool, const std::string& source)
+    -> ByteaExecution {
+  REQUIRE(source.size() <= 8192);
+  const auto destroy = [&pool](BridgeContext* context) {
+    pool.destroy(context);
+  };
+  std::unique_ptr<BridgeContext, decltype(destroy)> context{pool.acquire(),
+                                                            destroy};
+  REQUIRE(context != nullptr);
+  auto result = drogon::sync_wait(run_on_context(*context, source));
+  ByteaCleanup cleanup{
+      .retired = !context->execution_lifetime.load(std::memory_order_acquire),
+      .queues_empty =
+          context->pending_ops.empty() && context->retired_pending_ops.empty(),
+      .callbacks_empty =
+          context->callbacks.empty() && context->persistent_callbacks.empty(),
+      .concurrent = context->concurrent_async_ops,
+      .detached = context->inflight_detached.load(std::memory_order_acquire),
+      .batch_empty = context->batch_state.depth == 0 &&
+                     context->batch_state.scope_id == 0 &&
+                     !context->batch_state.pinned_conn &&
+                     !context->batch_state.rollback_owner &&
+                     context->batch_state.timer_id == trantor::InvalidTimerId &&
+                     context->batch_state.timer_loop == nullptr,
+      .drained =
+          plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}),
+      .audits_drained = plinth::log::wait_for_audits(std::chrono::seconds{5}),
+      .native_active = plinth::lifecycle::async_tasks().active_for_test()};
+  // Everything returned is independently owned C++ data. The context is gone
+  // before byte-oracle assertions can abort the caller's current row.
+  context.reset();
+  return {.result = std::move(result), .cleanup = cleanup};
+}
+
+class ByteaStoredRows {
+ public:
+  explicit ByteaStoredRows(const plinth::Config::Database& cfg) {
+    const auto info = plinth::db::connection_info(cfg) + " connect_timeout=3";
+    connection.reset(PQconnectdb(info.c_str()));
+    REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+    exec("SET statement_timeout='3000ms'");
+    exec("CREATE TABLE plinth.native_bytea_regression "
+         "(id integer PRIMARY KEY,payload bytea)");
+  }
+  ~ByteaStoredRows() {
+    // Failure cleanup never drops a table still reachable by owned work.
+    if (!removed &&
+        plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}) &&
+        plinth::log::wait_for_audits(std::chrono::seconds{5})) {
+      std::unique_ptr<PGresult, decltype(&PQclear)> result{
+          PQexec(connection.get(), "DROP TABLE plinth.native_bytea_regression"),
+          PQclear};
+    }
+  }
+  ByteaStoredRows(const ByteaStoredRows&) = delete;
+  auto operator=(const ByteaStoredRows&) -> ByteaStoredRows& = delete;
+
+  auto observe(int id) -> Json::Value {
+    const auto text = std::to_string(id);
+    const std::array<const char*, 1> params{text.c_str()};
+    std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexecParams(connection.get(),
+                     "SELECT encode(payload,'hex'),octet_length(payload),"
+                     "payload IS NULL FROM plinth.native_bytea_regression "
+                     "WHERE id=$1::int4",
+                     1, nullptr, params.data(), nullptr, nullptr, 0),
+        PQclear};
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQnfields(result.get()) == 3);
+    Json::Value value{Json::objectValue};
+    value["rows"] = PQntuples(result.get());
+    if (PQntuples(result.get()) == 1) {
+      value["hex"] = PQgetisnull(result.get(), 0, 0)
+                         ? Json::Value{}
+                         : Json::Value{PQgetvalue(result.get(), 0, 0)};
+      value["n"] = PQgetisnull(result.get(), 0, 1)
+                       ? Json::Value{}
+                       : Json::Value{std::stoi(PQgetvalue(result.get(), 0, 1))};
+      value["nil"] = std::string{PQgetvalue(result.get(), 0, 2)};
+    }
+    return value;
+  }
+  auto remove() -> void {
+    REQUIRE(plinth::lifecycle::async_tasks().drain(std::chrono::seconds{5}));
+    REQUIRE(plinth::log::wait_for_audits(std::chrono::seconds{5}));
+    exec("DROP TABLE plinth.native_bytea_regression");
+    removed = true;
+  }
+
+ private:
+  auto exec(const char* sql) -> void {
+    std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexec(connection.get(), sql), PQclear};
+    REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+  }
+  std::unique_ptr<PGconn, decltype(&PQfinish)> connection{nullptr, PQfinish};
+  bool removed = false;
+};
+
+auto bytea_stored_expected(const ByteaInput& input) -> Json::Value {
+  Json::Value expected{Json::objectValue};
+  expected["rows"] = 1;
+  expected["hex"] =
+      input.nil ? Json::Value{} : Json::Value{std::string{input.hex}};
+  expected["n"] = input.nil ? Json::Value{} : Json::Value{input.length};
+  expected["nil"] = input.nil ? "t" : "f";
+  return expected;
+}
+
+auto bytea_program(ByteaRoute route, const ByteaInput& input, int id,
+                   bool rollback = false) -> std::string {
+  const auto key = std::to_string(id);
+  std::string source = "(async()=>{let mutate=()=>{};" +
+                       std::string{input.setup} + std::string{BYTEA_OBSERVER};
+  source += "let observed;try{";
+  constexpr std::string_view PROJECTION =
+      "SELECT payload,encode(payload,'hex') AS hex,"
+      "octet_length(payload) AS n,payload IS NULL AS nil ";
+  const auto readback = std::string{PROJECTION} +
+                        "FROM plinth.native_bytea_regression WHERE id=" + key;
+  REQUIRE(readback.size() <= 2048);
+  if (route == ByteaRoute::QUERY) {
+    source += "const pending=db.query(\"" + std::string{PROJECTION} +
+              "FROM (SELECT $1::bytea AS payload) AS source\",[parameter]);"
+              "mutate();const result=await pending;"
+              "observed={status:'fulfilled',value:snapshot(result),"
+              "affected:null,inside:null};";
+  } else {
+    if (route == ByteaRoute::BATCH) {
+      source += "const body=await db.batch(async()=>{";
+    }
+    source += "const pending=db.exec(\"INSERT INTO "
+              "plinth.native_bytea_regression(id,payload) VALUES(" +
+              key +
+              ",$1::bytea)\",[parameter],{silent:true});"
+              "mutate();const affected=await pending;";
+    if (route == ByteaRoute::BATCH) {
+      source += "const inside=snapshot(await db.query(\"" + readback + "\"));";
+      if (rollback) {
+        source += "throw {marker:'bytea-rollback-control',inside};";
+      } else {
+        source += "return {affected,inside};";
+      }
+      source += "});const affected=body.affected,inside=body.inside;";
+    } else {
+      source += "const inside=null;";
+    }
+    source += "const result=await db.query(\"" + readback +
+              "\");observed={status:'fulfilled',value:snapshot(result),"
+              "affected,inside};";
+  }
+  source += "}catch(error){observed={status:'rejected',code:error.code??null,"
+            "message:error.message??null,marker:error.marker??null,"
+            "inside:error.inside??null};}"
+            "observed.recovery=await db.query('SELECT 1::int4 AS one');"
+            "return observed;})()";
+  return source;
+}
+
+auto bytea_expected(ByteaRoute route, const ByteaInput& input) -> Json::Value {
+  Json::Value expected{Json::objectValue};
+  expected["status"] = "fulfilled";
+  expected["value"] = bytea_snapshot_expected(input);
+  expected["affected"] = Json::Value{};
+  expected["inside"] = Json::Value{};
+  if (route != ByteaRoute::QUERY) {
+    expected["affected"]["row_count"] = 1;
+  }
+  if (route == ByteaRoute::BATCH) {
+    expected["inside"] = bytea_snapshot_expected(input);
+  }
+  expected["recovery"]["row_count"] = 1;
+  expected["recovery"]["rows"] = Json::Value{Json::arrayValue};
+  Json::Value row{Json::objectValue};
+  row["one"] = 1;
+  expected["recovery"]["rows"].append(row);
+  return expected;
+}
+
+using ByteaCoverage = std::array<std::array<int, 12>, 2>;
+auto bytea_coverage_complete(const ByteaCoverage& coverage) -> bool {
+  for (const auto& replay : coverage) {
+    for (const int count : replay) {
+      if (count != 1) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+auto check_native_bytea(ByteaRoute route) -> void {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds{60};
+  REQUIRE(pg_available());
+  ensure_drogon_with_db_running();
+  auto cfg = test_config();
+  reset_schema(cfg.db);
+  ByteaStoredRows stored{cfg.db};
+  const auto inputs = bytea_inputs();
+  ByteaCoverage coverage{};
+  int observations = 0;
+  int recoveries = 0;
+  int result_controls = 0;
+  int cleanup_controls = 0;
+  int durable_controls = 0;
+  int affected_controls = 0;
+  int inside_controls = 0;
+  int shutdowns = 0;
+  int shutdown_controls = 0;
+  int rollbacks = 0;
+  int rollback_controls = 0;
+
+  const auto check_cleanup = [&](const ByteaCleanup& actual) {
+    REQUIRE(bytea_cleanup_matches(actual));
+    auto corrupt = actual;
+    ++corrupt.detached;
+    REQUIRE_FALSE(bytea_cleanup_matches(corrupt));
+    ++cleanup_controls;
+  };
+  for (std::size_t replay = 0; replay < 2; ++replay) {
+    // Config and the pool remain live until every checked-out context and all
+    // native completion/audit owners have actually retired.
+    RuntimePool pool{nullptr, default_runtime_limits(), cfg, 1};
+    for (std::size_t entry = 0; entry < inputs.size(); ++entry) {
+      const auto& input = inputs[entry];
+      INFO("native BYTEA route=" << static_cast<int>(route)
+                                 << " replay=" << replay << " entry=" << entry
+                                 << " family=" << input.name);
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      const auto id = static_cast<int>(replay * 100 + entry);
+      const auto observed = bytea_drive(pool, bytea_program(route, input, id));
+      check_cleanup(observed.cleanup);
+      ++coverage[replay][entry];
+      ++observations;
+      REQUIRE(observed.result.value.has_value());
+      const auto& actual = *observed.result.value;
+      REQUIRE(actual.isObject());
+      INFO("actual BYTEA observation=" << actual.toStyledString());
+      const auto expected = bytea_expected(route, input);
+      const bool matched = bytea_typed_equal(actual, expected);
+      CHECK(matched);
+      CHECK(bytea_typed_equal(actual["recovery"], expected["recovery"]));
+      if (bytea_typed_equal(actual["recovery"], expected["recovery"])) {
+        ++recoveries;
+      }
+      if (route != ByteaRoute::QUERY) {
+        // This independent PG connection cannot see an uncommitted batch row.
+        // bytea_drive already drained real native and audit ownership.
+        const auto durable = stored.observe(id);
+        const auto expected_stored = bytea_stored_expected(input);
+        INFO("independent stored BYTEA=" << durable.toStyledString());
+        const bool stored_matched = bytea_typed_equal(durable, expected_stored);
+        CHECK(stored_matched);
+        if (stored_matched) {
+          auto corrupt = durable;
+          corrupt["rows"] = 0;
+          REQUIRE_FALSE(bytea_typed_equal(corrupt, expected_stored));
+          ++durable_controls;
+        }
+      }
+      // A failing baseline is recorded and counted, never silently omitted.
+      // Corruption controls require a passing unmodified actual observation.
+      if (matched) {
+        for (int mutation = 0; mutation < 8; ++mutation) {
+          auto corrupt = actual;
+          auto& value = corrupt["value"];
+          switch (mutation) {
+            case 0:
+              if (value["hex"].isNull()) {
+                value["hex"] = "";
+              } else if (value["hex"].asString().empty()) {
+                value["hex"] = Json::Value{};
+              } else {
+                auto hex = value["hex"].asString();
+                hex[0] = hex[0] == '0' ? '1' : '0';
+                value["hex"] = hex;
+              }
+              break;
+            case 1:
+              if (value["bytes"].isArray() && !value["bytes"].empty()) {
+                value["bytes"][0] = value["bytes"][0].asInt() ^ 1;
+              } else {
+                value["bytes"] = value["bytes"].isNull()
+                                     ? Json::Value{Json::arrayValue}
+                                     : Json::Value{};
+              }
+              break;
+            case 2: value["n"] = -1; break;
+            case 3: value["hex"] = false; break;
+            case 4: value["nil"] = !value["nil"].asBool(); break;
+            case 5: value.removeMember("hex"); break;
+            case 6: corrupt["status"] = "rejected"; break;
+            case 7: value["isU8"] = !value["isU8"].asBool(); break;
+          }
+          REQUIRE_FALSE(bytea_typed_equal(corrupt, expected));
+          ++result_controls;
+        }
+        if (route != ByteaRoute::QUERY) {
+          auto corrupt = actual;
+          corrupt["affected"]["row_count"] = 0;
+          REQUIRE_FALSE(bytea_typed_equal(corrupt, expected));
+          ++affected_controls;
+        }
+        if (route == ByteaRoute::BATCH) {
+          auto corrupt = actual;
+          corrupt["inside"]["row_count"] = 0;
+          REQUIRE_FALSE(bytea_typed_equal(corrupt, expected));
+          ++inside_controls;
+        }
+      }
+    }
+    if (route == ByteaRoute::BATCH) {
+      INFO("actual BYTEA rollback replay=" << replay);
+      REQUIRE(std::chrono::steady_clock::now() < deadline);
+      const auto id = static_cast<int>(replay * 100 + 99);
+      const auto observed =
+          bytea_drive(pool, bytea_program(route, inputs[10], id, true));
+      check_cleanup(observed.cleanup);
+      REQUIRE(observed.result.value.has_value());
+      const auto& actual = *observed.result.value;
+      INFO("actual BYTEA rollback=" << actual.toStyledString());
+      Json::Value expected{Json::objectValue};
+      expected["status"] = "rejected";
+      expected["code"] = Json::Value{};
+      expected["message"] = Json::Value{};
+      expected["marker"] = "bytea-rollback-control";
+      expected["inside"] = bytea_snapshot_expected(inputs[10]);
+      expected["recovery"] = bytea_expected(route, inputs[10])["recovery"];
+      Json::Value absent{Json::objectValue};
+      absent["rows"] = 0;
+      const auto durable = stored.observe(id);
+      const bool matched = bytea_typed_equal(actual, expected);
+      const bool absent_matched = bytea_typed_equal(durable, absent);
+      CHECK(matched);
+      CHECK(absent_matched);
+      ++rollbacks;
+      if (matched && absent_matched) {
+        auto wrong_marker = actual;
+        wrong_marker["marker"] = "wrong-rollback-marker";
+        REQUIRE_FALSE(bytea_typed_equal(wrong_marker, expected));
+        auto wrong_inside = actual;
+        wrong_inside["inside"]["length"] = 255;
+        REQUIRE_FALSE(bytea_typed_equal(wrong_inside, expected));
+        auto wrong_durable = durable;
+        wrong_durable["rows"] = 1;
+        REQUIRE_FALSE(bytea_typed_equal(wrong_durable, absent));
+        rollback_controls += 3;
+      }
+    }
+    const bool stopped = pool.shutdown(std::chrono::seconds{5});
+    const bool stopped_again = pool.shutdown(std::chrono::milliseconds{0});
+    const std::array<int, 4> actual{stopped ? 1 : 0, stopped_again ? 1 : 0,
+                                    pool.active_count(), pool.free_count()};
+    const std::array<int, 4> expected{1, 1, 0, 0};
+    REQUIRE(actual == expected);
+    ++shutdowns;
+    auto corrupt = actual;
+    ++corrupt[2];
+    REQUIRE(corrupt != expected);
+    ++shutdown_controls;
+  }
+  stored.remove();
+  REQUIRE(bytea_coverage_complete(coverage));
+  REQUIRE(observations == 24);
+  REQUIRE(recoveries == 24);
+  REQUIRE(result_controls == 192);
+  REQUIRE(cleanup_controls == (route == ByteaRoute::BATCH ? 26 : 24));
+  REQUIRE(durable_controls == (route == ByteaRoute::QUERY ? 0 : 24));
+  REQUIRE(affected_controls == (route == ByteaRoute::QUERY ? 0 : 24));
+  REQUIRE(inside_controls == (route == ByteaRoute::BATCH ? 24 : 0));
+  REQUIRE(rollbacks == (route == ByteaRoute::BATCH ? 2 : 0));
+  REQUIRE(rollback_controls == (route == ByteaRoute::BATCH ? 6 : 0));
+  REQUIRE(shutdowns == 2);
+  REQUIRE(shutdown_controls == 2);
+  int coverage_controls = 0;
+  for (std::size_t replay = 0; replay < coverage.size(); ++replay) {
+    for (std::size_t entry = 0; entry < coverage[replay].size(); ++entry) {
+      auto missing = coverage;
+      --missing[replay][entry];
+      REQUIRE_FALSE(bytea_coverage_complete(missing));
+      auto duplicate = coverage;
+      ++duplicate[replay][entry];
+      REQUIRE_FALSE(bytea_coverage_complete(duplicate));
+      coverage_controls += 2;
+    }
+    auto missing_replay = coverage;
+    missing_replay[replay].fill(0);
+    REQUIRE_FALSE(bytea_coverage_complete(missing_replay));
+    ++coverage_controls;
+  }
+  REQUIRE(coverage_controls == 50);
+  REQUIRE(std::chrono::steady_clock::now() < deadline);
+}
+
 } // namespace
+
+TEST_CASE("Native database queries preserve binary parameter bytes",
+          "[js][async][db][bytea-native][bytea-query]") {
+  check_native_bytea(ByteaRoute::QUERY);
+}
+
+TEST_CASE("Native database exec preserves stored binary parameter bytes",
+          "[js][async][db][bytea-native][bytea-exec]") {
+  check_native_bytea(ByteaRoute::EXEC);
+}
+
+TEST_CASE("Native database batches preserve stored binary parameter bytes",
+          "[js][async][db][bytea-native][bytea-batch]") {
+  check_native_bytea(ByteaRoute::BATCH);
+}
 
 // ─── Group A — Correctness (ICD §Tests A.1–A.6) ────────────────────
 
