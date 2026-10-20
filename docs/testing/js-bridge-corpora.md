@@ -13,6 +13,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Log/config (#121) | `plinth_tests_log_corpus`, `plinth_tests_config_corpus` | Registered log callbacks and allowed configuration projection |
 | Shared conversion (#124) | `plinth_tests_conversion_corpus` | Shared JS-to-JSON conversion and error classification |
 | Synchronous host evaluation (#176, parent #90) | `plinth_tests_sync_conversion_corpus` | Actual one-shot and pooled synchronous evaluation, their distinct private result converters/classifiers, and owned runtime lifecycle |
+| Extension module import (parent #90) | `plinth_tests_module_import_corpus` | Actual staged handler loading, registered nested source import, compile/evaluate entry, namespace/default invocation and fresh-owner replacement replay |
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
 | Pubsub (#148) | `plinth_tests_pubsub_corpus` | Publish/subscribe admission, callback replacement/invocation, returned unsubscribe enqueue and runtime ownership |
 | Capability (#150) | `plinth_tests_cap_corpus` | Call/batch admission, owned snapshots, real Promise.all composition with simulated host settlement and runtime ownership |
@@ -21,7 +22,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 
 These are bounded slices, not comprehensive coverage claims. Broader direct
 internal transaction callback denial/coercion policy, real DB dispatch/driver/result conversion,
-capability resolver/dispatch, extension
+capability resolver/dispatch, broader extension
 module import, remaining conversion implementations and broader async dispatch
 remain separate requested targets. The separate JS/JSON implementations in
 `eval.cpp`, `runtime_pool.cpp`, `bridge_context.cpp` and the extension runtime
@@ -286,3 +287,78 @@ Parent #90 stays open. Extension import, reverse conversion, remaining runtime
 conversion paths, SQL/driver execution, capability dispatch, production
 cancellation and SDK/HTTP ambiguity obligations remain separate. This work
 does not authorize a version bump, release or publication.
+
+## Extension module import
+
+`Extension module imports have a bounded deterministic corpus` is a real
+PostgreSQL/Drogon extension-dispatch test, not a simulated settlement or a
+renamed source-gate regression. It stages actual handlers through `ExtScratch`,
+calls the registry dispatcher and registered `import_from_src`, and observes the
+existing trusted C++ seam at both actual compile and evaluate calls. Literal
+typed JSON, error names, seeded error markers and stage counts are independent
+oracles; production scanners, converters and one row's output are not oracles.
+Parser-generated SyntaxError and TypeError prose is deliberately not pinned.
+
+Four fixed seeds vary literal values, module ids and finite comment placement.
+Two fresh-owner replay epochs execute every selected row: host-original
+precedence H has 32 observations, nested gating N has 32, compile/evaluate C has
+24, namespace/default D has 24, and replacement/fresh-owner R has 12, for 124
+actual dispatches. Every seed/replay/entry ledger cell is required exactly once;
+separate family and total assertions cannot be satisfied by dropping a row.
+Actual observations first satisfy the clean oracle, then 124 wrong-target-stage,
+80 wrong-outer-stage and 124 wrong-result corruptions must fail it.
+Selected compile-family observations additionally reject eight wrong literal
+values, eight same-value/wrong-JSON-type results, eight wrong error names and
+eight wrong seeded error markers. Each corruption follows a passing unmodified
+actual observation and has a separate required count.
+Dropping each of the 124 ledger cells
+must also fail the coverage validator.
+
+H executes a clean handler, a 50-marker replacement, a clean restoration with
+a different literal return value and
+one fixed malformed UTF-8 form, repeated for each seed. Zero target engine
+entries, not inspection of a released context, prove pre-entry denial. N uses
+a valid 49-marker source without NUL, then three 50-marker denials: ordinary,
+markers before NUL, and markers after NUL with invalid syntax. This sparse
+matrix does not assert parser acceptance of a 49-marker NUL-containing source.
+Denied nested rows also require complete literal diagnostics, including the
+first finding's UTF-8 byte offset and `variation-selector` range. Expected
+offsets are independent literal tables for the fixed inputs, not scanner
+results or values copied from an observed failure.
+C separates success, syntax failure before evaluation, and a seeded module-body
+throw. D checks missing/noncallable defaults and a throwing callable default,
+including literal body/default-call counters. R uses seeds 0 and 3: seed 0's A
+is denied, while seed 3's A successfully returns literal `{value:901,prior:1}`
+after setting its global marker. Replacement B at the same handler/id must
+return its own literal value with `prior:0`, then B is replayed on a new owner.
+Thus the absent-A-marker oracle follows an actually observed successful marker,
+not only a source that failed before its body. Compile-family syntax rows remain
+separate.
+
+Source is capped at 4,096 bytes and module ids at 128 bytes; programs have no
+unbounded loops, getters, proxy traps, intentionally unresolved promises or
+unbounded pending work. The actual async loader uses bounded microtasks drained
+by the existing runtime, with no work retained across owner boundaries.
+Eight seed/replay owners
+plus four fresh R owners each explicitly require bounded successful registry
+shutdown, zero in-flight dispatches and an idempotent second shutdown. No JS
+value, context or Promise is retained across an owner boundary. A steady-clock
+60-second deadline is checked between observations and shutdowns; exceeding it
+fails rather than skipping a row. These are harness budgets, not new production
+limits. There is no fuzz loop or reducer in this finite matrix.
+
+`plinth_tests_module_import_corpus` requires real PG availability, the one exact
+Catch case, fresh strict XML, positive assertions, zero failures/skips and a
+successful child exit. The inner/outer bounds remain 60/75 seconds; the gate
+uses the PG schema resource lock and `needs_pg` provisioner. Both ASan/UBSan
+lanes and TSan explicitly discover exactly one gate and run it verbosely;
+ordinary PG aggregation and full compiler/image inventories retain the case.
+The pre-existing module-source regression remains a separate required gate.
+Actual sanitizer/runtime outcomes require execution evidence, not this wiring.
+
+This slice does not prove HTTP installation, package authorization, external
+module resolution, arbitrary coercion/exotic-object policy, allocator exhaustion,
+production cancellation or unbounded async behavior. Broader native dispatch,
+SQL/driver/result conversion, remaining conversion and SDK/HTTP obligations
+remain separate. Parent #90 stays open; no production policy, public API,
+asset/version, grant or release changes are made here.
