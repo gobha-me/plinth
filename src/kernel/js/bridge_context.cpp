@@ -96,7 +96,16 @@ auto json_to_js(JSContext* ctx, const Json::Value& v) -> JSValue {
       }
       JSValue obj = JS_NewObject(ctx);
       for (const auto& key : v.getMemberNames()) {
-        JS_SetPropertyStr(ctx, obj, key.c_str(), json_to_js(ctx, v[key]));
+        // Keep child-before-atom conversion and the ordinary setter's
+        // ownership.
+        JSValue child = json_to_js(ctx, v[key]);
+        JSAtom atom = JS_NewAtomLen(ctx, key.data(), key.size());
+        if (atom == JS_ATOM_NULL) {
+          JS_FreeValue(ctx, child);
+          continue;
+        }
+        (void)JS_SetProperty(ctx, obj, atom, child);
+        JS_FreeAtom(ctx, atom);
       }
       return obj;
     }
