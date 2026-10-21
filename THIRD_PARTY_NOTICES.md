@@ -19,8 +19,10 @@ versions, commits, and vendored-file hashes are recorded in
 | Preact and Preact Hooks | 10.22.0 | MIT | Vendored browser modules |
 | HTM | 3.1.1 | Apache-2.0 | Vendored browser module |
 
-`third_party/drogon-patches/ftype-accessor.patch` modifies Drogon 1.9.12 and is
-distributed under Drogon's MIT terms. Preact Hooks has one local import-path
+The local patches in `third_party/drogon-patches/` modify the pinned Drogon
+1.9.12 under its MIT terms and its Trantor dependency under its BSD-3-Clause
+terms. Their README records each change, including the upstream SQLSTATE
+backport's author and immutable commit. Preact Hooks has one local import-path
 rewrite, documented alongside its checksum in
 `client/shell/client/vendor/VERSIONS.txt`; it remains under Preact's MIT terms.
 

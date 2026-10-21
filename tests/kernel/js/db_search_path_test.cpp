@@ -230,24 +230,51 @@ TEST_CASE("P.04: cross-extension schema isolation — PG permissions prevail",
   pg.exec("DROP SCHEMA IF EXISTS ext_terminal CASCADE");
   pg.exec("CREATE SCHEMA ext_notes");
   pg.exec("CREATE SCHEMA ext_terminal");
-  pg.exec("CREATE TABLE ext_terminal.sessions (id serial primary key, "
+  pg.exec("CREATE TABLE ext_terminal.private_terminal_records "
+          "(id serial primary key, "
           "body text)");
+
+  const auto absent = [&pg](const char* relation) {
+    const std::array<const char*, 1> values{relation};
+    std::unique_ptr<PGresult, decltype(&PQclear)> result{
+        PQexecParams(pg.conn, "SELECT to_regclass($1)", 1, nullptr,
+                     values.data(), nullptr, nullptr, 0),
+        PQclear};
+    REQUIRE(result != nullptr);
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(result.get()) == 1);
+    REQUIRE(PQnfields(result.get()) == 1);
+    return PQgetisnull(result.get(), 0, 0) != 0;
+  };
+  REQUIRE_FALSE(absent("ext_terminal.private_terminal_records"));
+  REQUIRE(absent("ext_notes.private_terminal_records"));
+  REQUIRE(absent("plinth.private_terminal_records"));
 
   // A privileged fixture connection does not confer its authority on SQL
   // executed by an extension, including explicitly qualified identifiers.
   auto pool = make_pool(cfg);
   auto r = eval_as(
       pool, "notes",
-      "db.exec(\"INSERT INTO ext_terminal.sessions(body) VALUES('x')\")");
+      "db.exec(\"INSERT INTO ext_terminal.private_terminal_records(body) "
+      "VALUES('x')\")");
   REQUIRE_FALSE(r.value.has_value());
-  REQUIRE(pg.count_rows("ext_terminal.sessions") == 0);
-  // The unqualified-`sessions` case: the wrapper points search_path
-  // at ext_notes. `sessions` doesn't exist there → PG errors.
+  REQUIRE(pg.count_rows("ext_terminal.private_terminal_records") == 0);
+  // The wrapper's ext_notes,plinth path must not resolve a terminal-only
+  // relation. Avoid colliding with the real fallback plinth.sessions table:
+  // that produces authoritative undefined-column, not undefined-table.
   auto r2 = eval_as(pool, "notes",
-                    "db.exec(\"INSERT INTO sessions(body) VALUES('x')\")"
-                    "  .then(() => 'ok', e => e.code)");
+                    "db.exec(\"INSERT INTO private_terminal_records(body) "
+                    "VALUES('x')\")"
+                    "  .then(() => 'ok', e => ({code:e.code,"
+                    "sqlstate:e.sqlstate,ownState:"
+                    "Object.prototype.hasOwnProperty.call(e,'sqlstate')}))");
   REQUIRE(r2.value.has_value());
-  REQUIRE(r2.value->asString() == "db.undefined_table");
+  REQUIRE(r2.value->isObject());
+  REQUIRE((*r2.value)["code"].asString() == "db.undefined_table");
+  REQUIRE((*r2.value)["sqlstate"].isString());
+  REQUIRE((*r2.value)["sqlstate"].asString() == "42P01");
+  REQUIRE((*r2.value)["ownState"].asBool());
+  REQUIRE(pg.count_rows("ext_terminal.private_terminal_records") == 0);
 }
 
 // ─── P.05 ─────────────────────────────────────────────────────────

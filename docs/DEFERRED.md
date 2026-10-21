@@ -935,36 +935,31 @@ peak-tracking classifier). `RE-EVAL-0.3.x-arc-closeout §5.2`.
 
 ---
 
-### 2026-04-18 — Drogon `PgBatchConnection` loses `SqlError` typing on batch abort (ICD-0.3.3) [pattern-match fallback in 0.3.3]
+### 2026-04-18 — PostgreSQL error typing and the temporary prose fallback (ICD-0.3.3)
 
 **Tracking:** [GitHub issue #92](https://github.com/gobha-me/plinth/issues/92).
 
-**Milestone:** 0.3.3 ships a message-pattern fallback in
-`pg_exception_to_rejection` that recovers the canonical `db.*` `code`
-from common SQL error text. GitHub issue #92 now owns the upstream-fix or
-minimal-local-patch follow-up.
+**Historical behavior:** 0.3.3 added message-pattern inference because the
+pinned driver constructed generic `Failure` for server errors, discarding
+SQLSTATE and the original query. It did not wrap an existing `SqlError` in
+`InternalError`, as this entry previously stated. A skipped pipeline command
+also received a generic abort diagnostic. Prose inference could mistake a
+genuine unknown state for a known one when its message contained matching text.
 
-**Why deferred:** When a `db.query`/`db.exec` runs through Drogon's
-PgBatchConnection path (the default for the kernel DbClient pool) and
-PG returns a syntax error, the batch is aborted and the second/Nth
-statement gets `Command didn't run because of an abort earlier in a
-pipeline`. Drogon wraps the original `SqlError` (which carries
-`sqlState()`) inside an `InternalError` for the abort message, losing
-the SQLSTATE typing in the process. `dynamic_cast<SqlError*>` against
-the caught `DrogonDbException` returns nullptr.
+**Repair under #92:** `pg-sqlstate-errors.patch` backports the three production
+files from upstream Drogon commit `4d078eeab6805c82e8e109479bc52beda4c0a2db`
+(also included in 1.9.14), retaining the current dependency pins and all four
+existing safety patches. Both compiled PostgreSQL implementations copy the
+server's authoritative SQLSTATE and causal query before releasing the result.
+Skipped commands and result-less errors remain separate generic failures.
+The sender and queue selector are unchanged; this is not a broader queue repair.
 
-**Current behavior (0.3.3):** `pg_exception_to_rejection` first tries
-the proper `dynamic_cast<SqlError*>` path. On miss, it scrapes
-`SQLSTATE NNNNN` from the message text. On second miss, it
-pattern-matches three common error families (`syntax error`, `relation
-... does not exist`, `column ... does not exist`) and synthesizes the
-SQLSTATE + code. ICD §Tests Group A.2 (`db.query('INVALID SQL')` →
-`db.syntax_error` + `42601`) passes via this fallback.
-
-**Future approach:** Either (a) submit an upstream Drogon patch to
-preserve `SqlError` typing through PgBatchConnection's pipeline-abort
-path, or (b) carry a small local fork. Option (a) is cleaner; option
-(b) is faster. Until then, the heuristic stays.
+`pg_exception_to_rejection` now trusts only a nonempty actual `SqlError` state.
+Known states use the existing code map; genuine unmapped states retain their
+own state with `db.internal`. Generic errors retain `db.internal` without a
+fabricated state. No SQLSTATE marker or English message pattern is scraped.
+The documented local patch and focused native/registered-JS regressions own
+this contract; issue closure still requires the repository delivery gates.
 
 ---
 

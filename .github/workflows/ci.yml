@@ -162,6 +162,34 @@ jobs:
       - name: Check version command
         run: ./build/plinth --version
 
+      - name: Verify separately compiled standard PostgreSQL diagnostics
+        if: ${{ matrix.cc == 'clang-21' }}
+        env:
+          CC: clang-21
+          CXX: clang++-21
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-pg-standard -DCMAKE_BUILD_TYPE=Debug -DLIBPQ_BATCH_MODE=OFF
+          cmake --build build-pg-standard --target plinth_tests --parallel 2
+          config=build-pg-standard/_deps/drogon-build/drogon/config.h
+          test -f "$config"
+          if grep -Ex '#define LIBPQ_SUPPORTS_BATCH_MODE 1' "$config"; then exit 1; fi
+          grep -F '/postgresql_impl/PgConnection.cc' build-pg-standard/compile_commands.json
+          if grep -F '/postgresql_impl/PgBatchConnection.cc' build-pg-standard/compile_commands.json; then exit 1; fi
+          ar t build-pg-standard/_deps/drogon-build/libdrogon.a | grep -Ex 'PgConnection.cc.o'
+          if ar t build-pg-standard/_deps/drogon-build/libdrogon.a | grep -Ex 'PgBatchConnection.cc.o'; then exit 1; fi
+          ctest --test-dir build-pg-standard -N -R '^plinth_tests_sqlstate_pipeline$' |
+            grep -Ex 'Total Tests: 0'
+          ctest --test-dir build-pg-standard -N -R '^plinth_tests_sqlstate_(native|projection)$' |
+            grep -Ex 'Total Tests: 2'
+          ctest --test-dir build-pg-standard --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_sqlstate_(native|projection)$'
+
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: ${{ matrix.cc == 'gcc' }}
         with:
@@ -383,6 +411,22 @@ jobs:
             grep -Ex 'Total Tests: 3'
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_native_bytea_(query|exec|batch)$'
+
+      - name: Focused PostgreSQL SQLSTATE sanitizer regressions
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_sqlstate_(native|projection|pipeline)$' |
+            grep -Ex 'Total Tests: 3'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_sqlstate_(native|projection|pipeline)$'
 
       - name: Focused extension module source gate sanitizer regression
         env:
@@ -685,6 +729,21 @@ jobs:
             grep -Ex 'Total Tests: 3'
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_native_bytea_(query|exec|batch)$'
+
+      - name: Focused PostgreSQL SQLSTATE TSan regressions
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R '^plinth_tests_sqlstate_(native|projection|pipeline)$' |
+            grep -Ex 'Total Tests: 3'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_sqlstate_(native|projection|pipeline)$'
 
       - name: Focused extension module source gate TSan regression
         env:

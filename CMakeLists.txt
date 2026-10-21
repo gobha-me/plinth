@@ -147,6 +147,8 @@ set(PLINTH_DROGON_SHUTDOWN_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/db-client-owned-shutdown.patch)
 set(PLINTH_DROGON_BINDER_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/sql-binder-cancel.patch)
+set(PLINTH_DROGON_SQLSTATE_PATCH
+    ${CMAKE_SOURCE_DIR}/third_party/drogon-patches/pg-sqlstate-errors.patch)
 FetchContent_Declare(
   drogon
   GIT_REPOSITORY https://github.com/drogonframework/drogon.git
@@ -163,6 +165,9 @@ FetchContent_Declare(
   COMMAND sh -c
     "git apply --reverse --check '${PLINTH_DROGON_BINDER_PATCH}' 2>/dev/null \
      || git apply --whitespace=nowarn '${PLINTH_DROGON_BINDER_PATCH}'"
+  COMMAND sh -c
+    "git apply --reverse --check '${PLINTH_DROGON_SQLSTATE_PATCH}' 2>/dev/null \
+     || git apply --whitespace=nowarn '${PLINTH_DROGON_SQLSTATE_PATCH}'"
 )
 FetchContent_MakeAvailable(drogon)
 set(DROGON_TARGET drogon)
@@ -780,6 +785,8 @@ add_executable(plinth_tests
   tests/kernel/js/async_bridge_test.cpp
   tests/kernel/js/async_bridge_fixture.cpp
   tests/kernel/js/db_batch_test.cpp
+  tests/kernel/js/db_sqlstate_native_test.cpp
+  tests/kernel/js/db_sqlstate_projection_test.cpp
   tests/kernel/js/db_search_path_test.cpp
   tests/kernel/js/db_silent_test.cpp
   tests/kernel/js/pubsub_test.cpp
@@ -966,6 +973,11 @@ target_include_directories(plinth_tests PRIVATE
 # it is not part of the production include interface or a fabricated admission.
 set_source_files_properties(tests/kernel/frontend/typed_assets_test.cpp
   PROPERTIES INCLUDE_DIRECTORIES "${drogon_SOURCE_DIR}/lib/src")
+
+# Observe the real compiled PostgreSQL implementation and its owned pipeline
+# boundaries. These private headers are not a production include interface.
+set_source_files_properties(tests/kernel/js/db_sqlstate_native_test.cpp
+  PROPERTIES INCLUDE_DIRECTORIES "${drogon_SOURCE_DIR}/orm_lib/src")
 
 target_compile_definitions(plinth_tests PRIVATE
   CMAKE_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
@@ -1382,6 +1394,29 @@ add_plinth_native_bytea_case(exec
   "Native database exec preserves stored binary parameter bytes")
 add_plinth_native_bytea_case(batch
   "Native database batches preserve stored binary parameter bytes")
+
+function(add_plinth_sqlstate_case name selector)
+  add_test(NAME plinth_tests_sqlstate_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}" --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_sqlstate_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg"
+    ENVIRONMENT "PLINTH_TEST_DB_POOL_SIZE=1" TIMEOUT 75)
+endfunction()
+add_plinth_sqlstate_case(native
+  "PostgreSQL driver preserves authoritative error diagnostics")
+add_plinth_sqlstate_case(projection
+  "Registered database bindings preserve authoritative SQLSTATE")
+# Use the actual generated implementation choice, not an autoBatch runtime flag.
+file(STRINGS "${drogon_BINARY_DIR}/drogon/config.h" PLINTH_PG_PIPELINE_DEFINE
+  REGEX "^#define LIBPQ_SUPPORTS_BATCH_MODE 1$")
+if(PLINTH_PG_PIPELINE_DEFINE)
+  add_plinth_sqlstate_case(pipeline
+    "PostgreSQL pipeline failures preserve only their causal diagnostics")
+endif()
 
 # Exercise the actual registered module loader and original host bytes. A
 # missing database, skipped case or failed teardown cannot satisfy this gate.
