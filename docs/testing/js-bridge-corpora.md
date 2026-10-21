@@ -20,6 +20,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Ordinary database (#151) | `plinth_tests_db_admission_corpus` | Query/exec admission, parameter and client-manager snapshots, simulated host settlement and runtime ownership; no SQL execution |
 | Public database batch (#174, parent #90) | `plinth_tests_db_batch_corpus` | Public callback admission and installed batch orchestration with simulated host completion/reset; no SQL execution |
 | Native binary database parameters (parent #90) | `plinth_tests_native_bytea_query`, `plinth_tests_native_bytea_exec`, `plinth_tests_native_bytea_batch` | Real registered query/exec and installed batch dispatch, typed PostgreSQL bytes, durable storage, rollback and owned teardown |
+| Authoritative PostgreSQL errors (#92) | `plinth_tests_sqlstate_native`, `plinth_tests_sqlstate_pipeline`, `plinth_tests_sqlstate_projection` | Real driver diagnostics/query ownership, deterministic causal errors versus skipped pipeline commands, and registered query/exec/batch error projection |
 
 These are bounded slices, not comprehensive coverage claims. Broader direct
 internal transaction callback denial/coercion policy, broader DB dispatch/driver/result conversion,
@@ -89,6 +90,57 @@ Select a freshly configured build of the current source. An old binary,
 reused success XML, console summary, zero discovered cases or pending CI is
 not coverage. Candidate and terminal exact-merge CI remain delivery gates;
 corpus success is not an authorization to publish a release or a vulnerability.
+
+## Authoritative PostgreSQL diagnostics
+
+The SQLSTATE gates use six literal server errors: syntax42601, relation42P01,
+column42703, division22012, unique23505, and an unmapped P1234 whose message
+deliberately resembles syntax/relation errors and a SQLSTATE42601 marker.
+An independent libpq connection establishes each native state for identical
+SQL and parameters. Twelve public-client error observations retain the actual
+exception beyond callback and bounded client close, requiring the exact state
+and original query; fourteen readiness/recovery controls use the same backend
+within each client epoch. Runtime autoBatch flags are not two compiled drivers.
+
+The pipeline case owns four fresh connection/cache epochs: cold preparation
+and warmed parameterized execution, each repeated twice. One atomic two-command
+submission identifies the cause and a cached skipped follower. The cause must
+retain its own diagnostics; the follower must remain a distinct generic Failure
+without inherited SQLSTATE/query. Exact callbacks, actual idle after consumed
+Sync, same-connection recovery and disconnect-before-loop-join are required.
+These four epochs do not establish every possible network/backpressure or mixed
+pending/waiting-queue schedule. The repair changes no sender or queue selector.
+
+Registered bindings run two fresh runtime epochs: six errors through both query
+and exec (24 observations), plus two real transaction failures per epoch (four
+batch observations). They require own string error fields, literal code/state,
+benign recovery, independent durable rollback readback, native/audit drain,
+context retirement and destruction, cleared callbacks/pins/timers, and bounded
+idempotent pool shutdown. They use the existing `[batch-transaction]` isolation
+contract and a dedicated strict process with PLINTH_TEST_DB_POOL_SIZE=1; they
+must not inherit a previously initialized larger pool.
+The independent control has explicit three-second libpq/server limits. The
+registered client keeps the shared fixture's existing connection/GUC defaults:
+its per-context three-second JS cancellation is not a three-second server SQL
+deadline. Native/audit drains are bounded separately; the strict subprocess
+watchdog covers uncooperative native work and teardown and must fail, not pass,
+when it fires. The 45-second admission deadline starts before fixture setup.
+
+Missing PostgreSQL, a skipped case, incomplete observations or failed teardown
+fails the strict gate. Pipeline builds discover all three named CTests. A fresh
+LIBPQ_BATCH_MODE=OFF build instead compiles PgConnection.cc, not
+PgBatchConnection.cc, and runs the two applicable native/projection gates;
+the pipeline-only case is not registered. Actual on-loop PQpipelineStatus is
+checked against that compiled route. The Clang21 compiler CI lane requires this
+second configuration and its compile/archive inventory. Both ASan/UBSan lanes
+and selected TSan explicitly discover and execute all three pipeline gates;
+the complete ordinary suite retains every existing gate, including binary
+parameter ownership and shutdown regressions.
+
+These are #92's focused error-contract gates, not the remaining #90 native
+result corpus. They do not replace its required168 cells, prove every error
+policy, or authorize publication. Actual assertion/test/TU counts must be read
+from fresh built inventories and reports, not inferred from this description.
 
 ## Capability admission and batch composition
 

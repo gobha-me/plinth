@@ -567,13 +567,15 @@ TEST_CASE("batch query database error rolls back preceding mixed writes",
       await db.exec("INSERT INTO notes(body) VALUES($1)", ["exec"]);
       await db.query("INSERT INTO notes(body) VALUES($1) RETURNING body", ["query"]);
       await db.query("INSERT INTO notes(body) VALUES($1) RETURNING body", ["exec"]);
-    }).then(() => ({code: "unexpected commit"}), e => ({code: e.code, message: e.message}))
+    }).then(() => ({code: "unexpected commit"}), e => ({code: e.code,
+      message: e.message, sqlstate: e.sqlstate,
+      ownState: Object.prototype.hasOwnProperty.call(e, "sqlstate")}))
   )JS");
   REQUIRE(r.value.has_value());
-  // PgBatchConnection currently loses SQLSTATE for this error; still require
-  // the intended constraint's diagnostic so unrelated DB failures cannot pass.
-  const auto code = (*r.value)["code"].asString();
-  REQUIRE((code == "db.constraint_violation" || code == "db.internal"));
+  REQUIRE((*r.value)["code"].asString() == "db.constraint_violation");
+  REQUIRE((*r.value)["sqlstate"].isString());
+  REQUIRE((*r.value)["sqlstate"].asString() == "23505");
+  REQUIRE((*r.value)["ownState"].asBool());
   REQUIRE((*r.value)["message"].asString().find("notes_body_key") !=
           std::string::npos);
   REQUIRE(pg.count_rows("ext_batch.notes") == 0);
@@ -599,12 +601,14 @@ TEST_CASE("B.03: rollback on DB error — 0 rows persist",
       "db.batch(async () => {"
       "  await db.exec(\"INSERT INTO notes(body, unique_col) VALUES('a', 1)\");"
       "  await db.exec(\"INSERT INTO notes(body, unique_col) VALUES('b', 1)\");"
-      "}).then(() => 'ok', e => 'err:' + (e && e.code))");
+      "}).then(() => 'ok', e => ({code:e.code, sqlstate:e.sqlstate,"
+      "ownState:Object.prototype.hasOwnProperty.call(e,'sqlstate')}))");
   REQUIRE(r.value.has_value());
-  auto code = r.value->asString();
-  // Either the unique-violation code or a generic db.internal — PG
-  // wires SQLSTATE 23505 which db_error_map translates.
-  REQUIRE(code.rfind("err:", 0) == 0);
+  REQUIRE(r.value->isObject());
+  REQUIRE((*r.value)["code"].asString() == "db.constraint_violation");
+  REQUIRE((*r.value)["sqlstate"].isString());
+  REQUIRE((*r.value)["sqlstate"].asString() == "23505");
+  REQUIRE((*r.value)["ownState"].asBool());
   REQUIRE(pg.count_rows("ext_batch.notes") == 0);
 }
 

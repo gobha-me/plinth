@@ -10,6 +10,32 @@ upstreamable. Breaking changes belong in a fork.
 
 ## Patches
 
+### `pg-sqlstate-errors.patch`
+
+Backports the three production-file changes from upstream
+[`4d078eeab6805c82e8e109479bc52beda4c0a2db`](https://github.com/drogonframework/drogon/commit/4d078eeab6805c82e8e109479bc52beda4c0a2db)
+("Report typed errors for PostgreSQL queries", #2616, Ughur Aghakishiyev)
+to the pinned Drogon 1.9.12 commit for Plinth issue #92. The implementation is
+unchanged from upstream; Plinth carries its own real-driver and registered-JS
+regressions rather than importing upstream's standalone test executables.
+
+Both PostgreSQL implementations copy the authoritative server SQLSTATE,
+message and causal query into the existing SqlError hierarchy before freeing
+the PGresult. A skipped pipeline command retains a separate generic Failure;
+it does not inherit the earlier command's SQLSTATE. Result-less transport and
+shutdown errors remain generic. No sender/queue-selector changes are included.
+Plinth no longer synthesizes SQLSTATE from diagnostic prose.
+
+The fix is also included in released Drogon 1.9.14. A full upgrade changes
+97 commits plus Trantor and conflicts with the owned-shutdown patch in five
+paths. This narrow backport retains both dependency pins and all four existing
+safeguards without an unrelated lifecycle rebase. No license change is made.
+The normal forward/reverse apply check fails closed on incompatible source;
+review this patch AND the ownership patch when updating Drogon. Retire this
+patch only after equivalent upstream behavior and all Plinth regressions pass
+on the replacement dependency pair. Runtime autoBatch=false is not a substitute
+for a separately compiled LIBPQ_BATCH_MODE=OFF regression run.
+
 ### `sql-binder-cancel.patch`
 
 Adds a small `SqlBinder::cancel() noexcept` operation against the same pinned

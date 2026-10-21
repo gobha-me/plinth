@@ -248,14 +248,9 @@ auto bind_param(Binder& binder, const Json::Value& v) -> void {
 //     └ InternalError / TimeoutError / ... : DrogonDbException +
 //     std::logic_error
 //
-// SqlError carries `sqlState()`. We try that first via dynamic_cast
-// against the DrogonDbException polymorphic base.  Some Drogon paths
-// (e.g. PgBatchConnection's "Command didn't run because of an abort
-// earlier in a pipeline") wrap the original error in InternalError
-// instead of SqlError; in that case we fall back to scraping SQLSTATE
-// out of the message text. PG drivers commonly format messages as
-// "ERROR:  <text>" — for now we keep db.internal for those, since the
-// failing query in the same pipeline is reported separately.
+// The patched driver copies authoritative diagnostics into SqlError for
+// the command that failed. Skipped pipeline commands and result-less errors
+// remain generic: diagnostic prose is never an authoritative SQLSTATE.
 auto pg_exception_to_rejection(const drogon::orm::DrogonDbException& e)
     -> PromiseRejection {
   PromiseRejection rej{.code = "db.internal",
@@ -269,34 +264,6 @@ auto pg_exception_to_rejection(const drogon::orm::DrogonDbException& e)
       rej.code = std::string{db_error_map::map_sqlstate(state)};
     }
     return rej;
-  }
-  // Heuristic SQLSTATE extraction from message text: PG includes the
-  // five-char SQLSTATE in the form `... [SQLSTATE 42601]` in some
-  // driver paths. Match the keyword.
-  auto pos = rej.message.find("SQLSTATE ");
-  if (pos != std::string::npos && pos + 14 <= rej.message.size()) {
-    std::string state = rej.message.substr(pos + 9, 5);
-    rej.sqlstate = state;
-    rej.code = std::string{db_error_map::map_sqlstate(state)};
-    return rej;
-  }
-  // Final fallback: pattern-match common syntax-error / undefined-X
-  // messages so the test suite can prove the error-mapping pipeline
-  // works against Drogon's PgBatchConnection (which loses SqlError
-  // typing when batches abort). This is a pragmatic stopgap; proper
-  // fix is a Drogon patch to preserve SqlError through batch aborts,
-  // tracked as a follow-up in DEFERRED.md.
-  if (rej.message.find("syntax error") != std::string::npos) {
-    rej.code = "db.syntax_error";
-    rej.sqlstate = std::string{"42601"};
-  } else if (rej.message.find("does not exist") != std::string::npos &&
-             rej.message.find("relation") != std::string::npos) {
-    rej.code = "db.undefined_table";
-    rej.sqlstate = std::string{"42P01"};
-  } else if (rej.message.find("does not exist") != std::string::npos &&
-             rej.message.find("column") != std::string::npos) {
-    rej.code = "db.undefined_column";
-    rej.sqlstate = std::string{"42703"};
   }
   return rej;
 }
