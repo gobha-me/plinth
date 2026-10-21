@@ -21,6 +21,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Public database batch (#174, parent #90) | `plinth_tests_db_batch_corpus` | Public callback admission and installed batch orchestration with simulated host completion/reset; no SQL execution |
 | Native binary database parameters (parent #90) | `plinth_tests_native_bytea_query`, `plinth_tests_native_bytea_exec`, `plinth_tests_native_bytea_batch` | Real registered query/exec and installed batch dispatch, typed PostgreSQL bytes, durable storage, rollback and owned teardown |
 | Authoritative PostgreSQL errors (#92) | `plinth_tests_sqlstate_native`, `plinth_tests_sqlstate_pipeline`, `plinth_tests_sqlstate_projection` | Real driver diagnostics/query ownership, deterministic causal errors versus skipped pipeline commands, and registered query/exec/batch error projection |
+| Native PostgreSQL results (#185, parent #90) | `plinth_tests_native_pg_result_corpus` | Selected real scalar input/result kinds, returned BYTEA lifetime, ordered envelopes, server errors/recovery, affected rows and fresh-owner cleanup |
 
 These are bounded slices, not comprehensive coverage claims. Broader direct
 internal transaction callback denial/coercion policy, broader DB dispatch/driver/result conversion,
@@ -141,6 +142,71 @@ These are #92's focused error-contract gates, not the remaining #90 native
 result corpus. They do not replace its required168 cells, prove every error
 policy, or authorize publication. Actual assertion/test/TU counts must be read
 from fresh built inventories and reports, not inferred from this description.
+
+## Native PostgreSQL result and error corpus
+
+This test-only slice follows actual RuntimePool-injected `db.query`/`db.exec`
+through the native dispatcher, real PostgreSQL, result/OID conversion, Promise
+settlement and final owned observations. It does not fabricate driver fields,
+call production converters as an oracle, or simulate host settlement. Fixed
+SQL programs and independent literal expected values remain separate.
+
+The required ledger contains168 primary cells:16 result families times four
+fixed seeds times two fresh owner epochs, four server-error families times
+four seeds times two epochs, and affected-row counts0/1/2/3 times two epochs.
+Eight independent Config/RuntimePool owners use a fresh context per cell.
+The selected families cover SQL NULL, BOOL, INT2/INT4, safe-number and outer
+decimal-string INT8 results, exactly representable finite FLOAT4/FLOAT8/NUMERIC,
+TEXT/VARCHAR/NAME/internal `"char"`/UUID, copied BYTEA results and ordered0–3-row
+envelopes. The four required error pairs are syntax42601, missing-relation42P01,
+missing-column42703 and division22012, with literal expected binding codes and
+one benign recovery on the same live context after each rejection.
+
+Native null/boolean/number/string parameters are retained where admitted.
+Narrow integer result programs declare the documented BIGINT input type before
+casting to SMALLINT/INTEGER; fractional inputs declare DOUBLE PRECISION before
+requesting a REAL result. This checks those explicit input/result programs,
+not arbitrary server type inference or direct-to-narrow-column insertion.
+Outer INT8, NUMERIC, BYTEA output and ordered-envelope families deliberately use
+literal SQL; they do not replace the real parameter families or prove BYTEA
+input binding. Separate binary-input and authoritative-error gates remain.
+
+Exactly216 registered native operations comprise168 primary calls,32 error
+recovery queries, eight returned-buffer follow-up queries and eight affected-row
+readback queries (208 query, eight exec). Independent libpq fixture setup,
+acknowledged preseed/count checks and durable-empty readbacks are separate
+control operations. The affected-row family uses documented `silent:true` to
+isolate this result contract from realtime emission; real silent-use audit work
+must drain. It is not proof of default realtime delivery. Missing-relation
+names have independent absence checks; no pre-existing object is replaced.
+
+Oracles require actual JS kinds, exact scalar values, complete UTF-16 code
+units/lengths and byte arrays, own-key sets, row order/counts and owned string
+error fields without pinning server diagnostic prose. BYTEA retains its first
+array through a second real query and a local mutation of a separate sentinel.
+Corrupted copies of passing observations and dropped/duplicated/invalid ledger
+identities must fail their test-only validators. Real contexts, owners and
+fixture cleanup complete before these oracle/control assertions.
+
+Live pre-destroy observations include execution retirement, queues, callbacks,
+concurrent/detached counts, batch depth/scope/pin/rollback/timer fields and real
+native/audit drains. Actual context destruction and zero pool-active counts
+must be observed, not inferred from a destroy call. Every owner requires bounded
+idempotent shutdown and zero active/free counts. Uncooperative teardown fails
+closed; a strict process watchdog is not a successful cleanup result.
+
+`plinth_tests_native_pg_result_corpus` selects one exact positive-assertion,
+zero-skip Catch/XML case with PostgreSQL schema locking. Both ASan/UBSan lanes
+and selected TSan explicitly discover exactly one target and execute it
+verbosely with fatal sanitizer settings. Existing grouped PostgreSQL/WebSocket
+and full compiler/image gates remain required. Runtime and assertion counts
+must come from fresh executions, not these required matrix counts.
+
+This finite slice does not complete #90. JSON/JSONB, nonfinite/rounding/precision
+and endpoint policy, time rendering, exotic names/OIDs, arrays/domains, broader
+permission/cancellation/inference behavior, installed extension authority and
+other bridge surfaces remain outstanding. It changes no production policy,
+API, permission, version or release promise.
 
 ## Capability admission and batch composition
 

@@ -787,6 +787,7 @@ add_executable(plinth_tests
   tests/kernel/js/db_batch_test.cpp
   tests/kernel/js/db_sqlstate_native_test.cpp
   tests/kernel/js/db_sqlstate_projection_test.cpp
+  tests/kernel/js/native_pg_result_corpus_test.cpp
   tests/kernel/js/db_search_path_test.cpp
   tests/kernel/js/db_silent_test.cpp
   tests/kernel/js/pubsub_test.cpp
@@ -1394,6 +1395,18 @@ add_plinth_native_bytea_case(exec
   "Native database exec preserves stored binary parameter bytes")
 add_plinth_native_bytea_case(batch
   "Native database batches preserve stored binary parameter bytes")
+
+# Real registered calls and owned PostgreSQL teardown: no skip or absent case
+# may satisfy this selected result/error corpus.
+add_test(NAME plinth_tests_native_pg_result_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS native PostgreSQL calls have a bounded result corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_native_pg_result_corpus PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
 
 function(add_plinth_sqlstate_case name selector)
   add_test(NAME plinth_tests_sqlstate_${name}
