@@ -75,6 +75,10 @@ class AsyncTaskRegistry {
   // The record must have been allocated before acquiring native resources.
   // Intrusive retention does not allocate in a cleanup failure path.
   auto retain_cleanup(std::shared_ptr<AsyncCleanupOwner> owner) -> void;
+  // Signal progress of an ALREADY retained cleanup obligation. This neither
+  // registers an owner nor changes its revision/count, so late completion
+  // cannot resurrect an owner already removed by a successful drain.
+  auto notify_cleanup_progress() -> void;
   auto close_admission() -> void;
   [[nodiscard]] auto drain(std::chrono::milliseconds timeout) -> bool;
 

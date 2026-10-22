@@ -20,6 +20,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <string>
 #include <string_view>
 
 namespace plinth::js {
@@ -91,9 +93,9 @@ auto drop_bc_subscriptions(plinth::js::BridgeContext* bc) -> void;
 // populates `ev.delivered_to_users` for the writer's subsequent
 // cursor-advance loop) and the JS-side `pubsub.subscribe` arm. Safe
 // to call from any thread; the WS arm hops onto each subscriber's
-// owning loop and the JS arm hops onto drogon's main loop. Returns
-// the JS-side dispatch count (WS-side fan-out happens
-// asynchronously and is reported separately via `ws_subscriber_count`).
+// owning loop and the JS arm visits its revocable checkout's owner loop.
+// Returns the JS-side dispatch count (WS-side fan-out happens asynchronously
+// and is reported separately via `ws_subscriber_count`).
 auto dispatch(const DispatchedEvent& ev) -> std::size_t;
 
 // Test seam — dispatch a DispatchedEvent through the broker exactly
@@ -101,6 +103,17 @@ auto dispatch(const DispatchedEvent& ev) -> std::size_t;
 // parsing AND the writer's INSERT path. Covers B.* cases without PG.
 // Returns the JS-side dispatch count.
 auto dispatch_for_test(const DispatchedEvent& ev) -> std::size_t;
+
+// Trusted C++ diagnostic seam, never a runtime/extension API. A matching
+// channel's probe observes the selected delivery loop before any BC/JS access
+// and may suppress invocation. Empty probe restores uninstrumented behavior.
+// Test owners must retain their state through all queued delivery fences.
+// The observer must not throw or block; its BC argument is identity only,
+// never a lease or liveness guarantee. Fixture owners retain the context.
+using JsDeliveryProbeForTest =
+    std::function<bool(const plinth::js::BridgeContext*, std::string_view)>;
+auto set_js_delivery_probe_for_test(std::string channel,
+                                    JsDeliveryProbeForTest probe) -> void;
 
 // Test seam — synthesize an RBAC enforcement flip for S.11 / I.07
 // style tests. Toggles the broker's effective rbac_enforce without a

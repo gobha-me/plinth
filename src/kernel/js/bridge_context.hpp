@@ -44,6 +44,7 @@ namespace plinth::js {
 struct Extension;
 class ExecutionLifetime;
 class NativeRollbackOwner;
+class PubsubDeliveryOwner;
 
 // ConfigProjection — the value-copy slice of `plinth::Config` that
 // `config.get()` from JS is allowed to read. Populated by RuntimePool
@@ -73,6 +74,8 @@ struct ConfigProjection {
 };
 
 struct BridgeContext {
+  ~BridgeContext();
+  std::atomic<std::shared_ptr<PubsubDeliveryOwner>> pubsub_delivery_owner;
   // Strong only during the admitted JS execution; reset at EVERY exit.
   // Native children retain their independently revocable generation instead.
   std::atomic<std::shared_ptr<ExecutionLifetime>> execution_lifetime;

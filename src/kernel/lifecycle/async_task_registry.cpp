@@ -79,6 +79,14 @@ auto AsyncTaskRegistry::retain_cleanup(std::shared_ptr<AsyncCleanupOwner> owner)
   state->cv.notify_all();
 }
 
+auto AsyncTaskRegistry::notify_cleanup_progress() -> void {
+  {
+    std::lock_guard lock(state->mu);
+    ++state->cleanup_epoch;
+  }
+  state->cv.notify_all();
+}
+
 auto AsyncTaskRegistry::retry_cleanups(
     std::chrono::steady_clock::time_point deadline) -> bool {
   bool progressed = false;
@@ -130,6 +138,11 @@ auto AsyncTaskRegistry::drain(std::chrono::milliseconds timeout) -> bool {
     return false;
   }
   for (;;) {
+    std::uint64_t before_retry;
+    {
+      std::lock_guard lock(state->mu);
+      before_retry = state->cleanup_epoch;
+    }
     const bool progressed = retry_cleanups(deadline);
     std::unique_lock lock(state->mu);
     if (state->active == 0 && state->cleanup_count == 0) {
@@ -138,7 +151,10 @@ auto AsyncTaskRegistry::drain(std::chrono::milliseconds timeout) -> bool {
     // Closing an already-stopping domain may make a native rollback record
     // from the same pass retryable. Retry that dependency immediately instead
     // of waiting for a callback which a completed domain will never deliver.
-    if (progressed && std::chrono::steady_clock::now() < deadline) {
+    // Progress may also have arrived INSIDE that pass after a record returned
+    // false. Observe the epoch across the whole pass, not only before parking.
+    if ((progressed || state->cleanup_epoch != before_retry) &&
+        std::chrono::steady_clock::now() < deadline) {
       continue;
     }
     const auto epoch = state->cleanup_epoch;

@@ -6,6 +6,7 @@
 
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/js/execution_lifetime.hpp"
+#include "kernel/js/pubsub_delivery_owner.hpp"
 
 #include <json/value.h>
 #include <quickjs.h>
@@ -14,12 +15,19 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace plinth::js {
+
+BridgeContext::~BridgeContext() {
+  if (auto owner = pubsub_delivery_owner.load(std::memory_order_acquire)) {
+    if (!owner->revoke()) std::terminate();
+  }
+}
 
 namespace {
 

@@ -1,6 +1,8 @@
 #include "kernel/realtime/broker.hpp"
 
 #include "kernel/js/bridge_context.hpp"
+#include "kernel/js/pubsub_delivery_owner.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/realtime/channel.hpp"
 #include "kernel/realtime/listener.hpp"
@@ -13,6 +15,7 @@
 #include <json/value.h>
 #include <memory>
 #include <mutex>
+#include <quickjs.h>
 #include <shared_mutex>
 #include <spdlog/spdlog.h>
 #include <string>
@@ -35,8 +38,13 @@ namespace {
 // lifetime + reachability — see ICD §JS-side subscription registry).
 using BcSubscriptions =
     std::unordered_map<std::string, int>; // channel → callback_id
+struct BcRegistration {
+  BcSubscriptions channels;
+  std::weak_ptr<plinth::js::PubsubDeliveryOwner> owner;
+  std::string extension_name;
+};
 using BcRegistry =
-    std::unordered_map<plinth::js::BridgeContext*, BcSubscriptions>;
+    std::unordered_map<plinth::js::BridgeContext*, BcRegistration>;
 
 // ICD-0.5.2 §Audit Events — sliding-window rate limiter. A single
 // audit per (user_id, channel) per minute on the deny path, and a
@@ -74,6 +82,12 @@ std::atomic<std::uint64_t> g_rbac_denial_count{0};
 std::shared_mutex g_bc_mu;
 BcRegistry g_bc_registry;
 
+struct JsDeliveryProbeState {
+  std::string channel;
+  JsDeliveryProbeForTest probe;
+};
+std::atomic<std::shared_ptr<const JsDeliveryProbeState>> g_js_delivery_probe;
+
 std::mutex g_lifecycle_mu;
 
 std::mutex g_audit_mu;
@@ -110,49 +124,57 @@ auto dispatch_to_js_subscribers(const DispatchedEvent& ev) -> std::size_t {
   // dispatch outside the lock (so the bc's invoke_callback call
   // chain — which may reach back into the runtime's loop — does not
   // hold the broker's registry mutex).
-  std::vector<plinth::js::BridgeContext*> matches;
+  struct Match {
+    plinth::js::BridgeContext* identity;
+    std::shared_ptr<plinth::js::PubsubDeliveryOwner> owner;
+  };
+  std::vector<Match> matches;
   {
     std::shared_lock lock(g_bc_mu);
-    for (const auto& [bc, subs] : g_bc_registry) {
-      if (subs.contains(ev.channel)) {
-        matches.push_back(bc);
+    for (const auto& [bc, registration] : g_bc_registry) {
+      if (registration.channels.contains(ev.channel)) {
+        matches.push_back({bc, registration.owner.lock()});
       }
     }
   }
   if (matches.empty()) {
     return 0;
   }
-  // Hop onto drogon's main loop — the bc's JSContext is only safe
-  // to touch there. The envelope is shared_ptr'd across lambdas so
-  // each subscriber gets a read-only copy without re-serializing.
+  // Snapshot ownership, never raw BC liveness. Each finite queued delivery
+  // shares a drain lease and visits its actual checkout's loop/gate.
   auto envelope_shared = std::make_shared<Json::Value>(ev.envelope);
   std::string channel_str{ev.channel};
-  auto* main_loop = drogon::app().getLoop();
-  if (main_loop == nullptr) {
-    return matches.size();
-  }
-  for (auto* bc : matches) {
-    main_loop->queueInLoop([bc, envelope_shared, channel_str]() {
-      if (bc == nullptr) {
-        return;
-      }
-      // Liveness check — between the listener-thread snapshot
-      // and this loop-hop a pool destroy could have run
-      // `drop_bc_subscriptions`, in which case the bc is
-      // either destroyed or reset and invoking it would
-      // reach into freed JS state. The registry presence is
-      // the canonical "is this subscription still live"
-      // signal.
-      {
-        std::shared_lock reg_lock(g_bc_mu);
-        if (!g_bc_registry.contains(bc)) {
-          return;
-        }
-      }
-      if (bc->cancelled.load(std::memory_order_acquire)) {
-        return;
-      }
-      bc->invoke_callback(channel_str, *envelope_shared);
+  for (const auto& match : matches) {
+    if (!match.owner) continue; // Registry-only stand-ins have no JS owner.
+    const auto target = match.owner->destination();
+    if (target.loop == nullptr) continue;
+    auto task = target.accepted
+                    ? target.accepted
+                    : plinth::lifecycle::async_tasks().try_acquire();
+    if (!task) continue;
+    target.loop->queueInLoop([owner = match.owner, identity = match.identity,
+                              target, envelope_shared, channel_str,
+                              task = std::move(task)] {
+      static_cast<void>(task);
+      static_cast<void>(
+          owner->visit(target, task, [&](plinth::js::BridgeContext& bc) {
+            {
+              std::shared_lock reg_lock(g_bc_mu);
+              const auto found = g_bc_registry.find(identity);
+              if (found == g_bc_registry.end() ||
+                  found->second.owner.lock() != owner ||
+                  !found->second.channels.contains(channel_str))
+                return;
+            }
+            const auto probe =
+                g_js_delivery_probe.load(std::memory_order_acquire);
+            if (probe && probe->channel == channel_str &&
+                !probe->probe(&bc, channel_str))
+              return;
+            if (bc.cancelled.load(std::memory_order_acquire)) return;
+            JS_UpdateStackTop(bc.rt);
+            bc.invoke_callback(channel_str, *envelope_shared);
+          }));
     });
   }
   return matches.size();
@@ -253,7 +275,7 @@ auto drain_extension(std::string_view name, std::string_view trigger) -> void {
   {
     std::unique_lock reg_lock(g_bc_mu);
     for (auto bc_it = g_bc_registry.begin(); bc_it != g_bc_registry.end();) {
-      auto& subs = bc_it->second;
+      auto& subs = bc_it->second.channels;
       for (auto sub_it = subs.begin(); sub_it != subs.end();) {
         if (channel_belongs_to_extension(sub_it->first, name)) {
           sub_it = subs.erase(sub_it);
@@ -264,8 +286,8 @@ auto drain_extension(std::string_view name, std::string_view trigger) -> void {
       }
       // Drop the bc entirely if the bc itself belongs to this
       // extension (pooled slot is going away on UPGRADE/UNINSTALL).
-      if (bc_it->first != nullptr && bc_it->first->extension_name == name) {
-        js_removed += bc_it->second.size();
+      if (bc_it->second.extension_name == name) {
+        js_removed += bc_it->second.channels.size();
         bc_it = g_bc_registry.erase(bc_it);
       } else if (subs.empty()) {
         bc_it = g_bc_registry.erase(bc_it);
@@ -296,8 +318,12 @@ auto drain_extension(std::string_view name, std::string_view trigger) -> void {
 auto register_js_subscription(plinth::js::BridgeContext* bc,
                               std::string_view channel, int callback_id)
     -> bool {
+  if (bc == nullptr) return false;
+  const auto owner = bc->pubsub_delivery_owner.load(std::memory_order_acquire);
+  const auto extension_name = bc->extension_name;
   std::unique_lock lock(g_bc_mu);
-  auto& subs = g_bc_registry[bc];
+  auto& registration = g_bc_registry[bc];
+  auto& subs = registration.channels;
   if (subs.size() >= g_max_subs_per_conn.load(std::memory_order_acquire) &&
       !subs.contains(std::string{channel})) {
     if (subs.empty()) {
@@ -306,6 +332,8 @@ auto register_js_subscription(plinth::js::BridgeContext* bc,
     return false;
   }
   subs[std::string{channel}] = callback_id;
+  registration.owner = owner;
+  registration.extension_name = extension_name;
   return true;
 }
 
@@ -316,8 +344,8 @@ auto unregister_js_subscription(plinth::js::BridgeContext* bc,
   if (bc_it == g_bc_registry.end()) {
     return;
   }
-  bc_it->second.erase(std::string{channel});
-  if (bc_it->second.empty()) {
+  bc_it->second.channels.erase(std::string{channel});
+  if (bc_it->second.channels.empty()) {
     g_bc_registry.erase(bc_it);
   }
 }
@@ -351,6 +379,18 @@ auto dispatch(const DispatchedEvent& ev) -> std::size_t {
   auto js_n = dispatch_to_js_subscribers(ev);
   g_dispatch_count.fetch_add(1, std::memory_order_relaxed);
   return js_n;
+}
+
+auto set_js_delivery_probe_for_test(std::string channel,
+                                    JsDeliveryProbeForTest probe) -> void {
+  if (!probe) {
+    g_js_delivery_probe.store({}, std::memory_order_release);
+    return;
+  }
+  g_js_delivery_probe.store(
+      std::make_shared<const JsDeliveryProbeState>(
+          JsDeliveryProbeState{std::move(channel), std::move(probe)}),
+      std::memory_order_release);
 }
 
 auto dispatch_for_test(const DispatchedEvent& ev) -> std::size_t {
@@ -452,7 +492,7 @@ auto js_subscriber_count() -> std::size_t {
   std::shared_lock lock(g_bc_mu);
   std::size_t total = 0;
   for (const auto& [_bc, subs] : g_bc_registry) {
-    total += subs.size();
+    total += subs.channels.size();
   }
   return total;
 }

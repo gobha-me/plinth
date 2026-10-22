@@ -106,6 +106,69 @@ struct DisposeGate {
   std::shared_ptr<Gate> gate;
   ~DisposeGate() { gate->enter_and_wait(); }
 };
+
+struct StopWakeupSchedule {
+  std::shared_ptr<Gate> work = std::make_shared<Gate>();
+  std::shared_ptr<Gate> admission = std::make_shared<Gate>();
+  std::shared_ptr<Gate> park = std::make_shared<Gate>();
+  std::atomic<bool> observing{true};
+  std::atomic<bool> armed{false};
+  std::atomic<bool> gate_timeout{false};
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool published = false;
+  bool notified = false;
+  bool finished = false;
+  std::size_t publications = 0;
+  std::size_t notifications = 0;
+  std::size_t finishes = 0;
+
+  auto block(const std::shared_ptr<Gate>& gate) -> void {
+    std::unique_lock lock{gate->mutex};
+    gate->entered = true;
+    gate->changed.notify_all();
+    if (!gate->changed.wait_for(lock, 2s, [&] { return gate->released; }))
+      gate_timeout.store(true);
+  }
+
+  auto observe(frontend::OwnedFrontendWorker::StopObservation stage) -> void {
+    if (!observing.load()) return;
+    using Stage = frontend::OwnedFrontendWorker::StopObservation;
+    if (stage == Stage::ADMISSION_CLOSED) {
+      block(admission);
+    } else if (stage == Stage::BEFORE_WAIT && armed.exchange(false)) {
+      block(park);
+    } else if (stage == Stage::STOP_PUBLISHED) {
+      std::lock_guard lock{mutex};
+      published = true;
+      ++publications;
+      changed.notify_all();
+    } else if (stage == Stage::STOP_NOTIFIED) {
+      std::lock_guard lock{mutex};
+      notified = true;
+      ++notifications;
+      changed.notify_all();
+    } else if (stage == Stage::FINISHED) {
+      std::lock_guard lock{mutex};
+      finished = true;
+      ++finishes;
+      changed.notify_all();
+    }
+  }
+};
+
+// Every assertion/exception path opens all three owned gates BEFORE joining
+// the stopping thread, and joins it BEFORE the worker can be destroyed.
+struct ReleaseStopWakeup {
+  std::shared_ptr<StopWakeupSchedule> schedule;
+  std::jthread stopper;
+  ~ReleaseStopWakeup() {
+    schedule->observing.store(false);
+    schedule->work->release();
+    schedule->admission->release();
+    schedule->park->release();
+  }
+};
 } // namespace
 
 TEST_CASE("frontend worker: physical work and completion retain one slot",
@@ -461,6 +524,85 @@ TEST_CASE("frontend worker: queued expiry and caller cancellation skip work",
   REQUIRE(batch->results[1]->error() == frontend::FrontendWorkError::DEADLINE);
   REQUIRE_FALSE(batch->results[2]->has_value());
   REQUIRE(batch->results[2]->error() == frontend::FrontendWorkError::CANCELLED);
+
+  SECTION("stop publication cannot notify ahead of the waiter's park") {
+    lifecycle::AsyncTaskRegistry parked_tasks;
+    auto schedule = std::make_shared<StopWakeupSchedule>();
+    frontend::OwnedFrontendWorker parked_worker{
+        1, [schedule](auto stage) { schedule->observe(stage); }};
+    std::exception_ptr stop_error;
+    ReleaseStopWakeup release_stop{schedule, {}};
+    auto completion = std::make_shared<Outcome>();
+    REQUIRE(parked_worker.try_submit(
+        [schedule](auto, auto) { schedule->block(schedule->work); },
+        [completion](auto result) { completion->record(result); },
+        parked_tasks.try_acquire(), std::chrono::steady_clock::now() + 10s));
+    REQUIRE(schedule->work->wait_entered());
+
+    release_stop.stopper = std::jthread{[&parked_worker, &stop_error] {
+      try {
+        parked_worker.request_stop();
+      } catch (...) {
+        stop_error = std::current_exception();
+      }
+    }};
+    // close_admission already released the worker mutex. Hold publication
+    // back until the worker has observed a false predicate under that mutex.
+    REQUIRE(schedule->admission->wait_entered());
+    schedule->armed.store(true);
+    schedule->work->release();
+    REQUIRE(schedule->park->wait_entered());
+    schedule->admission->release();
+    {
+      std::unique_lock lock{schedule->mutex};
+      REQUIRE(schedule->changed.wait_for(lock, 2s,
+                                         [&] { return schedule->published; }));
+    }
+    {
+      std::unique_lock lock{schedule->mutex};
+      // Give the original unsynchronized notifier an opportunity to notify
+      // while the real waiter's false-predicate-to-park gate is closed. This
+      // bounded event wait is schedule setup, NOT a pass/fail oracle: the
+      // first stop must actually publish FINISHED below, without rescue.
+      static_cast<void>(schedule->changed.wait_for(
+          lock, 100ms, [&] { return schedule->notified; }));
+    }
+    schedule->park->release();
+    release_stop.stopper.join();
+    {
+      std::unique_lock lock{schedule->mutex};
+      // No drain/request_stop/second notification may precede this positive
+      // receipt from the actual worker terminal path. A failed receipt fails
+      // the case; only assertion-unwind destruction may then rescue cleanup.
+      REQUIRE(schedule->changed.wait_for(lock, 2s,
+                                         [&] { return schedule->finished; }));
+      REQUIRE(schedule->publications == 1);
+      REQUIRE(schedule->notifications == 1);
+      REQUIRE(schedule->finishes == 1);
+    }
+    // Prevent the explicit drain/destructor's idempotent second request from
+    // contaminating the first stop's causal receipt.
+    schedule->observing.store(false);
+    const bool drained =
+        parked_worker.drain(std::chrono::steady_clock::now() + 2s);
+    REQUIRE_FALSE(stop_error);
+    REQUIRE_FALSE(schedule->gate_timeout.load());
+    {
+      std::lock_guard lock{schedule->mutex};
+      REQUIRE(schedule->published);
+      REQUIRE(schedule->notified);
+      REQUIRE(schedule->finished);
+    }
+    REQUIRE(drained);
+    REQUIRE(parked_worker.physical_joined());
+    REQUIRE_FALSE(parked_worker.active());
+    REQUIRE_FALSE(parked_worker.completion_failed());
+    REQUIRE(parked_tasks.active_for_test() == 0);
+    REQUIRE(completion->wait());
+    std::lock_guard lock{completion->mutex};
+    REQUIRE(completion->calls == 1);
+    REQUIRE(completion->result->has_value());
+  }
 }
 
 TEST_CASE("frontend worker: stop physically drains every queued closure FIFO",
