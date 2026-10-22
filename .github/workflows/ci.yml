@@ -513,6 +513,35 @@ jobs:
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_module_import_corpus$'
 
+      - name: Focused native capability round-trip and ownership sanitizer corpora
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R \
+            '^plinth_tests_native_capability_(data|edges|errors|ordering|ownership|nested)$' |
+            grep -Ex 'Total Tests: 6'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_native_capability_(data|edges|errors|ordering|ownership|nested)$'
+
+      - name: Focused capability cancellation sanitizer regressions
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R \
+            '^plinth_tests_cap_cancellation_(sticky|cpu|siblings|reuse|teardown|setup_failure|notification_failure)$' |
+            grep -Ex 'Total Tests: 7'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_cap_cancellation_(sticky|cpu|siblings|reuse|teardown|setup_failure|notification_failure)$'
+
       - name: Focused reverse JSON property-name sanitizer regressions
         env:
           PLINTH_PG_HOST: 127.0.0.1
@@ -842,6 +871,33 @@ jobs:
             grep -Ex 'Total Tests: 1'
           ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_module_import_corpus$'
+
+      - name: Focused native capability round-trip and ownership TSan corpora
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R \
+            '^plinth_tests_native_capability_(data|edges|errors|ordering|ownership|nested)$' |
+            grep -Ex 'Total Tests: 6'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_native_capability_(data|edges|errors|ordering|ownership|nested)$'
+
+      - name: Focused capability cancellation TSan regressions
+        env:
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -R \
+            '^plinth_tests_cap_cancellation_(sticky|cpu|siblings|reuse|teardown|setup_failure|notification_failure)$' |
+            grep -Ex 'Total Tests: 7'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 -R \
+            '^plinth_tests_cap_cancellation_(sticky|cpu|siblings|reuse|teardown|setup_failure|notification_failure)$'
 
       - name: Focused reverse JSON property-name TSan regressions
         env:

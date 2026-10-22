@@ -44,6 +44,7 @@
 #include <expected>
 #include <functional>
 #include <json/value.h>
+#include <stop_token>
 #include <string>
 #include <vector>
 
@@ -182,8 +183,8 @@ auto call_capability_async(
     CapabilityCall call, UserContext ctx,
     std::string* ext_detail_code_out = nullptr,
     std::string* ext_detail_message_out = nullptr,
-    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted = nullptr)
-    -> drogon::Task<ResolveResult>;
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted = nullptr,
+    std::stop_token inherited = {}) -> drogon::Task<ResolveResult>;
 
 // Full Tier 2 cache resync from plinth.capabilities. Builds a complete
 // replacement while holding the resolver write lock and swaps it into service

@@ -21,6 +21,9 @@ enum class NativeSetupFailurePoint : std::uint8_t {
   batch_begin_metadata,
   batch_begin_queue,
   batch_commit_metadata,
+  execution_lifetime_setup,
+  inherited_cancel_registration,
+  inherited_cancel_notification,
 };
 
 namespace native_setup_failure_detail {

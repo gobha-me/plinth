@@ -332,6 +332,28 @@ std::mutex construction_hook_mutex;
 PoolCreationHook construction_hook;
 std::mutex module_engine_observer_mutex;
 std::shared_ptr<const ModuleEngineObserver> module_engine_observer;
+std::mutex dispatch_result_observer_mutex;
+std::shared_ptr<const DispatchResultObserver> dispatch_result_observer;
+
+auto observe_dispatch_result(
+    std::string_view extension_name, std::string_view function, int call_depth,
+    const std::expected<Json::Value, js::PromiseRejection>& result) noexcept
+    -> void {
+  std::shared_ptr<const DispatchResultObserver> observer;
+  {
+    std::lock_guard lock(dispatch_result_observer_mutex);
+    observer = dispatch_result_observer;
+  }
+  if (observer) {
+    const DispatchResultObservation observation{
+        .extension_name = std::string{extension_name},
+        .function = std::string{function},
+        .call_depth = call_depth,
+        .rejection =
+            result.has_value() ? std::nullopt : std::optional{result.error()}};
+    (*observer)(observation);
+  }
+}
 // A pool whose bounded close could not finish stays owned for the coordinator
 // to retry. Successful replacement/disable never accumulates pools here.
 std::vector<std::shared_ptr<plinth::js::RuntimePool>> failed_pools;
@@ -883,7 +905,8 @@ auto handler_error_rejection(const plinth::js::EvalError& error, bool entered,
 auto invoke_owned_source(
     plinth::js::BridgeContext& bc, std::string_view extension_name,
     std::string_view function, const Json::Value& args, std::string_view src,
-    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+    std::stop_token inherited = {})
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>> {
 
   // Inspect original host bytes before JS_NewStringLen can normalize malformed
@@ -932,8 +955,8 @@ auto invoke_owned_source(
 
   // Step 4 — eval. run_on_context drives the async-bridge loop; the
   // top-level promise (returned by the async IIFE) is settled inside.
-  auto eval_outcome =
-      co_await plinth::js::run_on_context(bc, WRAPPER_SRC, std::move(accepted));
+  auto eval_outcome = co_await plinth::js::run_on_context(
+      bc, WRAPPER_SRC, std::move(accepted), std::move(inherited));
 
   // Step 5 — classify outcome.
   if (eval_outcome.value.has_value()) {
@@ -951,7 +974,8 @@ auto invoke_owned_source(
 auto invoke_handler(plinth::js::BridgeContext& bc,
                     std::string_view extension_name, std::string_view function,
                     const Json::Value& args, std::string_view data_dir,
-                    std::shared_ptr<lifecycle::AsyncTaskLease> accepted)
+                    std::shared_ptr<lifecycle::AsyncTaskLease> accepted,
+                    std::stop_token inherited)
     -> drogon::Task<std::expected<Json::Value, js::PromiseRejection>> {
   bool missing = false;
   bool io_error = false;
@@ -967,7 +991,8 @@ auto invoke_handler(plinth::js::BridgeContext& bc,
     });
   }
   co_return co_await invoke_owned_source(bc, extension_name, function, args,
-                                         source, std::move(accepted));
+                                         source, std::move(accepted),
+                                         std::move(inherited));
 }
 
 auto storage_rejection(std::string_view code = "storage_unavailable")
@@ -1537,6 +1562,17 @@ auto set_module_engine_observer_for_test(ModuleEngineObserver observer)
   std::lock_guard lock(module_engine_observer_mutex);
   module_engine_observer = std::move(next);
 }
+auto set_dispatch_result_observer_for_test(DispatchResultObserver observer)
+    -> void {
+  auto next =
+      observer
+          ? std::make_shared<const DispatchResultObserver>(std::move(observer))
+          : nullptr;
+  {
+    std::lock_guard lock(dispatch_result_observer_mutex);
+    dispatch_result_observer.swap(next);
+  }
+}
 auto pending_pool_constructions_for_test() -> std::size_t {
   std::shared_lock lock(registry_mutex);
   return constructions.size();
@@ -1557,7 +1593,8 @@ auto dispatch(std::string_view extension_name, std::string_view function,
               const Json::Value& args,
               const plinth::capabilities::UserContext& caller,
               int caller_call_depth,
-              std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
+              std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+              std::stop_token inherited)
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>> {
 
   using plinth::js::PromiseRejection;
@@ -1616,6 +1653,14 @@ auto dispatch(std::string_view extension_name, std::string_view function,
     });
   }
 
+  // Setup can allocate before the child publishes its execution generation.
+  // Retain the acquired context's destroy route on exceptional unwind too.
+  auto destroy = [pool = lease->pool](plinth::js::BridgeContext* context) {
+    pool->destroy(context);
+  };
+  std::unique_ptr<plinth::js::BridgeContext, decltype(destroy)> owned{bc,
+                                                                      destroy};
+
   // ICD §Security Constraint 1 — callee runs under caller's identity
   // for audit + cap.call / db.query / pubsub.publish attribution.
   // `bc.extension_name` is already the callee's own (pool ctor) for
@@ -1624,13 +1669,14 @@ auto dispatch(std::string_view extension_name, std::string_view function,
   bc->call_depth = caller_call_depth + 1;
 
   auto result = co_await invoke_handler(*bc, extension_name, function, args,
-                                        packages_data_dir, std::move(accepted));
+                                        packages_data_dir, std::move(accepted),
+                                        std::move(inherited));
+
+  observe_dispatch_result(extension_name, function, bc->call_depth, result);
 
   if (result.has_value()) {
-    lease->pool->release(bc);
+    lease->pool->release(owned.release());
     emit_preference_set_audit(extension_name, function, args, caller);
-  } else {
-    lease->pool->destroy(bc);
   }
   co_return result;
 }

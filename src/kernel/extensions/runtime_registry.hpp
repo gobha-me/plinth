@@ -42,6 +42,7 @@
 #include <json/value.h>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <string>
 #include <string_view>
 
@@ -248,6 +249,28 @@ using ModuleEngineObserver =
     std::function<void(std::string_view, ModuleEngineStage)>;
 auto set_module_engine_observer_for_test(ModuleEngineObserver observer) -> void;
 
+struct DispatchResultObservation {
+  std::string extension_name;
+  std::string function;
+  int call_depth = 0;
+  // Absent only for an actual successful invoke_handler result.
+  std::optional<js::PromiseRejection> rejection;
+};
+
+// Trusted C++ observation of the actual target result after invoke_handler,
+// before pool release/destroy. Earlier admission/acquire failures do not emit.
+// This is not caller-side promise settlement or an execution-generation token;
+// tests must establish their target's unambiguous generation separately.
+// Observers must not throw, block, re-enter the registry or mutate execution.
+// Invoked outside the observer/registry mutexes, with owned copied metadata;
+// no BC/JS handles, grants or JS registration. Empty removes the observer, but
+// already copied callbacks may still run: captures need independent ownership
+// through actual dispatch drain and owner-loop quiescence.
+using DispatchResultObserver =
+    std::function<void(const DispatchResultObservation&)>;
+auto set_dispatch_result_observer_for_test(DispatchResultObserver observer)
+    -> void;
+
 // The Tier 2 extension dispatch entry — invoked from
 // `capabilities::call_capability_async` after resolve + RBAC for an
 // entry whose `provider_type == "extension"`. Looks up the pool,
@@ -268,7 +291,8 @@ auto dispatch(
     std::string_view extension_name, std::string_view function,
     const Json::Value& args, const plinth::capabilities::UserContext& caller,
     int caller_call_depth,
-    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted = nullptr)
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted = nullptr,
+    std::stop_token inherited = {})
     -> drogon::Task<std::expected<Json::Value, plinth::js::PromiseRejection>>;
 
 } // namespace plinth::extensions

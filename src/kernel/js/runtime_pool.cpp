@@ -331,6 +331,10 @@ extern "C" auto plinth_js_interrupt_cb(JSRuntime* /*rt*/, void* opaque) -> int {
   if (bc == nullptr) {
     return 0;
   }
+  if (auto lifetime = bc->execution_lifetime.load(std::memory_order_acquire);
+      lifetime && lifetime->cancellation_requested()) {
+    bc->cancelled.store(true, std::memory_order_release);
+  }
   if (bc->cancelled.load(std::memory_order_acquire)) {
     return 1;
   }

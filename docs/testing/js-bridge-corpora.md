@@ -17,6 +17,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
 | Pubsub (#148) | `plinth_tests_pubsub_corpus` | Publish/subscribe admission, callback replacement/invocation, returned unsubscribe enqueue and runtime ownership |
 | Capability (#150) | `plinth_tests_cap_corpus` | Call/batch admission, owned snapshots, real Promise.all composition with simulated host settlement and runtime ownership |
+| Native capability acceptance inventory (#187, parent #90) | `plinth_tests_native_capability_data`, `plinth_tests_native_capability_edges`, `plinth_tests_native_capability_errors`, `plinth_tests_native_capability_ordering`, `plinth_tests_native_capability_ownership`, `plinth_tests_native_capability_nested` | Real resolver/extension dispatch, native settlement, causal composition and separately required nested cancellation; registration is not delivery evidence |
 | Ordinary database (#151) | `plinth_tests_db_admission_corpus` | Query/exec admission, parameter and client-manager snapshots, simulated host settlement and runtime ownership; no SQL execution |
 | Public database batch (#174, parent #90) | `plinth_tests_db_batch_corpus` | Public callback admission and installed batch orchestration with simulated host completion/reset; no SQL execution |
 | Native binary database parameters (parent #90) | `plinth_tests_native_bytea_query`, `plinth_tests_native_bytea_exec`, `plinth_tests_native_bytea_batch` | Real registered query/exec and installed batch dispatch, typed PostgreSQL bytes, durable storage, rollback and owned teardown |
@@ -240,6 +241,121 @@ admission case, one public DB batch case, one synchronous conversion case and
 the audit-drain fixture, retaining every
 ordinary JS fixture. Both sanitizer lanes explicitly discover and execute this
 gate; compiler and image suites keep the complete CTest inventory.
+
+## Native capability round-trips and owned cancellation
+
+#187 follows the actual injected `cap.call` and unmodified `cap.batch` through
+resolver/RBAC, staged extension handlers, native asynchronous completion and
+caller Promise settlement. This inventory describes required observations,
+not a claim that the issue, all six gates or their delivery CI have passed.
+The admission-only slice above remains a separate required gate.
+
+The primary ledger is frozen independently from boundary controls, warmups,
+child operations and cleanup. Both call entries and two fresh-owner replays
+are explicit dimensions; O/L use two fixed variants rather than four seeds.
+
+| Primary family | Dimensions | Required observations |
+| --- | --- | --- |
+| R00–R07: null, boolean, integer, fraction, string, member names, arrays and trees | 8 families × 4 seeds × 2 entries × 2 replays | 128 |
+| R08–R09: byte and conversion-depth edges | 2 families × 4 seeds × 2 entries × 2 replays | 32 |
+| E00–E07: resolver, authorization, depth and handler errors | 8 families × 2 seeds × 2 entries × 2 replays | 64 |
+| O00–O03: batch ordering, rejection, incremental admission and fanout | 4 families × 2 variants × 2 replays | 16 |
+| L00–L03: release/reuse, held rebuild, pre-cancel and blocked-work retirement | 4 families × 2 entries × 2 replays | 16 |
+| Primary total, excluding all controls and SC7 | | 256 |
+
+Fourteen additional real boundary controls distinguish raw caller conversion,
+handler wrapping and a shallow depth control. They bring the five non-nested
+cases to 270 observations, not 274: SC7's four nested-cancellation observations
+are a separate required ledger (two entries × two fresh-provider replays).
+Neither a count of 270 nor successful caller retirement substitutes for SC7.
+
+Literal typed descriptors and independently authored JS programs retain actual
+JS kinds, exact finite/safe-number values, UTF-16 value/member-name code units,
+array order and complete own-key sets. Reordered object entries remain valid;
+duplicate/missing keys, changed code units and type/value mutations do not.
+Oracles never invoke production converters or use their output as policy.
+R08 uses an explicit fixture quota and independent 63/64/65/64-byte expectations;
+R09 distinguishes input admission, handler-result conversion and outer caller
+conversion at depths 63/64/65. Fixture quotas do not change production limits.
+Native rejection codes, ordinary-object identity, own error fields and exact
+messages or independently bounded handler prefixes remain distinct from
+synchronous `TypeError` and final host-evaluation classification.
+
+The data case requires 192 durable handler-entry writes (128 target and 64 peer),
+not 128 native operations. R08/R09 and their extra controls require 64 writes;
+the error case requires 36, including admitted peers. These 292 writes are
+entry acknowledgements, not a count of successful final results. Independent
+libpq setup/readback/lock operations are not injected capability or DB calls.
+
+The corresponding R/E caller CAP-registration counts are 192/64/96, totaling
+352, including the 14 edge controls' 22 registrations and 22 entry writes.
+Excluding those controls, R/E account for 330 registrations and 270 writes.
+O/L separately require 86 CAP registrations, 142 native DB operations and 86
+entry writes (O: 52/96/52; L: 34/46/34). These counts already include 12 O
+ACK/barrier support calls and 16 L recovery calls; do not add them again.
+Primary target/prefix/fanout calls alone account for 58 of those registrations.
+Four registry warmup epochs add 16 CAP calls, 16 native INSERTs and 16 entry
+writes separately. Four L03 replacement-generation pure-JS checks add no CAP or
+DB operation. O/L observers require 52 caller and 86 callee generations, each
+with one ENTER and one FINISH (276 stage callbacks), excluding warmup.
+Polling, snapshots, provisioning, independent control SQL and audit persistence
+have no fixed query-count claim.
+
+O/L preserve distinct handler entry, physical SQL waiter, host delivery,
+JS catch acknowledgement and final return observations. Reverse completion
+cannot change input-order results; first rejection in time cannot become the
+first input-index rejection. A later invalid tuple must preserve actual
+execution of its admitted prefix, not promise atomic rollback. Fanout checks
+actual queued callbacks, active operations and successive released SQL gates.
+Release/reuse and held rebuild require old/new generation identity and pristine
+context state; pre-cancel requires zero primary admission. L03 observes a
+retired caller while accepted native SQL is still physically blocked, then
+acknowledged unlock, native/audit drain and fresh-generation recovery. SC7
+separately requires caller-only cancellation to reach the distinct owned callee,
+its actual rejection and final caller/callee classifications while preserving
+issued-SQL ownership. No direct child cancellation can satisfy that obligation.
+
+Observers retain copied metadata and weak generation identities, not task
+leases or contexts. Owner-loop snapshots and observer closure are fenced.
+Restricted extension DB identities and owned SQL gates use existing provisioned
+authority, with acknowledged unlock before join on every unwind path. Every
+caller requires execution retirement, cleared queues/callbacks/batch pins and
+timers, actual context destruction, bounded idempotent pool shutdown and zero
+remaining pool owners. L03 permits bounded abandoned inflight work at caller
+retirement, but still requires its separately observed final native/audit drain.
+R/E check 17 cleanup fields; O/L check pristine context state, physical drains
+and the four shutdown fields separately. Provisioned-provider cleanup in the
+five non-nested cases verifies registry/client shutdown, schema/role/credential
+removal and task-file removal. SC7 instead removes its owned receipt relation
+and temporary files while preserving the existing provisioned DB identity.
+
+Copied positive observations are independently corrupted after owner teardown.
+The data case pins 1316 value/type/entry controls, 2176 cleanup-field controls,
+512 identity controls and 128 accepted object-order permutations. Its separate
+six row-ledger, eight shutdown, four owner-finish/receipt and two owner-ledger
+negative controls bring the rejection-control count to 4024; object-order
+permutations remain positive controls. The edge and error cases pin 432 and 640
+copied negative controls respectively, plus six inventory negatives each.
+Each O/L case pins 160 copied field controls and six ledger/epoch negatives.
+Two helper-only checks per O/L case reject a premature poll-count ceiling and
+acceptance after an expired wall budget; they are not additional native
+operations or primary cells.
+
+Each of the six named CTests uses exact-case fresh positive/no-skip Catch XML,
+a successful post-teardown process exit, a 60-second process bound, a 75-second
+CTest bound and the PostgreSQL schema lock. Missing PostgreSQL, missing cells,
+unknown settlement, failed drain or watchdog termination fails closed. Both
+ASan/UBSan lanes and selected TSan explicitly discover exactly six and execute
+all six with fatal sanitizer settings. The ordinary grouped JS tests and full
+PostgreSQL/WebSocket/compiler/image gates remain required. Five selected passes,
+discovery-only output or an old report cannot establish six-case/full-suite
+success. Candidate and fresh exact-merge CI remain delivery gates.
+
+This finite slice does not close parent #90 or establish new API, grant,
+atomic-batch, cancellation-preemption or result-normalization policy. Broader
+transport/layer/scope combinations and the other bridge boundaries remain
+separate work. Registration and documentation do not authorize public security
+disclosure, a release or an asset/version change.
 
 ## Ordinary database admission and ownership
 

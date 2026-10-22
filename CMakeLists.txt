@@ -788,6 +788,12 @@ add_executable(plinth_tests
   tests/kernel/js/db_sqlstate_native_test.cpp
   tests/kernel/js/db_sqlstate_projection_test.cpp
   tests/kernel/js/native_pg_result_corpus_test.cpp
+  tests/kernel/js/native_capability_corpus_test.cpp
+  tests/kernel/js/cap_cancellation_test.cpp
+  tests/kernel/js/cap_cancellation_failure_test.cpp
+  tests/kernel/js/native_capability_data_test.cpp
+  tests/kernel/js/native_capability_edges_test.cpp
+  tests/kernel/js/native_capability_ownership_test.cpp
   tests/kernel/js/db_search_path_test.cpp
   tests/kernel/js/db_silent_test.cpp
   tests/kernel/js/pubsub_test.cpp
@@ -1407,6 +1413,58 @@ add_test(NAME plinth_tests_native_pg_result_corpus
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_native_pg_result_corpus PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
+# Separate fresh processes make every native capability family fail closed on
+# missing PostgreSQL, skipped observations or incomplete owner teardown. The
+# ordinary JS group also retains these tests; no existing selector is narrowed.
+function(add_plinth_native_capability_case name selector)
+  add_test(NAME plinth_tests_native_capability_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}"
+      --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_native_capability_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+endfunction()
+add_plinth_native_capability_case(data
+  "QuickJS native capability calls have a bounded data corpus")
+add_plinth_native_capability_case(edges
+  "Native capability byte and conversion-depth boundaries retain their exact edges")
+add_plinth_native_capability_case(errors
+  "Native capability error families retain literal rejection and entry contracts")
+add_plinth_native_capability_case(ordering
+  "Native capability batches retain causal ordering and bounded fanout")
+add_plinth_native_capability_case(ownership
+  "Native capability callers retain bounded generation ownership")
+add_plinth_native_capability_case(nested
+  "Native capability cancellation reaches the owned callee generation")
+
+function(add_plinth_cap_cancellation_case name selector)
+  add_test(NAME plinth_tests_cap_cancellation_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}" --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_cap_cancellation_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema TIMEOUT 75)
+endfunction()
+add_plinth_cap_cancellation_case(sticky
+  "Capability cancellation tokens are sticky before child registration")
+add_plinth_cap_cancellation_case(cpu
+  "Capability cancellation interrupts an entered CPU child as cancelled")
+add_plinth_cap_cancellation_case(siblings
+  "Capability cancellation tokens isolate sibling generations")
+add_plinth_cap_cancellation_case(reuse
+  "Retired capability generations cannot cancel a reused context")
+add_plinth_cap_cancellation_case(teardown
+  "Capability cancellation callback teardown joins cross-thread requests")
+add_plinth_cap_cancellation_case(setup_failure
+  "Capability cancellation setup faults retire owned contexts")
+add_plinth_cap_cancellation_case(notification_failure
+  "Capability cancellation notification faults retain sticky wall-wake cancellation")
 
 function(add_plinth_sqlstate_case name selector)
   add_test(NAME plinth_tests_sqlstate_${name}
