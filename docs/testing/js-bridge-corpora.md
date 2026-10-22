@@ -15,6 +15,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Synchronous host evaluation (#176, parent #90) | `plinth_tests_sync_conversion_corpus` | Actual one-shot and pooled synchronous evaluation, their distinct private result converters/classifiers, and owned runtime lifecycle |
 | Extension module import (parent #90) | `plinth_tests_module_import_corpus` | Actual staged handler loading, registered nested source import, compile/evaluate entry, namespace/default invocation and fresh-owner replacement replay |
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
+| Native audit (#191, parent #90) | `plinth_tests_native_audit_corpus`, `plinth_tests_native_audit_acknowledgement` | Actual registered audit dispatch, committed PostgreSQL rows and separately gated fire-and-forget acknowledgement before persistence |
 | Pubsub (#148) | `plinth_tests_pubsub_corpus` | Publish/subscribe admission, callback replacement/invocation, returned unsubscribe enqueue and runtime ownership |
 | Native pubsub (#189, parent #90) | `plinth_tests_native_pubsub_publish`, `plinth_tests_native_pubsub_delivery` | Actual PostgreSQL outbox acknowledgement and separately tested registered JS delivery/cleanup with an explicitly synthetic broker producer |
 | Native pubsub checkout ownership | `plinth_tests_native_pubsub_owner`, `plinth_tests_native_pubsub_retirement` | Separately required actual owner-loop routing and queued checkout-retirement controls; not the full notification chain |
@@ -37,6 +38,68 @@ The synchronous slice below covers the first two entry points with finite
 inputs; reverse conversion and the other implementations remain outstanding.
 Reserved, unimplemented HTTP/storage operation variants are not exposed fuzz
 targets. Parent #90 stays open while requested coverage remains incomplete.
+
+## Native audit persistence and acknowledgement
+
+This pair extends rather than replaces #133's DB-free admission and simulated
+settlement corpus. Both cases call actual RuntimePool-injected `audit.log`
+through the native dispatcher with the existing PostgreSQL fixture and
+production process shutdown order. They remain ordinary `[js]` cases, not new
+isolated fixtures. Neither case may seal the process-global audit writer or
+stop the shared Drogon fixture as a per-case cleanup shortcut.
+
+The committed-row corpus requires 24 admitted native writes, with bounded fixed
+inputs and fresh-owner replays. Independent PostgreSQL readback checks the
+actual stored rows, payloads and trusted provenance against literal test
+expectations; the production converter or audit detail decoder is not the
+oracle. Existing namespace, reserved-field and denial checks remain separate
+required observations, not extra successful writes. Missing/duplicate rows or
+ledger cells and corrupted copies of passing observations must be rejected.
+Fixture-selected user/session/IP, node, extension and call-depth profiles are
+synthetic trusted setup identities. They do not prove HTTP authentication,
+credential validation or permission assignment.
+
+The 12 denial calls include eight with exact event-action zero-row readback.
+The four non-string/empty-event calls instead prove the exact synchronous
+TypeError and zero native admission; their cleanup sentinels are not event-row
+receipts for inputs that have no valid event identity.
+
+The acknowledgement case adds one admitted write, bringing the pair's required
+native-write inventory to 25. A separately owned PostgreSQL control connection
+causally blocks its INSERT while the JavaScript acknowledgement is observed;
+independent storage observations distinguish that settlement from a committed
+row. The gate is then released and actual audit persistence must drain before
+durable readback and teardown. This exercises the current fire-and-forget
+admission acknowledgement, not a persistence acknowledgement or a newly chosen
+public contract for the Promise's resolved value. No simulated host settlement,
+sleep-based readiness or manually completed audit callback substitutes for the
+native path.
+
+Every exit path must release the owned SQL gate before joining work or draining
+its owners. Native/audit barriers, context retirement, empty callback and
+operation ownership, and bounded idempotent RuntimePool shutdown precede final
+assertions and deletion of exact task-owned audit rows. The production fixture
+owns final process teardown; neither case pauses/seals global audit admission for later
+grouped tests. Real database/setup/teardown failures fail rather than skip.
+
+Each exact CTest requires the named single case, fresh positive Catch XML, zero
+failures/expected failures/skips and a successful child exit after cleanup. The
+inner/outer bounds are 60/75 seconds; both use `plinth_pg_schema` and `needs_pg`.
+Both existing ASan/UBSan lanes and selected TSan discover exactly two and run
+them verbosely and serially under the existing fatal sanitizer settings. All
+prior audit, native ownership, lifecycle and full compiler/image gates remain
+required. Wiring alone is not an execution or sanitizer pass.
+
+```sh
+ctest --test-dir "$audit_build_dir" --verbose --output-on-failure --parallel 1 \
+  -R '^plinth_tests_native_audit_(corpus|acknowledgement)$'
+```
+
+This is finite native audit coverage, not exhaustive malformed-input,
+allocation-failure, every cancellation/race schedule or HTTP authentication
+coverage. Parent #90 remains open for its other requested boundaries. No
+production policy, public API, permission, version, asset or release change is
+made by this slice.
 
 ## Pubsub admission and callback ownership
 
