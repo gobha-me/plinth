@@ -84,6 +84,90 @@ namespace {
 
 using std::chrono::steady_clock;
 
+// Called only on the JS owner. The token read itself is independent of BC
+// lifetime locking and is also used by the CPU interrupt handler.
+auto latch_cancellation(BridgeContext& bc) -> bool {
+  auto lifetime = bc.execution_lifetime.load(std::memory_order_acquire);
+  if (lifetime && lifetime->cancellation_requested()) {
+    bc.cancelled.store(true, std::memory_order_release);
+    return true;
+  }
+  return false;
+}
+
+struct InheritedCancellationWake {
+  std::weak_ptr<ExecutionLifetime> execution;
+  trantor::EventLoop* loop;
+
+  auto operator()() const noexcept -> void {
+    // Never visit/request_cancel/wake inline here. Callback destruction can
+    // wait for this invocation while the child resumes under its lifetime lock.
+    {
+      auto lifetime = execution.lock();
+      if (!lifetime) {
+        return;
+      }
+      // Only independent stop state is touched: publish through descendants
+      // even when a CPU-running grandchild blocks the shared owner loop.
+      lifetime->publish_cancellation();
+    } // No strong execution/accepted-task lease crosses the queued boundary.
+    try {
+      maybe_fail_native_setup(
+          NativeSetupFailurePoint::inherited_cancel_notification);
+      loop->queueInLoop([weak = execution] {
+        if (auto lifetime = weak.lock()) {
+          static_cast<void>(lifetime->request_cancel());
+        }
+      });
+    } catch (...) {
+      // Sticky cancellation is still observed by the CPU interrupt or the
+      // already-armed wall wake. This is NOT a successfully delivered wake.
+      // No BC access, lifetime mutex or logging allocation in the callback.
+      if (auto lifetime = execution.lock()) {
+        lifetime->note_notification_failure();
+      }
+    }
+  }
+};
+
+std::mutex execution_observer_mutex;
+std::shared_ptr<const ExecutionObserver> execution_observer;
+
+auto observe_execution(
+    const BridgeContext& bc, const std::shared_ptr<ExecutionLifetime>& lifetime,
+    ExecutionObservationStage stage,
+    std::optional<EvalErrorKind> error_kind = std::nullopt) noexcept -> void {
+  std::shared_ptr<const ExecutionObserver> observer;
+  {
+    std::lock_guard lock(execution_observer_mutex);
+    observer = execution_observer;
+  }
+  if (observer) {
+    const ExecutionObservation observation{
+        .stage = stage,
+        .execution = lifetime,
+        .extension_name = bc.extension_name,
+        .call_depth = bc.call_depth,
+        .cancelled = bc.cancelled.load(std::memory_order_acquire),
+        .error_kind = error_kind};
+    (*observer)(observation);
+  }
+}
+
+auto observe_execution_finish(
+    const BridgeContext& bc, const std::shared_ptr<ExecutionLifetime>& lifetime,
+    EvalResult result) -> EvalResult {
+  if (lifetime->take_notification_failure()) {
+    plinth::log::error("inherited cancellation wake could not be enqueued; "
+                       "cancellation observed at an existing driver boundary");
+  }
+  observe_execution(bc, lifetime, ExecutionObservationStage::FINISH,
+                    result.value.has_value()
+                        ? std::nullopt
+                        : std::optional{result.value.error().kind});
+  return result;
+}
+
 // Per-op outcome produced by the detached coroutine arm. The success
 // side carries the Json result; the failure side carries the JS-visible
 // rejection envelope. `std::expected` keeps the common-case resolve
@@ -121,6 +205,7 @@ auto drive_jobs(BridgeContext& bc) -> std::optional<EvalError> {
   JS_UpdateStackTop(bc.rt);
   bc.resume_cpu_timer();
   while (JS_IsJobPending(bc.rt)) {
+    latch_cancellation(bc);
     JSContext* pctx = bc.ctx;
     int rc = JS_ExecutePendingJob(bc.rt, &pctx);
     // Capture OOM peaks between jobs — the interrupt handler's
@@ -128,6 +213,7 @@ auto drive_jobs(BridgeContext& bc) -> std::optional<EvalError> {
     // settle promises and fire .then handlers so sampling here
     // covers allocation bursts in async function bodies.
     detail::sample_memory_peak(bc);
+    latch_cancellation(bc);
     if (rc < 0) {
       bc.pause_cpu_timer();
       return detail::extract_error(pctx, bc);
@@ -748,8 +834,8 @@ auto run_db_exec_outcome(
 // detached coroutine is free of cross-thread races — the op is moved
 // into this function and owned here.
 auto run_cap_call_outcome(
-    AsyncOp op, std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
-    -> drogon::Task<OpOutcome> {
+    AsyncOp op, std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+    std::stop_token inherited) -> drogon::Task<OpOutcome> {
   plinth::capabilities::CapabilityCall cc{.signature = op.cap_signature,
                                           .args = op.cap_args,
                                           .call_depth = op.cap_call_depth};
@@ -762,7 +848,7 @@ auto run_cap_call_outcome(
   std::string ext_detail_message;
   auto res = co_await plinth::capabilities::call_capability_async(
       std::move(cc), std::move(op.cap_user), &ext_detail_code,
-      &ext_detail_message, std::move(accepted));
+      &ext_detail_message, std::move(accepted), std::move(inherited));
   if (res.has_value()) {
     co_return res->data;
   }
@@ -1247,7 +1333,8 @@ auto dispatch_async_op_detached(std::shared_ptr<ExecutionLifetime> lifetime,
       // main loop at cap.call enqueue time). No bc.user /
       // bc.call_depth read inside this detached coroutine arm.
       outcome = co_await run_cap_call_outcome(std::move(op),
-                                              lifetime->accepted_lease());
+                                              lifetime->accepted_lease(),
+                                              lifetime->cancellation_token());
       break;
     case AsyncOp::Type::PUBSUB_PUBLISH:
       outcome = co_await run_pubsub_publish_outcome(std::move(op));
@@ -1427,10 +1514,16 @@ auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start,
                               std::optional<EvalError> original)
     -> drogon::Task<EvalResult> {
   auto cancel_deadline = steady_clock::now() + std::chrono::seconds(5);
+  auto lifetime = bc.execution_lifetime.load(std::memory_order_acquire);
   if (!original) {
     original = EvalError{
-        .kind = bc.wall_clock_exceeded() ? EvalErrorKind::WALL_CLOCK_EXCEEDED
-                                         : EvalErrorKind::CANCELLED,
+        // The new inherited-stop route uses the interrupt classifier's
+        // cancellation precedence, including its failed-notification fallback.
+        // Never replace a previously captured error or extend a deadline.
+        .kind = lifetime->inherited_cancellation_requested()
+                    ? EvalErrorKind::CANCELLED
+                : bc.wall_clock_exceeded() ? EvalErrorKind::WALL_CLOCK_EXCEEDED
+                                           : EvalErrorKind::CANCELLED,
         .message = "execution cancelled after 5s abandon window",
         .line = 0,
         .column = 0};
@@ -1438,7 +1531,7 @@ auto run_cancellation_cascade(BridgeContext& bc, steady_clock::time_point start,
   // Preserve the captured error; cancellation flags now forbid new host
   // admission from promise cleanup. This does not cancel already-issued SQL.
   bc.cancelled.store(true, std::memory_order_release);
-  auto lifetime = bc.execution_lifetime.load(std::memory_order_acquire);
+  lifetime->publish_cancellation();
   retire_batch_owners(bc, lifetime);
   lifetime->arm_wake(cancel_deadline);
 
@@ -1701,6 +1794,16 @@ auto dispatch_ops_batch_fanout(BridgeContext& bc, std::vector<AsyncOp> ops,
 
 } // namespace
 
+auto set_execution_observer_for_test(ExecutionObserver observer) -> void {
+  auto next =
+      observer ? std::make_shared<const ExecutionObserver>(std::move(observer))
+               : nullptr;
+  {
+    std::lock_guard lock(execution_observer_mutex);
+    execution_observer.swap(next);
+  }
+}
+
 // No async work in this guard: all remaining pinned/undispatched transaction
 // owners receive rollback requests before generation access is revoked.
 struct ExecutionExit {
@@ -1723,8 +1826,8 @@ struct ExecutionExit {
 
 // header: bc outlives the coroutine (owned by RuntimePool).
 auto run_on_context(BridgeContext& bc, std::string_view source,
-                    std::shared_ptr<lifecycle::AsyncTaskLease> accepted)
-    -> drogon::Task<EvalResult> {
+                    std::shared_ptr<lifecycle::AsyncTaskLease> accepted,
+                    std::stop_token inherited) -> drogon::Task<EvalResult> {
   auto start = steady_clock::now();
   // Admission occurs before any owner-loop scheduling hop. An explicitly
   // inherited lease authorizes descendants of an already accepted request.
@@ -1742,8 +1845,20 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
   if (main_loop == nullptr) {
     main_loop = drogon::app().getLoop();
   }
-  auto lifetime =
-      std::make_shared<ExecutionLifetime>(bc, *main_loop, std::move(admitted));
+  std::shared_ptr<ExecutionLifetime> lifetime;
+  try {
+    maybe_fail_native_setup(NativeSetupFailurePoint::execution_lifetime_setup);
+    lifetime = std::make_shared<ExecutionLifetime>(
+        bc, *main_loop, std::move(admitted), inherited);
+  } catch (const std::exception& error) {
+    co_return EvalResult{
+        .value = std::unexpected(EvalError{.kind = EvalErrorKind::RUNTIME_ERROR,
+                                           .message = error.what(),
+                                           .line = 0,
+                                           .column = 0}),
+        .duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+            steady_clock::now() - start)};
+  }
   std::shared_ptr<ExecutionLifetime> previous;
   if (!bc.execution_lifetime.compare_exchange_strong(
           previous, lifetime, std::memory_order_acq_rel)) {
@@ -1803,11 +1918,21 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
   if (!main_loop->isInLoopThread()) {
     co_await drogon::switchThreadCoro(main_loop);
   }
+  observe_execution(bc, lifetime, ExecutionObservationStage::ENTER);
+  std::optional<std::stop_callback<InheritedCancellationWake>> inherited_wake;
   OwnedJsValue owned_result{bc.ctx, JS_UNDEFINED};
   auto& result = owned_result.value;
   std::optional<EvalError> unexpected_failure;
   try {
     lifetime->arm_wake(start + bc.wall_clock_limit);
+    maybe_fail_native_setup(
+        NativeSetupFailurePoint::inherited_cancel_registration);
+    inherited_wake.emplace(inherited,
+                           InheritedCancellationWake{lifetime, main_loop});
+    if (latch_cancellation(bc)) {
+      co_return observe_execution_finish(
+          bc, lifetime, co_await run_cancellation_cascade(bc, start));
+    }
 
     // QuickJS uses a thread-local stack base for stack-overflow
     // detection. The runtime was likely created on a different thread
@@ -1823,8 +1948,10 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
     if (auto err = pre_eval_scan(source, "<async>"); err.has_value()) {
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
           steady_clock::now() - start);
-      co_return EvalResult{.value = std::unexpected(std::move(*err)),
-                           .duration = duration};
+      co_return observe_execution_finish(
+          bc, lifetime,
+          EvalResult{.value = std::unexpected(std::move(*err)),
+                     .duration = duration});
     }
 
     bc.resume_cpu_timer();
@@ -1844,10 +1971,17 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
     // captures the pre-reclaim peak.
     detail::sample_memory_peak(bc);
 
+    if (latch_cancellation(bc)) {
+      owned_result.reset();
+      co_return observe_execution_finish(
+          bc, lifetime, co_await run_cancellation_cascade(bc, start));
+    }
+
     // If JS_Eval threw (and we have nothing to drive), short-circuit.
     if (JS_IsException(result) && !bc.has_pending_ops() &&
         !JS_IsJobPending(bc.rt)) {
-      co_return finalize(bc, owned_result.take(), start);
+      co_return observe_execution_finish(
+          bc, lifetime, finalize(bc, owned_result.take(), start));
     }
 
     // Loop: dispatch pending AsyncOps, drive JS job queue, check
@@ -1857,10 +1991,12 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
     while (bc.has_pending_ops() || JS_IsJobPending(bc.rt) ||
            top_result_pending(bc, result) ||
            bc.inflight_detached.load(std::memory_order_acquire) > 0) {
+      latch_cancellation(bc);
       if (bc.cancelled.load(std::memory_order_acquire) ||
           bc.wall_clock_exceeded()) {
         owned_result.reset();
-        co_return co_await run_cancellation_cascade(bc, start);
+        co_return observe_execution_finish(
+            bc, lifetime, co_await run_cancellation_cascade(bc, start));
       }
       // 1. Fire-and-forget dispatch of any newly queued async ops
       //    (respecting back-pressure).
@@ -1894,20 +2030,30 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
       }
 
       // 3. Resume JS to process resolved promises (.then handlers).
+      latch_cancellation(bc);
       if (auto err = drive_jobs(bc); err.has_value()) {
         owned_result.reset();
-        co_return co_await run_cancellation_cascade(bc, start, std::move(err));
+        co_return observe_execution_finish(
+            bc, lifetime,
+            co_await run_cancellation_cascade(bc, start, std::move(err)));
       }
 
       // 4. Cancellation / wall-clock check.
       if (bc.cancelled.load(std::memory_order_acquire) ||
           bc.wall_clock_exceeded()) {
         owned_result.reset();
-        co_return co_await run_cancellation_cascade(bc, start);
+        co_return observe_execution_finish(
+            bc, lifetime, co_await run_cancellation_cascade(bc, start));
       }
     }
 
-    co_return finalize(bc, owned_result.take(), start);
+    if (latch_cancellation(bc)) {
+      owned_result.reset();
+      co_return observe_execution_finish(
+          bc, lifetime, co_await run_cancellation_cascade(bc, start));
+    }
+    co_return observe_execution_finish(
+        bc, lifetime, finalize(bc, owned_result.take(), start));
   } catch (const std::exception& error) {
     unexpected_failure = EvalError{.kind = EvalErrorKind::RUNTIME_ERROR,
                                    .message = error.what(),
@@ -1920,8 +2066,10 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
                                    .column = 0};
   }
   owned_result.reset();
-  co_return co_await run_cancellation_cascade(bc, start,
-                                              std::move(unexpected_failure));
+  co_return observe_execution_finish(
+      bc, lifetime,
+      co_await run_cancellation_cascade(bc, start,
+                                        std::move(unexpected_failure)));
 }
 
 } // namespace plinth::js

@@ -4,12 +4,14 @@
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/lifecycle/async_task_registry.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <trantor/net/EventLoop.h>
 #include <unordered_set>
 #include <utility>
@@ -26,17 +28,42 @@ class ExecutionLifetime
   // Declared first, hence destroyed last: dependency snapshots and queued
   // native owners are released BEFORE the process drain lease publishes zero.
   std::shared_ptr<lifecycle::AsyncTaskLease> task;
+  std::stop_source cancellation;
+  const std::stop_token inherited_cancellation;
+  std::atomic<bool> notification_failed{false};
 
  public:
   ExecutionLifetime(BridgeContext& context, trantor::EventLoop& loop,
-                    std::shared_ptr<lifecycle::AsyncTaskLease> admitted)
-      : task(std::move(admitted)),
+                    std::shared_ptr<lifecycle::AsyncTaskLease> admitted,
+                    std::stop_token inherited = {})
+      : task(std::move(admitted)), inherited_cancellation(std::move(inherited)),
         result_size_limit(context.async_result_size_limit_bytes),
         database_owner(context.extension_database_clients), owner_loop(loop),
         current(&context) {}
 
   auto accepted_lease() const -> std::shared_ptr<lifecycle::AsyncTaskLease> {
     return task;
+  }
+
+  // Cancellation is per generation, not shared admission/drain ownership.
+  // Tokens remain sticky without retaining a parent execution or JS context.
+  auto cancellation_token() const noexcept -> std::stop_token {
+    return cancellation.get_token();
+  }
+  auto cancellation_requested() const noexcept -> bool {
+    return cancellation.stop_requested() || inherited_cancellation_requested();
+  }
+  auto inherited_cancellation_requested() const noexcept -> bool {
+    return inherited_cancellation.stop_requested();
+  }
+  auto publish_cancellation() noexcept -> void {
+    static_cast<void>(cancellation.request_stop());
+  }
+  auto note_notification_failure() noexcept -> void {
+    notification_failed.store(true, std::memory_order_release);
+  }
+  auto take_notification_failure() noexcept -> bool {
+    return notification_failed.exchange(false, std::memory_order_acq_rel);
   }
 
   auto begin_commit(std::uint64_t scope) -> void {
@@ -55,11 +82,15 @@ class ExecutionLifetime
   // Called without RuntimePool mutex held. It never writes through a stale
   // caller BC pointer after a separate active() observation.
   auto request_cancel() -> bool {
-    std::lock_guard<std::recursive_mutex> lock(mutex);
-    if (current == nullptr) {
-      return false;
+    {
+      std::lock_guard<std::recursive_mutex> lock(mutex);
+      if (current == nullptr) {
+        return false;
+      }
+      current->cancelled.store(true, std::memory_order_release);
     }
-    current->cancelled.store(true, std::memory_order_release);
+    // No lifetime mutex spans stop callbacks or an inline owner-loop resume.
+    publish_cancellation();
     wake();
     return true;
   }

@@ -449,8 +449,8 @@ auto call_capability(const CapabilityCall& call, const UserContext& ctx)
 auto call_capability_async(
     CapabilityCall call, UserContext ctx, std::string* ext_detail_code_out,
     std::string* ext_detail_message_out,
-    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted)
-    -> drogon::Task<ResolveResult> {
+    std::shared_ptr<plinth::lifecycle::AsyncTaskLease> accepted,
+    std::stop_token inherited) -> drogon::Task<ResolveResult> {
   // The async resolver mirrors `call_capability`'s steps 1-5 verbatim,
   // then diverges at step 8 for `provider_type == "extension"` — the
   // extension arm releases the resolver's shared_lock and co_awaits
@@ -553,7 +553,7 @@ auto call_capability_async(
   // its own locking; the resolver's shared_lock was released above.
   auto dispatch_out = co_await plinth::extensions::dispatch(
       ext_name, ext_function, call.args, ctx, call.call_depth,
-      std::move(accepted));
+      std::move(accepted), std::move(inherited));
 
   if (dispatch_out.has_value()) {
     co_return CapabilityResult{
