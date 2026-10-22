@@ -39,6 +39,7 @@
 #include "kernel/js/native_rollback_owner.hpp"
 #include "kernel/js/native_setup_failure.hpp"
 #include "kernel/js/owned_database_awaiters.hpp"
+#include "kernel/js/pubsub_delivery_owner.hpp"
 #include "kernel/js/stdlib/cap_bindings.hpp"
 #include "kernel/js/stdlib/db_error_map.hpp"
 #include "kernel/js/stdlib/db_result_to_json.hpp"
@@ -1816,8 +1817,12 @@ struct ExecutionExit {
   auto operator=(ExecutionExit&&) -> ExecutionExit& = delete;
   BridgeContext& bc;
   std::shared_ptr<ExecutionLifetime> lifetime;
+  bool initialized = false;
   ~ExecutionExit() {
-    retire_batch_owners(bc, lifetime);
+    // Failed admission to a busy checkout has not touched/owned its mutable
+    // state. In particular it cannot retire a concurrently invoked callback's
+    // pending operations from the rejected driver's loop.
+    if (initialized) retire_batch_owners(bc, lifetime);
     lifetime->retire([this] {
       bc.execution_lifetime.store(nullptr, std::memory_order_release);
     });
@@ -1873,17 +1878,6 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
   // Publish ownership before the scheduling hop: defensive pool calls cannot
   // destroy a context while this coroutine is queued on its owner loop.
   ExecutionExit exit{bc, lifetime};
-  bc.execution_start = start;
-  bc.cpu_time_accumulated = std::chrono::nanoseconds{0};
-  bc.cpu_timer_start = {};
-  bc.next_callback_id = 0;
-  bc.concurrent_async_ops = 0;
-  bc.inflight_detached.store(0, std::memory_order_release);
-  {
-    std::lock_guard<std::mutex> g{bc.wake_mu};
-    bc.wake_count = 0;
-    bc.waiter_handle = {};
-  }
 
   // Capture the loop this coroutine starts on. Detached per-op
   // dispatchers will `queueInLoop` back to this loop to invoke
@@ -1917,6 +1911,27 @@ auto run_on_context(BridgeContext& bc, std::string_view source,
   // suspend whenever no progress can be made this iteration.
   if (!main_loop->isInLoopThread()) {
     co_await drogon::switchThreadCoro(main_loop);
+  }
+  if (auto owner = bc.pubsub_delivery_owner.load(std::memory_order_acquire);
+      owner && !owner->bind(*main_loop, lifetime->accepted_lease())) {
+    co_return EvalResult{.value = std::unexpected(
+                             EvalError{.kind = EvalErrorKind::CANCELLED,
+                                       .message = "context checkout retired",
+                                       .line = 0,
+                                       .column = 0}),
+                         .duration = std::chrono::milliseconds{0}};
+  }
+  exit.initialized = true;
+  bc.execution_start = start;
+  bc.cpu_time_accumulated = std::chrono::nanoseconds{0};
+  bc.cpu_timer_start = {};
+  bc.next_callback_id = 0;
+  bc.concurrent_async_ops = 0;
+  bc.inflight_detached.store(0, std::memory_order_release);
+  {
+    std::lock_guard<std::mutex> g{bc.wake_mu};
+    bc.wake_count = 0;
+    bc.waiter_handle = {};
   }
   observe_execution(bc, lifetime, ExecutionObservationStage::ENTER);
   std::optional<std::stop_callback<InheritedCancellationWake>> inherited_wake;

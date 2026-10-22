@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include <expected>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -119,9 +120,15 @@ class RuntimePool {
   // destroyed instead. A context whose cancelled flag is set, or whose
   // last execution produced a *_EXCEEDED error, is also destroyed —
   // this is the defensive branch from ICD §Security Constraint 4.
+  // With an active evaluation driver, cancellation is requested and return is
+  // refused: the caller still owns the checkout until that driver completes.
+  // A settled checkout with an admitted persistent callback is instead accepted
+  // into pool-owned pending destruction; the callback's JS stack stays alive.
   auto release(BridgeContext* bc) -> void;
 
-  // Return a context after failure / cancellation. Always destroys.
+  // Return after failure/cancellation. Destruction is deferred for an admitted
+  // persistent callback; an active evaluation is cancelled and refused as
+  // above.
   auto destroy(BridgeContext* bc) -> void;
 
   // Destroy all pooled contexts and rebuild a fresh free list of the
@@ -134,12 +141,28 @@ class RuntimePool {
   [[nodiscard]] auto pool_size() const noexcept -> int;
   [[nodiscard]] auto active_count() const -> int;
   [[nodiscard]] auto free_count() const -> int;
+  // Accepted pending entries are excluded from active_count, but still prevent
+  // successful shutdown until their actual JS destruction is acknowledged.
+  [[nodiscard]] auto pending_retirement_count() const -> std::size_t;
+  // Trusted default-off, per-pool observation of a retry that actually sees
+  // queued cleanup. Called outside the retirement mutex; callbacks must own
+  // captures, must not throw, block or re-enter the pool. No runtime/SDK API.
+  using RetirementRetryObserver = std::function<void()>;
+  auto set_retirement_retry_observer_for_test(RetirementRetryObserver observer)
+      -> void;
 
  private:
   struct Entry; // internal PIMPL-ish record per context
+  struct Retirement;
+  struct PendingRetirements;
   using EntryPtr = std::unique_ptr<Entry>;
 
   auto create_entry(bool transient) -> EntryPtr;
+  static auto destroy_entry(Entry& entry) -> void;
+  auto defer_retirement(BridgeContext* bc,
+                        std::shared_ptr<PubsubDeliveryOwner> owner,
+                        std::shared_ptr<lifecycle::AsyncTaskLease> accepted,
+                        trantor::EventLoop* loop) -> void;
 
   // `capacity` is the configured pool size; the public `pool_size()`
   // accessor returns it. Naming them differently avoids trailing-
@@ -152,6 +175,7 @@ class RuntimePool {
   std::string ext_name; // see ctor comment
   int capacity;
   std::shared_ptr<ExtensionDatabaseClients> extension_database_clients;
+  const std::shared_ptr<PendingRetirements> pending_retirements;
 
   std::timed_mutex shutdown_mutex;
   mutable std::mutex mu;

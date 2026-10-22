@@ -64,6 +64,14 @@ class RetainedTestOwner final
       registry.retain_cleanup(shared_from_this());
       return true;
     }
+    if (progress_once) {
+      progress_once = false;
+      observations.ready = true;
+      // Actual completion can publish progress while the current retry still
+      // returns false. No revision or owner registration changes here.
+      registry.notify_cleanup_progress();
+      return false;
+    }
     if (completes_prerequisite) {
       observations.prerequisite_ready = true;
       return true;
@@ -76,6 +84,7 @@ class RetainedTestOwner final
   bool requires_prerequisite = false;
   bool completes_prerequisite = false;
   bool republish_once = false;
+  bool progress_once = false;
 
  private:
   // Declared first so the accepted lease remains alive through dependency
@@ -162,6 +171,43 @@ TEST_CASE("async cleanup duplicate retention registers only one owner",
   CHECK(drained);
   CHECK(observations.calls == 1);
   CHECK(weak.expired());
+
+  SECTION("progress during a retry pass cannot be missed before parking") {
+    AsyncTaskRegistry progress_registry;
+    CleanupObservations progress;
+    CleanupOnUnwind progress_cleanup{progress_registry, progress};
+    auto progressing =
+        std::make_shared<RetainedTestOwner>(progress_registry, progress);
+    progressing->progress_once = true;
+    std::weak_ptr<RetainedTestOwner> resource = progressing;
+    progress_registry.retain_cleanup(progressing);
+    progressing.reset();
+    progress_registry.close_admission();
+
+    // One real bounded drain must retry the retained obligation after its
+    // first-pass progress signal. Snapshot before unwind's possible rescue.
+    const auto before = Clock::now();
+    const bool first = progress_registry.drain(100ms);
+    const auto after = Clock::now();
+    const bool resource_released = resource.expired();
+    const auto calls = progress.calls;
+    const auto active = progress_registry.active_for_test();
+    CHECK(first);
+    CHECK(resource_released);
+    CHECK(progress.destroyed);
+    CHECK(calls == 2);
+    CHECK(active == 0);
+    CHECK(progress.deadlines[0] >= before + 100ms);
+    CHECK(progress.deadlines[0] <= after + 100ms);
+    CHECK(progress.deadlines[1] == progress.deadlines[0]);
+
+    // Late progress must not re-register a completed cleanup owner or invent
+    // active work. The now-empty registry still drains with zero budget.
+    progress_registry.notify_cleanup_progress();
+    CHECK(progress_registry.drain(0ms));
+    CHECK(progress_registry.active_for_test() == 0);
+    CHECK(progress.calls == calls);
+  }
 }
 
 TEST_CASE("async cleanup republished revision cannot be discarded as completed",
@@ -181,9 +227,13 @@ TEST_CASE("async cleanup republished revision cannot be discarded as completed",
   const bool retried = registry.drain(100ms);
   CHECK_FALSE(first_drained);
   CHECK(retained);
-  CHECK(first_calls == 1);
+  // Republishing permits an immediate same-deadline retry, but preemption
+  // may exhaust the original 2ms budget first. Either way the unresolved
+  // owner stays retained; the later ready drain must complete it once.
+  CHECK(first_calls >= 1);
+  CHECK(first_calls <= 2);
   CHECK(retried);
-  CHECK(observations.calls == 2);
+  CHECK(observations.calls == first_calls + 1);
   CHECK(weak.expired());
 }
 

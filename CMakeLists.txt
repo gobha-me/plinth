@@ -777,6 +777,9 @@ add_executable(plinth_tests
   tests/kernel/js/audit_authority_regression_test.cpp
   tests/kernel/js/audit_corpus_test.cpp
   tests/kernel/js/pubsub_corpus_test.cpp
+  tests/kernel/js/native_pubsub_publish_corpus_test.cpp
+  tests/kernel/js/native_pubsub_delivery_corpus_test.cpp
+  tests/kernel/js/pubsub_dispatch_owner_test.cpp
   tests/kernel/js/cap_corpus_test.cpp
   tests/kernel/js/db_admission_corpus_test.cpp
   tests/kernel/js/db_batch_corpus_test.cpp
@@ -1348,6 +1351,29 @@ add_test(NAME plinth_tests_pubsub_corpus
     --timeout 60
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_pubsub_corpus PROPERTIES TIMEOUT 75)
+
+# Actual native publication and registered callback delivery remain distinct:
+# the latter uses the synthetic broker producer, not the listener/writer chain.
+# Missing PostgreSQL, skipped cases and teardown failures fail both exact gates.
+function(add_plinth_native_pubsub_case name selector)
+  add_test(NAME plinth_tests_native_pubsub_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}"
+      --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_native_pubsub_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+endfunction()
+add_plinth_native_pubsub_case(publish
+  "Native pubsub publish acknowledgements preserve the owned corpus")
+add_plinth_native_pubsub_case(delivery
+  "Native pubsub registered delivery preserves owned cleanup")
+add_plinth_native_pubsub_case(owner
+  "Pubsub dispatch remains on the registered JavaScript owner loop")
+add_plinth_native_pubsub_case(retirement
+  "Pubsub queued delivery rejects retired checkout ownership")
 
 # Actual capability admission and simulated settlement are isolated from any
 # process-lifetime dispatcher/DB fixture. Missing cases and skipped XML fail.

@@ -44,8 +44,10 @@ auto execute(OwnedFrontendWorker::Work& work, std::stop_token cancellation,
 }
 } // namespace
 
-OwnedFrontendWorker::OwnedFrontendWorker(std::size_t capacity)
-    : maximum(checked_capacity(capacity)), worker([this] { run(); }) {
+OwnedFrontendWorker::OwnedFrontendWorker(std::size_t capacity,
+                                         StopObserver observer)
+    : maximum(checked_capacity(capacity)), stop_observer(std::move(observer)),
+      worker([this] { run(); }) {
 }
 
 OwnedFrontendWorker::~OwnedFrontendWorker() {
@@ -121,10 +123,19 @@ auto OwnedFrontendWorker::close_admission() -> void {
 
 auto OwnedFrontendWorker::request_stop() -> void {
   close_admission();
+  if (stop_observer) stop_observer(StopObservation::ADMISSION_CLOSED);
   // Stop callbacks may run synchronously. They must remain bounded and must
   // never perform the blocked IO itself; do not run them under our mutex.
   stop.request_stop();
-  changed.notify_all();
+  if (stop_observer) stop_observer(StopObservation::STOP_PUBLISHED);
+  {
+    // Rendezvous with the waiter's false-predicate-to-park boundary. Stop
+    // callbacks remain outside this mutex, but notification cannot overtake
+    // the atomic unlock-and-wait after a false predicate observation.
+    std::lock_guard lock{mutex};
+    changed.notify_all();
+  }
+  if (stop_observer) stop_observer(StopObservation::STOP_NOTIFIED);
 }
 
 auto OwnedFrontendWorker::drain(Deadline deadline) -> bool {
@@ -177,10 +188,14 @@ auto OwnedFrontendWorker::run() -> void {
   for (;;) {
     std::unique_lock lock{mutex};
     changed.wait(lock, [this] {
-      return waiting != 0 || (stop.stop_requested() && preparing == 0);
+      const bool ready =
+          waiting != 0 || (stop.stop_requested() && preparing == 0);
+      if (!ready && stop_observer) stop_observer(StopObservation::BEFORE_WAIT);
+      return ready;
     });
     if (waiting == 0) {
       finished = true;
+      if (stop_observer) stop_observer(StopObservation::FINISHED);
       changed.notify_all();
       return;
     }

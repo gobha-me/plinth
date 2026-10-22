@@ -12,7 +12,9 @@
 #include "kernel/js/eval_guard.hpp"
 #include "kernel/js/execution_lifetime.hpp"
 #include "kernel/js/extension_database.hpp"
+#include "kernel/js/pubsub_delivery_owner.hpp"
 #include "kernel/js/stdlib_inject.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 #include "kernel/realtime/broker.hpp"
 
@@ -20,6 +22,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -440,7 +443,240 @@ auto clear_global_own_props(JSContext* ctx) -> bool {
 struct RuntimePool::Entry {
   BridgeContext bc{};
   bool transient = false;
+  std::shared_ptr<Retirement> retirement;
 };
+
+struct RuntimePool::PendingRetirements {
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::shared_ptr<Retirement> head;
+  std::size_t count = 0;
+  std::size_t epoch = 0;
+  std::atomic<std::shared_ptr<const RetirementRetryObserver>> retry_observer;
+
+  auto complete(Retirement* record) -> void;
+  auto drain(std::chrono::steady_clock::time_point deadline, bool unbounded)
+      -> bool;
+};
+
+// Allocated before Entry acquires any JS resource. A pending record owns the
+// returned Entry independently of RuntimePool, including queue failure and
+// stopped-loop failure. No asynchronous closure captures a pool pointer.
+struct RuntimePool::Retirement : lifecycle::AsyncCleanupOwner,
+                                 std::enable_shared_from_this<Retirement> {
+  explicit Retirement(std::shared_ptr<PendingRetirements> state)
+      : pending(std::move(state)) {}
+
+  std::shared_ptr<lifecycle::AsyncTaskLease> accepted;
+  const std::shared_ptr<PendingRetirements> pending;
+  std::shared_ptr<Retirement> next;
+  EntryPtr entry;
+  std::shared_ptr<PubsubDeliveryOwner> owner;
+  PubsubDeliveryOwner::Target target;
+  std::mutex mutex;
+  bool queued = false;
+  bool completed = false;
+
+  auto retain_failure() -> void {
+    lifecycle::async_tasks().retain_cleanup(shared_from_this());
+    plinth::log::error("pubsub context retirement incomplete; owner retained");
+  }
+
+  auto finish_on_loop() -> void {
+    std::unique_lock lock(mutex);
+    queued = false;
+    if (completed) return;
+    if (target.loop == nullptr || !target.loop->isInLoopThread() ||
+        !owner->try_revoke()) {
+      lock.unlock();
+      retain_failure();
+      return;
+    }
+    // queueInLoop does not run inside the retiring JS callback's stack.
+    // Revocation is now exclusive; no later visit can enter this checkout.
+    try {
+      RuntimePool::destroy_entry(*entry);
+    } catch (...) {
+      lock.unlock();
+      retain_failure();
+      return;
+    }
+    entry.reset();
+    owner.reset();
+    auto task = std::move(accepted);
+    completed = true;
+    lock.unlock();
+    pending->complete(this);
+    // A global drain may already have seen this record queued and be waiting
+    // on its own cleanup epoch. Publish progress without registering a new
+    // cleanup obligation; the finite accepted lease still spans this signal.
+    lifecycle::async_tasks().notify_cleanup_progress();
+    // The finite process lease dies after actual JS destruction and removal
+    // from pending state, never while cleanup still owns native resources.
+    static_cast<void>(task);
+  }
+
+  auto retry_cleanup(std::chrono::steady_clock::time_point deadline) noexcept
+      -> bool override {
+    try {
+      std::unique_lock lock(mutex, std::try_to_lock);
+      if (!lock) return false;
+      if (completed) return true;
+      if (queued) {
+        const auto observer =
+            pending->retry_observer.load(std::memory_order_acquire);
+        lock.unlock();
+        if (observer) (*observer)();
+        return false;
+      }
+      if (std::chrono::steady_clock::now() >= deadline) return false;
+      if (!accepted) accepted = lifecycle::async_tasks().try_acquire();
+      if (target.loop == nullptr || !accepted || !target.loop->isRunning()) {
+        lock.unlock();
+        retain_failure();
+        return false;
+      }
+      auto task = accepted;
+      queued = true;
+      lock.unlock();
+      try {
+        target.loop->queueInLoop(
+            [record = shared_from_this(), task = std::move(task)] {
+              static_cast<void>(task);
+              record->finish_on_loop();
+            });
+      } catch (...) {
+        std::lock_guard failed_lock(mutex);
+        queued = false;
+        retain_failure();
+      }
+    } catch (...) {
+      // The preallocated pending list remains the exact resource owner even
+      // if error reporting/queue preparation itself cannot complete.
+      try {
+        retain_failure();
+      } catch (...) {
+        // No allocation or exception may discard the pending Entry owner.
+      }
+      return false;
+    }
+    std::unique_lock lock(mutex, std::try_to_lock);
+    return lock && completed;
+  }
+};
+
+auto RuntimePool::PendingRetirements::complete(Retirement* record) -> void {
+  std::shared_ptr<Retirement> removed;
+  {
+    std::lock_guard lock(mutex);
+    auto* link = &head;
+    while (*link && link->get() != record)
+      link = &(*link)->next;
+    if (*link) {
+      removed = std::move(*link);
+      *link = std::move(removed->next);
+      --count;
+      ++epoch;
+    }
+  }
+  changed.notify_all();
+}
+
+auto RuntimePool::PendingRetirements::drain(
+    std::chrono::steady_clock::time_point deadline, bool unbounded) -> bool {
+  for (;;) {
+    std::unique_lock lock(mutex);
+    if (count == 0) return true;
+    auto record = head;
+    const auto observed = epoch;
+    lock.unlock();
+    while (record) {
+      std::shared_ptr<Retirement> next;
+      {
+        std::lock_guard next_lock(mutex);
+        next = record->next;
+      }
+      static_cast<void>(record->retry_cleanup(deadline));
+      record = std::move(next);
+    }
+    lock.lock();
+    if (count == 0) return true;
+    if (unbounded || std::chrono::steady_clock::now() >= deadline) {
+      record = head;
+      lock.unlock();
+      while (record) {
+        std::shared_ptr<Retirement> next;
+        {
+          std::lock_guard next_lock(mutex);
+          next = record->next;
+        }
+        record->retain_failure();
+        record = std::move(next);
+      }
+      // Destruction must not turn a stopped loop into an unbounded wait.
+      // Explicit lifecycle owners use their existing bounded shutdown retry.
+      return false;
+    }
+    changed.wait_until(lock, deadline,
+                       [&] { return count == 0 || epoch != observed; });
+  }
+}
+
+auto RuntimePool::destroy_entry(Entry& entry) -> void {
+  auto& bc = entry.bc;
+  for (auto& [id, callbacks] : bc.callbacks) {
+    static_cast<void>(id);
+    JS_FreeValue(bc.ctx, callbacks.resolve);
+    JS_FreeValue(bc.ctx, callbacks.reject);
+  }
+  bc.callbacks.clear();
+  bc.pending_ops.clear();
+  plinth::realtime::broker::drop_bc_subscriptions(&bc);
+  bc.drop_persistent_callbacks();
+  drain_pending_jobs(bc.ctx, bc.rt);
+  if (bc.ctx != nullptr) {
+    JS_FreeContext(bc.ctx);
+    bc.ctx = nullptr;
+  }
+  if (bc.rt != nullptr) {
+    JS_FreeRuntime(bc.rt);
+    bc.rt = nullptr;
+  }
+}
+
+auto RuntimePool::defer_retirement(
+    BridgeContext* bc, std::shared_ptr<PubsubDeliveryOwner> owner,
+    std::shared_ptr<lifecycle::AsyncTaskLease> accepted,
+    trantor::EventLoop* loop) -> void {
+  std::shared_ptr<Retirement> record;
+  // Metadata acquisition never takes the JS visit gate. In particular, an
+  // owner-loop callback may synchronously return its own context here.
+  {
+    std::lock_guard lock(mu);
+    const auto found = std::ranges::find_if(
+        checked_out, [bc](const EntryPtr& entry) { return &entry->bc == bc; });
+    if (found == checked_out.end()) {
+      plinth::log::warn("pubsub retirement context is no longer checked out");
+      return;
+    }
+    record = std::move((*found)->retirement);
+    record->entry = std::move(*found);
+    checked_out.erase(found);
+    record->owner = std::move(owner);
+    record->target.loop = loop;
+    record->accepted = std::move(accepted);
+    {
+      std::lock_guard pending_lock(pending_retirements->mutex);
+      record->next = std::move(pending_retirements->head);
+      pending_retirements->head = record;
+      ++pending_retirements->count;
+      ++pending_retirements->epoch;
+    }
+  }
+  pending_retirements->changed.notify_all();
+  static_cast<void>(
+      record->retry_cleanup(std::chrono::steady_clock::time_point::max()));
+}
 
 // ─── Lifecycle ───────────────────────────────────────────────────────
 
@@ -456,7 +692,8 @@ RuntimePool::RuntimePool(const Extension* ext, RuntimeLimits runtime_limits,
       ext_name(std::move(extension_name)),
       capacity(resolve_pool_size(pool_size)),
       extension_database_clients(
-          std::make_shared<ExtensionDatabaseClients>(cfg.db)) {
+          std::make_shared<ExtensionDatabaseClients>(cfg.db)),
+      pending_retirements(std::make_shared<PendingRetirements>()) {
   // ICD §Security Constraints #2: memory / stack / cpu / wall-clock
   // must all be set before any JS code runs. There is no fallback to
   // an unlimited default — a missing limit is a programming error,
@@ -513,6 +750,11 @@ auto RuntimePool::shutdown(std::chrono::milliseconds timeout) -> bool {
     }
   }
 
+  // Returned busy entries are no longer caller checkouts, but still own JS
+  // and extension-domain references. Drain them within THIS deadline before
+  // closing those DB clients; never wait while holding the pool mutex.
+  if (!pending_retirements->drain(deadline, unbounded)) return false;
+
   // RuntimePool is the lifecycle owner for all extension-isolated clients.
   // Close their private Drogon loops while this owner is still durable and
   // before BridgeContext aliases are destroyed.
@@ -552,6 +794,7 @@ auto RuntimePool::shutdown(std::chrono::milliseconds timeout) -> bool {
 
 auto RuntimePool::create_entry(bool transient) -> EntryPtr {
   auto entry = std::make_unique<Entry>();
+  entry->retirement = std::make_shared<Retirement>(pending_retirements);
   JSRuntime* rt = JS_NewRuntime();
   if (rt == nullptr) {
     plinth::log::error("RuntimePool: JS_NewRuntime failed");
@@ -607,6 +850,9 @@ auto RuntimePool::acquire() -> BridgeContext* {
   if (state != State::running) {
     return nullptr;
   }
+  // Allocate before extracting a free Entry: allocation failure must leave
+  // the pool's QuickJS resources owned, not destroy a bare Entry wrapper.
+  auto delivery_owner = std::make_shared<PubsubDeliveryOwner>();
   EntryPtr entry;
   if (!free_list.empty()) {
     entry = std::move(free_list.back());
@@ -621,6 +867,9 @@ auto RuntimePool::acquire() -> BridgeContext* {
     return nullptr;
   }
   BridgeContext* raw = &entry->bc;
+  delivery_owner->initialize(*raw);
+  raw->pubsub_delivery_owner.store(std::move(delivery_owner),
+                                   std::memory_order_release);
   checked_out.push_back(std::move(entry));
   return raw;
 }
@@ -635,6 +884,14 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
     // but retain the checked-out owner; never recycle/free a running frame.
     plinth::log::error("RuntimePool::release refused an active JS owner");
     return;
+  }
+  if (auto owner = bc->pubsub_delivery_owner.load(std::memory_order_acquire)) {
+    PubsubDeliveryOwner::Target target;
+    if (!owner->try_revoke(&target)) {
+      defer_retirement(bc, std::move(owner), std::move(target.accepted),
+                       target.loop);
+      return;
+    }
   }
   std::lock_guard<std::mutex> lock(mu);
   auto it = std::ranges::find_if(
@@ -682,24 +939,7 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
           "destroy (ICD-0.3.1 §Security Constraint 4)",
           was_cancelled, cpu_tripped, wall_tripped);
     }
-    // Free any leftover promise-capability refs before destroying
-    // the context, so ASAN / leak detectors stay clean. The
-    // resolve/reject closures themselves are managed by QuickJS via
-    // JS_FreeContext, but the callback-pair refs we hold are not.
-    for (auto& [id, cbs] : entry->bc.callbacks) {
-      JS_FreeValue(entry->bc.ctx, cbs.resolve);
-      JS_FreeValue(entry->bc.ctx, cbs.reject);
-    }
-    entry->bc.callbacks.clear();
-    entry->bc.pending_ops.clear();
-    // ICD-0.5.2 §Per-bc lifetime + eviction — bc teardown must
-    // notify the broker and release the persistent subscriber
-    // JSValues before the runtime goes away.
-    plinth::realtime::broker::drop_bc_subscriptions(&entry->bc);
-    entry->bc.drop_persistent_callbacks();
-    drain_pending_jobs(entry->bc.ctx, entry->bc.rt);
-    JS_FreeContext(entry->bc.ctx);
-    JS_FreeRuntime(entry->bc.rt);
+    destroy_entry(*entry);
     return;
   }
 
@@ -713,9 +953,7 @@ auto RuntimePool::release(BridgeContext* bc) -> void {
     // fall back to destroy to avoid returning a poisoned context.
     plinth::log::warn("RuntimePool::release: global-reset failed; destroying "
                       "context");
-    drain_pending_jobs(entry->bc.ctx, entry->bc.rt);
-    JS_FreeContext(entry->bc.ctx);
-    JS_FreeRuntime(entry->bc.rt);
+    destroy_entry(*entry);
     return;
   }
   inject_kernel_stdlib(entry->bc.ctx);
@@ -748,6 +986,14 @@ auto RuntimePool::destroy(BridgeContext* bc) -> void {
     plinth::log::error("RuntimePool::destroy refused an active JS owner");
     return;
   }
+  if (auto owner = bc->pubsub_delivery_owner.load(std::memory_order_acquire)) {
+    PubsubDeliveryOwner::Target target;
+    if (!owner->try_revoke(&target)) {
+      defer_retirement(bc, std::move(owner), std::move(target.accepted),
+                       target.loop);
+      return;
+    }
+  }
   std::lock_guard<std::mutex> lock(mu);
   auto it = std::ranges::find_if(
       checked_out, [bc](const EntryPtr& e) { return &e->bc == bc; });
@@ -758,29 +1004,7 @@ auto RuntimePool::destroy(BridgeContext* bc) -> void {
   }
   EntryPtr entry = std::move(*it);
   checked_out.erase(it);
-  // Free any leftover promise-capability refs before destroying the
-  // context, matching the release()-defensive-destroy path. The
-  // cancellation cascade should have drained these already; this is
-  // belt-and-braces so an early-exit destroy() in tests stays clean
-  // under ASAN.
-  for (auto& [id, cbs] : entry->bc.callbacks) {
-    JS_FreeValue(entry->bc.ctx, cbs.resolve);
-    JS_FreeValue(entry->bc.ctx, cbs.reject);
-  }
-  entry->bc.callbacks.clear();
-  entry->bc.pending_ops.clear();
-  // ICD-0.5.2 §Per-bc lifetime + eviction — release any persistent
-  // `pubsub.subscribe` handler JSValues and notify the broker before
-  // the runtime goes away. Matches the release()-defensive-destroy
-  // path; without this a bc that called `pubsub.subscribe` and is
-  // then `destroy()`d (early-exit tests, runtime-pool shutdown)
-  // leaks handler JSValues into `rt->gc_obj_list`, which trips
-  // `list_empty` in `JS_FreeRuntime`.
-  plinth::realtime::broker::drop_bc_subscriptions(&entry->bc);
-  entry->bc.drop_persistent_callbacks();
-  drain_pending_jobs(entry->bc.ctx, entry->bc.rt);
-  JS_FreeContext(entry->bc.ctx);
-  JS_FreeRuntime(entry->bc.rt);
+  destroy_entry(*entry);
 }
 
 auto RuntimePool::rebuild() -> void {
@@ -829,10 +1053,27 @@ auto RuntimePool::free_count() const -> int {
   return static_cast<int>(free_list.size());
 }
 
+auto RuntimePool::pending_retirement_count() const -> std::size_t {
+  std::lock_guard lock(pending_retirements->mutex);
+  return pending_retirements->count;
+}
+
+auto RuntimePool::set_retirement_retry_observer_for_test(
+    RetirementRetryObserver observer) -> void {
+  auto next =
+      observer
+          ? std::make_shared<const RetirementRetryObserver>(std::move(observer))
+          : nullptr;
+  pending_retirements->retry_observer.store(std::move(next),
+                                            std::memory_order_release);
+}
+
 // ─── eval_on_context helper ─────────────────────────────────────────
 
-auto eval_on_context(BridgeContext& bc, std::string_view src)
+namespace {
+auto eval_owned_context(BridgeContext& bc, std::string_view src)
     -> std::expected<Json::Value, EvalError> {
+  JS_UpdateStackTop(bc.rt);
   // Reset execution-scoped timing state. Limit fields and cancelled
   // are left as the caller set them.
   bc.execution_start = std::chrono::steady_clock::now();
@@ -862,6 +1103,22 @@ auto eval_on_context(BridgeContext& bc, std::string_view src)
     }
   }
   JS_FreeValue(bc.ctx, ev);
+  return result;
+}
+} // namespace
+
+auto eval_on_context(BridgeContext& bc, std::string_view src)
+    -> std::expected<Json::Value, EvalError> {
+  const auto owner = bc.pubsub_delivery_owner.load(std::memory_order_acquire);
+  if (!owner) return eval_owned_context(bc, src);
+  std::expected<Json::Value, EvalError> result = std::unexpected(
+      EvalError{.kind = EvalErrorKind::INTERNAL_ASYNC,
+                .message = "synchronous eval requires its live checkout owner",
+                .line = 0,
+                .column = 0});
+  static_cast<void>(owner->synchronous_visit([&](BridgeContext& current) {
+    result = eval_owned_context(current, src);
+  }));
   return result;
 }
 

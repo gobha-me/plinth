@@ -162,6 +162,37 @@ starting a new execution and returning the same checkout is not supported.
 This protocol covers native asynchronous operations; it is not a claim that
 every separate broker/subscription callback family uses this generation.
 
+### Persistent subscription delivery retirement
+
+Persistent JavaScript subscriptions use a separate revocable checkout owner,
+not an execution generation: a settled evaluation may leave its handler alive
+until the checkout is returned. Broker registrations hold weak ownership and
+copied extension identity. A queued delivery holds its immutable envelope,
+checkout identity and finite accepted process lease, never a raw context as
+its lifetime authority. Matching registration is not delivery acknowledgement.
+
+Delivery runs on the checkout's actual bound event loop. Its visit gate spans
+validation and JavaScript invocation; registry locks do not span JavaScript.
+Checkout retirement closes further visits before resetting or freeing context
+state. A different checkout at the same address cannot inherit queued work.
+A loop change is admitted only when no invocation is active; busy or reentrant
+binding is rejected, not waited for. Already queued work for the old loop
+revision is discarded, not moved to another JS thread.
+The synchronous host evaluation helper cannot enter a bound checkout from a
+different thread or re-enter its running callback.
+
+Returning a context during an admitted persistent callback, with no active
+evaluation driver, transfers its exact runtime entry into preallocated pending
+retirement. That accepted return needs no later caller pointer; an active
+evaluation is still cancelled and refused, retaining the caller's checkout.
+Retirement does not wait for the callback under the pool mutex. Cleanup runs
+after invocation quiesces; failed
+or unexecuted scheduling retains the entry and reports incomplete shutdown.
+Pending retirement must drain within the pool's existing shutdown deadline
+before closing its database clients. An empty checked-out list alone is not
+completion. Subscriptions do not permanently retain process task leases;
+accepted active work and finite queued descendants retain only their lineage.
+
 ## Bounds and failure policy
 
 One 40-second deadline is shared by the owned-worker and runtime-drain nodes;

@@ -31,8 +31,23 @@ class OwnedFrontendWorker {
   using Work = std::function<void(std::stop_token, Deadline)>;
   using Completion = std::function<void(FrontendWorkResult)>;
 
+  // Default-off, per-instance causal test observation. BEFORE_WAIT runs with
+  // the worker mutex held after a false predicate; FINISHED runs with that
+  // mutex held after terminal publication. Other stages run outside it.
+  // Observers must own their captures, must not throw or
+  // re-enter the worker, and may block only behind test-owned bounded gates.
+  enum class StopObservation {
+    ADMISSION_CLOSED,
+    STOP_PUBLISHED,
+    BEFORE_WAIT,
+    STOP_NOTIFIED,
+    FINISHED,
+  };
+  using StopObserver = std::function<void(StopObservation)>;
+
   // 1..64, validated BEFORE starting the thread; invalid capacity throws.
-  explicit OwnedFrontendWorker(std::size_t capacity = 1);
+  explicit OwnedFrontendWorker(std::size_t capacity = 1,
+                               StopObserver stop_observer = {});
   ~OwnedFrontendWorker();
   OwnedFrontendWorker(const OwnedFrontendWorker&) = delete;
   auto operator=(const OwnedFrontendWorker&) -> OwnedFrontendWorker& = delete;
@@ -89,6 +104,7 @@ class OwnedFrontendWorker {
   bool failed_completion = false;
   std::atomic<bool> joined{false};
   std::stop_source stop;
+  const StopObserver stop_observer;
   // Declared last, started only after all state is initialized.
   std::thread worker;
 };

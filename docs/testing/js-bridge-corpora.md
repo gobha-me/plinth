@@ -16,6 +16,8 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Extension module import (parent #90) | `plinth_tests_module_import_corpus` | Actual staged handler loading, registered nested source import, compile/evaluate entry, namespace/default invocation and fresh-owner replacement replay |
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
 | Pubsub (#148) | `plinth_tests_pubsub_corpus` | Publish/subscribe admission, callback replacement/invocation, returned unsubscribe enqueue and runtime ownership |
+| Native pubsub (#189, parent #90) | `plinth_tests_native_pubsub_publish`, `plinth_tests_native_pubsub_delivery` | Actual PostgreSQL outbox acknowledgement and separately tested registered JS delivery/cleanup with an explicitly synthetic broker producer |
+| Native pubsub checkout ownership | `plinth_tests_native_pubsub_owner`, `plinth_tests_native_pubsub_retirement` | Separately required actual owner-loop routing and queued checkout-retirement controls; not the full notification chain |
 | Capability (#150) | `plinth_tests_cap_corpus` | Call/batch admission, owned snapshots, real Promise.all composition with simulated host settlement and runtime ownership |
 | Native capability acceptance inventory (#187, parent #90) | `plinth_tests_native_capability_data`, `plinth_tests_native_capability_edges`, `plinth_tests_native_capability_errors`, `plinth_tests_native_capability_ordering`, `plinth_tests_native_capability_ownership`, `plinth_tests_native_capability_nested` | Real resolver/extension dispatch, native settlement, causal composition and separately required nested cancellation; registration is not delivery evidence |
 | Ordinary database (#151) | `plinth_tests_db_admission_corpus` | Query/exec admission, parameter and client-manager snapshots, simulated host settlement and runtime ownership; no SQL execution |
@@ -92,6 +94,69 @@ Select a freshly configured build of the current source. An old binary,
 reused success XML, console summary, zero discovered cases or pending CI is
 not coverage. Candidate and terminal exact-merge CI remain delivery gates;
 corpus success is not an authorization to publish a release or a vulnerability.
+
+## Native pubsub acknowledgement and registered delivery
+
+The original publish/delivery pair extends, rather than replaces, #148's
+DB-free admission corpus. Both call actual RuntimePool-injected functions through the coroutine
+dispatcher, retain ordinary `[js]` group inclusion, and run in separate strict
+processes with the existing PostgreSQL fixture and production shutdown order.
+They do not use the `[isolated-pubsub]` admission-only tag.
+
+The publish ledger requires six supported payload families, two fixed seeds
+and two fresh-owner replays:24 actual publications. Literal expectations cover
+null, boolean, safe integer, valid Unicode string, Unicode-key object and
+bounded nested containers. An independent libpq lookup keyed by a unique
+channel requires exactly one committed outbox row with the exact layer,
+channel and payload value. String/member-name code units are checked without
+making JSON object serialization order an oracle. Successful publication
+checks the actual native acknowledgement, not the binding comment's return
+type or a truthiness approximation. NUL and lone-surrogate JSONB publication
+are not claimed as supported successful values.
+
+The delivery ledger has four scenarios replayed under two fresh owners:
+quota-one callback replacement, actual unsubscribe after observed delivery,
+context destruction after queued delivery settles, and extension drain.
+A joined worker enters the existing `broker::dispatch_for_test` seam, and
+owner-loop observations check actual callback identity, payload and count
+separately from broker registry matches. The producer is synthetic: it skips
+listener parsing and the events-writer INSERT. A matching registration alone
+is not proof that its JavaScript callback executed. Extension drain removes
+broker registrations; context destruction still owns persistent JS callback
+cleanup. Quota/RBAC configuration must be restored for later grouped cases.
+
+Corrupted copies of actual passing observations and missing/duplicate replay
+entries must fail the test-only validators. Owners and captured state survive
+until queued work settles; native/audit drains, context retirement, zero live
+registrations and bounded idempotent pool shutdown remain acceptance gates.
+Each exact CTest uses fresh positive Catch XML with zero skips/failures, a
+60-second inner bound,75-second outer bound and `plinth_pg_schema` lock.
+Both ASan/UBSan lanes and selected TSan explicitly discover exactly four and
+execute them serially with existing fatal sanitizer options.
+
+```sh
+ctest --test-dir "$pubsub_build_dir" --verbose --output-on-failure --parallel 1 \
+  -R '^plinth_tests_native_pubsub_(publish|delivery|owner|retirement)$'
+```
+
+These gates do not establish the full listener-to-writer-to-broker chain,
+delivery-time revocation, production cancellation races, every malformed
+payload policy, or complete parent #90 coverage. An outbox acknowledgement
+does not prove listener delivery, and synthetic dispatch does not prove a
+PostgreSQL publication caused delivery. Those targets remain incomplete.
+
+The separate ownership cases use bounded causal loop gates and actual native
+subscriptions. A default-off C++ observer can safely deny a wrong-thread
+invocation before JavaScript access; the routing oracle additionally requires
+the real callback receipt on its actual owner. Retirement coverage is separate
+from the original delivery corpus's fully settled destruction journey: queued
+destruction, same-address checkout reuse, and returning a context during a
+positively held actual callback. The last cell requires checked-out0/pending1,
+refused zero-budget shutdown, then pending0 after the callback, queued cleanup
+and native drain really complete. These
+checks do not establish exploitation, a deployed affected caller, every possible
+schedule, or a listener-to-writer delivery guarantee. The owning shutdown
+protocol is documented in [shutdown ownership](../architecture/shutdown.md).
 
 ## Authoritative PostgreSQL diagnostics
 
