@@ -776,6 +776,7 @@ add_executable(plinth_tests
   tests/kernel/js/host_string_boundary_test.cpp
   tests/kernel/js/audit_authority_regression_test.cpp
   tests/kernel/js/audit_corpus_test.cpp
+  tests/kernel/js/native_audit_corpus_test.cpp
   tests/kernel/js/pubsub_corpus_test.cpp
   tests/kernel/js/native_pubsub_publish_corpus_test.cpp
   tests/kernel/js/native_pubsub_delivery_corpus_test.cpp
@@ -1339,6 +1340,24 @@ add_test(NAME plinth_tests_audit_corpus
     --timeout 60
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
 set_tests_properties(plinth_tests_audit_corpus PROPERTIES TIMEOUT 75)
+
+# Native persistence and admission acknowledgement remain distinct contracts.
+# Both cases retain ordinary grouped JS inclusion and fail closed without PG.
+function(add_plinth_native_audit_case name selector)
+  add_test(NAME plinth_tests_native_audit_${name}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${selector}"
+      --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_native_audit_${name} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+endfunction()
+add_plinth_native_audit_case(corpus
+  "Native audit writes preserve the owned corpus")
+add_plinth_native_audit_case(acknowledgement
+  "Native audit acknowledgement precedes blocked persistence")
 
 # Admission and callback ownership run before any broker/logging fixture in
 # their process. The inventory gate keeps this exact exclusion independently
