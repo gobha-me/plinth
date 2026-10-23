@@ -13,6 +13,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Log/config (#121) | `plinth_tests_log_corpus`, `plinth_tests_config_corpus` | Registered log callbacks and allowed configuration projection |
 | Shared conversion (#124) | `plinth_tests_conversion_corpus` | Shared JS-to-JSON conversion and error classification |
 | Synchronous host evaluation (#176, parent #90) | `plinth_tests_sync_conversion_corpus` | Actual one-shot and pooled synchronous evaluation, their distinct private result converters/classifiers, and owned runtime lifecycle |
+| Reverse tagged JSON values (parent #90) | `plinth_tests_reverse_json_registry_values`, `plinth_tests_reverse_json_promise_values` | Distinct actual argument-injection and capability-result tag interpretation, literal fallback observations, buffer independence and fresh runtime ownership |
 | Extension module import (parent #90) | `plinth_tests_module_import_corpus` | Actual staged handler loading, registered nested source import, compile/evaluate entry, namespace/default invocation and fresh-owner replacement replay |
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
 | Native audit (#191, parent #90) | `plinth_tests_native_audit_corpus`, `plinth_tests_native_audit_acknowledgement` | Actual registered audit dispatch, committed PostgreSQL rows and separately gated fire-and-forget acknowledgement before persistence |
@@ -84,9 +85,9 @@ These are finite observations, not proof of every reverse branch.
 The remaining result/conversion ledger includes distinct native JSON/JSONB
 and temporal string branches, unknown-OID fallback, disabled-type-flag
 heuristics and finite numeric/column-name boundaries outside the selected
-PostgreSQL result corpus. Reverse singleton BYTEA-tag fallback also needs its
-own explicit literal observations; valid native binary round trips are not
-that fallback oracle. This is one bounded remainder, not a requirement to
+PostgreSQL result corpus. The [reverse tagged-value corpus](#reverse-tagged-json-values-and-ownership)
+separately enumerates singleton BYTEA-tag interpretation and fallback; its
+literal observations complement the native binary round trips. This is one bounded remainder, not a requirement to
 implement every future PostgreSQL type or promote arrays to a new SDK type.
 
 Runtime reset, cancellation and teardown are not wholly outstanding: existing
@@ -841,3 +842,72 @@ untyped parameter inference, other database backends, production cancellation
 under every interleaving or complete #90 coverage. Ordinary TEXT/NUL admission
 and existing native ownership/setup/lifecycle regressions remain separate
 required gates. No new public method, permission, quota or release is introduced.
+
+
+## Reverse tagged JSON values and ownership
+
+The two local reverse converters have different entry contracts. Actual
+extension argument injection preserves tag-shaped JSON objects recursively.
+Actual capability Promise settlement recognizes an exact singleton
+`{"__bytea_hex__": "<valid even-length hex>"}` as a fresh `Uint8Array`;
+malformed, differently named, non-string and multi-member objects follow
+ordinary JSON object conversion. This records the existing internal routes
+and the BYTEA special case retained by the scoped
+[capability conversion amendment](../icd/ICD-0.3.4-cap-call-from-js.md#type-conversion--additions-beyond-033).
+It adds no public tag API or database result-mapping policy.
+
+The separate strict targets are `plinth_tests_reverse_json_registry_values`
+and `plinth_tests_reverse_json_promise_values`. They use the actual resolver,
+staged extension and pool. The second route additionally invokes a registered
+native handler through real awaited `cap.call` and owned Promise delivery.
+The fixture handler supplies JSON values; PostgreSQL result conversion has
+its own targets.
+
+Eighteen fixed families cross root, nested-object and nested-array placements
+in each route and two fresh runtime-owner epochs: 216 primary observations.
+
+| Family | Literal payload or distinguishing property |
+| --- | --- |
+| Empty hex | Empty string |
+| Zero byte | `00` |
+| Mixed-case hex | `00Aa80Ff` |
+| Complete byte range | Hex for all 256 byte values in order |
+| Odd length | `0` |
+| Non-hex | `0g` |
+| Prefix retained | Literal backslash-x prefix before `00` |
+| Embedded NUL | Hex-looking prefix and suffix separated by U+0000 |
+| Null tag value | JSON null |
+| Number tag value | `17` |
+| Boolean tag value | false |
+| Array tag value | `["00"]` |
+| Object tag value | `{"hex":"00"}` |
+| Additional member | Valid-looking tag plus an ordinary marker member |
+| NUL-suffixed name | Full tag name followed by U+0000 and `tail` |
+| Near-miss name | Tag spelling with one underscore removed |
+| Invalid first nibble | `g0`, exercising high-nibble rejection separately |
+| Even-length NUL | `0` followed by U+0000, reaching byte validation |
+
+A bounded iterative JavaScript observer uses at most 32 input nodes while
+retaining the existing runtime stack, CPU and memory limits. Its observations
+retain kinds, complete enumerable own-key/value code units and literal byte
+arrays; array length is observed separately.
+The complete inventory is validated first. Each received value must match
+its literal oracle immediately before that receipt's corruption controls;
+missing and duplicated cells must fail inventory validation. Valid Promise
+buffer cells retain their first buffer through another actual native call
+and mutate the two results independently. Reuse observations within a live
+pool remain separate from generation identity; expired generation receipts
+and bounded, idempotent pool/registry retirement establish the ownership
+controls.
+
+Each strict target requires its exact positive Catch case, a 60-second inner
+watchdog, a 75-second CTest bound and the PostgreSQL schema resource lock.
+The existing member-name targets remain independently required. Both
+Clang 20/21 ASan/UBSan jobs and the Clang 21 TSan job discover and run these
+two tagged-value targets explicitly with the existing fatal environments.
+Registration and discovery alone are insufficient execution evidence.
+
+Parent #90 remains open for its other entries, conversion branches and
+applicable ownership schedules. JSON/JSONB structural-versus-text policy,
+FLOAT4 rounding, direct transaction-helper combinations and database type
+fallbacks retain their separate decisions and coverage requirements.
