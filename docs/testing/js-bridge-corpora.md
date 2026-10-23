@@ -27,17 +27,75 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Authoritative PostgreSQL errors (#92) | `plinth_tests_sqlstate_native`, `plinth_tests_sqlstate_pipeline`, `plinth_tests_sqlstate_projection` | Real driver diagnostics/query ownership, deterministic causal errors versus skipped pipeline commands, and registered query/exec/batch error projection |
 | Native PostgreSQL results (#185, parent #90) | `plinth_tests_native_pg_result_corpus` | Selected real scalar input/result kinds, returned BYTEA lifetime, ordered envelopes, server errors/recovery, affected rows and fresh-owner cleanup |
 
-These are bounded slices, not comprehensive coverage claims. Broader direct
-internal transaction callback denial/coercion policy, broader DB dispatch/driver/result conversion,
-capability resolver/dispatch, broader extension
-module import, remaining conversion implementations and broader async dispatch
-remain separate requested targets. The separate JS/JSON implementations in
-`eval.cpp`, `runtime_pool.cpp`, `bridge_context.cpp` and the extension runtime
-registry do not inherit exhaustive coverage from the shared conversion slice.
-The synchronous slice below covers the first two entry points with finite
-inputs; reverse conversion and the other implementations remain outstanding.
-Reserved, unimplemented HTTP/storage operation variants are not exposed fuzz
-targets. Parent #90 stays open while requested coverage remains incomplete.
+These are bounded slices, not comprehensive coverage claims. In particular,
+simulated admission/settlement and actual native execution are separate evidence;
+neither replaces the other. Later native capability, SQL, import and reverse
+conversion tests extend the earlier slices rather than leaving those entire
+surfaces untested. Their remaining branches and applicable ownership cases
+still require explicit accounting. Parent #90 stays open while requested
+coverage remains incomplete.
+
+### Registered-entry inventory
+
+The current production registration sites are `stdlib_inject.cpp`, its seven
+`stdlib/*_bindings.cpp` registrars and the per-dispatch intrinsic installed by
+`extensions/runtime_registry.cpp`. Counting each log level and the returned
+unsubscribe callback gives **21 native entry identities**. The following is a
+source/target inventory, not a claim that every input or schedule has passed.
+Targets named in the slice table above retain their narrower documented scope.
+
+| Native entries | Count | Existing bounded target ownership |
+| --- | --- | --- |
+| `log.debug`, `log.info`, `log.warn`, `log.error` | 4 | Log corpus, log regression and C-string allocation-failure regression |
+| `config.get` | 1 | Config corpus, allowed projection and runtime ownership |
+| `crypto.hash`, `crypto.randomBytes`, `crypto.timingSafeEqual` | 3 | Crypto corpus and numeric regression |
+| `db.query`, `db.exec` | 2 | Ordinary admission plus separate native binary parameters, selected PostgreSQL results and SQLSTATE gates |
+| `db.batch` | 1 | Public admission/orchestration plus separate native transactions, binary batch, timeout and cancellation regressions |
+| `__db_batch_begin__`, `__db_batch_commit__`, `__db_batch_rollback__` | 3 | Valid installed orchestration is covered; a dedicated direct malformed-entry corpus remains incomplete |
+| `audit.log` | 1 | Audit admission/authority plus native persistence and acknowledgement gates |
+| `cap.call`, `cap.batch` | 2 | Capability admission plus native data, edges, errors, ordering, ownership and nested cancellation gates |
+| `pubsub.publish`, `pubsub.subscribe`, returned unsubscribe callback | 3 | Pubsub admission plus native publish/delivery and checkout/retirement ownership gates |
+| `import_from_src` | 1 | Module-source regression and actual module-import corpus |
+
+The installed `__db_batch_orchestrator__` is an additional directly callable
+JavaScript function, not a 22nd native callback. Its public sequencing has
+coverage; direct malformed helper/orchestrator combinations remain separate
+work. Existing helper scope parsing uses `JS_ToInt64` followed by a positivity
+check. A future corpus must characterize that coercion and error precedence,
+not infer a strict JavaScript-integer contract from an error message or turn
+the internal globals into a newly promised SDK API.
+
+`test_host_sleep` and test receipt observers are not production entries.
+Reserved, unimplemented HTTP/storage operation variants are not registered
+fuzz targets. They do not become missing exposed targets solely because an
+enum or historical milestone mentions them.
+
+### Distinct conversion and ownership coverage
+
+The JS/JSON implementations in `conversion.cpp`, `eval.cpp`, `runtime_pool.cpp`,
+`bridge_context.cpp` and the extension registry do not inherit exhaustive
+coverage from one shared corpus. The shared and synchronous corpora exercise
+their actual respective entry points. Reverse conversion has separate
+`plinth_tests_reverse_json_registry_arguments` and
+`plinth_tests_reverse_json_promise_settlement` regressions; native capability,
+pubsub delivery and BYTEA tests additionally exercise real typed settlement.
+These are finite observations, not proof of every reverse branch.
+
+The remaining result/conversion ledger includes distinct native JSON/JSONB
+and temporal string branches, unknown-OID fallback, disabled-type-flag
+heuristics and finite numeric/column-name boundaries outside the selected
+PostgreSQL result corpus. Reverse singleton BYTEA-tag fallback also needs its
+own explicit literal observations; valid native binary round trips are not
+that fallback oracle. This is one bounded remainder, not a requirement to
+implement every future PostgreSQL type or promote arrays to a new SDK type.
+
+Runtime reset, cancellation and teardown are not wholly outstanding: existing
+pool, native cleanup/setup-failure, capability cancellation/generation, pubsub
+retirement and production coordinator tests provide route-specific coverage.
+Each new entry/branch corpus still needs its applicable ownership cases and
+actual sanitizer evidence. No combination of existing green tests proves
+every cancellation schedule, authentication, a full broker/network journey,
+or that a fire-and-forget acknowledgement proves persistence.
 
 ## Native audit persistence and acknowledgement
 
@@ -556,9 +614,11 @@ they do not establish that clean release itself resets a transaction. Dirty
 release, held-owner rebuild and bounded/idempotent shutdown keep all JS values
 within a live owned context. This is not proof of real BEGIN/COMMIT/ROLLBACK,
 driver/result conversion, authorization, timers, transaction durability or
-the production cancellation cascade. Direct internal-helper coercion and
-denial policy, exotic accessors/global replacements and remaining parent #90
-targets stay outstanding; no production policy or limit changes.
+the production cancellation cascade. Direct internal-helper malformed-entry
+coverage, exotic accessors/global replacements and the remaining parent #90
+inventory stay separate; no production policy or limit changes. Later native
+transaction/cancellation regressions do not turn this simulated corpus into
+native execution evidence.
 
 `plinth_tests_db_batch_corpus` requires exactly its named case, fresh Catch/XML,
 positive assertions, zero failures/expected failures/skips and successful child
@@ -646,10 +706,12 @@ slice does not claim production threaded dispatch or cancellation coverage.
 Actual sanitizer and CI outcomes must come from the candidate and exact-merge
 runs; configuration or self-tests alone do not establish those outcomes.
 
-Parent #90 stays open. Extension import, reverse conversion, remaining runtime
-conversion paths, SQL/driver execution, capability dispatch, production
-cancellation and SDK/HTTP ambiguity obligations remain separate. This work
-does not authorize a version bump, release or publication.
+Parent #90 stays open. This synchronous slice does not itself exercise extension
+import, reverse conversion, SQL/driver execution, capability dispatch or native
+cancellation; their later named gates retain their own finite coverage. The
+current remaining entry/branch ledger is above, not a blanket assertion that
+those surfaces are untested. This work does not authorize a version bump,
+release or publication.
 
 ## Extension module import
 
@@ -721,9 +783,11 @@ Actual sanitizer/runtime outcomes require execution evidence, not this wiring.
 
 This slice does not prove HTTP installation, package authorization, external
 module resolution, arbitrary coercion/exotic-object policy, allocator exhaustion,
-production cancellation or unbounded async behavior. Broader native dispatch,
-SQL/driver/result conversion, remaining conversion and SDK/HTTP obligations
-remain separate. Parent #90 stays open; no production policy, public API,
+production cancellation or unbounded async behavior. Native dispatch, SQL and
+reverse-conversion tests elsewhere retain their separate finite evidence; they
+are neither execution credit for this import corpus nor wholly absent. The
+remaining entry/branch ledger is above. SDK/HTTP journeys are separate from
+this corpus. Parent #90 stays open; no production policy, public API,
 asset/version, grant or release changes are made here.
 
 ## Native PostgreSQL binary parameters
