@@ -1578,6 +1578,28 @@ add_test(NAME plinth_tests_reverse_json_promise_settlement
 set_tests_properties(plinth_tests_reverse_json_promise_settlement PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
 
+# Tagged JSON values have distinct registry-argument and Promise-result
+# semantics. Require both real routes independently of the member-name gates.
+add_test(NAME plinth_tests_reverse_json_registry_values
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "Extension argument injection has a bounded tagged JSON corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_reverse_json_registry_values PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
+add_test(NAME plinth_tests_reverse_json_promise_values
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "Capability promise settlement has a bounded tagged JSON corpus"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_reverse_json_promise_values PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})

@@ -21,6 +21,9 @@
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/js/async_op.hpp"
 #include "kernel/js/eval_guard.hpp"
+#include "kernel/js/execution_lifetime.hpp"
+#include "kernel/js/run_on_context.hpp"
+#include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 
 #include "../js/async_bridge_fixture.hpp"
@@ -30,9 +33,11 @@
 #include <json/value.h>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -41,6 +46,7 @@
 #include <initializer_list>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -1002,6 +1008,815 @@ auto check_reverse_name_entrypoint(bool promise_settlement) -> void {
   }
 }
 
+// Two distinct production converters deliberately have different tag behavior:
+// registry arguments remain objects; actual cap.call settlement recognizes a
+// valid singleton BYTEA tag. This native producer is not PostgreSQL JSON/OID
+// coverage. No production converter or chosen Promise settlement is an oracle.
+constexpr std::size_t TAGGED_FAMILIES = 18;
+constexpr std::size_t TAGGED_PLACEMENTS = 3;
+constexpr std::size_t TAGGED_EPOCHS = 2;
+constexpr std::size_t TAGGED_PER_EPOCH = TAGGED_FAMILIES * TAGGED_PLACEMENTS;
+constexpr std::size_t TAGGED_PER_ROUTE = TAGGED_PER_EPOCH * TAGGED_EPOCHS;
+
+auto tagged_input(std::size_t family, bool follow) -> Json::Value {
+  Json::Value value{Json::objectValue};
+  if (follow) {
+    value["__bytea_hex__"] = "110080ff";
+    return value;
+  }
+  // Frozen F00..F17 input ledger. The independent receipt table below never
+  // reads these values to derive its expected bytes or UTF-16 observations.
+  switch (family) {
+    case 0: value["__bytea_hex__"] = ""; break;
+    case 1: value["__bytea_hex__"] = "00"; break;
+    case 2: value["__bytea_hex__"] = "00Aa80Ff"; break;
+    case 3:
+      value["__bytea_hex__"] = "000102030405060708090a0b0c0d0e0f"
+                               "101112131415161718191a1b1c1d1e1f"
+                               "202122232425262728292a2b2c2d2e2f"
+                               "303132333435363738393a3b3c3d3e3f"
+                               "404142434445464748494a4b4c4d4e4f"
+                               "505152535455565758595a5b5c5d5e5f"
+                               "606162636465666768696a6b6c6d6e6f"
+                               "707172737475767778797a7b7c7d7e7f"
+                               "808182838485868788898a8b8c8d8e8f"
+                               "909192939495969798999a9b9c9d9e9f"
+                               "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+                               "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+                               "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+                               "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+                               "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+                               "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff";
+      break;
+    case 4: value["__bytea_hex__"] = "0"; break;
+    case 5: value["__bytea_hex__"] = "0g"; break;
+    case 6: value["__bytea_hex__"] = "\\x00"; break;
+    case 7: value["__bytea_hex__"] = std::string{"00\0ff", 5}; break;
+    case 8: value["__bytea_hex__"] = Json::Value{}; break;
+    case 9: value["__bytea_hex__"] = 17; break;
+    case 10: value["__bytea_hex__"] = false; break;
+    case 11:
+      value["__bytea_hex__"] = Json::Value{Json::arrayValue};
+      value["__bytea_hex__"].append("00");
+      break;
+    case 12: value["__bytea_hex__"]["hex"] = "00"; break;
+    case 13:
+      value["__bytea_hex__"] = "00";
+      value["marker"] = 41;
+      break;
+    case 14: value[std::string{"__bytea_hex__\0tail", 18}] = "00"; break;
+    case 15: value["__bytea_hex_"] = "00"; break;
+    case 16: value["__bytea_hex__"] = "g0"; break;
+    case 17: value["__bytea_hex__"] = std::string{"0\0", 2}; break;
+    default: throw std::logic_error("unknown reverse tagged family");
+  }
+  return value;
+}
+
+auto tagged_place(Json::Value value, std::size_t placement) -> Json::Value {
+  if (placement == 0) return value;
+  if (placement == 1) {
+    Json::Value wrapped{Json::objectValue};
+    wrapped["left"] = 17;
+    wrapped["slot"] = std::move(value);
+    wrapped["text"] = "\xc3\xa9\xf0\x9f\x98\x80";
+    return wrapped;
+  }
+  Json::Value wrapped{Json::arrayValue};
+  wrapped.append(31);
+  wrapped.append(std::move(value));
+  wrapped.append("\xc3\xa9\xf0\x9f\x98\x80");
+  return wrapped;
+}
+
+// ASCII-only metadata encoding, not a UTF-8 decoder or a BYTEA decoder. The
+// non-ASCII/NUL unit vectors below are independently written literal values.
+auto tagged_ascii_units(std::string_view text) -> Json::Value {
+  Json::Value result{Json::arrayValue};
+  for (const unsigned char unit : text)
+    result.append(static_cast<int>(unit));
+  return result;
+}
+
+auto tagged_units(std::initializer_list<int> units) -> Json::Value {
+  Json::Value result{Json::arrayValue};
+  for (const auto unit : units)
+    result.append(unit);
+  return result;
+}
+
+auto tagged_node(std::string_view kind, std::string_view type) -> Json::Value {
+  Json::Value node{Json::objectValue};
+  node["kind"] = std::string{kind};
+  node["type"] = std::string{type};
+  for (const auto* field : {"keys", "value", "units", "bytes", "length",
+                            "byteLength", "children"}) {
+    node[field] = Json::Value{};
+  }
+  return node;
+}
+
+auto tagged_string(const Json::Value& units) -> Json::Value {
+  auto node = tagged_node("string", "string");
+  node["units"] = units;
+  // These bounded JS lengths use JS_TAG_INT and therefore signed Json::Int
+  // in the actual forward receipt. Preserve exact JsonCpp storage equality.
+  node["length"] = static_cast<Json::Int>(units.size());
+  return node;
+}
+
+auto tagged_number(int value) -> Json::Value {
+  auto node = tagged_node("number", "number");
+  node["value"] = value;
+  return node;
+}
+
+auto tagged_object(
+    std::initializer_list<std::pair<Json::Value, Json::Value>> members)
+    -> Json::Value {
+  auto node = tagged_node("object", "object");
+  node["keys"] = Json::Value{Json::arrayValue};
+  node["children"] = Json::Value{Json::arrayValue};
+  // Call sites list exact independently expected JS lexicographic key order.
+  for (const auto& [key, child] : members) {
+    node["keys"].append(key);
+    node["children"].append(child);
+  }
+  return node;
+}
+
+auto tagged_index_keys(std::size_t length) -> Json::Value {
+  std::vector<std::string> names;
+  names.reserve(length);
+  for (std::size_t index = 0; index < length; ++index)
+    names.push_back(std::to_string(index));
+  std::ranges::sort(names);
+  Json::Value result{Json::arrayValue};
+  for (const auto& name : names)
+    result.append(tagged_ascii_units(name));
+  return result;
+}
+
+auto tagged_array(std::initializer_list<Json::Value> children) -> Json::Value {
+  auto node = tagged_node("array", "object");
+  node["keys"] = tagged_index_keys(children.size());
+  node["length"] = static_cast<Json::Int>(children.size());
+  node["children"] = Json::Value{Json::arrayValue};
+  for (const auto& child : children)
+    node["children"].append(child);
+  return node;
+}
+
+auto tagged_bytes(Json::Value bytes) -> Json::Value {
+  auto node = tagged_node("u8", "object");
+  node["keys"] = tagged_index_keys(bytes.size());
+  node["length"] = static_cast<Json::Int>(bytes.size());
+  node["byteLength"] = static_cast<Json::Int>(bytes.size());
+  node["bytes"] = std::move(bytes);
+  return node;
+}
+
+auto tagged_literal_bytes(std::size_t family) -> Json::Value {
+  if (family == 0) return tagged_units({});
+  if (family == 1) return tagged_units({0});
+  if (family == 2) return tagged_units({0, 170, 128, 255});
+  // Explicit independent byte vector: not decoded from the producer's hex.
+  return tagged_units(
+      {0,   1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,
+       14,  15,  16,  17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,
+       28,  29,  30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,
+       42,  43,  44,  45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,
+       56,  57,  58,  59,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,
+       70,  71,  72,  73,  74,  75,  76,  77,  78,  79,  80,  81,  82,  83,
+       84,  85,  86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,
+       98,  99,  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111,
+       112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125,
+       126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139,
+       140, 141, 142, 143, 144, 145, 146, 147, 148, 149, 150, 151, 152, 153,
+       154, 155, 156, 157, 158, 159, 160, 161, 162, 163, 164, 165, 166, 167,
+       168, 169, 170, 171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181,
+       182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 192, 193, 194, 195,
+       196, 197, 198, 199, 200, 201, 202, 203, 204, 205, 206, 207, 208, 209,
+       210, 211, 212, 213, 214, 215, 216, 217, 218, 219, 220, 221, 222, 223,
+       224, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 235, 236, 237,
+       238, 239, 240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251,
+       252, 253, 254, 255});
+}
+
+auto tagged_literal_object(std::size_t family) -> Json::Value {
+  const auto tag =
+      tagged_units({95, 95, 98, 121, 116, 101, 97, 95, 104, 101, 120, 95, 95});
+  Json::Value child;
+  switch (family) {
+    case 0: child = tagged_string(tagged_units({})); break;
+    case 1: child = tagged_string(tagged_units({48, 48})); break;
+    case 2:
+      child = tagged_string(tagged_units({48, 48, 65, 97, 56, 48, 70, 102}));
+      break;
+    case 3:
+      child =
+          tagged_string(tagged_ascii_units("000102030405060708090a0b0c0d0e0f"
+                                           "101112131415161718191a1b1c1d1e1f"
+                                           "202122232425262728292a2b2c2d2e2f"
+                                           "303132333435363738393a3b3c3d3e3f"
+                                           "404142434445464748494a4b4c4d4e4f"
+                                           "505152535455565758595a5b5c5d5e5f"
+                                           "606162636465666768696a6b6c6d6e6f"
+                                           "707172737475767778797a7b7c7d7e7f"
+                                           "808182838485868788898a8b8c8d8e8f"
+                                           "909192939495969798999a9b9c9d9e9f"
+                                           "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf"
+                                           "b0b1b2b3b4b5b6b7b8b9babbbcbdbebf"
+                                           "c0c1c2c3c4c5c6c7c8c9cacbcccdcecf"
+                                           "d0d1d2d3d4d5d6d7d8d9dadbdcdddedf"
+                                           "e0e1e2e3e4e5e6e7e8e9eaebecedeeef"
+                                           "f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"));
+      break;
+    case 4: child = tagged_string(tagged_units({48})); break;
+    case 5: child = tagged_string(tagged_units({48, 103})); break;
+    case 6: child = tagged_string(tagged_units({92, 120, 48, 48})); break;
+    case 7: child = tagged_string(tagged_units({48, 48, 0, 102, 102})); break;
+    case 8: child = tagged_node("null", "object"); break;
+    case 9: child = tagged_number(17); break;
+    case 10:
+      child = tagged_node("boolean", "boolean");
+      child["value"] = false;
+      break;
+    case 11:
+      child = tagged_array({tagged_string(tagged_units({48, 48}))});
+      break;
+    case 12:
+      child = tagged_object({{tagged_units({104, 101, 120}),
+                              tagged_string(tagged_units({48, 48}))}});
+      break;
+    case 13:
+      return tagged_object(
+          {{tag, tagged_string(tagged_units({48, 48}))},
+           {tagged_units({109, 97, 114, 107, 101, 114}), tagged_number(41)}});
+    case 14:
+      return tagged_object(
+          {{tagged_units({95, 95, 98, 121, 116, 101, 97, 95, 104, 101, 120, 95,
+                          95, 0, 116, 97, 105, 108}),
+            tagged_string(tagged_units({48, 48}))}});
+    case 15:
+      return tagged_object({{tagged_units({95, 95, 98, 121, 116, 101, 97, 95,
+                                           104, 101, 120, 95}),
+                             tagged_string(tagged_units({48, 48}))}});
+    case 16: child = tagged_string(tagged_units({103, 48})); break;
+    case 17: child = tagged_string(tagged_units({48, 0})); break;
+    default: throw std::logic_error("unknown reverse tagged literal");
+  }
+  return tagged_object({{tag, std::move(child)}});
+}
+
+auto tagged_expected_placement(Json::Value value, std::size_t placement)
+    -> Json::Value {
+  if (placement == 0) return value;
+  const auto text = tagged_string(tagged_units({233, 55357, 56832}));
+  if (placement == 1) {
+    return tagged_object(
+        {{tagged_units({108, 101, 102, 116}), tagged_number(17)},
+         {tagged_units({115, 108, 111, 116}), std::move(value)},
+         {tagged_units({116, 101, 120, 116}), text}});
+  }
+  return tagged_array({tagged_number(31), std::move(value), text});
+}
+
+auto tagged_expected(std::size_t family, std::size_t placement, bool settlement)
+    -> Json::Value {
+  const bool buffer = settlement && family < 4;
+  const auto first = buffer ? tagged_bytes(tagged_literal_bytes(family))
+                            : tagged_literal_object(family);
+  Json::Value result{Json::objectValue};
+  result["prior"] = 0;
+  result["visits"] = 1;
+  result["first"] = tagged_expected_placement(first, placement);
+  result["independent"] = false;
+  result["followups"] = 0;
+  for (const auto* field :
+       {"second", "held", "firstChanged", "secondChanged", "heldAfterSecond"}) {
+    result[field] = Json::Value{};
+  }
+  if (buffer) {
+    auto changed = tagged_literal_bytes(family);
+    if (!changed.empty()) changed[0] = changed[0].asInt() ^ 1;
+    result["second"] = tagged_expected_placement(
+        tagged_bytes(tagged_units({17, 0, 128, 255})), placement);
+    result["held"] = result["first"];
+    result["firstChanged"] =
+        tagged_expected_placement(tagged_bytes(std::move(changed)), placement);
+    result["secondChanged"] = tagged_expected_placement(
+        tagged_bytes(tagged_units({16, 0, 128, 255})), placement);
+    result["heldAfterSecond"] = result["firstChanged"];
+    result["independent"] = true;
+    result["followups"] = 1;
+  }
+  return result;
+}
+
+constexpr std::string_view TAGGED_OBSERVER = R"JS(
+function taggedDescribe(v) {
+  const pending=[{value:v,parent:null,index:0}];let root=null,nodes=0;
+  while(pending.length) {
+    if(++nodes>32||pending.length>32)throw new Error('tagged observer node bound');
+    const work=pending.pop(),value=work.value,type=typeof value;
+    const u8=value instanceof Uint8Array,array=Array.isArray(value);
+    const names=value!==null&&type==='object'?Object.keys(value).sort():null;
+    let keys=null,stringUnits=null,byteValues=null;
+    if(names!==null) {
+      keys=[];
+      for(let i=0;i<names.length;i++) {
+        const name=names[i],units=[];
+        for(let j=0;j<name.length;j++)units.push(name.charCodeAt(j));
+        keys.push(units);
+      }
+    }
+    if(type==='string') {
+      stringUnits=[];
+      for(let i=0;i<value.length;i++)stringUnits.push(value.charCodeAt(i));
+    }
+    if(u8) {
+      byteValues=[];
+      for(let i=0;i<value.length;i++)byteValues.push(value[i]);
+    }
+    const children=array?new Array(value.length):names!==null&&!u8?new Array(names.length):null;
+    const node={kind:value===null?'null':u8?'u8':array?'array':type,type,keys,
+      value:type==='boolean'||type==='number'?value:null,units:stringUnits,bytes:byteValues,
+      length:u8||array||type==='string'?value.length:null,byteLength:u8?value.byteLength:null,children};
+    if(work.parent===null)root=node;else work.parent[work.index]=node;
+    if(children!==null) {
+      for(let i=children.length-1;i>=0;i--) {
+        pending.push({value:array?value[i]:value[names[i]],parent:children,index:i});
+        if(pending.length>32)throw new Error('tagged observer worklist bound');
+      }
+    }
+  }
+  return root;
+}
+function taggedTarget(value,placement) {
+  return placement===0?value:placement===1?value.slot:value[1];
+}
+function taggedReceipt(value) {
+  const prior=globalThis.reverse_tag_visits||0;
+  globalThis.reverse_tag_visits=prior+1;
+  return {prior,visits:globalThis.reverse_tag_visits,first:taggedDescribe(value),
+    second:null,held:null,firstChanged:null,secondChanged:null,heldAfterSecond:null,
+    independent:false,followups:0};
+}
+)JS";
+
+struct TaggedExecution {
+  std::weak_ptr<plinth::js::ExecutionLifetime> generation;
+  std::uintptr_t context = 0;
+  bool entered = false;
+  bool finished = false;
+  bool clean = false;
+  bool same_generation = false;
+  bool cancelled = false;
+  std::optional<plinth::js::EvalErrorKind> error_kind;
+};
+
+class TaggedExecutionWatch {
+ public:
+  struct State {
+    std::array<TaggedExecution, TAGGED_PER_EPOCH> records;
+    std::atomic<std::size_t> entered{0};
+    std::atomic<std::size_t> finished{0};
+    std::atomic<bool> invalid{false};
+  };
+  std::shared_ptr<State> state = std::make_shared<State>();
+
+  TaggedExecutionWatch() {
+    plinth::js::set_execution_observer_for_test(
+        [owned =
+             state](const plinth::js::ExecutionObservation& event) noexcept {
+          if (event.extension_name != "reversetags") return;
+          try {
+            const bool entering =
+                event.stage == plinth::js::ExecutionObservationStage::ENTER;
+            const auto index = entering ? owned->entered.fetch_add(1)
+                                        : owned->finished.fetch_add(1);
+            if (index >= owned->records.size()) {
+              owned->invalid.store(true);
+              return;
+            }
+            auto& record = owned->records[index];
+            auto generation = event.execution.lock();
+            if (!generation) {
+              owned->invalid.store(true);
+              return;
+            }
+            if (entering) {
+              record.generation = event.execution;
+              record.entered =
+                  generation->visit([&](plinth::js::BridgeContext& bc) {
+                    // Integer diagnostics only, within this live pool epoch.
+                    // Never retained as a dereferenceable handle or generation
+                    // identity.
+                    record.context = reinterpret_cast<std::uintptr_t>(bc.ctx);
+                  });
+            } else {
+              record.same_generation =
+                  !record.generation.owner_before(event.execution) &&
+                  !event.execution.owner_before(record.generation);
+              record.error_kind = event.error_kind;
+              record.cancelled = event.cancelled;
+              record.finished = record.same_generation &&
+                                !record.error_kind.has_value() &&
+                                !record.cancelled;
+              const bool visited =
+                  generation->visit([&](plinth::js::BridgeContext& bc) {
+                    const auto& batch = bc.batch_state;
+                    record.clean = bc.pending_ops.empty() &&
+                                   bc.retired_pending_ops.empty() &&
+                                   bc.callbacks.empty() &&
+                                   bc.persistent_callbacks.empty() &&
+                                   bc.concurrent_async_ops == 0 &&
+                                   bc.inflight_detached.load() == 0 &&
+                                   batch.depth == 0 && batch.scope_id == 0 &&
+                                   !batch.pinned_conn &&
+                                   !batch.rollback_owner &&
+                                   batch.timer_id == trantor::InvalidTimerId &&
+                                   batch.timer_loop == nullptr;
+                  });
+              record.clean = visited && record.clean;
+            }
+          } catch (...) {
+            owned->invalid.store(true);
+          }
+          // The temporary strong generation/accepted lease is released before
+          // the observer returns and before the test asks native work to drain.
+        });
+  }
+  ~TaggedExecutionWatch() { plinth::js::set_execution_observer_for_test({}); }
+  TaggedExecutionWatch(const TaggedExecutionWatch&) = delete;
+  auto operator=(const TaggedExecutionWatch&) -> TaggedExecutionWatch& = delete;
+};
+
+struct TaggedCleanup {
+  bool stopped = false;
+  bool idempotent = false;
+  bool native = false;
+  bool audits = false;
+  bool absent = false;
+  std::size_t active = 1;
+  std::size_t failed = 1;
+  std::size_t constructing = 1;
+  std::size_t tasks = 1;
+};
+
+auto tagged_clean(const TaggedCleanup& state) -> bool {
+  return state.stopped && state.idempotent && state.native && state.audits &&
+         state.absent && state.active == 0 && state.failed == 0 &&
+         state.constructing == 0 && state.tasks == 0;
+}
+
+class TaggedRegistryOwner {
+ public:
+  TaggedCleanup cleanup;
+  TaggedRegistryOwner() = default;
+  ~TaggedRegistryOwner() {
+    if (!closed && !finish()) std::terminate();
+  }
+  TaggedRegistryOwner(const TaggedRegistryOwner&) = delete;
+  auto operator=(const TaggedRegistryOwner&) -> TaggedRegistryOwner& = delete;
+  auto finish() noexcept -> bool {
+    if (closed) return true;
+    try {
+      plinth::extensions::destroy_pool("reversetags");
+      cleanup.stopped = plinth::extensions::shutdown_registry(5s);
+      if (!cleanup.stopped) return false;
+      cleanup.native = plinth::lifecycle::async_tasks().drain(5s);
+      cleanup.audits = plinth::log::wait_for_audits(5s);
+      cleanup.idempotent = plinth::extensions::shutdown_registry(0ms);
+      cleanup.absent = !plinth::extensions::has_pool("reversetags");
+      cleanup.active = plinth::extensions::inflight_dispatch_count_for_test();
+      cleanup.failed = plinth::extensions::failed_pool_count_for_test();
+      cleanup.constructing =
+          plinth::extensions::pending_pool_constructions_for_test();
+      cleanup.tasks = plinth::lifecycle::async_tasks().active_for_test();
+      closed = tagged_clean(cleanup);
+      return closed;
+    } catch (...) {
+      return false;
+    }
+  }
+
+ private:
+  bool closed = false;
+};
+
+struct TaggedNative {
+  std::array<std::atomic<unsigned>, TAGGED_PER_EPOCH> primary{};
+  std::array<std::atomic<unsigned>, TAGGED_PER_EPOCH> follow{};
+  std::atomic<unsigned> invalid{0};
+};
+
+struct TaggedCell {
+  std::size_t epoch;
+  std::size_t family;
+  std::size_t placement;
+  bool settlement;
+  bool resolved;
+  bool tier;
+  Json::Value data;
+  std::string resolver_code;
+  std::string resolver_message;
+};
+
+auto tagged_complete(const std::vector<TaggedCell>& cells, bool settlement)
+    -> bool {
+  if (cells.size() != TAGGED_PER_ROUTE) return false;
+  std::array<unsigned, TAGGED_PER_ROUTE> seen{};
+  for (const auto& cell : cells) {
+    if (cell.epoch >= TAGGED_EPOCHS || cell.family >= TAGGED_FAMILIES ||
+        cell.placement >= TAGGED_PLACEMENTS || cell.settlement != settlement)
+      return false;
+    const auto index = cell.epoch * TAGGED_PER_EPOCH +
+                       cell.family * TAGGED_PLACEMENTS + cell.placement;
+    if (++seen[index] != 1) return false;
+  }
+  return std::ranges::all_of(seen, [](unsigned value) { return value == 1; });
+}
+
+auto tagged_receipt_target(Json::Value& receipt, std::size_t placement)
+    -> Json::Value& {
+  if (placement == 0) return receipt;
+  return receipt["children"][1]; // slot is the middle sorted object key too.
+}
+
+auto tagged_corrupt_value(Json::Value& node) -> void {
+  // Change an observed value without changing its descriptor's kind. The
+  // baseline has already passed, including shape and exact scalar type.
+  const auto kind = node["kind"].asString();
+  if (kind == "string") {
+    if (node["units"].empty())
+      node["units"].append(199);
+    else
+      node["units"][0] = 199;
+  } else if (kind == "u8") {
+    if (node["bytes"].empty())
+      node["bytes"].append(199);
+    else
+      node["bytes"][0] = 199;
+  } else if (kind == "number") {
+    node["value"] = node["value"].asInt() + 1;
+  } else if (kind == "boolean") {
+    node["value"] = !node["value"].asBool();
+  } else if (kind == "null") {
+    node["value"] = 17;
+  } else {
+    tagged_corrupt_value(node["children"][0]);
+  }
+}
+
+auto check_reverse_tagged_entrypoint(bool settlement) -> void {
+  const auto deadline = std::chrono::steady_clock::now() + 55s;
+  std::vector<TaggedCell> cells;
+  cells.reserve(TAGGED_PER_ROUTE);
+  unsigned ownership_controls = 0;
+  for (std::size_t epoch = 0; epoch < TAGGED_EPOCHS; ++epoch) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    ExtScratch scratch;
+    TaggedExecutionWatch executions;
+    TaggedRegistryOwner
+        owner; // Bounded unwind runs before scratch destruction.
+    auto native = std::make_shared<TaggedNative>();
+    if (settlement) {
+      plinth::capabilities::register_tier1_handler(
+          "kernel:1:tagged_values", "kernel.admin",
+          [native](const Json::Value& args,
+                   const plinth::capabilities::UserContext& user,
+                   int depth) -> plinth::capabilities::HandlerOutcome {
+            if (!args.isObject() || args.size() != 3 ||
+                !args["family"].isUInt() || !args["placement"].isUInt() ||
+                !args["follow"].isBool() ||
+                args["family"].asUInt() >= TAGGED_FAMILIES ||
+                args["placement"].asUInt() >= TAGGED_PLACEMENTS ||
+                user.user_id != "11111111-1111-1111-1111-111111111111" ||
+                user.username != "tester" || depth != 2) {
+              native->invalid.fetch_add(1);
+              return std::unexpected(
+                  plinth::capabilities::CapabilityError::INVALID_CAPABILITY);
+            }
+            const auto family = args["family"].asUInt();
+            const auto placement = args["placement"].asUInt();
+            const bool follow = args["follow"].asBool();
+            const auto index = family * TAGGED_PLACEMENTS + placement;
+            if (follow && family >= 4) {
+              native->invalid.fetch_add(1);
+              return std::unexpected(
+                  plinth::capabilities::CapabilityError::INVALID_CAPABILITY);
+            }
+            (follow ? native->follow[index] : native->primary[index])
+                .fetch_add(1);
+            // A fresh owned Json result leaves this real native handler. No
+            // reference to a test-stack value survives the handler invocation.
+            return tagged_place(tagged_input(family, follow), placement);
+          });
+    }
+    auto source = std::string{TAGGED_OBSERVER};
+    source += settlement ? R"JS(
+export default async function(args) {
+  const value=await cap.call('kernel:1:tagged_values',
+    {family:args.family,placement:args.placement,follow:false});
+  const result=taggedReceipt(value), target=taggedTarget(value,args.placement);
+  if(args.family<4) {
+    const second=await cap.call('kernel:1:tagged_values',
+      {family:args.family,placement:args.placement,follow:true});
+    const other=taggedTarget(second,args.placement);
+    result.followups++;result.second=taggedDescribe(second);result.held=taggedDescribe(value);
+    result.independent=target instanceof Uint8Array&&other instanceof Uint8Array&&
+      target!==other&&target.buffer!==other.buffer;
+    if(target instanceof Uint8Array&&target.length)target[0]^=1;
+    result.firstChanged=taggedDescribe(value);
+    if(other instanceof Uint8Array&&other.length)other[0]^=1;
+    result.secondChanged=taggedDescribe(second);result.heldAfterSecond=taggedDescribe(value);
+  }
+  return result;
+}
+)JS"
+                         : R"JS(
+export default function(args) { return taggedReceipt(args); }
+)JS";
+    REQUIRE(source.size() <= 4096);
+    scratch.stage_extension("reversetags", {{"inspect", source}});
+    seed_tier2("reversetags:1:inspect", "reversetags");
+    REQUIRE(plinth::extensions::create_pool("reversetags"));
+    REQUIRE(plinth::extensions::has_pool("reversetags"));
+    ModuleEngineWatch engines{"reversetags/inspect", ""};
+    for (std::size_t family = 0; family < TAGGED_FAMILIES; ++family) {
+      for (std::size_t placement = 0; placement < TAGGED_PLACEMENTS;
+           ++placement) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        auto args = tagged_place(tagged_input(family, false), placement);
+        if (settlement) {
+          args = Json::Value{Json::objectValue};
+          args["family"] = static_cast<unsigned>(family);
+          args["placement"] = static_cast<unsigned>(placement);
+        }
+        // The out-parameters are owned locals through synchronous resolver
+        // completion and the native-tail barrier; only copied strings survive.
+        std::string resolver_code;
+        std::string resolver_message;
+        auto result = run_resolver("reversetags:1:inspect", args,
+                                   &resolver_code, &resolver_message);
+        // Registry dispatch releases its successful checkout before co_return.
+        // Also join every accepted native tail before the next acquire: reuse
+        // is causally observed, not guessed from two rapidly adjacent calls.
+        if (!plinth::lifecycle::async_tasks().drain(5s)) {
+          throw std::runtime_error(
+              "reverse tagged native completion did not drain");
+        }
+        cells.push_back(
+            {epoch, family, placement, settlement, result.has_value(),
+             result && result->resolved_tier == "tier2" &&
+                 result->provider_type == "extension",
+             result ? std::move(result->data) : Json::Value{},
+             std::move(resolver_code), std::move(resolver_message)});
+      }
+    }
+    // All copied observations and weak receipts survive actual pool/context
+    // retirement. Cleanup completes before any oracle/corruption assertions.
+    const bool closed = owner.finish();
+    REQUIRE(closed);
+    REQUIRE(tagged_clean(owner.cleanup));
+    REQUIRE(engines.counts().compiled == TAGGED_PER_EPOCH);
+    REQUIRE(engines.counts().evaluated == TAGGED_PER_EPOCH);
+    REQUIRE_FALSE(executions.state->invalid.load());
+    REQUIRE(executions.state->entered.load() == TAGGED_PER_EPOCH);
+    REQUIRE(executions.state->finished.load() == TAGGED_PER_EPOCH);
+    const auto context = executions.state->records.front().context;
+    REQUIRE(context != 0);
+    for (std::size_t index = 0; index < TAGGED_PER_EPOCH; ++index) {
+      const auto& record = executions.state->records[index];
+      const auto& cell = cells[epoch * TAGGED_PER_EPOCH + index];
+      INFO("tag execution epoch="
+           << epoch << " index=" << index
+           << " family=" << index / TAGGED_PLACEMENTS
+           << " placement=" << index % TAGGED_PLACEMENTS
+           << " weakMatch=" << record.same_generation
+           << " cancelled=" << record.cancelled << " errorKind="
+           << (record.error_kind ? static_cast<int>(*record.error_kind) : -1)
+           << " resolverCode=" << cell.resolver_code
+           << " resolverMessage=" << cell.resolver_message);
+      REQUIRE(record.entered);
+      REQUIRE(record.finished);
+      REQUIRE(record.clean);
+      REQUIRE(record.context == context);
+      REQUIRE(record.generation.expired());
+      if (index != 0) {
+        const auto& previous = executions.state->records[index - 1].generation;
+        REQUIRE((previous.owner_before(record.generation) ||
+                 record.generation.owner_before(previous)));
+      }
+      const auto family = index / TAGGED_PLACEMENTS;
+      REQUIRE(native->primary[index].load() == (settlement ? 1U : 0U));
+      REQUIRE(native->follow[index].load() ==
+              (settlement && family < 4 ? 1U : 0U));
+    }
+    REQUIRE(native->invalid.load() == 0);
+    for (unsigned field = 0; field < 9; ++field) {
+      auto corrupt = owner.cleanup;
+      if (field == 0) corrupt.stopped = false;
+      if (field == 1) corrupt.idempotent = false;
+      if (field == 2) corrupt.native = false;
+      if (field == 3) corrupt.audits = false;
+      if (field == 4) corrupt.absent = false;
+      if (field == 5) corrupt.active = 1;
+      if (field == 6) corrupt.failed = 1;
+      if (field == 7) corrupt.constructing = 1;
+      if (field == 8) corrupt.tasks = 1;
+      REQUIRE_FALSE(tagged_clean(corrupt));
+      ++ownership_controls;
+    }
+  }
+  REQUIRE(tagged_complete(cells, settlement));
+  unsigned controls = 0;
+  unsigned value_controls = 0;
+  unsigned key_controls = 0;
+  unsigned buffer_controls = 0;
+  unsigned ledger_controls = 0;
+  for (std::size_t index = 0; index < cells.size(); ++index) {
+    const auto& cell = cells[index];
+    INFO("tag route=" << settlement << " epoch=" << cell.epoch << " family="
+                      << cell.family << " placement=" << cell.placement);
+    REQUIRE(cell.resolved);
+    REQUIRE(cell.tier);
+    const auto expected =
+        tagged_expected(cell.family, cell.placement, settlement);
+    REQUIRE(cell.data == expected);
+    for (unsigned field = 0; field < 7; ++field) {
+      auto corrupt = cell.data;
+      auto& target = tagged_receipt_target(corrupt["first"], cell.placement);
+      if (field == 0) corrupt["prior"] = 1;
+      if (field == 1) corrupt["visits"] = 0;
+      if (field == 2) target["kind"] = "wrong";
+      if (field == 3) target["type"] = "wrong";
+      if (field == 4) target["keys"] = "wrong";
+      if (field == 5) target["children"] = "wrong";
+      if (field == 6) corrupt["followups"] = 2;
+      REQUIRE_FALSE(corrupt == expected);
+      ++controls;
+    }
+    {
+      auto corrupt = cell.data;
+      tagged_corrupt_value(
+          tagged_receipt_target(corrupt["first"], cell.placement));
+      REQUIRE_FALSE(corrupt == expected);
+      ++value_controls;
+    }
+    {
+      auto corrupt = cell.data;
+      auto& names =
+          tagged_receipt_target(corrupt["first"], cell.placement)["keys"];
+      if (names.empty())
+        names.append(tagged_units({199}));
+      else
+        names[0][0] = 199;
+      REQUIRE_FALSE(corrupt == expected);
+      ++key_controls;
+    }
+    if (settlement && cell.family < 4) {
+      for (const auto* field : {"second", "held", "firstChanged",
+                                "secondChanged", "heldAfterSecond"}) {
+        auto corrupt = cell.data;
+        auto& target = tagged_receipt_target(corrupt[field], cell.placement);
+        target["bytes"][0] = 199;
+        REQUIRE_FALSE(corrupt == expected);
+        ++buffer_controls;
+      }
+      auto corrupt = cell.data;
+      corrupt["independent"] = false;
+      REQUIRE_FALSE(corrupt == expected);
+      ++buffer_controls;
+    }
+    auto missing = cells;
+    missing.erase(missing.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(tagged_complete(missing, settlement));
+    auto duplicate = cells;
+    duplicate[index] = cells[(index + 1) % cells.size()];
+    REQUIRE_FALSE(tagged_complete(duplicate, settlement));
+    ledger_controls += 2;
+  }
+  for (unsigned field = 0; field < 4; ++field) {
+    auto corrupt = cells;
+    if (field == 0) corrupt[0].epoch = TAGGED_EPOCHS;
+    if (field == 1) corrupt[0].family = TAGGED_FAMILIES;
+    if (field == 2) corrupt[0].placement = TAGGED_PLACEMENTS;
+    if (field == 3) corrupt[0].settlement = !settlement;
+    REQUIRE_FALSE(tagged_complete(corrupt, settlement));
+    ++ledger_controls;
+  }
+  CHECK(controls == 756);
+  CHECK(value_controls == 108);
+  CHECK(key_controls == 108);
+  CHECK(buffer_controls == (settlement ? 144U : 0U));
+  CHECK(ledger_controls == 220);
+  CHECK(ownership_controls == 18);
+  CHECK(std::chrono::steady_clock::now() < deadline);
+}
+
 } // namespace
 
 // Sentinel for ordinary cases when PG isn't available. The strict module gate
@@ -1030,6 +1845,18 @@ TEST_CASE("Capability promise settlement preserves JSON member names",
           "[cap][ext][integration][promise-property-names]") {
   REQUIRE(pg_available());
   check_reverse_name_entrypoint(true);
+}
+
+TEST_CASE("Extension argument injection has a bounded tagged JSON corpus",
+          "[cap][ext][integration][argument-tagged-corpus]") {
+  REQUIRE(pg_available());
+  check_reverse_tagged_entrypoint(false);
+}
+
+TEST_CASE("Capability promise settlement has a bounded tagged JSON corpus",
+          "[cap][ext][integration][promise-tagged-corpus]") {
+  REQUIRE(pg_available());
+  check_reverse_tagged_entrypoint(true);
 }
 
 TEST_CASE("Extension module loading enforces the original source gate",
