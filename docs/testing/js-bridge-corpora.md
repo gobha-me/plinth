@@ -28,6 +28,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Authoritative PostgreSQL errors (#92) | `plinth_tests_sqlstate_native`, `plinth_tests_sqlstate_pipeline`, `plinth_tests_sqlstate_projection` | Real driver diagnostics/query ownership, deterministic causal errors versus skipped pipeline commands, and registered query/exec/batch error projection |
 | Native PostgreSQL results (#185, parent #90) | `plinth_tests_native_pg_result_corpus` | Selected real scalar input/result kinds, returned BYTEA lifetime, ordered envelopes, server errors/recovery, affected rows and fresh-owner cleanup |
 | Native PostgreSQL text branches (parent #90) | `plinth_tests_native_pg_text_corpus` | Actual temporal result strings under guarded ISO/UTC fixture settings, BIT default-arm strings and retained values through a second native query |
+| Native PostgreSQL benign column names (parent #90) | `plinth_tests_native_pg_column_names_corpus` | Quoted ordinary alias membership, literal UTF-16 units and key-to-value association, retained first row through a second real query, and fresh-owner cleanup |
 
 These are bounded slices, not comprehensive coverage claims. In particular,
 simulated admission/settlement and actual native execution are separate evidence;
@@ -85,7 +86,8 @@ These are finite observations, not proof of every reverse branch.
 
 The remaining result/conversion ledger includes distinct native JSON/JSONB
 branches, disabled-type-flag heuristics and finite numeric/column-name boundaries
-outside the selected PostgreSQL result corpus. The separate
+outside the selected PostgreSQL result corpus. The [benign column-name corpus](#native-postgresql-benign-column-names)
+adds nine small quoted aliases without selecting column-key enumeration policy. The separate
 [PostgreSQL text corpus](#native-postgresql-temporal-and-fallback-text) enumerates
 four temporal string arms and one actual default-arm type under bounded fixture
 conditions; it does not establish general date/time normalization. The [reverse tagged-value corpus](#reverse-tagged-json-values-and-ownership)
@@ -971,3 +973,62 @@ Parent #90 remains open for its other entries, conversion branches and
 applicable ownership schedules. JSON/JSONB structural-versus-text policy,
 FLOAT4 rounding, direct transaction-helper combinations and database type
 fallbacks retain their separate decisions and coverage requirements.
+
+## Native PostgreSQL benign column names
+
+The separate `plinth_tests_native_pg_column_names_corpus` requires six primary
+native observations: three established scalar families across two fresh-owner
+epochs. Each one-row projection has nine distinct nonempty quoted aliases:
+`alpha`, `Alpha`, `two words`, `dash-name`, `dot.name`, precomposed `café`,
+`café` with U+0301, `Ωmega`, and `orbit🪐`. Each name is at most nine UTF-8
+bytes. The 54 primary name/value cells use independent literal per-key values:
+an alternating BOOL pattern, small distinct INT4 values 10 through 18, and
+non-JSON TEXT literals `plain-0` through `plain-8`. SQL inputs and expected
+names, UTF-16 integer vectors, kinds and values are separately written.
+
+Each live JS context retains the actual first-row reference while a second
+real injected `db.query` returns `42::int4 AS followup`. All nine names and
+associated values are then re-observed on the retained row: 54 retained cells,
+six followup cells and 12 fulfilled native query operations, with zero exec or
+batch. This witnesses stability across that second query and replay under a
+fresh owner; it does not prove a particular driver-result destruction or free.
+
+The observer checks generic nonnull, nonarray object shape, full
+`Reflect.ownKeys` membership, own presence, exact row_count/row-array length and
+literal per-key value association. It records `charCodeAt(i)` for every UTF-16
+code unit, including the D83E/DE90 pair in U+1FA90. The host oracle looks up
+literal names rather than assuming their enumeration positions. Positive
+controls permute complete key/unit/kind/value/own tuples; negative controls
+swap only values between INT4 or TEXT keys while membership stays unchanged.
+Missing/extra/duplicate observation records, wrong units/kinds/values/ownership,
+envelope/row counts, operations, identities and cleanup state must fail their
+validators. These copied controls never send duplicate or malformed SQL names.
+
+The insertion-order wording in ICD-0.3.3 is unchanged. This case asserts no PG
+projection-versus-intermediary-JSON property ordering or prototype identity.
+It adds no duplicate/empty/truncation/NUL/malformed/special-prototype name,
+JSON/FLOAT4, disabled-mapping, normalization or type-policy coverage.
+
+The enabled mapping posture is required before and after collection without a
+flag change. Six contexts share the existing bounded deadline/cleanup helper;
+two separately owned Config/RuntimePool pairs each finish bounded idempotent
+shutdown. Native/audit drains and observed context/pool cleanup precede all
+copied-oracle controls. The case budget is 55 seconds; the exact named case
+`QuickJS native PostgreSQL queries preserve benign column names` uses fresh
+positive Catch XML with no skips, a 60-second child bound and 75-second outer
+bound, `needs_pg`, and the PostgreSQL schema resource lock. Missing PG fails.
+Both existing ASan/UBSan lanes and selected TSan discover exactly one target
+and execute it verbosely under unchanged fatal settings. Existing result/text
+ledgers, grouped/full PG/WS, standard-driver, compiler/image and other source
+gates remain required.
+
+```sh
+ctest --test-dir "$pg_column_build_dir" --verbose --output-on-failure --parallel 1 \
+  -R '^plinth_tests_native_pg_column_names_corpus$'
+```
+
+Registration and source counts are not runtime evidence. Actual assertions,
+control counts, sanitizer outcomes and cleanup require fresh execution. This
+finite slice does not complete parent #90 or alter production behavior, API,
+permissions, assets, version or release promises. Candidate and exact-merge CI
+remain delivery gates.
