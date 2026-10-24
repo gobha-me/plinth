@@ -1472,6 +1472,18 @@ add_test(NAME plinth_tests_native_pg_text_corpus
 set_tests_properties(plinth_tests_native_pg_text_corpus PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
 
+# Benign column names have a separate literal membership/retention oracle;
+# existing result/text selectors and their complete ledgers stay unchanged.
+add_test(NAME plinth_tests_native_pg_column_names_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS native PostgreSQL queries preserve benign column names"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_native_pg_column_names_corpus PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
 # Separate fresh processes make every native capability family fail closed on
 # missing PostgreSQL, skipped observations or incomplete owner teardown. The
 # ordinary JS group also retains these tests; no existing selector is narrowed.
