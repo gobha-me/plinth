@@ -14,6 +14,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Shared conversion (#124) | `plinth_tests_conversion_corpus` | Shared JS-to-JSON conversion and error classification |
 | Synchronous host evaluation (#176, parent #90) | `plinth_tests_sync_conversion_corpus` | Actual one-shot and pooled synchronous evaluation, their distinct private result converters/classifiers, and owned runtime lifecycle |
 | Reverse tagged JSON values (parent #90) | `plinth_tests_reverse_json_registry_values`, `plinth_tests_reverse_json_promise_values` | Distinct actual argument-injection and capability-result tag interpretation, literal fallback observations, buffer independence and fresh runtime ownership |
+| Safe unsigned reverse values (#199, parent #90) | `plinth_tests_reverse_json_registry_unsigned`, `plinth_tests_reverse_json_promise_unsigned` | Explicit host UInt64 payloads within the JS safe-integer range on both actual routes, retained observations and fresh-owner cleanup |
 | Extension module import (parent #90) | `plinth_tests_module_import_corpus` | Actual staged handler loading, registered nested source import, compile/evaluate entry, namespace/default invocation and fresh-owner replacement replay |
 | Audit (#133) | `plinth_tests_audit_corpus` | Audit admission, owned snapshots and simulated host settlement |
 | Native audit (#191, parent #90) | `plinth_tests_native_audit_corpus`, `plinth_tests_native_audit_acknowledgement` | Actual registered audit dispatch, committed PostgreSQL rows and separately gated fire-and-forget acknowledgement before persistence |
@@ -1032,3 +1033,57 @@ control counts, sanitizer outcomes and cleanup require fresh execution. This
 finite slice does not complete parent #90 or alter production behavior, API,
 permissions, assets, version or release promises. Candidate and exact-merge CI
 remain delivery gates.
+
+## Safe unsigned reverse JSON integers
+
+Issue #199 adds two independently required cases for explicit host
+`Json::UInt64` payloads. Both local reverse converters use their `uintValue`
+arm and `JS_NewInt64(static_cast<int64_t>(asUInt64()))`. Existing JS-origin
+numeric traffic and small unsigned selector metadata do not replace these
+payload-boundary observations. This test-only slice selects no behavior above
+the JavaScript safe-integer range and changes no production converter.
+
+The fixed inputs are 0, 1, 2147483647, 2147483648, 4294967295, 4294967296,
+9007199254740990 and 9007199254740991. The fixture asserts the exact JsonCpp
+`uintValue` storage kind before dispatch and again in the native producer;
+`isUInt64()` convertibility alone is insufficient. Each value crosses root,
+nested-object and nested-array placement in two fresh-owner epochs through
+actual extension argument injection and actual awaited capability Promise
+settlement: 24 primary cells per owner, 48 per route, 96 overall.
+
+The JavaScript observer records `typeof`, `Number.isSafeInteger` and decimal
+`String(value)` against separate literal C++ expectations. It retains the first
+value through one real native follow-up supplying a distinct value from the
+same table, then observes both values. There are 96 retained observations and
+96 follow-ups; the Promise route also makes 48 primary native calls, for 144
+native entries overall. These supplemental calls do not inflate the primary
+cell ledger. Each row has a finite staged handler with literal row selectors;
+observed numeric values never choose their expected family or follow-up.
+
+The generic execution watch defaults to the original 54-entry tagged owner;
+the new owner uses 24 entries. Every accepted execution requires its own expired
+weak generation receipt, clean queues/callbacks and native tail join. Each of
+four pool/registry owners requires native/audit drains, absence, zero active,
+failed, constructing and task counts, and bounded idempotent shutdown. Copied
+data is checked only after actual owner retirement; integer context addresses
+are diagnostics within an epoch, never lifetime identities or handles.
+
+Positive literal receipts precede five semantic corruptions per primary cell:
+type, safety, decimal, retained decimal and follow-up decimal. The two routes
+require 480 semantic controls, 200 missing/duplicate/wrong-identity ledger
+controls and 36 cleanup-field controls. Missing PG, a missing row or a failed
+baseline must fail rather than skip or receive later control credit.
+
+`plinth_tests_reverse_json_registry_unsigned` and
+`plinth_tests_reverse_json_promise_unsigned` each require one exact positive
+Catch case with fresh strict XML, zero failures/expected failures/skips and
+successful process exit. The inner/outer bounds remain 60/75 seconds, with
+`needs_pg` and the PostgreSQL schema resource lock. Both ASan/UBSan lanes and
+selected TSan discover exactly two and execute them with unchanged fatal
+settings. Existing four reverse, full compiler/image and other required gates
+remain. Registration and source counts are not execution or sanitizer evidence.
+
+This is a synthetic native JSON producer under the existing resolver fixture
+identity, not HTTP authentication or PostgreSQL type-mapping proof. Parent #90
+remains open. No API, SDK, permissions, assets, versions or release change is
+introduced; candidate and exact-merge CI remain delivery gates.

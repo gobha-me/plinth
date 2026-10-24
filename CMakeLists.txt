@@ -1625,6 +1625,27 @@ add_test(NAME plinth_tests_reverse_json_promise_values
 set_tests_properties(plinth_tests_reverse_json_promise_values PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
 
+# Safe UInt64 payloads select the actual unsigned arm on both reverse routes.
+add_test(NAME plinth_tests_reverse_json_registry_unsigned
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "Extension argument injection preserves safe unsigned JSON integers"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_reverse_json_registry_unsigned PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
+add_test(NAME plinth_tests_reverse_json_promise_unsigned
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "Capability promise settlement preserves safe unsigned JSON integers"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_reverse_json_promise_unsigned PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
 add_test(NAME plinth_tests_log_corpus
   COMMAND plinth_tests "[js][stdlib][log][corpus]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
