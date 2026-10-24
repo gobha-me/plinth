@@ -5,6 +5,7 @@
 #include "kernel/js/bridge_context.hpp"
 #include "kernel/js/run_on_context.hpp"
 #include "kernel/js/runtime_pool.hpp"
+#include "kernel/js/stdlib/db_result_to_json.hpp"
 #include "kernel/lifecycle/async_task_registry.hpp"
 #include "kernel/logging.hpp"
 
@@ -1091,5 +1092,684 @@ TEST_CASE("QuickJS native PostgreSQL calls have a bounded result corpus",
   CHECK(cleanup_controls == 2856);
   CHECK(ledger_controls == 800);
   CHECK(shutdown_controls == 32);
+  CHECK(Clock::now() < deadline);
+}
+
+namespace {
+
+constexpr std::size_t TEXT_FAMILIES = 5;
+constexpr std::size_t TEXT_VARIANTS = 4;
+constexpr std::size_t TEXT_EPOCHS = 2;
+static_assert(TEXT_VARIANTS == SEEDS && TEXT_EPOCHS == EPOCHS);
+
+// Every new cleanup wait shares the case deadline; the original corpus keeps
+// its existing drive/Owner implementation and all of its fixed checks.
+auto text_remaining(Clock::time_point deadline) -> std::chrono::milliseconds {
+  const auto now = Clock::now();
+  if (now >= deadline) return 0ms;
+  const auto remaining =
+      std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+  return remaining < 5s ? remaining : 5000ms;
+}
+
+struct TextMetadata {
+  bool command;
+  int rows;
+  int columns;
+  unsigned queries;
+  std::array<unsigned, TEXT_FAMILIES> oids{};
+  std::array<std::string, TEXT_FAMILIES> names{};
+  std::array<bool, TEXT_FAMILIES> nulls{};
+  bool closed;
+};
+
+auto text_metadata_valid(const TextMetadata& actual) -> bool {
+  constexpr std::array<unsigned, TEXT_FAMILIES> expected_oids{1082, 1083, 1114,
+                                                              1184, 1560};
+  constexpr std::array<std::string_view, TEXT_FAMILIES> expected_names{
+      "day", "clock", "local_stamp", "utc_stamp", "bits"};
+  if (!actual.command || actual.rows != 1 || actual.columns != 5 ||
+      actual.queries != 1 || actual.oids != expected_oids || !actual.closed)
+    return false;
+  for (std::size_t index = 0; index < TEXT_FAMILIES; ++index) {
+    if (actual.names[index] != expected_names[index] || !actual.nulls[index])
+      return false;
+  }
+  return true;
+}
+
+class TextControl {
+ public:
+  explicit TextControl(const plinth::Config::Database& config) {
+    const auto info = plinth::db::connection_info(config) +
+                      " connect_timeout=3 options='-c statement_timeout=3000 "
+                      "-c lock_timeout=2500'";
+    connection.reset(PQconnectdb(info.c_str()));
+    demand(connection && PQstatus(connection.get()) == CONNECTION_OK,
+           "native PG text control connection unavailable");
+    ++metadata.queries;
+    Result result{
+        PQexec(connection.get(),
+               "SELECT NULL::date AS day, NULL::time AS clock, "
+               "NULL::timestamp AS local_stamp, "
+               "NULL::timestamptz AS utc_stamp, NULL::bit(4) AS bits"),
+        PQclear};
+    metadata.command =
+        result && PQresultStatus(result.get()) == PGRES_TUPLES_OK;
+    demand(metadata.command, "native PG text metadata query failed");
+    metadata.rows = PQntuples(result.get());
+    metadata.columns = PQnfields(result.get());
+    demand(metadata.rows == 1 && metadata.columns == 5,
+           "native PG text metadata shape changed");
+    for (std::size_t index = 0; index < TEXT_FAMILIES; ++index) {
+      const auto column = static_cast<int>(index);
+      metadata.oids[index] = PQftype(result.get(), column);
+      const char* name = PQfname(result.get(), column);
+      demand(name != nullptr, "native PG text metadata name missing");
+      metadata.names[index] = name;
+      metadata.nulls[index] = PQgetisnull(result.get(), 0, column) != 0;
+    }
+  }
+  TextControl(const TextControl&) = delete;
+  auto operator=(const TextControl&) -> TextControl& = delete;
+  auto finish() -> TextMetadata {
+    connection.reset();
+    metadata.closed = connection == nullptr;
+    return metadata;
+  }
+
+ private:
+  using Result = std::unique_ptr<PGresult, decltype(&PQclear)>;
+  std::unique_ptr<PGconn, decltype(&PQfinish)> connection{nullptr, PQfinish};
+  TextMetadata metadata{};
+};
+
+class TextOwner {
+ public:
+  explicit TextOwner(Clock::time_point deadline)
+      : config(plinth::async_bridge_test::test_config()),
+        pool(nullptr, limits(), config, 1), budget_end(deadline) {}
+  ~TextOwner() noexcept {
+    if (!closed) {
+      try {
+        if (!stopped(finish())) std::terminate();
+      } catch (...) {
+        std::terminate();
+      }
+    }
+  }
+  TextOwner(const TextOwner&) = delete;
+  auto operator=(const TextOwner&) -> TextOwner& = delete;
+  auto finish() -> Shutdown {
+    const bool first = pool.shutdown(text_remaining(budget_end));
+    const bool second = pool.shutdown(0ms);
+    Shutdown result{first, second, pool.active_count(), pool.free_count()};
+    closed = stopped(result);
+    return result;
+  }
+  plinth::Config config;
+  RuntimePool pool;
+
+ private:
+  static auto limits() -> plinth::js::RuntimeLimits {
+    auto result = plinth::js::default_runtime_limits();
+    result.wall_clock_limit = 3s;
+    return result;
+  }
+  const Clock::time_point budget_end;
+  bool closed = false;
+};
+
+auto drive_text(RuntimePool& pool, const std::string& source,
+                Clock::time_point deadline) -> Execution {
+  demand(source.size() <= 8192 && Clock::now() + 3s < deadline,
+         "native PG text source or remaining case budget exceeded");
+  const auto destroy = [&pool, deadline](BridgeContext* context) noexcept {
+    try {
+      // Also applies during exception unwinding. Never free a context under
+      // native work or fall through to an unbounded pool destructor on failure.
+      if (!plinth::lifecycle::async_tasks().drain(text_remaining(deadline)) ||
+          !plinth::log::wait_for_audits(text_remaining(deadline)))
+        std::terminate();
+      pool.destroy(context);
+      if (pool.active_count() != 0) std::terminate();
+    } catch (...) {
+      std::terminate();
+    }
+  };
+  std::unique_ptr<BridgeContext, decltype(destroy)> context{pool.acquire(),
+                                                            destroy};
+  demand(context != nullptr, "native PG text context unavailable");
+  auto result = drogon::sync_wait(plinth::js::run_on_context(*context, source));
+  const bool drained =
+      plinth::lifecycle::async_tasks().drain(text_remaining(deadline));
+  const bool audits = plinth::log::wait_for_audits(text_remaining(deadline));
+  const auto& batch = context->batch_state;
+  Cleanup state{!context->execution_lifetime.load(std::memory_order_acquire),
+                context->pending_ops.size(),
+                context->retired_pending_ops.size(),
+                context->callbacks.size(),
+                context->persistent_callbacks.size(),
+                context->concurrent_async_ops,
+                context->inflight_detached.load(std::memory_order_acquire),
+                batch.depth,
+                batch.scope_id,
+                static_cast<bool>(batch.pinned_conn),
+                static_cast<bool>(batch.rollback_owner),
+                batch.timer_id != trantor::InvalidTimerId,
+                batch.timer_loop != nullptr,
+                drained,
+                audits,
+                plinth::lifecycle::async_tasks().active_for_test(),
+                0};
+  context.reset();
+  state.pool_active = pool.active_count();
+  return {std::move(result), state};
+}
+
+// SQL input expressions are separate from the literal text-result table below.
+auto text_sql(std::size_t family, std::size_t variant) -> std::string {
+  constexpr std::array<std::array<std::string_view, TEXT_VARIANTS>,
+                       TEXT_FAMILIES>
+      expressions{{
+          {"DATE '1970-01-01'", "DATE '2000-02-29'", "DATE '2038-01-19'",
+           "DATE '2026-10-23'"},
+          {"TIME '00:00:00'", "TIME '12:34:56.123456'",
+           "TIME '23:59:59.999999'", "TIME '01:02:03'"},
+          {"TIMESTAMP '1970-01-01 00:00:00'",
+           "TIMESTAMP '2000-02-29 12:34:56.123456'",
+           "TIMESTAMP '2038-01-19 03:14:07'",
+           "TIMESTAMP '2026-10-23 23:59:59.999999'"},
+          {"TIMESTAMPTZ '1970-01-01 00:00:00+00'",
+           "TIMESTAMPTZ '2000-02-29 14:34:56.123456+02'",
+           "TIMESTAMPTZ '2038-01-18 22:14:07-05'",
+           "TIMESTAMPTZ '2026-10-24 00:59:59.999999+01'"},
+          {"B'0000'::bit(4)", "B'0101'::bit(4)", "B'1010'::bit(4)",
+           "B'1111'::bit(4)"},
+      }};
+  return "SELECT " + std::string{expressions[family][variant]} +
+         " AS value, current_setting('DateStyle') AS date_style, "
+         "current_setting('TimeZone') AS time_zone";
+}
+
+auto text_literal(std::size_t family, std::size_t variant) -> std::string_view {
+  constexpr std::array<std::array<std::string_view, TEXT_VARIANTS>,
+                       TEXT_FAMILIES>
+      literals{{
+          {"1970-01-01", "2000-02-29", "2038-01-19", "2026-10-23"},
+          {"00:00:00", "12:34:56.123456", "23:59:59.999999", "01:02:03"},
+          {"1970-01-01 00:00:00", "2000-02-29 12:34:56.123456",
+           "2038-01-19 03:14:07", "2026-10-23 23:59:59.999999"},
+          {"1970-01-01 00:00:00+00", "2000-02-29 12:34:56.123456+00",
+           "2038-01-19 03:14:07+00", "2026-10-23 23:59:59.999999+00"},
+          {"0000", "0101", "1010", "1111"},
+      }};
+  return literals[family][variant];
+}
+
+constexpr std::string_view TEXT_OBSERVER = R"JS(
+const own=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);
+function scalar(v) {
+  const u=v instanceof Uint8Array, string=typeof v==='string';
+  if((u||string)&&v.length>128)throw Error('text observer input bound');
+  const units=[],bytes=[];
+  if(string)for(let i=0;i<v.length;++i)units.push(v.charCodeAt(i));
+  if(u)for(let i=0;i<v.length;++i)bytes.push(v[i]);
+  return {kind:typeof v,nil:v===null,u8:u,value:u?null:v,
+    units:string?units:null,bytes:u?bytes:null,
+    length:u||string?v.length:null,byteLength:u?v.byteLength:null};
+}
+function snapshot(r) {
+  if(!r||!Array.isArray(r.rows)||r.rows.length>1)throw Error('text row bound');
+  const rows=[];
+  for(const row of r.rows) {
+    const keys=Object.keys(row).sort();
+    if(keys.length>3)throw Error('text member bound');
+    rows.push({keys,owns:{value:own(row,'value'),dateStyle:own(row,'date_style'),
+      timeZone:own(row,'time_zone')},value:scalar(row.value),
+      dateStyle:scalar(row.date_style),timeZone:scalar(row.time_zone)});
+  }
+  return {keys:Object.keys(r).sort(),count:r.row_count,rows};
+}
+(async()=>{
+  const operations=[];
+  const first=await db.query(sql);
+  operations.push({role:'primary',route:'query',settled:'fulfilled'});
+  const before=snapshot(first),held=first.rows[0].value;
+  const second=await db.query("SELECT 'after-text'::text AS value, "+
+    "current_setting('DateStyle') AS date_style,current_setting('TimeZone') AS time_zone");
+  operations.push({role:'retained-followup',route:'query',settled:'fulfilled'});
+  return {before,retained:snapshot(first),held:scalar(held),follow:snapshot(second),
+    queries:operations.length,execs:0,operations};
+})()
+)JS";
+
+auto text_source(std::size_t family, std::size_t variant) -> std::string {
+  Json::StreamWriterBuilder writer;
+  writer["indentation"] = "";
+  return "const sql=" + Json::writeString(writer, text_sql(family, variant)) +
+         ";" + std::string{TEXT_OBSERVER};
+}
+
+auto text_snapshot(std::string_view value, const char* style, const char* zone)
+    -> Json::Value {
+  Json::Value result{Json::objectValue};
+  result["keys"] = keys({"row_count", "rows"});
+  result["count"] = 1;
+  result["rows"] = Json::Value{Json::arrayValue};
+  Json::Value row{Json::objectValue};
+  row["keys"] = keys({"date_style", "time_zone", "value"});
+  for (const auto* field : {"value", "dateStyle", "timeZone"})
+    row["owns"][field] = true;
+  row["value"] = scalar(std::string{value});
+  row["dateStyle"] = scalar(style);
+  row["timeZone"] = scalar(zone);
+  result["rows"].append(std::move(row));
+  return result;
+}
+
+auto text_snapshot_valid(const Json::Value& actual, std::string_view value)
+    -> bool {
+  // These are fixture preconditions, not a production normalization promise.
+  // They are observed on each actual SELECT, never inferred from another
+  // pooled connection or copied from the returned value into its oracle.
+  for (const auto* style : {"ISO, MDY", "ISO, DMY", "ISO, YMD"}) {
+    for (const auto* zone : {"UTC", "Etc/UTC"}) {
+      if (equal(actual, text_snapshot(value, style, zone))) return true;
+    }
+  }
+  return false;
+}
+
+auto text_operations() -> Json::Value {
+  Json::Value result{Json::arrayValue};
+  for (const auto* role : {"primary", "retained-followup"}) {
+    Json::Value operation{Json::objectValue};
+    operation["role"] = role;
+    operation["route"] = "query";
+    operation["settled"] = "fulfilled";
+    result.append(std::move(operation));
+  }
+  return result;
+}
+
+auto text_observation_valid(const Json::Value& actual, std::size_t family,
+                            std::size_t variant) -> bool {
+  if (!actual.isObject() ||
+      actual.getMemberNames() !=
+          std::vector<std::string>{"before", "execs", "follow", "held",
+                                   "operations", "queries", "retained"} ||
+      !equal(actual["queries"], 2) || !equal(actual["execs"], 0) ||
+      !equal(actual["operations"], text_operations()))
+    return false;
+  const auto literal = text_literal(family, variant);
+  return text_snapshot_valid(actual["before"], literal) &&
+         text_snapshot_valid(actual["follow"], "after-text") &&
+         equal(actual["held"], scalar(std::string{literal})) &&
+         equal(actual["retained"], actual["before"]);
+}
+
+struct TextIdentity {
+  std::size_t family;
+  std::size_t variant;
+  std::size_t epoch;
+};
+using TextLedger =
+    std::array<std::array<std::array<unsigned, TEXT_EPOCHS>, TEXT_VARIANTS>,
+               TEXT_FAMILIES>;
+
+auto text_identity_valid(const TextIdentity& id) -> bool {
+  return id.family < TEXT_FAMILIES && id.variant < TEXT_VARIANTS &&
+         id.epoch < TEXT_EPOCHS;
+}
+
+auto text_identities_complete(const std::vector<TextIdentity>& records)
+    -> bool {
+  TextLedger ledger{};
+  for (const auto& id : records) {
+    if (!text_identity_valid(id)) return false;
+    ++ledger[id.family][id.variant][id.epoch];
+  }
+  for (const auto& family : ledger)
+    for (const auto& variant : family)
+      for (const unsigned count : variant)
+        if (count != 1) return false;
+  return true;
+}
+
+struct TextOperation {
+  TextIdentity id;
+  std::string role;
+  std::string route;
+  std::string settled;
+};
+
+auto text_operations_complete(const std::vector<TextOperation>& records)
+    -> bool {
+  std::array<TextLedger, 2> ledger{};
+  for (const auto& record : records) {
+    if (!text_identity_valid(record.id) || record.route != "query" ||
+        record.settled != "fulfilled")
+      return false;
+    std::size_t role = 2;
+    if (record.role == "primary") role = 0;
+    if (record.role == "retained-followup") role = 1;
+    if (role == 2) return false;
+    ++ledger[role][record.id.family][record.id.variant][record.id.epoch];
+  }
+  for (const auto& role : ledger)
+    for (const auto& family : role)
+      for (const auto& variant : family)
+        for (const unsigned count : variant)
+          if (count != 1) return false;
+  return true;
+}
+
+struct TextFinal {
+  bool drained;
+  bool audits;
+  std::size_t active;
+  bool mapping_before;
+  bool mapping_after;
+};
+
+auto text_final_valid(const TextFinal& actual) -> bool {
+  return actual.drained && actual.audits && actual.active == 0 &&
+         actual.mapping_before && actual.mapping_after;
+}
+
+struct TextCell {
+  TextIdentity id;
+  Execution execution;
+};
+
+auto corrupt_text_scalar(Json::Value& value, unsigned field) -> void {
+  switch (field) {
+    case 0: value["kind"] = "number"; break;
+    case 1: value["nil"] = true; break;
+    case 2: value["u8"] = true; break;
+    case 3: value["value"] = "corrupted"; break;
+    case 4: value["units"].append(65535); break;
+    case 5: value["bytes"] = list({1}); break;
+    case 6: value["length"] = value["length"].asUInt() + 1; break;
+    default: value["byteLength"] = 1; break;
+  }
+}
+
+auto corrupt_text_snapshot(Json::Value& value, unsigned field) -> void {
+  switch (field) {
+    case 0: value["keys"].append("extra"); break;
+    case 1: value["count"] = 0; break;
+    case 2: value["rows"].clear(); break;
+    case 3: value["rows"][0]["keys"].append("extra"); break;
+    case 4: value["rows"][0]["owns"]["value"] = false; break;
+    case 5: value["rows"][0]["owns"]["dateStyle"] = false; break;
+    case 6: value["rows"][0]["owns"]["timeZone"] = false; break;
+    default: value["rows"][0]["extra"] = true; break;
+  }
+}
+
+struct TextControlCounts {
+  unsigned common = 0;
+  unsigned snapshots = 0;
+  unsigned scalars = 0;
+  unsigned held = 0;
+  unsigned cleanup = 0;
+  unsigned identities = 0;
+  unsigned operations = 0;
+  unsigned owners = 0;
+  unsigned shutdown = 0;
+  unsigned metadata = 0;
+  unsigned final = 0;
+};
+
+auto text_observation_controls(const std::vector<TextCell>& observations,
+                               TextControlCounts& counts) -> void {
+  for (const auto& cell : observations) {
+    const auto& actual = *cell.execution.result.value;
+    const auto rejected = [&](const Json::Value& corrupt) {
+      REQUIRE_FALSE(
+          text_observation_valid(corrupt, cell.id.family, cell.id.variant));
+    };
+    for (unsigned field = 0; field < 4; ++field) {
+      auto corrupt = actual;
+      if (field == 0) corrupt["queries"] = 3;
+      if (field == 1) corrupt["execs"] = 1;
+      if (field == 2) corrupt.removeMember("before");
+      if (field == 3) corrupt["extra"] = true;
+      rejected(corrupt);
+      ++counts.common;
+    }
+    for (const auto* part : {"before", "retained", "follow"}) {
+      for (unsigned field = 0; field < 8; ++field) {
+        auto corrupt = actual;
+        corrupt_text_snapshot(corrupt[part], field);
+        rejected(corrupt);
+        ++counts.snapshots;
+      }
+      for (const auto* descriptor : {"value", "dateStyle", "timeZone"}) {
+        for (unsigned field = 0; field < 8; ++field) {
+          auto corrupt = actual;
+          corrupt_text_scalar(corrupt[part]["rows"][0][descriptor], field);
+          rejected(corrupt);
+          ++counts.scalars;
+        }
+      }
+    }
+    for (unsigned field = 0; field < 8; ++field) {
+      auto corrupt = actual;
+      corrupt_text_scalar(corrupt["held"], field);
+      rejected(corrupt);
+      ++counts.held;
+    }
+    for (unsigned field = 0; field < 17; ++field) {
+      auto corrupt = cell.execution.cleanup;
+      corrupt_cleanup(corrupt, field);
+      REQUIRE_FALSE(clean(corrupt));
+      ++counts.cleanup;
+    }
+  }
+}
+
+auto text_ledger_controls(const std::vector<TextIdentity>& identities,
+                          const std::vector<TextOperation>& operations,
+                          const std::vector<OwnerRecord>& owners,
+                          TextControlCounts& counts) -> void {
+  for (std::size_t index = 0; index < identities.size(); ++index) {
+    auto dropped = identities;
+    dropped.erase(dropped.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(text_identities_complete(dropped));
+    auto duplicate = identities;
+    duplicate.push_back(identities[index]);
+    REQUIRE_FALSE(text_identities_complete(duplicate));
+    counts.identities += 2;
+  }
+  for (unsigned field = 0; field < 3; ++field) {
+    auto corrupt = identities;
+    if (field == 0) corrupt[0].family = TEXT_FAMILIES;
+    if (field == 1) corrupt[0].variant = TEXT_VARIANTS;
+    if (field == 2) corrupt[0].epoch = TEXT_EPOCHS;
+    REQUIRE_FALSE(text_identities_complete(corrupt));
+    ++counts.identities;
+  }
+  for (std::size_t variant = 0; variant < TEXT_VARIANTS; ++variant) {
+    for (std::size_t epoch = 0; epoch < TEXT_EPOCHS; ++epoch) {
+      auto corrupt = identities;
+      std::erase_if(corrupt, [variant, epoch](const TextIdentity& id) {
+        return id.variant == variant && id.epoch == epoch;
+      });
+      REQUIRE_FALSE(text_identities_complete(corrupt));
+      ++counts.identities;
+    }
+  }
+  for (std::size_t epoch = 0; epoch < TEXT_EPOCHS; ++epoch) {
+    auto corrupt = identities;
+    std::erase_if(
+        corrupt, [epoch](const TextIdentity& id) { return id.epoch == epoch; });
+    REQUIRE_FALSE(text_identities_complete(corrupt));
+    ++counts.identities;
+  }
+  for (std::size_t index = 0; index < operations.size(); ++index) {
+    auto dropped = operations;
+    dropped.erase(dropped.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(text_operations_complete(dropped));
+    auto duplicate = operations;
+    duplicate.push_back(operations[index]);
+    REQUIRE_FALSE(text_operations_complete(duplicate));
+    counts.operations += 2;
+  }
+  for (unsigned field = 0; field < 7; ++field) {
+    auto corrupt = operations;
+    if (field == 0) corrupt[0].role = "unknown";
+    if (field == 1) corrupt[0].route = "exec";
+    if (field == 2) corrupt[0].settled = "rejected";
+    if (field == 3) corrupt[0].id.family = TEXT_FAMILIES;
+    if (field == 4) corrupt[0].id.variant = TEXT_VARIANTS;
+    if (field == 5) corrupt[0].id.epoch = TEXT_EPOCHS;
+    if (field == 6) corrupt[0].role = "retained-followup";
+    REQUIRE_FALSE(text_operations_complete(corrupt));
+    ++counts.operations;
+  }
+  for (std::size_t index = 0; index < owners.size(); ++index) {
+    auto dropped = owners;
+    dropped.erase(dropped.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(owners_complete(dropped));
+    auto duplicate = owners;
+    duplicate.push_back(owners[index]);
+    REQUIRE_FALSE(owners_complete(duplicate));
+    counts.owners += 2;
+  }
+  for (unsigned field = 0; field < 2; ++field) {
+    auto corrupt = owners;
+    if (field == 0) corrupt[0].seed = SEEDS;
+    if (field == 1) corrupt[0].epoch = EPOCHS;
+    REQUIRE_FALSE(owners_complete(corrupt));
+    ++counts.owners;
+  }
+  for (const auto& owner : owners) {
+    for (unsigned field = 0; field < 4; ++field) {
+      auto corrupt = owner.state;
+      if (field == 0) corrupt.stopped = false;
+      if (field == 1) corrupt.idempotent = false;
+      if (field == 2) corrupt.active = 1;
+      if (field == 3) corrupt.free = 1;
+      REQUIRE_FALSE(stopped(corrupt));
+      ++counts.shutdown;
+    }
+  }
+}
+
+auto text_environment_controls(const TextMetadata& metadata,
+                               const TextFinal& final,
+                               TextControlCounts& counts) -> void {
+  for (unsigned field = 0; field < 5; ++field) {
+    auto corrupt = metadata;
+    if (field == 0) corrupt.command = false;
+    if (field == 1) corrupt.rows = 0;
+    if (field == 2) corrupt.columns = 4;
+    if (field == 3) corrupt.queries = 0;
+    if (field == 4) corrupt.closed = false;
+    REQUIRE_FALSE(text_metadata_valid(corrupt));
+    ++counts.metadata;
+  }
+  for (std::size_t index = 0; index < TEXT_FAMILIES; ++index) {
+    for (unsigned field = 0; field < 3; ++field) {
+      auto corrupt = metadata;
+      if (field == 0) corrupt.oids[index] = 25;
+      if (field == 1) corrupt.names[index] = "wrong";
+      if (field == 2) corrupt.nulls[index] = false;
+      REQUIRE_FALSE(text_metadata_valid(corrupt));
+      ++counts.metadata;
+    }
+  }
+  for (unsigned field = 0; field < 5; ++field) {
+    auto corrupt = final;
+    if (field == 0) corrupt.drained = false;
+    if (field == 1) corrupt.audits = false;
+    if (field == 2) corrupt.active = 1;
+    if (field == 3) corrupt.mapping_before = false;
+    if (field == 4) corrupt.mapping_after = false;
+    REQUIRE_FALSE(text_final_valid(corrupt));
+    ++counts.final;
+  }
+}
+
+} // namespace
+
+TEST_CASE(
+    "QuickJS native PostgreSQL temporal and fallback values preserve text",
+    "[js][async][db][corpus][native-pg-text-results]") {
+  const auto deadline = Clock::now() + 55s;
+  REQUIRE(plinth::async_bridge_test::pg_available());
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  const bool mapping_before = plinth::js::db::oid_mapping_enabled();
+  REQUIRE(mapping_before);
+  TextControl control{plinth::async_bridge_test::test_config().db};
+  std::vector<TextCell> observations;
+  std::vector<OwnerRecord> owners;
+  observations.reserve(40);
+  owners.reserve(8);
+  for (std::size_t variant = 0; variant < TEXT_VARIANTS; ++variant) {
+    for (std::size_t epoch = 0; epoch < TEXT_EPOCHS; ++epoch) {
+      TextOwner owner{deadline};
+      for (std::size_t family = 0; family < TEXT_FAMILIES; ++family) {
+        observations.push_back(
+            {{family, variant, epoch},
+             drive_text(owner.pool, text_source(family, variant), deadline)});
+      }
+      owners.push_back({variant, epoch, owner.finish()});
+    }
+  }
+  const TextFinal final{
+      plinth::lifecycle::async_tasks().drain(text_remaining(deadline)),
+      plinth::log::wait_for_audits(text_remaining(deadline)),
+      plinth::lifecycle::async_tasks().active_for_test(), mapping_before,
+      plinth::js::db::oid_mapping_enabled()};
+  const auto metadata = control.finish();
+  // Real owners/contexts/native work and the independent control connection
+  // close before baseline assertions and copied-oracle mutation controls.
+  REQUIRE(text_final_valid(final));
+  REQUIRE(text_metadata_valid(metadata));
+  REQUIRE(observations.size() == 40);
+  REQUIRE(owners.size() == 8);
+  REQUIRE(owners_complete(owners));
+  std::vector<TextIdentity> identities;
+  std::vector<TextOperation> operations;
+  identities.reserve(40);
+  operations.reserve(80);
+  for (const auto& cell : observations) {
+    INFO("native PG text family=" << cell.id.family
+                                  << " variant=" << cell.id.variant
+                                  << " epoch=" << cell.id.epoch);
+    REQUIRE(clean(cell.execution.cleanup));
+    REQUIRE(cell.execution.result.value.has_value());
+    const auto& actual = *cell.execution.result.value;
+    INFO("native PG text actual=" << actual.toStyledString());
+    REQUIRE(text_observation_valid(actual, cell.id.family, cell.id.variant));
+    identities.push_back(cell.id);
+    for (const auto& operation : actual["operations"]) {
+      operations.push_back({cell.id, operation["role"].asString(),
+                            operation["route"].asString(),
+                            operation["settled"].asString()});
+    }
+  }
+  REQUIRE(text_identities_complete(identities));
+  REQUIRE(text_operations_complete(operations));
+  REQUIRE(operations.size() == 80);
+  TextControlCounts counts;
+  text_observation_controls(observations, counts);
+  text_ledger_controls(identities, operations, owners, counts);
+  text_environment_controls(metadata, final, counts);
+  CHECK(counts.common == 160);
+  CHECK(counts.snapshots == 960);
+  CHECK(counts.scalars == 2880);
+  CHECK(counts.held == 320);
+  CHECK(counts.cleanup == 680);
+  CHECK(counts.identities == 93);
+  CHECK(counts.operations == 167);
+  CHECK(counts.owners == 18);
+  CHECK(counts.shutdown == 32);
+  CHECK(counts.metadata == 20);
+  CHECK(counts.final == 5);
   CHECK(Clock::now() < deadline);
 }
