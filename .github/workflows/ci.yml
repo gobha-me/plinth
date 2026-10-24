@@ -61,7 +61,9 @@ jobs:
         run: python3 tests/deployment/postgres_readiness_test.py
 
       - name: Check licenses, dependency pins, and SBOM
-        run: tools/public_readiness.py
+        run: |
+          python3 -m unittest tests.tools.public_readiness_test
+          tools/public_readiness.py
 
       - name: Verify the Helm deployment contract
         env:

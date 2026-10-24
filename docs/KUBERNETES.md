@@ -457,6 +457,80 @@ starts from the retained cursor. Confirm `/healthz`, the running image ID,
 Host/Origin enforcement, and WebSocket upgrade before restoring the public
 route. Record the observed results alongside the backup manifest.
 
+## Published-pair recovery test inputs
+
+`tests/deployment/k3d_recovery_test.py` retains its existing local source-image
+mode (`--image`, `--previous-image`, and `--previous-chart`). That mode tests
+revision mechanics and does not certify a published release pair.
+
+The optional source-mode `--runtime-identity-evidence PATH` adds node content
+hash checks and records selected actual Pod/CRI/containerd identity fields.
+It preserves the original source assertions. Runtime environment, full Pod/CRI
+objects and container specifications are excluded from the file and concise
+positive logs. Qualified runtime handles resolve only as the verified root
+index or selected amd64 manifest; config-only fields must equal the verified
+config digest. Content caching is bound to the node's ID and start time and
+cannot bypass current container or expected-release checks. The first retained
+actual field fixture covers flat source manifests only, without publication or
+release-pair credit. The candidate workflow uses this hook on its existing owned
+recovery cluster and does not upload the identity file as an artifact.
+
+The lifecycle script accepts the same optional evidence flag for its existing
+`attacker` container after Ready and before the unchanged network-denial check.
+The existing min/max lifecycle clusters observe that pinned upstream helper's
+actual root kind using the shared graph/binding core, retaining its real name
+and fixed tag-plus-digest Pod reference. No Pod, cluster, registry staging or
+permission is added. Helper observations apply no Plinth UID, entrypoint or
+binary-version contract. Their explicit index-profile result is supporting
+upstream-image evidence only; a flat root supplies no indexed-runtime proof,
+and unavailable/unsupported content fails explicitly. Both candidate min/max
+invocations also set `--require-indexed-helper-proof`, which requires an evidence
+path and fails before a success receipt or denial check if the verified root is
+flat. The helper remains curl 8.16.0: its pinned parent index selects the same
+amd64 manifest previously pinned directly. The [retained public metadata](../tests/deployment/fixtures/runtime-identity/curl-8.16.0-PROVENANCE.md)
+documents that link without claiming runtime execution. The indexed branch
+still requires fresh actual candidate-CI evidence in both lanes before accepting
+that validation claim; default optional observation continues to accept flat roots.
+
+The separate `--published-pair PATH --evidence-dir NEW_DIRECTORY` mode accepts a
+schema-version-1 JSON descriptor containing `previous`, `current`, and a
+`compatibility` evidence reference for the reviewed forward upgrade. Each release
+entry contains `version`, full `revision`, `index_digest`, successful official
+`publication_run`, and the absolute canonical `chart` path in its clean exact-tag
+source checkout. Both versions must be supported, ordered and distinct, as must
+the source and image identities. Supply both complete source checkouts locally;
+the test never fetches `main` or substitutes its own chart. The evidence directory
+must be new and outside both release checkouts. Source-mode inputs cannot be
+mixed with the published descriptor.
+
+Before allocating a cluster, published mode verifies the official successful
+tag-push image publication job, exact provenance and CycloneDX attestations,
+version-tag/index agreement, supported platform descriptors, amd64 image config,
+and both exact chart renders. It uses the existing `gh`, Docker/buildx, Git and
+Helm toolchain. Those read-only verification steps require access to the official
+GitHub evidence and public image; they do not log in, publish, retag, push, rebuild
+or import a release. K3d consumes `ghcr.io/gobha-me/plinth@sha256:...` directly,
+without a task registry or image pull credentials. Fixed immutable public image
+references remain in the host cache: a pull or failed inspection does not prove
+exclusive ownership, so cleanup never removes those references. A failed verifier, absent
+release, unsupported chart or incomplete input is an error, never a fallback to
+a locally built image or a successful skip.
+
+The journey preserves the existing retained-user/grant/package/preferences/data,
+matched backup and fresh restore, active-work signal, ordered container exit and
+matched-data rollback checks. Published mode uses the normal isolated bootstrap
+Secret path and removes it before public routing; the historical source fixture
+keeps its original first-account registration behavior. Runtime receipts must bind
+the actual node/container content to the verified index, selected amd64 manifest
+and config. The adapter checks actual Plinth release labels, user and entrypoint,
+rebinds current metadata on every call, and requires complete initial,
+bootstrap-removal, public, restore, upgrade, SIGINT, SIGTERM and rollback receipts
+with the exact phase image/chart/binary version before reporting success.
+Simulated indexed helper tests are not actual indexed-runtime or published-pair
+recovery evidence. No supported release pair is supplied by the repository, and this
+preparation does not complete issue #38. Descriptor verification of arm64 does not
+constitute an arm64 recovery execution.
+
 ## Upgrade and rollback
 
 Before an upgrade, create and verify a matched recovery point as above. Verify
