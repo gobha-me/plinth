@@ -1,4 +1,5 @@
 #include "kernel/packages/validator.hpp"
+#include "static_validation_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -269,6 +270,44 @@ TEST_CASE("CLI: --json output parses as JSON", "[packages][validator][cli]") {
   REQUIRE(res.exit_code == 0);
   auto j = nlohmann::json::parse(res.stdout_buf);
   REQUIRE(j["exit_code"] == 0);
+}
+
+TEST_CASE("CLI: static parity keeps JSON quiet composition and dispositions",
+          "[packages][validator][cli][static-parity]") {
+  plinth::packages::static_test::PackageCopy copy;
+  const auto path = copy.root().string();
+  const auto accepted = run_cli("validate --quiet --json " + path);
+  REQUIRE(accepted.exit_code == 0);
+  auto document = nlohmann::json::parse(accepted.stdout_buf);
+  CHECK(document.at("exit_code") == 0);
+  CHECK(document.at("messages").empty());
+  const auto quiet = run_cli("validate --quiet " + path);
+  CHECK(quiet.exit_code == 0);
+  CHECK(quiet.stdout_buf.empty());
+
+  fs::copy_file(copy.root() / "migrations/001_init.sql",
+                copy.root() / "migrations/004_next.sql");
+  const auto warned = run_cli("validate --quiet --json " + path);
+  REQUIRE(warned.exit_code == 2);
+  document = nlohmann::json::parse(warned.stdout_buf);
+  REQUIRE(document.at("messages").size() == 1);
+  const auto& warning = document.at("messages")[0];
+  CHECK(warning.at("rule") == "migration-gap");
+  CHECK(warning.at("phase") == "cross_file");
+  CHECK(warning.at("severity") == "warning");
+  CHECK(warning.at("path") == "migrations");
+  CHECK(warning.at("remediation").is_null());
+  CHECK(run_cli("validate --quiet --structure-only " + path).exit_code == 0);
+
+  fs::remove(copy.root() / "migrations/004_next.sql");
+  copy.assertion("notes:99:missing");
+  const auto rejected = run_cli("validate --quiet --json " + path);
+  REQUIRE(rejected.exit_code == 1);
+  document = nlohmann::json::parse(rejected.stdout_buf);
+  CHECK(document.at("exit_code") == 1);
+  REQUIRE(document.at("messages").size() == 1);
+  CHECK(document.at("messages")[0].at("rule") == "rbac.test.call.unresolved");
+  CHECK(run_cli("validate --quiet --structure-only " + path).exit_code == 0);
 }
 
 // ─── ICD-0.4.1 Layer 1 — GlassWorm fixture cases (G.09–G.13) ─────────

@@ -8,6 +8,7 @@
 #include "kernel/packages/manifest.hpp"
 #include "kernel/packages/manifest_error.hpp"
 #include "kernel/packages/panels_manifest.hpp"
+#include "kernel/rbac/rbac_manifest.hpp"
 #include "kernel/security/unicode_scanner.hpp"
 
 #include <json/value.h>
@@ -246,6 +247,7 @@ auto run_walk(const fs::path& root, const ValidationConfig& cfg, Reporter& r,
 
   bool size_exceeded = false;
 
+  std::vector<fs::directory_entry> entries;
   for (; it != end; it.increment(ec)) {
     if (ec) {
       r.warn("filesystem-race",
@@ -255,7 +257,6 @@ auto run_walk(const fs::path& root, const ValidationConfig& cfg, Reporter& r,
     }
     const auto& entry = *it;
     const auto& p = entry.path();
-    auto rel = relative_string(root, p);
     auto name = p.filename().generic_string();
 
     // VCS directories: skip descent + do not count.
@@ -264,12 +265,24 @@ auto run_walk(const fs::path& root, const ValidationConfig& cfg, Reporter& r,
       continue;
     }
 
-    // R2: symlinks → error (no following either way).
+    // Prune before sorting; the iterator never follows directory symlinks.
     if (entry.is_symlink(ec)) {
-      handle_symlink(entry, p, rel, root_real, r);
       if (entry.is_directory(ec)) {
         it.disable_recursion_pending();
       }
+    }
+    entries.push_back(entry);
+  }
+
+  std::ranges::sort(entries, {}, [&](const fs::directory_entry& entry) {
+    return entry.path().lexically_relative(root).generic_string();
+  });
+  for (const auto& entry : entries) {
+    const auto& p = entry.path();
+    auto rel = relative_string(root, p);
+    auto name = p.filename().generic_string();
+    if (entry.is_symlink(ec)) {
+      handle_symlink(entry, p, rel, root_real, r);
       continue;
     }
 
@@ -289,8 +302,8 @@ auto run_walk(const fs::path& root, const ValidationConfig& cfg, Reporter& r,
 
 // R3 — JSON parse for known files. Uses 0.4.1 parsers for the two
 // required files and 0.4.2 typed parsers for panels.json and
-// config.json; rbac.json stays as raw JSON until 0.4.6. The resulting
-// ParsedPackage is threaded through both the 0.4.0 R-rules and the
+// config.json; typed RBAC parsing supplements its legacy raw checks. The
+// resulting ParsedPackage is threaded through both the 0.4.0 R-rules and the
 // 0.4.2 cross-file pass (parse-once discipline per ICD-0.4.2
 // §Implementation Hints).
 
@@ -395,6 +408,15 @@ auto parse_rbac_raw(const fs::path& root, const fs::path& op,
             std::string{"rbac.json does not parse: "} + e.what(),
             relative_string(root, op),
             "ensure the file is syntactically valid JSON");
+    return;
+  }
+  auto res = rbac::parse_rbac_manifest(*bytes, "rbac.json");
+  forward_manifest_messages(res.messages, root, op, r);
+  const bool have_errors = std::ranges::any_of(res.messages, [](const auto& m) {
+    return m.severity == Severity::ERROR;
+  });
+  if (res.value && !have_errors) {
+    parsed.rbac_typed = std::move(*res.value);
   }
 }
 
@@ -629,6 +651,7 @@ auto scan_directory_pattern(const fs::path& root, std::string_view subdir,
     return;
   }
   auto walk = [&](auto&& iter_factory) {
+    std::vector<fs::path> files;
     for (auto it = iter_factory(); it != decltype(it){}; it.increment(ec)) {
       if (ec) {
         ec.clear();
@@ -641,8 +664,14 @@ auto scan_directory_pattern(const fs::path& root, std::string_view subdir,
       if (!extension_in(entry.path(), exts)) {
         continue;
       }
-      auto rel = relative_string(root, entry.path());
-      scan_one_file(entry.path(), rel, threshold, log_findings, r);
+      files.push_back(entry.path());
+    }
+    std::ranges::sort(files, {}, [&](const fs::path& file) {
+      return file.lexically_relative(root).generic_string();
+    });
+    for (const auto& file : files) {
+      scan_one_file(file, relative_string(root, file), threshold, log_findings,
+                    r);
     }
   };
   if (recursive) {

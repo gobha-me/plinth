@@ -177,6 +177,15 @@ auto check_rules_a3_a4(const RbacRule& r, std::size_t idx,
   }
 }
 
+auto check_static_rule(const RbacRule& r, std::size_t idx,
+                       const plinth::packages::CapabilityManifest& caps,
+                       std::string_view package_name,
+                       std::vector<ManifestParseError>& out) -> void {
+  check_rule_a1(r, idx, out);
+  check_rule_a2(r, idx, package_name, out);
+  check_rules_a3_a4(r, idx, caps, out);
+}
+
 auto check_rule_a5(const RbacRule& r, std::size_t idx,
                    std::string_view package_name, PGconn& conn,
                    std::vector<ManifestParseError>& out) -> void {
@@ -212,6 +221,17 @@ auto check_rule_a5(const RbacRule& r, std::size_t idx,
 
 } // namespace
 
+auto validate_rules_static(const RbacManifest& rbac,
+                           const plinth::packages::CapabilityManifest& caps,
+                           std::string_view package_name)
+    -> std::vector<ManifestParseError> {
+  std::vector<ManifestParseError> out;
+  for (std::size_t i = 0; i < rbac.rules.size(); ++i) {
+    check_static_rule(rbac.rules[i], i, caps, package_name, out);
+  }
+  return out;
+}
+
 auto validate_rules(const RbacManifest& rbac,
                     const plinth::packages::CapabilityManifest& caps,
                     std::string_view package_name, PGconn& conn)
@@ -219,9 +239,7 @@ auto validate_rules(const RbacManifest& rbac,
   std::vector<ManifestParseError> out;
   for (std::size_t i = 0; i < rbac.rules.size(); ++i) {
     const auto& r = rbac.rules[i];
-    check_rule_a1(r, i, out);
-    check_rule_a2(r, i, package_name, out);
-    check_rules_a3_a4(r, i, caps, out);
+    check_static_rule(r, i, caps, package_name, out);
     check_rule_a5(r, i, package_name, conn, out);
   }
   return out;

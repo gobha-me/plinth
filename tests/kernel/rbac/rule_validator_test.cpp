@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <libpq-fe.h>
@@ -135,6 +136,87 @@ auto notes_caps() -> CapabilityManifest {
 }
 
 } // namespace
+
+TEST_CASE("rule validator static checks need no database",
+          "[rule_validator][static-parity]") {
+  RbacManifest manifest;
+  manifest.rules.push_back(RbacRule{
+      .rule = "Notes.Edit",
+      .namespace_ = "other",
+      .description = "Ordinary invalid static fixture",
+      .test = nlohmann::json{{"assert_deny",
+                              {{"call", "not a valid signature"},
+                               {"expect", "permission_denied"}}},
+                             {"assert_allow",
+                              {{"call", "notes:99:missing"},
+                               {"expect", "success"}}}},
+  });
+  const auto findings =
+      plinth::rbac::validate_rules_static(manifest, notes_caps(), "notes");
+  const std::array<std::string_view, 4> codes{
+      "rbac.rule.invalid_name", "rbac.rule.namespace_mismatch",
+      "rbac.test.call.parse_error", "rbac.test.call.unresolved"};
+  const std::array<std::string_view, 4> paths{
+      "/rules/0/rule", "/rules/0/namespace", "/rules/0/test/assert_deny/call",
+      "/rules/0/test/assert_allow/call"};
+  REQUIRE(findings.size() == codes.size());
+  for (std::size_t i = 0; i < codes.size(); ++i) {
+    CHECK(findings[i].rule == codes[i]);
+    CHECK(findings[i].field_path == paths[i]);
+  }
+  manifest.rules[0].rule = "notes.edit";
+  manifest.rules[0].namespace_ = "notes";
+  manifest.rules[0].test = nlohmann::json{
+      {"assert_deny",
+       {{"call", "notes:1:edit"}, {"expect", "permission_denied"}}},
+      {"assert_allow", {{"call", "notes:1:edit"}, {"expect", "success"}}}};
+  CHECK(plinth::rbac::validate_rules_static(manifest, notes_caps(), "notes")
+            .empty());
+  manifest.rules[0].namespace_ = "kernel";
+  CHECK(plinth::rbac::validate_rules_static(manifest, notes_caps(), "notes")
+            .empty());
+}
+
+TEST_CASE("rule validator preserves static then ownership order per rule",
+          "[rule_validator][integration][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available (set PLINTH_PG_HOST to enable)");
+  }
+  Scratch scratch;
+  REQUIRE(scratch.exec_ok(
+      "INSERT INTO plinth.rbac_rules (rule, namespace, description, "
+      "extension_name) VALUES ('Notes.Edit', 'notes', 'edit', 'terminal'), "
+      "('Notes.Read', 'notes', 'read', 'terminal')"));
+  RbacManifest manifest;
+  // Seed foreign rows directly so every rule emits A.1-A.4 followed by A.5.
+  // This asserts ordering, not acceptance by the registration API.
+  for (const auto* name : {"Notes.Edit", "Notes.Read"}) {
+    manifest.rules.push_back(RbacRule{
+        .rule = name,
+        .namespace_ = "other",
+        .description = "Static and ownership failures",
+        .test = nlohmann::json{{"assert_deny",
+                                {{"call", "not a valid signature"},
+                                 {"expect", "permission_denied"}}},
+                               {"assert_allow",
+                                {{"call", "notes:99:missing"},
+                                 {"expect", "success"}}}},
+    });
+  }
+  const auto findings =
+      validate_rules(manifest, notes_caps(), "notes", *scratch.conn);
+  const std::array<std::string_view, 5> codes{
+      "rbac.rule.invalid_name", "rbac.rule.namespace_mismatch",
+      "rbac.test.call.parse_error", "rbac.test.call.unresolved",
+      "rbac.rule.name_collision"};
+  REQUIRE(findings.size() == 2 * codes.size());
+  for (std::size_t i = 0; i < findings.size(); ++i) {
+    CHECK(findings[i].rule == codes[i % codes.size()]);
+    REQUIRE(findings[i].field_path.has_value());
+    CHECK(findings[i].field_path->starts_with(
+        "/rules/" + std::to_string(i / codes.size()) + "/"));
+  }
+}
 
 TEST_CASE("P.M1 rule validator rejects rule name that violates the regex",
           "[rule_validator][integration]") {

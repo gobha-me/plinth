@@ -100,6 +100,11 @@ python3 tests/deployment/helm_contract_test.py
 PostgreSQL-backed tests use the `PLINTH_PG_*` variables shown in CI. See
 [Contributing](CONTRIBUTING.md) for the complete workflow.
 
+Extension authors can run `./build/plinth validate path/to/extension --json`
+for static package feedback shared with installation. See the
+[extension guide](docs/EXTENSION-GUIDE.md) for the output,
+size policy, migration and RBAC checks, and remaining target-state limits.
+
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)

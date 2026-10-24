@@ -23,6 +23,7 @@
 #include "kernel/packages/manifest.hpp"
 #include "kernel/packages/panels_manifest.hpp"
 #include "kernel/packages/validator.hpp"
+#include "kernel/rbac/rbac_manifest.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -32,14 +33,15 @@
 namespace plinth::packages {
 
 // ParseResult-of-all-manifests bundle threaded through both passes.
-// Typed fields are only populated if the 0.4.1 parser succeeded. rbac
-// stays as raw JSON until 0.4.6 (per ICD-0.4.2 §Out-of-Scope).
+// Typed RBAC is populated only when its parser reports no errors, preserving
+// source-array indexes for A.1-A.4. Raw RBAC retains the legacy CF contracts.
 struct ParsedPackage {
   std::optional<PackageManifest> manifest;
   std::optional<CapabilityManifest> capabilities;
   std::optional<PanelsManifest> panels;
   std::optional<ConfigManifest> config;
   std::optional<nlohmann::json> rbac_raw;
+  std::optional<rbac::RbacManifest> rbac_typed;
 };
 
 auto run_cross_file_validation(const ParsedPackage& pkg,
