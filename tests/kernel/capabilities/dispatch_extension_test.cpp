@@ -1376,21 +1376,21 @@ struct TaggedExecution {
   std::optional<plinth::js::EvalErrorKind> error_kind;
 };
 
-class TaggedExecutionWatch {
+template <std::size_t Count = TAGGED_PER_EPOCH> class TaggedExecutionWatch {
  public:
   struct State {
-    std::array<TaggedExecution, TAGGED_PER_EPOCH> records;
+    std::array<TaggedExecution, Count> records;
     std::atomic<std::size_t> entered{0};
     std::atomic<std::size_t> finished{0};
     std::atomic<bool> invalid{false};
   };
   std::shared_ptr<State> state = std::make_shared<State>();
 
-  TaggedExecutionWatch() {
+  explicit TaggedExecutionWatch(std::string extension = "reversetags") {
     plinth::js::set_execution_observer_for_test(
-        [owned =
-             state](const plinth::js::ExecutionObservation& event) noexcept {
-          if (event.extension_name != "reversetags") return;
+        [owned = state, extension = std::move(extension)](
+            const plinth::js::ExecutionObservation& event) noexcept {
+          if (event.extension_name != extension) return;
           try {
             const bool entering =
                 event.stage == plinth::js::ExecutionObservationStage::ENTER;
@@ -1474,7 +1474,8 @@ auto tagged_clean(const TaggedCleanup& state) -> bool {
 class TaggedRegistryOwner {
  public:
   TaggedCleanup cleanup;
-  TaggedRegistryOwner() = default;
+  explicit TaggedRegistryOwner(std::string extension = "reversetags")
+      : extension_name(std::move(extension)) {}
   ~TaggedRegistryOwner() {
     if (!closed && !finish()) std::terminate();
   }
@@ -1483,13 +1484,13 @@ class TaggedRegistryOwner {
   auto finish() noexcept -> bool {
     if (closed) return true;
     try {
-      plinth::extensions::destroy_pool("reversetags");
+      plinth::extensions::destroy_pool(extension_name);
       cleanup.stopped = plinth::extensions::shutdown_registry(5s);
       if (!cleanup.stopped) return false;
       cleanup.native = plinth::lifecycle::async_tasks().drain(5s);
       cleanup.audits = plinth::log::wait_for_audits(5s);
       cleanup.idempotent = plinth::extensions::shutdown_registry(0ms);
-      cleanup.absent = !plinth::extensions::has_pool("reversetags");
+      cleanup.absent = !plinth::extensions::has_pool(extension_name);
       cleanup.active = plinth::extensions::inflight_dispatch_count_for_test();
       cleanup.failed = plinth::extensions::failed_pool_count_for_test();
       cleanup.constructing =
@@ -1503,6 +1504,7 @@ class TaggedRegistryOwner {
   }
 
  private:
+  const std::string extension_name;
   bool closed = false;
 };
 
@@ -1524,16 +1526,21 @@ struct TaggedCell {
   std::string resolver_message;
 };
 
+template <std::size_t Families = TAGGED_FAMILIES,
+          std::size_t Placements = TAGGED_PLACEMENTS,
+          std::size_t Epochs = TAGGED_EPOCHS>
 auto tagged_complete(const std::vector<TaggedCell>& cells, bool settlement)
     -> bool {
-  if (cells.size() != TAGGED_PER_ROUTE) return false;
-  std::array<unsigned, TAGGED_PER_ROUTE> seen{};
+  constexpr auto per_epoch = Families * Placements;
+  constexpr auto per_route = per_epoch * Epochs;
+  if (cells.size() != per_route) return false;
+  std::array<unsigned, per_route> seen{};
   for (const auto& cell : cells) {
-    if (cell.epoch >= TAGGED_EPOCHS || cell.family >= TAGGED_FAMILIES ||
-        cell.placement >= TAGGED_PLACEMENTS || cell.settlement != settlement)
+    if (cell.epoch >= Epochs || cell.family >= Families ||
+        cell.placement >= Placements || cell.settlement != settlement)
       return false;
-    const auto index = cell.epoch * TAGGED_PER_EPOCH +
-                       cell.family * TAGGED_PLACEMENTS + cell.placement;
+    const auto index =
+        cell.epoch * per_epoch + cell.family * Placements + cell.placement;
     if (++seen[index] != 1) return false;
   }
   return std::ranges::all_of(seen, [](unsigned value) { return value == 1; });
@@ -1817,6 +1824,293 @@ export default function(args) { return taggedReceipt(args); }
   CHECK(std::chrono::steady_clock::now() < deadline);
 }
 
+// Explicit unsigned host values select a different reverse-converter arm than
+// the JS-origin signed/real numeric corpus. All values are exactly
+// representable JS safe integers; this does not choose behavior above that
+// range.
+constexpr std::size_t UNSIGNED_VALUES = 8;
+constexpr std::size_t UNSIGNED_PLACEMENTS = 3;
+constexpr std::size_t UNSIGNED_EPOCHS = 2;
+constexpr std::size_t UNSIGNED_PER_EPOCH = 24;
+constexpr std::size_t UNSIGNED_PER_ROUTE = 48;
+
+auto unsigned_input(std::size_t family, bool follow) -> Json::Value {
+  constexpr std::array<Json::UInt64, UNSIGNED_VALUES> PRIMARY{
+      0ULL,          1ULL,          2147483647ULL,       2147483648ULL,
+      4294967295ULL, 4294967296ULL, 9007199254740990ULL, 9007199254740991ULL};
+  constexpr std::array<Json::UInt64, UNSIGNED_VALUES> FOLLOW{
+      1ULL,          0ULL,          2147483648ULL,       2147483647ULL,
+      4294967296ULL, 4294967295ULL, 9007199254740991ULL, 9007199254740990ULL};
+  if (family >= UNSIGNED_VALUES)
+    throw std::logic_error("unknown unsigned input family");
+  return Json::Value{follow ? FOLLOW[family] : PRIMARY[family]};
+}
+
+auto unsigned_place(Json::Value value, std::size_t placement) -> Json::Value {
+  if (placement == 0) return value;
+  Json::Value result{placement == 1 ? Json::objectValue : Json::arrayValue};
+  if (placement == 1)
+    result["slot"] = std::move(value);
+  else
+    result.append(std::move(value));
+  return result;
+}
+
+auto unsigned_target(const Json::Value& value, std::size_t placement)
+    -> Json::Value {
+  if (placement == 0) return value;
+  return placement == 1 ? value["slot"] : value[0];
+}
+
+// Independent literal decimal oracles: never formatted from unsigned_input,
+// from a converter, or from another route's observed result.
+auto unsigned_expected(std::size_t family, std::size_t placement)
+    -> Json::Value {
+  constexpr std::array<std::string_view, UNSIGNED_VALUES> PRIMARY{
+      "0",          "1",          "2147483647",       "2147483648",
+      "4294967295", "4294967296", "9007199254740990", "9007199254740991"};
+  constexpr std::array<std::string_view, UNSIGNED_VALUES> FOLLOW{
+      "1",          "0",          "2147483648",       "2147483647",
+      "4294967296", "4294967295", "9007199254740991", "9007199254740990"};
+  constexpr std::array<std::string_view, UNSIGNED_PLACEMENTS> SHAPES{
+      "number", "object", "array"};
+  if (family >= UNSIGNED_VALUES || placement >= UNSIGNED_PLACEMENTS)
+    throw std::logic_error("unknown unsigned expected cell");
+  const auto node = [&](std::string_view decimal) {
+    Json::Value descriptor{Json::objectValue};
+    descriptor["type"] = "number";
+    descriptor["safe"] = true;
+    descriptor["decimal"] = std::string{decimal};
+    descriptor["shape"] = std::string{SHAPES[placement]};
+    return descriptor;
+  };
+  Json::Value result{Json::objectValue};
+  result["first"] = node(PRIMARY[family]);
+  result["held"] = node(PRIMARY[family]);
+  result["follow"] = node(FOLLOW[family]);
+  result["prior"] = 0;
+  result["visits"] = 1;
+  result["followups"] = 1;
+  return result;
+}
+
+auto unsigned_source(std::size_t family, std::size_t placement, bool settlement)
+    -> std::string {
+  auto source = std::string{R"JS(
+function unsignedDescribe(value, placement) {
+  const target=placement===0?value:placement===1?value.slot:value[0];
+  return {type:typeof target,safe:Number.isSafeInteger(target),decimal:String(target),
+    shape:Array.isArray(value)?'array':typeof value};
+}
+export default async function(args) {
+  const prior=globalThis.reverse_unsigned_visits||0;
+  globalThis.reverse_unsigned_visits=prior+1;
+)JS"};
+  const auto selector = "{family:" + std::to_string(family) +
+                        ",placement:" + std::to_string(placement);
+  source += settlement
+                ? "const value=await cap.call('kernel:1:unsigned_values'," +
+                      selector + ",follow:false});\n"
+                : "const value=args;\n";
+  source += "const first=unsignedDescribe(value," + std::to_string(placement) +
+            ");\n";
+  source += "const follow=await cap.call('kernel:1:unsigned_values'," +
+            selector + ",follow:true});\n";
+  source +=
+      "return {first,held:unsignedDescribe(value," + std::to_string(placement) +
+      "),follow:unsignedDescribe(follow," + std::to_string(placement) +
+      "),prior,visits:globalThis.reverse_unsigned_visits,followups:1};}\n";
+  return source;
+}
+
+struct UnsignedNative {
+  std::array<std::atomic<unsigned>, UNSIGNED_PER_EPOCH> primary{};
+  std::array<std::atomic<unsigned>, UNSIGNED_PER_EPOCH> follow{};
+  std::atomic<unsigned> invalid{0};
+};
+
+auto unsigned_complete(const std::vector<TaggedCell>& cells, bool settlement)
+    -> bool {
+  return tagged_complete<UNSIGNED_VALUES, UNSIGNED_PLACEMENTS, UNSIGNED_EPOCHS>(
+      cells, settlement);
+}
+
+auto check_reverse_unsigned_entrypoint(bool settlement) -> void {
+  const auto deadline = std::chrono::steady_clock::now() + 55s;
+  std::vector<TaggedCell> cells;
+  cells.reserve(UNSIGNED_PER_ROUTE);
+  unsigned ownership_controls = 0;
+  unsigned native_entries = 0;
+  for (std::size_t epoch = 0; epoch < UNSIGNED_EPOCHS; ++epoch) {
+    REQUIRE(std::chrono::steady_clock::now() < deadline);
+    ExtScratch scratch;
+    TaggedExecutionWatch<UNSIGNED_PER_EPOCH> executions{"reverseuint"};
+    TaggedRegistryOwner owner{"reverseuint"};
+    auto native = std::make_shared<UnsignedNative>();
+    plinth::capabilities::register_tier1_handler(
+        "kernel:1:unsigned_values", "kernel.admin",
+        [native](const Json::Value& args,
+                 const plinth::capabilities::UserContext& user,
+                 int depth) -> plinth::capabilities::HandlerOutcome {
+          if (!args.isObject() || args.size() != 3 ||
+              !args["family"].isUInt() || !args["placement"].isUInt() ||
+              !args["follow"].isBool() ||
+              args["family"].asUInt() >= UNSIGNED_VALUES ||
+              args["placement"].asUInt() >= UNSIGNED_PLACEMENTS ||
+              user.user_id != "11111111-1111-1111-1111-111111111111" ||
+              user.username != "tester" || depth != 2) {
+            native->invalid.fetch_add(1);
+            return std::unexpected(
+                plinth::capabilities::CapabilityError::INVALID_CAPABILITY);
+          }
+          const auto family = args["family"].asUInt();
+          const auto placement = args["placement"].asUInt();
+          const bool follow = args["follow"].asBool();
+          auto value =
+              unsigned_place(unsigned_input(family, follow), placement);
+          if (unsigned_target(value, placement).type() != Json::uintValue) {
+            native->invalid.fetch_add(1);
+            return std::unexpected(
+                plinth::capabilities::CapabilityError::INVALID_CAPABILITY);
+          }
+          const auto index = family * UNSIGNED_PLACEMENTS + placement;
+          (follow ? native->follow[index] : native->primary[index])
+              .fetch_add(1);
+          return value;
+        });
+    for (std::size_t family = 0; family < UNSIGNED_VALUES; ++family) {
+      for (std::size_t placement = 0; placement < UNSIGNED_PLACEMENTS;
+           ++placement) {
+        const auto name =
+            "v" + std::to_string(family) + "p" + std::to_string(placement);
+        const auto source = unsigned_source(family, placement, settlement);
+        REQUIRE(source.size() <= 4096);
+        scratch.stage_extension("reverseuint", {{name, source}});
+        seed_tier2("reverseuint:1:" + name, "reverseuint");
+      }
+    }
+    REQUIRE(plinth::extensions::create_pool("reverseuint"));
+    REQUIRE(plinth::extensions::has_pool("reverseuint"));
+    for (std::size_t family = 0; family < UNSIGNED_VALUES; ++family) {
+      for (std::size_t placement = 0; placement < UNSIGNED_PLACEMENTS;
+           ++placement) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        const auto name =
+            "v" + std::to_string(family) + "p" + std::to_string(placement);
+        auto args = unsigned_place(unsigned_input(family, false), placement);
+        REQUIRE(unsigned_target(args, placement).type() == Json::uintValue);
+        const auto follow = unsigned_input(family, true);
+        REQUIRE(follow.type() == Json::uintValue);
+        REQUIRE(follow != unsigned_input(family, false));
+        if (settlement) args = Json::Value{Json::objectValue};
+        ModuleEngineWatch engine{"reverseuint/" + name, ""};
+        std::string code;
+        std::string message;
+        auto result =
+            run_resolver("reverseuint:1:" + name, args, &code, &message);
+        REQUIRE(plinth::lifecycle::async_tasks().drain(5s));
+        REQUIRE(engine.counts().compiled == 1);
+        REQUIRE(engine.counts().evaluated == 1);
+        cells.push_back({epoch, family, placement, settlement,
+                         result.has_value(),
+                         result && result->resolved_tier == "tier2" &&
+                             result->provider_type == "extension",
+                         result ? std::move(result->data) : Json::Value{},
+                         std::move(code), std::move(message)});
+      }
+    }
+    REQUIRE(owner.finish());
+    REQUIRE(tagged_clean(owner.cleanup));
+    REQUIRE_FALSE(executions.state->invalid.load());
+    REQUIRE(executions.state->entered.load() == UNSIGNED_PER_EPOCH);
+    REQUIRE(executions.state->finished.load() == UNSIGNED_PER_EPOCH);
+    const auto context = executions.state->records.front().context;
+    REQUIRE(context != 0);
+    for (std::size_t index = 0; index < UNSIGNED_PER_EPOCH; ++index) {
+      const auto& record = executions.state->records[index];
+      INFO("unsigned route=" << settlement << " epoch=" << epoch
+                             << " execution=" << index);
+      REQUIRE(record.entered);
+      REQUIRE(record.finished);
+      REQUIRE(record.clean);
+      REQUIRE(record.same_generation);
+      REQUIRE(record.context == context);
+      REQUIRE(record.generation.expired());
+      if (index != 0) {
+        const auto& previous = executions.state->records[index - 1].generation;
+        REQUIRE((previous.owner_before(record.generation) ||
+                 record.generation.owner_before(previous)));
+      }
+      const auto primary = native->primary[index].load();
+      const auto follow = native->follow[index].load();
+      REQUIRE(primary == (settlement ? 1U : 0U));
+      REQUIRE(follow == 1);
+      native_entries += primary + follow;
+    }
+    REQUIRE(native->invalid.load() == 0);
+    for (unsigned field = 0; field < 9; ++field) {
+      auto corrupt = owner.cleanup;
+      if (field == 0) corrupt.stopped = false;
+      if (field == 1) corrupt.idempotent = false;
+      if (field == 2) corrupt.native = false;
+      if (field == 3) corrupt.audits = false;
+      if (field == 4) corrupt.absent = false;
+      if (field == 5) corrupt.active = 1;
+      if (field == 6) corrupt.failed = 1;
+      if (field == 7) corrupt.constructing = 1;
+      if (field == 8) corrupt.tasks = 1;
+      REQUIRE_FALSE(tagged_clean(corrupt));
+      ++ownership_controls;
+    }
+  }
+  REQUIRE(unsigned_complete(cells, settlement));
+  unsigned semantic_controls = 0;
+  unsigned ledger_controls = 0;
+  for (std::size_t index = 0; index < cells.size(); ++index) {
+    const auto& cell = cells[index];
+    INFO("unsigned route=" << settlement << " epoch=" << cell.epoch
+                           << " family=" << cell.family << " placement="
+                           << cell.placement << " code=" << cell.resolver_code
+                           << " message=" << cell.resolver_message);
+    REQUIRE(cell.resolved);
+    REQUIRE(cell.tier);
+    const auto expected = unsigned_expected(cell.family, cell.placement);
+    REQUIRE(cell.data == expected);
+    for (unsigned field = 0; field < 5; ++field) {
+      auto corrupt = cell.data;
+      if (field == 0) corrupt["first"]["type"] = "string";
+      if (field == 1) corrupt["first"]["safe"] = false;
+      if (field == 2) corrupt["first"]["decimal"] = "wrong";
+      if (field == 3) corrupt["held"]["decimal"] = "wrong";
+      if (field == 4) corrupt["follow"]["decimal"] = "wrong";
+      REQUIRE_FALSE(corrupt == expected);
+      ++semantic_controls;
+    }
+    auto missing = cells;
+    missing.erase(missing.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(unsigned_complete(missing, settlement));
+    auto duplicate = cells;
+    duplicate[index] = cells[(index + 1) % cells.size()];
+    REQUIRE_FALSE(unsigned_complete(duplicate, settlement));
+    ledger_controls += 2;
+  }
+  for (unsigned field = 0; field < 4; ++field) {
+    auto corrupt = cells;
+    if (field == 0) corrupt[0].settlement = !settlement;
+    if (field == 1) corrupt[0].epoch = UNSIGNED_EPOCHS;
+    if (field == 2) corrupt[0].placement = UNSIGNED_PLACEMENTS;
+    if (field == 3) corrupt[0].family = UNSIGNED_VALUES;
+    REQUIRE_FALSE(unsigned_complete(corrupt, settlement));
+    ++ledger_controls;
+  }
+  CHECK(cells.size() == 48);
+  CHECK(native_entries == (settlement ? 96U : 48U));
+  CHECK(semantic_controls == 240);
+  CHECK(ledger_controls == 100);
+  CHECK(ownership_controls == 18);
+  CHECK(std::chrono::steady_clock::now() < deadline);
+}
+
 } // namespace
 
 // Sentinel for ordinary cases when PG isn't available. The strict module gate
@@ -1857,6 +2151,18 @@ TEST_CASE("Capability promise settlement has a bounded tagged JSON corpus",
           "[cap][ext][integration][promise-tagged-corpus]") {
   REQUIRE(pg_available());
   check_reverse_tagged_entrypoint(true);
+}
+
+TEST_CASE("Extension argument injection preserves safe unsigned JSON integers",
+          "[cap][ext][integration][argument-unsigned-corpus]") {
+  REQUIRE(pg_available());
+  check_reverse_unsigned_entrypoint(false);
+}
+
+TEST_CASE("Capability promise settlement preserves safe unsigned JSON integers",
+          "[cap][ext][integration][promise-unsigned-corpus]") {
+  REQUIRE(pg_available());
+  check_reverse_unsigned_entrypoint(true);
 }
 
 TEST_CASE("Extension module loading enforces the original source gate",
