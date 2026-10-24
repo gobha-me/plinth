@@ -27,6 +27,7 @@ Missing, unbuildable, skipped or incomplete targets must remain explicit.
 | Native binary database parameters (parent #90) | `plinth_tests_native_bytea_query`, `plinth_tests_native_bytea_exec`, `plinth_tests_native_bytea_batch` | Real registered query/exec and installed batch dispatch, typed PostgreSQL bytes, durable storage, rollback and owned teardown |
 | Authoritative PostgreSQL errors (#92) | `plinth_tests_sqlstate_native`, `plinth_tests_sqlstate_pipeline`, `plinth_tests_sqlstate_projection` | Real driver diagnostics/query ownership, deterministic causal errors versus skipped pipeline commands, and registered query/exec/batch error projection |
 | Native PostgreSQL results (#185, parent #90) | `plinth_tests_native_pg_result_corpus` | Selected real scalar input/result kinds, returned BYTEA lifetime, ordered envelopes, server errors/recovery, affected rows and fresh-owner cleanup |
+| Native PostgreSQL text branches (parent #90) | `plinth_tests_native_pg_text_corpus` | Actual temporal result strings under guarded ISO/UTC fixture settings, BIT default-arm strings and retained values through a second native query |
 
 These are bounded slices, not comprehensive coverage claims. In particular,
 simulated admission/settlement and actual native execution are separate evidence;
@@ -83,9 +84,11 @@ pubsub delivery and BYTEA tests additionally exercise real typed settlement.
 These are finite observations, not proof of every reverse branch.
 
 The remaining result/conversion ledger includes distinct native JSON/JSONB
-and temporal string branches, unknown-OID fallback, disabled-type-flag
-heuristics and finite numeric/column-name boundaries outside the selected
-PostgreSQL result corpus. The [reverse tagged-value corpus](#reverse-tagged-json-values-and-ownership)
+branches, disabled-type-flag heuristics and finite numeric/column-name boundaries
+outside the selected PostgreSQL result corpus. The separate
+[PostgreSQL text corpus](#native-postgresql-temporal-and-fallback-text) enumerates
+four temporal string arms and one actual default-arm type under bounded fixture
+conditions; it does not establish general date/time normalization. The [reverse tagged-value corpus](#reverse-tagged-json-values-and-ownership)
 separately enumerates singleton BYTEA-tag interpretation and fallback; its
 literal observations complement the native binary round trips. This is one bounded remainder, not a requirement to
 implement every future PostgreSQL type or promote arrays to a new SDK type.
@@ -395,6 +398,63 @@ and endpoint policy, time rendering, exotic names/OIDs, arrays/domains, broader
 permission/cancellation/inference behavior, installed extension authority and
 other bridge surfaces remain outstanding. It changes no production policy,
 API, permission, version or release promise.
+
+
+## Native PostgreSQL temporal and fallback text
+
+The separate `plinth_tests_native_pg_text_corpus` extends the native result
+corpus without replacing its 168 primary cells or 216 operations. It follows the
+actual injected `db.query`, native dispatcher, PostgreSQL result mapping and
+Promise settlement. The required ledger is 40 primary cells: DATE, TIME,
+TIMESTAMP, TIMESTAMPTZ and BIT(4), four fixed variants each, replayed across two
+fresh-owner epochs. Forty additional real queries retain and re-observe the
+first result on the same live context: 80 query operations, zero exec/batch.
+Eight independently owned Config/RuntimePool pairs each run five cells, with a
+fresh context per cell.
+
+Temporal output is observed under explicit same-result ISO DateStyle and
+UTC/Etc/UTC fixture preconditions. Expected values remain independent literal
+strings with complete ASCII UTF-16 code units, lengths, exact row/member keys
+and JavaScript kinds. The converter passes driver text verbatim; this case does
+not promise normalization of arbitrary session settings, date zones, BC,
+infinity, DST or general timestamp formatting. BIT is unrecognized by Plinth's
+OID switch and exercises its default string arm, including leading zeros and
+numeric-looking text. UUID is explicitly recognized and is not default-arm
+coverage. No array or new typed SDK representation is introduced.
+
+A bounded owned read-only libpq connection independently checks the five
+intended result OIDs using typed NULL metadata. Its values and the production
+converter are not expected-value oracles. The existing enabled mapping posture
+must hold before and after collection; no global feature flag or pooled session
+setting is changed. Retained immutable strings demonstrate stability after a
+second query, not mutable-buffer aliasing.
+
+Actual execution retirement, empty queues/callbacks/batch ownership, native and
+audit drains, context destruction, zero active pool state and bounded idempotent
+owner shutdown precede copied-oracle controls. Missing/duplicate identities,
+wrong values/kinds/units/lengths/keys/row counts, operation roles/routes/settlement
+and cleanup-state corruption must fail the validators. The 55-second case budget
+and existing resource limits are retained; no watchdog extension substitutes
+for successful cleanup.
+
+The exact named case `QuickJS native PostgreSQL temporal and fallback values
+preserve text` uses fresh positive Catch XML, zero failures/skips, 60-second child
+and 75-second outer bounds, `needs_pg` and the PostgreSQL schema lock. Both
+ASan/UBSan lanes and selected TSan discover exactly one new target and run it
+verbosely under their unchanged fatal settings. The original native result and
+all other compiler/image/browser/lifecycle gates remain required.
+
+```sh
+ctest --test-dir "$pg_text_build_dir" --verbose --output-on-failure --parallel 1 \
+  -R '^plinth_tests_native_pg_text_corpus$'
+```
+
+This is finite text-branch coverage. It does not resolve JSON/JSONB structure,
+numeric rounding/nonfinite/precision policy, disabled-flag heuristics, arbitrary
+future/custom OIDs, every cancellation schedule or complete parent #90. Runtime
+assertion/inventory totals require fresh execution; source registration alone
+is not a pass. Candidate and fresh exact-merge CI remain delivery gates. No
+production API, permission, asset, version or release change is made.
 
 ## Capability admission and batch composition
 

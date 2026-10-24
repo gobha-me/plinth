@@ -1459,6 +1459,18 @@ add_test(NAME plinth_tests_native_pg_result_corpus
 set_tests_properties(plinth_tests_native_pg_result_corpus PROPERTIES
   RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
 
+# Keep temporal/default-arm text coverage independently required; the original
+# result/error corpus and its complete ledger remain unchanged.
+add_test(NAME plinth_tests_native_pg_text_corpus
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_tests>
+    --case "QuickJS native PostgreSQL temporal and fallback values preserve text"
+    --timeout 60
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_native_pg_text_corpus PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg" TIMEOUT 75)
+
 # Separate fresh processes make every native capability family fail closed on
 # missing PostgreSQL, skipped observations or incomplete owner teardown. The
 # ordinary JS group also retains these tests; no existing selector is narrowed.
