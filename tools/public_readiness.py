@@ -64,7 +64,7 @@ def check_live_lifecycle_commands(candidate: str) -> list[str]:
         expected_lines.append(
             'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" '
             f'--kubernetes {lane} --runtime-identity-evidence '
-            f'"$RUNNER_TEMP/helper-runtime-identity-{lane}-$GITHUB_RUN_ID.json"')
+            f'"$RUNNER_TEMP/helper-runtime-identity-{lane}-$GITHUB_RUN_ID.json" --require-indexed-helper-proof')
     # Preserve quote spelling: single-quoted variables and quoted assignments
     # do not have the expansion/assignment semantics of these actual commands.
     expected = [shlex.split(line, comments=False, posix=False) for line in expected_lines]

@@ -483,8 +483,14 @@ and fixed tag-plus-digest Pod reference. No Pod, cluster, registry staging or
 permission is added. Helper observations apply no Plinth UID, entrypoint or
 binary-version contract. Their explicit index-profile result is supporting
 upstream-image evidence only; a flat root supplies no indexed-runtime proof,
-and unavailable/unsupported content fails explicitly. The indexed branch still
-requires actual candidate-CI evidence before accepting that validation claim.
+and unavailable/unsupported content fails explicitly. Both candidate min/max
+invocations also set `--require-indexed-helper-proof`, which requires an evidence
+path and fails before a success receipt or denial check if the verified root is
+flat. The helper remains curl 8.16.0: its pinned parent index selects the same
+amd64 manifest previously pinned directly. The [retained public metadata](../tests/deployment/fixtures/runtime-identity/curl-8.16.0-PROVENANCE.md)
+documents that link without claiming runtime execution. The indexed branch
+still requires fresh actual candidate-CI evidence in both lanes before accepting
+that validation claim; default optional observation continues to accept flat roots.
 
 The separate `--published-pair PATH --evidence-dir NEW_DIRECTORY` mode accepts a
 schema-version-1 JSON descriptor containing `previous`, `current`, and a

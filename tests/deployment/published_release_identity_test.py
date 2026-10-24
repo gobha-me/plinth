@@ -1106,8 +1106,8 @@ class SupportingObservationTest(unittest.TestCase):
 
     def test_existing_attacker_index_and_flat_profiles_use_shared_binding_without_plinth_policy(self):
         import k3d_lifecycle_test as lifecycle
-        for indexed in (True, False):
-            with self.subTest(indexed=indexed), tempfile.TemporaryDirectory() as directory:
+        for indexed, required in ((True, False), (False, False), (True, True)):
+            with self.subTest(indexed=indexed, required=required), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 release, blobs = simulated_release(root, config_overrides={"User": "101:102", "Entrypoint": ["curl"], "Labels": {}})
                 digest = release.spec.digest if indexed else release.platform.digest
@@ -1116,7 +1116,7 @@ class SupportingObservationTest(unittest.TestCase):
                 runner.pod["metadata"].update(name="attacker", namespace="owned")
                 harness = object.__new__(Harness)
                 path = root / "identity.json"
-                harness.args = SimpleNamespace(runtime_identity_evidence=path)
+                harness.args = SimpleNamespace(runtime_identity_evidence=path, require_indexed_helper_proof=required)
                 harness.namespace, harness.release, harness.cluster = "owned", "owned", "owned"
                 harness.apply_json = Mock()
                 harness.kubectl = Mock(side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(stdout=json.dumps(runner.pod)), SimpleNamespace(returncode=22)])
@@ -1133,6 +1133,58 @@ class SupportingObservationTest(unittest.TestCase):
                 self.assertNotIn("PRIVATE-CANARY", path.read_text())
                 self.assertNotIn("PRIVATE-CANARY", str(log.call_args))
                 self.assertEqual(log.call_count, 1)
+
+    def test_required_flat_observation_fails_without_receipt_log_or_denial_credit(self):
+        import k3d_lifecycle_test as lifecycle
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release, blobs = simulated_release(root)
+            reference = "docker.io/curlimages/curl:8.16.0@" + release.platform.digest
+            runner = RuntimeRunner(release, blobs, reference, "attacker")
+            runner.pod["metadata"].update(name="attacker", namespace="owned")
+            path = root / "identity.json"
+            harness = object.__new__(Harness)
+            harness.args = SimpleNamespace(runtime_identity_evidence=path, require_indexed_helper_proof=True)
+            harness.namespace, harness.release, harness.cluster = "owned", "owned", "owned"
+            harness.apply_json = Mock()
+            harness.kubectl = Mock(side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(stdout=json.dumps(runner.pod))])
+            with patch.object(lifecycle, "CURL_IMAGE", reference), patch.object(identity, "CommandRunner", return_value=runner), \
+                    patch("builtins.print") as log, self.assertRaisesRegex(AssertionError, "required indexed helper proof observed a flat root"):
+                harness.verify_network_policy_denial()
+            self.assertEqual(harness.kubectl.call_count, 2)  # Ready and selected Pod; denial curl was not credited.
+            self.assertFalse(path.exists())
+            log.assert_not_called()
+            self.assertEqual(runner.layer_reads, [release.layers[0].digest])
+
+    def test_required_index_flag_without_evidence_fails_before_tools_or_allocation(self):
+        import k3d_lifecycle_test as lifecycle
+        with patch.object(sys, "argv", ["k3d_lifecycle_test.py", "--image", "simulated", "--require-indexed-helper-proof"]), \
+                patch.object(lifecycle.shutil, "which") as which, patch.object(lifecycle, "Harness") as harness, \
+                patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+            lifecycle.main()
+        self.assertEqual(error.exception.code, 2)
+        which.assert_not_called()
+        harness.assert_not_called()
+
+    def test_public_curl_parent_index_retains_the_previous_exact_amd64_graph(self):
+        import k3d_lifecycle_test as lifecycle
+        root = Path(__file__).parent / "fixtures/runtime-identity"
+        index_raw = (root / "curl-8.16.0-parent-index.json").read_bytes()
+        manifest_raw = (root / "curl-8.16.0-amd64-manifest.json").read_bytes()
+        index, manifest = json.loads(index_raw), json.loads(manifest_raw)
+        expected_index = "sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
+        expected_child = "sha256:5a91ea0c9c3ee27b4abe657b68cf6bf0676afa13b236b3bda34283cb3924d4f6"
+        self.assertEqual(descriptor(index_raw), {"digest": expected_index, "size": 1193})
+        self.assertEqual(lifecycle.CURL_IMAGE, "docker.io/curlimages/curl:8.16.0@" + expected_index)
+        self.assertEqual(descriptor(manifest_raw), {"digest": expected_child, "size": 751})
+        self.assertEqual(identity.selected_amd64(index), identity.blob(descriptor(manifest_raw)))
+        self.assertEqual(manifest["config"], {"digest": "sha256:51674a38c3309d85352d13cf0955f588d7fe6a49cbb0c8b049c544c36441f6dc",
+                                            "size": 1464, "mediaType": "application/vnd.docker.container.image.v1+json"})
+        duplicate = copy.deepcopy(index)
+        duplicate["manifests"].append(copy.deepcopy(next(item for item in index["manifests"]
+                                                        if item["platform"]["architecture"] == "amd64")))
+        with self.assertRaisesRegex(ValueError, "one unique amd64"):
+            identity.selected_amd64(duplicate)
 
     def test_generic_index_can_select_amd64_among_additional_upstream_platforms(self):
         with tempfile.TemporaryDirectory() as directory:

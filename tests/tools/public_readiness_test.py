@@ -15,14 +15,15 @@ SPEC.loader.exec_module(VERIFIER)
 WORKFLOW = ROOT / ".github/workflows/runtime-image.yml"
 LIVE = 'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes '
 EVIDENCE = '"$RUNNER_TEMP/helper-runtime-identity-{}-$GITHUB_RUN_ID.json"'
+REQUIRE_INDEX = " --require-indexed-helper-proof"
 
 
 class LifecycleReadinessTest(unittest.TestCase):
     def setUp(self):
         self.workflow = WORKFLOW.read_text(encoding="utf-8")
         self.candidate = VERIFIER.workflow_job(self.workflow, "candidate")
-        self.minimum = LIVE + 'min \\\n            --runtime-identity-evidence ' + EVIDENCE.format("min")
-        self.maximum = LIVE + 'max \\\n            --runtime-identity-evidence ' + EVIDENCE.format("max")
+        self.minimum = LIVE + 'min \\\n            --runtime-identity-evidence ' + EVIDENCE.format("min") + REQUIRE_INDEX
+        self.maximum = LIVE + 'max \\\n            --runtime-identity-evidence ' + EVIDENCE.format("max") + REQUIRE_INDEX
         self.assertIn(self.minimum, self.candidate)
         self.assertIn(self.maximum, self.candidate)
 
@@ -52,6 +53,12 @@ class LifecycleReadinessTest(unittest.TestCase):
         for before, after in replacements:
             with self.subTest(before=before, after=after):
                 self.reject(self.candidate.replace(before, after, 1))
+
+    def test_each_executed_lane_requires_index_proof_not_only_an_evidence_file(self):
+        for command in (self.minimum, self.maximum):
+            with self.subTest(command=command):
+                self.reject(self.candidate.replace(command, command.removesuffix(REQUIRE_INDEX), 1))
+        self.reject(self.candidate.replace(REQUIRE_INDEX, ""))
 
     def test_commented_echo_heredoc_function_or_if_false_commands_do_not_count(self):
         for replacement in (

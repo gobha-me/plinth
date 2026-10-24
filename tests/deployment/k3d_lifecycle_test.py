@@ -56,7 +56,7 @@ POSTGRES_IMAGE = (
 )
 CURL_IMAGE = (
     "docker.io/curlimages/curl:8.16.0@"
-    "sha256:5a91ea0c9c3ee27b4abe657b68cf6bf0676afa13b236b3bda34283cb3924d4f6"
+    "sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6"
 )
 TRAEFIK_IMAGE_REPOSITORY = "rancher/mirrored-library-traefik"
 TRAEFIK_IMAGE_TAG = "3.7.13"
@@ -1279,7 +1279,9 @@ service:
 
     def observe_supporting_identity(self, pod_name, container_name, reference):
         path = getattr(getattr(self, "args", None), "runtime_identity_evidence", None)
+        required = getattr(getattr(self, "args", None), "require_indexed_helper_proof", False)
         if path is None:
+            require(not required, "required indexed helper proof needs an evidence path")
             return
         require(not path.exists(), "supporting runtime identity evidence already exists")
         pod = json.loads(self.kubectl("get", "pod", pod_name, "-n", self.namespace, "-o", "json").stdout)
@@ -1290,6 +1292,8 @@ service:
         receipt, graph = published.observe_runtime(reference, pod, node, container_id, runner, {}, container_name)
         receipt["qualification"] = "supporting upstream helper identity only; no Plinth publication or pair credit"
         receipt["indexed_runtime_proof"] = graph.root_kind == "index"
+        require(not required or receipt["indexed_runtime_proof"],
+                "required indexed helper proof observed a flat root")
         report = {"schema_version": 1, "mode": "supporting_helper", "receipt": receipt,
                   "commands": runner.receipts}
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -1978,6 +1982,8 @@ service:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--runtime-identity-evidence", type=Path)
+    parser.add_argument("--require-indexed-helper-proof", action="store_true",
+                        help="fail unless the existing helper binds through a verified runtime index")
     parser.add_argument("--image", required=True,
                         help="exact locally built amd64 runtime image tag")
     parser.add_argument(
@@ -1988,6 +1994,8 @@ def main():
     parser.add_argument("--kubectl", default="kubectl")
     parser.add_argument("--k3d", default="k3d")
     args = parser.parse_args()
+    if args.require_indexed_helper_proof and args.runtime_identity_evidence is None:
+        parser.error("--require-indexed-helper-proof requires --runtime-identity-evidence")
 
     for executable in ("docker", "curl", "openssl", args.helm, args.kubectl, args.k3d):
         require(shutil.which(executable), f"required executable is unavailable: {executable}")

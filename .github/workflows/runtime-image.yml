@@ -206,9 +206,9 @@ jobs:
           export PATH="$PLINTH_DEPLOYMENT_TOOLS_DIR:$PATH"
           image="plinth-runtime:amd64-$GITHUB_RUN_ID"
           python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes min \
-            --runtime-identity-evidence "$RUNNER_TEMP/helper-runtime-identity-min-$GITHUB_RUN_ID.json"
+            --runtime-identity-evidence "$RUNNER_TEMP/helper-runtime-identity-min-$GITHUB_RUN_ID.json" --require-indexed-helper-proof
           python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes max \
-            --runtime-identity-evidence "$RUNNER_TEMP/helper-runtime-identity-max-$GITHUB_RUN_ID.json"
+            --runtime-identity-evidence "$RUNNER_TEMP/helper-runtime-identity-max-$GITHUB_RUN_ID.json" --require-indexed-helper-proof
 
       - name: Build the previous exact runtime revision for recovery validation
         if: ${{ matrix.arch == 'amd64' }}
