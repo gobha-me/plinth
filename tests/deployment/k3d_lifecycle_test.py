@@ -212,9 +212,7 @@ class Harness:
             + (last.stderr if last is not None else "")
         )
 
-    def create_infrastructure(self):
-        require(platform.machine() in ("x86_64", "amd64"),
-                "the live lane uses reviewed linux/amd64 image digests")
+    def prepare_image(self):
         self.run(["docker", "image", "inspect", self.args.image], timeout=30)
 
         self.run([
@@ -254,6 +252,18 @@ class Harness:
         require(match is not None, "registry push did not report an immutable digest")
         self.candidate_digest = match.group(1)
 
+    @property
+    def chart(self):
+        return CHART
+
+    def registry_arguments(self):
+        return ["--registry-use", f"k3d-{self.registry}:5000"]
+
+    def create_infrastructure(self):
+        require(platform.machine() in ("x86_64", "amd64"),
+                "the live lane uses reviewed linux/amd64 image digests")
+        self.prepare_image()
+
         self.traefik_config.write_text(
             """apiVersion: helm.cattle.io/v1
 kind: HelmChartConfig
@@ -276,8 +286,7 @@ spec:
             self.cluster,
             "--image",
             K3S_MIN_IMAGE if self.args.kubernetes == "min" else K3S_MAX_IMAGE,
-            "--registry-use",
-            f"k3d-{self.registry}:5000",
+            *self.registry_arguments(),
             "--port",
             f"127.0.0.1:{self.https_port}:443@loadbalancer",
             "--k3s-arg",
@@ -677,7 +686,7 @@ service:
         ))
         self.install_stage("CHART_HELM")
         self.helm(
-            "upgrade", "--install", self.release, CHART,
+            "upgrade", "--install", self.release, self.chart,
             "--namespace", self.namespace,
             "--values", self.values_path,
             "--atomic", "--wait", "--timeout", "5m",
@@ -730,11 +739,6 @@ service:
             None,
         )
         require(container is not None, "active Pod has no Plinth container spec")
-        require(
-            container.get("image")
-            == f"{self.internal_repository}@{self.candidate_digest}",
-            f"Pod spec did not retain the exact candidate digest: {container}",
-        )
         status = next(
             (
                 item
@@ -744,11 +748,19 @@ service:
             None,
         )
         require(status is not None, "active Pod has no Plinth container status")
+        self.verify_pod_image(active[0], container, status)
+        return active[0]
+
+    def verify_pod_image(self, _pod, container, status):
+        require(
+            container.get("image")
+            == f"{self.internal_repository}@{self.candidate_digest}",
+            f"Pod spec did not retain the exact candidate digest: {container}",
+        )
         require(
             self.candidate_digest in status.get("imageID", ""),
             f"running Plinth image ID drifted: {status.get('imageID', '')}",
         )
-        return active[0]
 
     def pvc_uids(self):
         response = json.loads(self.kubectl(
@@ -881,7 +893,7 @@ service:
         ))
         started = time.monotonic()
         self.helm(
-            "upgrade", self.release, CHART,
+            "upgrade", self.release, self.chart,
             "--namespace", self.namespace,
             "--values", self.values_path,
             "--atomic", "--wait", "--timeout", "5m",
@@ -937,7 +949,7 @@ service:
             registration=False, nonce="public", traefik_enabled=True
         ))
         self.helm(
-            "upgrade", self.release, CHART,
+            "upgrade", self.release, self.chart,
             "--namespace", self.namespace,
             "--values", self.values_path,
             "--atomic", "--wait", "--timeout", "5m",
@@ -1586,7 +1598,7 @@ service:
         ))
         process = subprocess.Popen(
             [
-                self.args.helm, "upgrade", self.release, str(CHART),
+                self.args.helm, "upgrade", self.release, str(self.chart),
                 "--namespace", self.namespace,
                 "--values", str(self.values_path),
                 "--atomic", "--wait", "--timeout", "5m",
@@ -1674,7 +1686,7 @@ service:
             registration=False, nonce="removal", traefik_enabled=False
         ))
         self.helm(
-            "upgrade", self.release, CHART,
+            "upgrade", self.release, self.chart,
             "--namespace", self.namespace,
             "--values", self.values_path,
             "--atomic", "--wait", "--timeout", "5m",
@@ -1864,26 +1876,7 @@ service:
         if result.returncode != 0:
             errors.append("cluster cleanup failed: " + result.stderr)
         self.cluster_created = False
-        result = self.run(
-            [self.args.k3d, "registry", "delete", self.registry],
-            check=False, timeout=120,
-        )
-        if result.returncode != 0:
-            errors.append("registry cleanup failed: " + result.stderr)
-        self.registry_created = False
-        local_image = self.run(
-            ["docker", "image", "inspect", self.local_tag],
-            check=False,
-            timeout=30,
-        )
-        if local_image.returncode == 0:
-            removed = self.run(
-                ["docker", "image", "rm", self.local_tag],
-                check=False,
-                timeout=60,
-            )
-            if removed.returncode != 0:
-                errors.append("candidate image-tag cleanup failed: " + removed.stderr)
+        errors.extend(self.cleanup_image())
 
         containers = self.run([
             "docker", "ps", "-a", "--format", "{{.Names}}"
@@ -1905,6 +1898,31 @@ service:
         if errors:
             raise RuntimeError("\n".join(errors))
         self.cleanup_complete = True
+
+    def cleanup_image(self):
+        errors = []
+        result = self.run(
+            [self.args.k3d, "registry", "delete", self.registry],
+            check=False, timeout=120,
+        )
+        if result.returncode != 0:
+            errors.append("registry cleanup failed: " + result.stderr)
+        self.registry_created = False
+        local_image = self.run(
+            ["docker", "image", "inspect", self.local_tag],
+            check=False,
+            timeout=30,
+        )
+        if local_image.returncode == 0:
+            removed = self.run(
+                ["docker", "image", "rm", self.local_tag],
+                check=False,
+                timeout=60,
+            )
+            if removed.returncode != 0:
+                errors.append("candidate image-tag cleanup failed: " + removed.stderr)
+
+        return errors
 
     def execute(self):
         self.create_infrastructure()

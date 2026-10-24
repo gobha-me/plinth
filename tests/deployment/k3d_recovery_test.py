@@ -16,6 +16,12 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
+from types import SimpleNamespace
+
+import yaml
+
+import published_release_identity as published
 import zipfile
 
 from k3d_lifecycle_test import (
@@ -132,6 +138,40 @@ class RecoveryHarness(Harness):
         self.current_revision = ""
         self.previous_revision = ""
 
+    def verify_pod_image(self, pod, container, status):
+        Harness.verify_pod_image(self, pod, container, status)
+        evidence_path = getattr(getattr(self, "args", None), "runtime_identity_evidence", None)
+        if evidence_path is None:
+            return
+        if not hasattr(self, "source_identity_runner"):
+            require(not evidence_path.exists(), "runtime identity evidence already exists")
+            self.source_identity_runner = published.CommandRunner()
+            self.source_identity_cache = {}
+            self.source_identity_receipts = {}
+        node, container_id = self.container_runtime_identity(pod)
+        key = (node, container_id)
+        if key in self.source_identity_receipts:
+            return
+        reference = f"{self.internal_repository}@{self.candidate_digest}"
+        receipt = published.verify_source_runtime(reference, pod, node, container_id,
+                                                   self.source_identity_runner, self.source_identity_cache)
+        self.source_identity_receipts[key] = receipt
+        report = {"schema_version": 1, "mode": "source", "published_credit": False,
+                  "identities": list(self.source_identity_receipts.values()),
+                  "commands": self.source_identity_runner.receipts}
+        temporary = evidence_path.with_name(evidence_path.name + ".tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(report, output, indent=2)
+            output.write("\n")
+        os.replace(temporary, evidence_path)
+        # Only whitelisted identity fields, never full Pod/CRI/Spec/environment output.
+        log_receipt = {"selected": receipt["selected"],
+                       "content": {name: receipt["content"][name]
+                                   for name in ("root", "manifest", "config", "platform", "rootfs_diff_ids")}}
+        print("source runtime identity verified (selected fields; no published credit): "
+              + json.dumps(log_receipt, sort_keys=True))
+
     def image_revision(self, image):
         result = self.run([
             "docker", "image", "inspect", "--format",
@@ -140,6 +180,9 @@ class RecoveryHarness(Harness):
         require(re.fullmatch(r"[0-9a-f]{40}", result) is not None,
                 "image lacks an exact source revision label")
         return result
+
+    def prepare_pair(self):
+        self.publish_previous()
 
     def publish_previous(self):
         self.current_digest = self.candidate_digest
@@ -612,12 +655,22 @@ class RecoveryHarness(Harness):
         finally:
             self.remove_helper(helper)
 
+    @property
+    def current_chart(self):
+        return self.chart
+
+    def select_release(self, digest, _chart):
+        self.candidate_digest = digest
+
+    def restored_values(self, chart, nonce):
+        return (self.previous_values(nonce, True)
+                if chart == self.args.previous_chart else
+                self.values(registration=False, nonce=nonce, traefik_enabled=True))
+
     def install_restored(self, digest, nonce, chart):
         self.candidate_digest = digest
-        values = (self.previous_values(nonce, True)
-                  if chart == self.args.previous_chart else
-                  self.values(registration=False, nonce=nonce,
-                              traefik_enabled=True))
+        self.select_release(digest, chart)
+        values = self.restored_values(chart, nonce)
         for kind in ("data", "logs"):
             values["persistence"][kind]["existingClaim"] = (
                 self.workload_name + "-" + kind)
@@ -647,14 +700,14 @@ class RecoveryHarness(Harness):
         watcher = self.start_container_exit_watch(
             *self.container_runtime_identity(old))
         claims = self.pvc_uids()
-        self.candidate_digest = self.current_digest
+        self.select_release(self.current_digest, self.current_chart)
         values = self.values(registration=False, nonce="current-revision",
                              traefik_enabled=True)
         for kind in ("data", "logs"):
             values["persistence"][kind]["existingClaim"] = (
                 self.workload_name + "-" + kind)
         self.write_values(values)
-        self.helm("upgrade", self.release, CHART,
+        self.helm("upgrade", self.release, self.current_chart,
                   "--namespace", self.namespace, "--values", self.values_path,
                   "--reset-values", "--atomic", "--wait", "--timeout", "5m",
                   timeout=330)
@@ -919,6 +972,12 @@ class RecoveryHarness(Harness):
             super().cleanup()
         except RuntimeError as error:
             errors.append(str(error))
+        errors.extend(self.cleanup_previous_image())
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def cleanup_previous_image(self):
+        errors = []
         previous = self.run(
             ["docker", "image", "inspect", self.previous_local_tag],
             check=False, timeout=30,
@@ -936,12 +995,11 @@ class RecoveryHarness(Harness):
         )
         if remaining.returncode == 0:
             errors.append("previous image tag remains")
-        if errors:
-            raise RuntimeError("; ".join(errors))
+        return errors
 
     def execute(self):
         self.create_infrastructure()
-        self.publish_previous()
+        self.prepare_pair()
         self.create_namespace_dependencies()
         self.install_chart()
         self.bootstrap_admin()
@@ -979,29 +1037,231 @@ class RecoveryHarness(Harness):
         self.verify_retained_user()
         self.stop_plinth()
         self.delete_current_namespace()
+        self.print_summary()
+
+    def print_summary(self):
         print("k3d recovery: matched backup/restore, revision upgrade and "
               "rollback, active-work SIGINT/SIGTERM passed; "
               f"previous={self.previous_revision} current={self.current_revision}")
 
 
-def main():
+class PublishedRecoveryHarness(RecoveryHarness):
+    """Reuse the retained journey with verified direct artifacts and modern auth."""
+
+    def __init__(self, args, pair, runner):
+        super().__init__(args)
+        self.pair = pair
+        self.runner = runner
+        self.selected = pair.previous
+        self.content_cache = {}
+        self.runtime_receipts = {}
+        self.previous_digest = pair.previous.spec.digest
+        self.current_digest = pair.current.spec.digest
+        self.previous_revision = pair.previous.spec.revision
+        self.current_revision = pair.current.spec.revision
+        self.select_release(self.previous_digest, pair.previous.spec.chart)
+
+    @property
+    def chart(self):
+        return self.selected.spec.chart
+
+    @property
+    def current_chart(self):
+        return self.pair.current.spec.chart
+
+    def select_release(self, digest, chart):
+        selected = [item for item in (self.pair.previous, self.pair.current)
+                    if item.spec.digest == digest and item.spec.chart == chart]
+        require(len(selected) == 1, "unverified release/chart selection")
+        self.selected = selected[0]
+        self.candidate_digest = digest
+        self.internal_repository = published.IMAGE
+
+    def prepare_image(self):
+        # The fresh node pulls the public exact digest, without registry credentials.
+        self.select_release(self.previous_digest, self.pair.previous.spec.chart)
+
+    def registry_arguments(self):
+        return []
+
+    def prepare_pair(self):
+        self.select_release(self.previous_digest, self.pair.previous.spec.chart)
+
+    def install_chart(self):
+        Harness.install_chart(self)
+
+    def bootstrap_admin(self):
+        Harness.bootstrap_admin(self)
+
+    def remove_bootstrap_authority(self):
+        Harness.remove_bootstrap_authority(self)
+
+    def enable_public_route(self):
+        Harness.enable_public_route(self)
+
+    def restored_values(self, _chart, nonce):
+        return self.values(registration=False, nonce=nonce, traefik_enabled=True)
+
+    def cleanup_image(self):
+        return []
+
+    def cleanup_previous_image(self):
+        return []
+
+    def verify_pod_image(self, pod, _container, _status):
+        node, container_id = self.container_runtime_identity(pod)
+        key = (node, container_id)
+        if key not in self.runtime_receipts:
+            receipt = published.verify_runtime(self.selected, pod, node, container_id,
+                                                self.runner, self.content_cache)
+            version = self.kubectl("exec", "-n", self.namespace, pod["metadata"]["name"],
+                                   "--", "/usr/local/bin/plinth", "--version").stdout.strip()
+            require(version == "v" + self.selected.spec.version,
+                    "deployed binary is not the selected release identity")
+            receipt["version"] = version
+            receipt["chart"] = str(self.chart)
+            self.runtime_receipts[key] = receipt
+        else:
+            require(self.runtime_receipts[key]["reference"] == self.selected.spec.reference,
+                    "container was rebound to a different release")
+
+    def print_summary(self):
+        print("k3d recovery: published exact-artifact matched backup/restore, "
+              "upgrade/rollback and active SIGINT/SIGTERM passed; "
+              f"previous={self.pair.previous.spec.reference} "
+              f"current={self.pair.current.spec.reference}; amd64 only")
+
+
+def preflight_charts(pair, args, runner, temporary):
+    """Render exact supplied charts before any Harness resource allocation."""
+    for release in (pair.previous, pair.current):
+        context = SimpleNamespace(internal_repository=published.IMAGE,
+                                  candidate_digest=release.spec.digest,
+                                  host="plinth.test", https_port=8443,
+                                  namespace="published-contract")
+        for bootstrap in (True, False):
+            values = Harness.values(context, registration=False, nonce="preflight",
+                                     traefik_enabled=not bootstrap,
+                                     bootstrap_secret_name="plinth-bootstrap" if bootstrap else "")
+            path = temporary / "values.yaml"
+            path.write_text(yaml.safe_dump(values, sort_keys=False))
+            rendered = runner.text([args.helm, "template", "published-contract", release.spec.chart,
+                                    "--namespace", context.namespace, "--values", path])
+            objects = list(yaml.safe_load_all(rendered))
+            if bootstrap:
+                require(not any(item and item.get("kind") in
+                                ("IngressRoute", "Middleware", "ServersTransport") for item in objects),
+                        "selected bootstrap chart creates Traefik exposure")
+            workloads = [item for item in objects if item and item.get("kind") == "StatefulSet"]
+            require(len(workloads) == 1, "selected chart lacks the supported StatefulSet")
+            containers = workloads[0]["spec"]["template"]["spec"]["containers"]
+            container = next(item for item in containers if item["name"] == "plinth")
+            require(container["image"] == release.spec.reference, "selected chart changed image identity")
+            env = {item["name"]: item for item in container.get("env", [])}
+            require(("PLINTH_BOOTSTRAP_TOKEN" in env) == bootstrap,
+                    "selected chart lacks the supported isolated bootstrap contract")
+            if bootstrap:
+                require(env["PLINTH_BOOTSTRAP_TOKEN"].get("valueFrom", {}).get("secretKeyRef")
+                        == {"name": "plinth-bootstrap", "key": "bootstrap-token"},
+                        "selected chart changed bootstrap Secret identity")
+            configs = [published.parse_json(item["data"]["config.json"])
+                       for item in objects if item and item.get("kind") == "ConfigMap"
+                       and "config.json" in item.get("data", {})]
+            require(len(configs) == 1 and configs[0].get("registration", {}).get("mode") == "disabled",
+                    "selected chart does not keep registration disabled")
+
+
+def require_tools(args, *, published_mode=False):
+    executables = ("docker", "curl", "git", "node", "openssl", args.helm, args.kubectl, args.k3d)
+    if published_mode:
+        executables += ("gh",)
+    for executable in executables:
+        require(shutil.which(executable), f"required executable is unavailable: {executable}")
+
+
+def run_published(args):
+    require_tools(args, published_mode=True)
+    evidence = args.evidence_dir.resolve()
+    spec = published.load_pair(args.published_pair)
+    require(all(not evidence.is_relative_to(item.chart.resolve(strict=True).parents[2])
+                for item in (spec.previous, spec.current)), "evidence must be outside release checkouts")
+    evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
+    runner = published.CommandRunner()
+    harness = None
+    report = {"schema_version": 1, "mode": "published", "outcome": "failed",
+              "compatibility": spec.compatibility, "runtime": []}
+    try:
+        pair = published.verify_pair(spec, runner)
+        report["verified_pair"] = [{"version": item.spec.version, "revision": item.spec.revision,
+                                    "reference": item.spec.reference, "chart": str(item.spec.chart),
+                                    "publication_run": item.spec.publication_run,
+                                    "index": item.index, "manifest": item.manifest}
+                                   for item in (pair.previous, pair.current)]
+        args.previous_chart = pair.previous.spec.chart
+        with tempfile.TemporaryDirectory(prefix="plinth-published-preflight-") as temporary:
+            preflight_charts(pair, args, runner, Path(temporary))
+        harness = PublishedRecoveryHarness(args, pair, runner)
+        harness.execute()
+        report["outcome"] = "passed"
+    finally:
+        primary = sys.exc_info()[0] is not None
+        if primary:
+            report["failure_type"] = sys.exc_info()[0].__name__
+        errors = []
+        if harness is not None:
+            report["runtime"] = list(harness.runtime_receipts.values())
+            try:
+                harness.cleanup()
+            except BaseException as error:
+                errors.append(str(error))
+        try:
+            runner.cleanup()
+        except BaseException as error:
+            errors.append(str(error))
+        report["commands"] = runner.receipts
+        report["cleanup_errors"] = errors
+        if errors:
+            report["outcome"] = "failed"
+        (evidence / "receipt.json").write_text(json.dumps(report, indent=2) + "\n")
+        if errors:
+            if primary:
+                print("published recovery cleanup failed; see receipt", file=sys.stderr)
+            else:
+                raise RuntimeError("published recovery cleanup failed; see receipt")
+
+
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--image", required=True)
-    parser.add_argument("--previous-image", required=True)
-    parser.add_argument("--previous-chart", required=True, type=Path)
+    parser.add_argument("--image")
+    parser.add_argument("--previous-image")
+    parser.add_argument("--previous-chart", type=Path)
+    parser.add_argument("--published-pair", type=Path)
+    parser.add_argument("--evidence-dir", type=Path)
+    parser.add_argument("--runtime-identity-evidence", type=Path)
     parser.add_argument("--kubernetes", choices=("min", "max"), default="max")
     parser.add_argument("--helm", default="helm")
     parser.add_argument("--kubectl", default="kubectl")
     parser.add_argument("--k3d", default="k3d")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    source = (args.image, args.previous_image, args.previous_chart)
+    if args.published_pair:
+        if any(source) or args.evidence_dir is None or args.runtime_identity_evidence is not None:
+            parser.error("--published-pair requires --evidence-dir and excludes source-image inputs")
+    elif not all(source) or args.evidence_dir is not None:
+        parser.error("source mode requires --image, --previous-image and --previous-chart")
+    return args
+
+
+def main():
+    args = parse_args()
+    if args.published_pair:
+        run_published(args)
+        return
     args.previous_chart = args.previous_chart.resolve(strict=True)
     require((args.previous_chart / "Chart.yaml").is_file(),
             "previous source chart is missing Chart.yaml")
     require(CHART.is_dir(), "current source chart is missing")
-    for executable in ("docker", "curl", "git", "node", "openssl",
-                       args.helm, args.kubectl, args.k3d):
-        require(shutil.which(executable),
-                f"required executable is unavailable: {executable}")
+    require_tools(args)
     harness = RecoveryHarness(args)
     try:
         harness.execute()
@@ -1015,6 +1275,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (AssertionError, RuntimeError, TimeoutError) as error:
+    except (AssertionError, RuntimeError, TimeoutError, ValueError, OSError, subprocess.SubprocessError) as error:
         print(f"k3d recovery failed: {error}", file=sys.stderr)
         raise SystemExit(1) from error

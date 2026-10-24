@@ -74,6 +74,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y postgresql-client python3-yaml
 
+      - name: Verify published recovery input contracts without registry access
+        run: python3 tests/deployment/published_release_identity_test.py
+
       - name: Verify container exit event matching
         run: python3 tests/deployment/containerd_exit_event_test.py
 
@@ -262,7 +265,8 @@ jobs:
             --image "plinth-runtime:amd64-$GITHUB_RUN_ID" \
             --previous-image "plinth-runtime:previous-$GITHUB_RUN_ID" \
             --previous-chart "$RUNNER_TEMP/plinth-previous-$GITHUB_RUN_ID/deploy/helm/plinth" \
-            --kubernetes max
+            --kubernetes max \
+            --runtime-identity-evidence "$RUNNER_TEMP/source-runtime-identity-$GITHUB_RUN_ID.json"
 
       - name: Scan only the disposable monitored ingress candidate
         if: ${{ matrix.arch == 'amd64' }}
