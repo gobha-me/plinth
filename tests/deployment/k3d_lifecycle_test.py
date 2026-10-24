@@ -24,6 +24,8 @@ import tempfile
 import threading
 import time
 
+import published_release_identity as published
+
 try:
     import yaml
 except ImportError as error:  # pragma: no cover - actionable CI preflight
@@ -715,7 +717,7 @@ service:
     def workload_name(self):
         return self.release + "-plinth"
 
-    def active_pod(self):
+    def ready_pod_snapshot(self):
         response = json.loads(self.kubectl(
             "get", "pods", "-n", self.namespace,
             "-l", f"app.kubernetes.io/instance={self.release},app.kubernetes.io/name=plinth",
@@ -730,10 +732,16 @@ service:
             condition.get("type") == "Ready" and condition.get("status") == "True"
             for condition in active[0].get("status", {}).get("conditions", [])
         ), "active Plinth pod is not ready")
+        return active[0]
+
+    def active_pod(self):
+        return self.verify_pod_snapshot(self.ready_pod_snapshot())
+
+    def verify_pod_snapshot(self, pod):
         container = next(
             (
                 item
-                for item in active[0]["spec"].get("containers", [])
+                for item in pod["spec"].get("containers", [])
                 if item.get("name") == "plinth"
             ),
             None,
@@ -742,14 +750,14 @@ service:
         status = next(
             (
                 item
-                for item in active[0].get("status", {}).get("containerStatuses", [])
+                for item in pod.get("status", {}).get("containerStatuses", [])
                 if item.get("name") == "plinth"
             ),
             None,
         )
         require(status is not None, "active Pod has no Plinth container status")
-        self.verify_pod_image(active[0], container, status)
-        return active[0]
+        self.verify_pod_image(pod, container, status)
+        return pod
 
     def verify_pod_image(self, _pod, container, status):
         require(
@@ -1259,6 +1267,7 @@ service:
             "wait", "--for=condition=Ready", "pod/attacker", "-n", self.namespace,
             "--timeout=120s", timeout=140,
         )
+        self.observe_supporting_identity("attacker", "attacker", CURL_IMAGE)
         denied = self.kubectl(
             "exec", "-n", self.namespace, "attacker", "--",
             "curl", "--silent", "--show-error", "--fail", "--max-time", "4",
@@ -1267,6 +1276,30 @@ service:
         )
         require(denied.returncode != 0,
                 "unlabelled pod bypassed the default-deny ingress policy")
+
+    def observe_supporting_identity(self, pod_name, container_name, reference):
+        path = getattr(getattr(self, "args", None), "runtime_identity_evidence", None)
+        if path is None:
+            return
+        require(not path.exists(), "supporting runtime identity evidence already exists")
+        pod = json.loads(self.kubectl("get", "pod", pod_name, "-n", self.namespace, "-o", "json").stdout)
+        require(pod.get("metadata", {}).get("name") == pod_name
+                and pod.get("metadata", {}).get("namespace") == self.namespace, "supporting Pod identity differs")
+        node, container_id = self.container_runtime_identity(pod, container_name)
+        runner = published.CommandRunner()
+        receipt, graph = published.observe_runtime(reference, pod, node, container_id, runner, {}, container_name)
+        receipt["qualification"] = "supporting upstream helper identity only; no Plinth publication or pair credit"
+        receipt["indexed_runtime_proof"] = graph.root_kind == "index"
+        report = {"schema_version": 1, "mode": "supporting_helper", "receipt": receipt,
+                  "commands": runner.receipts}
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+            json.dump(report, output, indent=2)
+            output.write("\n")
+        logged = published.log_identity(receipt)
+        logged["indexed_runtime_proof"] = receipt["indexed_runtime_proof"]
+        print("supporting runtime identity observed (selected fields; explicit profile): "
+              + json.dumps(logged, sort_keys=True))
 
     def verify_restart(self):
         before = self.active_pod()
@@ -1307,16 +1340,17 @@ service:
         self.verify_login(replacement_phase="restart")
         return claims, after["metadata"]["uid"]
 
-    def container_runtime_identity(self, pod):
+    def container_runtime_identity(self, pod, container_name="plinth"):
         statuses = pod.get("status", {}).get("containerStatuses", [])
-        status = next((item for item in statuses if item.get("name") == "plinth"), None)
-        require(status is not None, "Plinth container status is unavailable")
+        status = next((item for item in statuses if item.get("name") == container_name), None)
+        display = "Plinth" if container_name == "plinth" else container_name
+        require(status is not None, f"{display} container status is unavailable")
         container_id = status.get("containerID", "")
         require(container_id.startswith("containerd://"),
-                f"unexpected Plinth container runtime ID: {container_id}")
+                f"unexpected {display} container runtime ID: {container_id}")
         node = pod.get("spec", {}).get("nodeName", "")
         require(node.startswith("k3d-" + self.cluster + "-"),
-                f"Plinth pod ran on an unexpected node: {node}")
+                f"{display} pod ran on an unexpected node: {node}")
         return node, container_id.removeprefix("containerd://")
 
     def start_container_exit_watch(self, node, container_id):
@@ -1943,6 +1977,7 @@ service:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--runtime-identity-evidence", type=Path)
     parser.add_argument("--image", required=True,
                         help="exact locally built amd64 runtime image tag")
     parser.add_argument(

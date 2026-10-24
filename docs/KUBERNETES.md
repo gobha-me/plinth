@@ -467,10 +467,24 @@ The optional source-mode `--runtime-identity-evidence PATH` adds node content
 hash checks and records selected actual Pod/CRI/containerd identity fields.
 It preserves the original source assertions. Runtime environment, full Pod/CRI
 objects and container specifications are excluded from the file and concise
-positive logs. CRI digest forms remain opaque in this source-only evidence;
-it supplies neither strict published binding validation nor release-pair credit.
-The candidate workflow uses this hook on its existing owned recovery cluster
-and does not upload the identity file as an artifact.
+positive logs. Qualified runtime handles resolve only as the verified root
+index or selected amd64 manifest; config-only fields must equal the verified
+config digest. Content caching is bound to the node's ID and start time and
+cannot bypass current container or expected-release checks. The first retained
+actual field fixture covers flat source manifests only, without publication or
+release-pair credit. The candidate workflow uses this hook on its existing owned
+recovery cluster and does not upload the identity file as an artifact.
+
+The lifecycle script accepts the same optional evidence flag for its existing
+`attacker` container after Ready and before the unchanged network-denial check.
+The existing min/max lifecycle clusters observe that pinned upstream helper's
+actual root kind using the shared graph/binding core, retaining its real name
+and fixed tag-plus-digest Pod reference. No Pod, cluster, registry staging or
+permission is added. Helper observations apply no Plinth UID, entrypoint or
+binary-version contract. Their explicit index-profile result is supporting
+upstream-image evidence only; a flat root supplies no indexed-runtime proof,
+and unavailable/unsupported content fails explicitly. The indexed branch still
+requires actual candidate-CI evidence before accepting that validation claim.
 
 The separate `--published-pair PATH --evidence-dir NEW_DIRECTORY` mode accepts a
 schema-version-1 JSON descriptor containing `previous`, `current`, and a
@@ -502,9 +516,12 @@ matched-data rollback checks. Published mode uses the normal isolated bootstrap
 Secret path and removes it before public routing; the historical source fixture
 keeps its original first-account registration behavior. Runtime receipts must bind
 the actual node/container content to the verified index, selected amd64 manifest
-and config. The runtime binding adapter requires actual pinned CRI/containerd
-schema evidence; a simulated helper test is not that evidence or a published-pair
-recovery result. No supported release pair is supplied by the repository, and this
+and config. The adapter checks actual Plinth release labels, user and entrypoint,
+rebinds current metadata on every call, and requires complete initial,
+bootstrap-removal, public, restore, upgrade, SIGINT, SIGTERM and rollback receipts
+with the exact phase image/chart/binary version before reporting success.
+Simulated indexed helper tests are not actual indexed-runtime or published-pair
+recovery evidence. No supported release pair is supplied by the repository, and this
 preparation does not complete issue #38. Descriptor verification of arm64 does not
 constitute an arm64 recovery execution.
 

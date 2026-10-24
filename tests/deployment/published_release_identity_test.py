@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import copy
 import hashlib
 import json
 import os
@@ -30,17 +31,23 @@ def descriptor(data):
     return {"digest": "sha256:" + hashlib.sha256(data).hexdigest(), "size": len(data)}
 
 
-def simulated_release(root, version="0.6.8", revision="a" * 40):
+def simulated_release(root, version="0.6.8", revision="a" * 40, config_overrides=None, repeated=False):
     chart = root / version / "deploy/helm/plinth"
     chart.mkdir(parents=True)
     (chart / "Chart.yaml").write_text("name: plinth\n")
     (chart.parents[2] / "VERSION").write_text(version + "\n")
     layer = b"simulated compressed image layer " + version.encode()
-    config = encoded({"architecture": "amd64", "os": "linux",
-                      "rootfs": {"diff_ids": ["sha256:" + "e" * 64]}})
+    config_body = {"User": "10001:10001", "Entrypoint": ["/usr/local/bin/plinth"],
+                   "Labels": {"org.opencontainers.image.version": version,
+                              "org.opencontainers.image.revision": revision}}
+    config_body.update(config_overrides or {})
+    diffs = ["sha256:" + "e" * 64] * (2 if repeated else 1)
+    config = encoded({"architecture": "amd64", "os": "linux", "config": config_body,
+                      "rootfs": {"diff_ids": diffs}})
     manifest = encoded({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.manifest.v1+json",
                         "config": {**descriptor(config), "mediaType": "application/vnd.oci.image.config.v1+json"},
-                        "layers": [{**descriptor(layer), "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]})
+                        "layers": [{**descriptor(layer), "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip"}]
+                        * (2 if repeated else 1)})
     index = encoded({"schemaVersion": 2, "mediaType": "application/vnd.oci.image.index.v1+json", "manifests": [
         {**descriptor(manifest), "mediaType": "application/vnd.oci.image.manifest.v1+json", "platform": {"os": "linux", "architecture": "amd64"}},
         {"digest": "sha256:" + "f" * 64, "size": 123, "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -54,7 +61,7 @@ def simulated_release(root, version="0.6.8", revision="a" * 40):
                                    "org.opencontainers.image.revision": revision}}}
     verified = identity.VerifiedRelease(spec, json.loads(index), json.loads(manifest),
                                         identity.blob(descriptor(manifest)), identity.blob(descriptor(config)),
-                                        (identity.blob(descriptor(layer)),), image)
+                                        (identity.blob(descriptor(layer)),) * (2 if repeated else 1), image)
     blobs = {descriptor(value)["digest"]: value for value in (layer, config, manifest, index)}
     return verified, blobs
 
@@ -332,6 +339,7 @@ class ModeTest(unittest.TestCase):
 
     def test_published_bootstrap_delegates_to_existing_modern_auth_only(self):
         harness = object.__new__(recovery.PublishedRecoveryHarness)
+        harness.active_pod = Mock()
         for method in ("install_chart", "bootstrap_admin", "remove_bootstrap_authority", "enable_public_route"):
             with self.subTest(method=method), patch.object(Harness, method) as existing:
                 getattr(harness, method)()
@@ -478,6 +486,15 @@ class CommandOwnershipTest(unittest.TestCase):
             self.assertIsNotNone(receipt["returncode"])
             with self.assertRaises(ProcessLookupError):
                 os.kill(receipt["pid"], 0)
+
+    def test_oversize_receipt_hash_accounts_for_every_consumed_byte_before_rejection(self):
+        runner = identity.CommandRunner()
+        with self.assertRaisesRegex(ValueError, "stdout exceeds"):
+            runner.run([sys.executable, "-c", "import sys;sys.stdout.buffer.write(b'x'*100000)"], maximum=257)
+        receipt = runner.receipts[-1]
+        self.assertGreater(receipt["stdout_bytes"], 257)
+        self.assertLessEqual(receipt["stdout_bytes"], 100000)
+        self.assertEqual(receipt["stdout_sha256"], hashlib.sha256(b"x" * receipt["stdout_bytes"]).hexdigest())
 
     def test_group_cleanup_error_does_not_mask_primary_failure_or_leave_leader_unreaped(self):
         runner = identity.CommandRunner()
@@ -633,32 +650,40 @@ class CommandOwnershipTest(unittest.TestCase):
 class RuntimeRunner(identity.CommandRunner):
     """Synthetic container metadata only; never an actual runtime-schema fixture."""
 
-    def __init__(self, release, blobs):
+    def __init__(self, release, blobs, reference=None, container_name="plinth"):
         super().__init__()
         self.release, self.blobs = release, dict(blobs)
-        self.reference = "k3d-owned-reg:5000/plinth@" + release.platform.digest
+        self.reference = reference or "k3d-owned-reg:5000/plinth@" + release.platform.digest
         self.layer_reads = []
-        self.container_id = "container-id"
+        self.container_id = "1" * 64
+        self.calls = []
+        self.owner = {"id": "2" * 64, "started_at": "2026-10-24T05:00:00Z"}
         self.pod = {"metadata": {"uid": "pod-uid", "labels": {"canary": "PRIVATE-CANARY"}},
                     "spec": {"nodeName": "k3d-owned-server-0", "containers": [
                         {"name": "plinth", "image": self.reference,
                          "env": [{"name": "DATABASE_PASSWORD", "value": "PRIVATE-CANARY"}]}]},
-                    "status": {"containerStatuses": [{"name": "plinth", "containerID": "containerd://container-id",
+                    "status": {"containerStatuses": [{"name": "plinth", "containerID": "containerd://" + self.container_id,
                                                        "imageID": self.reference}]}}
-        self.cri = {"status": {"id": "container-id", "metadata": {"name": "plinth"},
-                               "image": {"image": self.reference, "annotations": {"canary": "PRIVATE-CANARY"}},
-                               "imageRef": "opaque-cri-reference"},
+        self.cri = {"status": {"id": self.container_id, "metadata": {"name": "plinth"},
+                               "image": {"image": release.config.digest, "annotations": {"canary": "PRIVATE-CANARY"}},
+                               "imageRef": identity.image_reference(self.reference).canonical},
                     "info": {"runtimeSpec": {"process": {"env": ["PRIVATE-CANARY"]}}}}
-        self.image = {"status": {"id": "opaque-config-identity", "repoTags": [],
-                                 "repoDigests": [self.reference], "size": "123"},
+        self.image = {"status": {"id": release.config.digest, "repoTags": [],
+                                 "repoDigests": [identity.image_reference(self.reference).canonical], "size": "123"},
                       "info": {"imageSpec": {"config": {"Env": ["PRIVATE-CANARY"]}}}}
-        self.container = {"ID": "container-id", "Image": self.reference,
+        self.container = {"ID": self.container_id, "Image": identity.image_reference(self.reference).canonical,
                           "Runtime": {"Name": "io.containerd.runc.v2"},
-                          "SnapshotKey": "snapshot", "Snapshotter": "overlayfs",
+                          "SnapshotKey": self.container_id, "Snapshotter": "overlayfs",
                           "Spec": {"process": {"env": ["PRIVATE-CANARY"]}}}
+        self.pod["spec"]["containers"][0]["name"] = container_name
+        self.pod["status"]["containerStatuses"][0]["name"] = container_name
+        self.cri["status"]["metadata"]["name"] = container_name
 
     def run(self, argv, **_kwargs):
-        if "content" in argv:
+        self.calls.append(list(argv))
+        if list(argv)[:2] == ["docker", "inspect"]:
+            data = encoded(self.owner)
+        elif "content" in argv:
             data = self.blobs[argv[-1]]
         elif "inspecti" in argv:
             data = encoded(self.image)
@@ -686,14 +711,14 @@ class SourceRuntimeEvidenceTest(unittest.TestCase):
 
     def verify(self, cache=None):
         return identity.verify_source_runtime(self.runner.reference, self.runner.pod,
-                                               "k3d-owned-server-0", "container-id", self.runner,
+                                               "k3d-owned-server-0", self.runner.container_id, self.runner,
                                                {} if cache is None else cache)
 
-    def test_simulated_source_manifest_proof_keeps_cri_ids_opaque_and_filters_every_secret_surface(self):
+    def test_simulated_source_manifest_binding_filters_every_secret_surface(self):
         result = self.verify()
         self.assertEqual(result["content"]["manifest"]["digest"], self.release.platform.digest)
-        self.assertEqual(result["selected"]["cri"]["imageRef"], "opaque-cri-reference")
-        self.assertEqual(result["selected"]["image"]["id"], "opaque-config-identity")
+        self.assertEqual(result["selected"]["cri"]["imageRef"], self.runner.reference)
+        self.assertEqual(result["selected"]["image"]["id"], self.release.config.digest)
         serialized = json.dumps(result)
         self.assertNotIn("PRIVATE-CANARY", serialized)
         self.assertNotIn("Env", serialized)
@@ -706,14 +731,15 @@ class SourceRuntimeEvidenceTest(unittest.TestCase):
         self.verify(cache)
         self.verify(cache)
         self.assertEqual(len(self.runner.layer_reads), 1)
-        self.assertEqual(set(cache), {("k3d-owned-server-0", self.runner.reference)})
+        self.assertEqual(set(cache), {("k3d-owned-server-0", self.runner.owner["id"],
+                                      self.runner.owner["started_at"], self.runner.reference)})
 
     def test_foreign_container_or_image_and_changed_metadata_or_layer_fail(self):
         for field, replacement in (("ID", "foreign-id"), ("Image", "foreign-reference")):
             with self.subTest(field=field):
                 original = self.runner.container[field]
                 self.runner.container[field] = replacement
-                with self.assertRaisesRegex(ValueError, "exact task image"):
+                with self.assertRaises(ValueError):
                     self.verify()
                 self.runner.container[field] = original
         for digest in (self.release.config.digest, self.release.layers[0].digest):
@@ -724,16 +750,12 @@ class SourceRuntimeEvidenceTest(unittest.TestCase):
                     self.verify()
                 self.runner.blobs[digest] = original
 
-    def test_strict_published_adapter_remains_held_until_actual_fixture_review(self):
-        with self.assertRaisesRegex(ValueError, "reviewed actual"):
-            identity.verify_runtime(self.release, self.runner.pod, "node", "id", self.runner, {})
-
     def test_optional_source_hook_keeps_original_assertion_and_writes_only_selected_fields(self):
         harness = object.__new__(recovery.RecoveryHarness)
         path = Path(self.temporary.name) / "identity.json"
         harness.args = SimpleNamespace(runtime_identity_evidence=path)
         harness.internal_repository, harness.candidate_digest = self.runner.reference.split("@")
-        harness.container_runtime_identity = Mock(return_value=("k3d-owned-server-0", "container-id"))
+        harness.container_runtime_identity = Mock(return_value=("k3d-owned-server-0", self.runner.container_id))
         pod = self.runner.pod
         container = pod["spec"]["containers"][0]
         status = pod["status"]["containerStatuses"][0]
@@ -755,6 +777,389 @@ class SourceRuntimeEvidenceTest(unittest.TestCase):
         with self.assertRaises(AssertionError), patch.object(identity, "verify_source_runtime") as verify:
             harness.verify_pod_image(pod, {**container, "image": "wrong"}, status)
         verify.assert_not_called()
+
+
+class GraphBindingTest(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.release, self.blobs = simulated_release(self.root, repeated=True)
+
+    def runner(self):
+        return RuntimeRunner(self.release, self.blobs, self.release.spec.reference)
+
+    def verify(self, runner, cache=None, release=None):
+        return identity.verify_runtime(release or self.release, runner.pod, "k3d-owned-server-0",
+                                       runner.container_id, runner, {} if cache is None else cache)
+
+    def test_simulated_index_root_and_selected_manifest_handles_bind_without_kind_guessing(self):
+        runner = self.runner()
+        receipt = self.verify(runner)
+        self.assertEqual(receipt["roles"]["pod.imageID"], "root_index")
+        self.assertEqual(receipt["content"]["root_kind"], "index")
+        self.assertEqual(receipt["content"]["rootfs_diff_ids"], ["sha256:" + "e" * 64] * 2)
+        self.assertEqual(runner.layer_reads, [self.release.layers[0].digest] * 2)
+        selected = identity.IMAGE + "@" + self.release.platform.digest
+        runner = self.runner()
+        runner.pod["status"]["containerStatuses"][0]["imageID"] = selected
+        runner.cri["status"]["imageRef"] = selected
+        runner.image["status"]["repoDigests"] = [selected, self.release.spec.reference]
+        receipt = self.verify(runner)
+        self.assertEqual(receipt["roles"]["cri.imageRef"], "selected_manifest")
+        self.assertEqual(receipt["roles"]["image.repoDigests"], ["selected_manifest", "root_index"])
+        self.assertIn(["docker", "exec", "k3d-owned-server-0", "crictl", "inspecti", selected], runner.calls)
+
+    def test_foreign_references_bare_config_and_config_object_handles_never_stand_in_for_images(self):
+        for field, value in (("imageID", self.release.config.digest),
+                             ("imageID", identity.IMAGE + "@" + self.release.config.digest),
+                             ("imageID", "other.invalid/plinth@" + self.release.spec.digest),
+                             ("imageRef", identity.IMAGE + "@sha256:" + "a" * 64),
+                             ("imageRef", self.release.config.digest)):
+            with self.subTest(field=field, value=value):
+                runner = self.runner()
+                if field == "imageID":
+                    runner.pod["status"]["containerStatuses"][0][field] = value
+                else:
+                    runner.cri["status"][field] = value
+                with self.assertRaises(ValueError):
+                    self.verify(runner)
+        runner = self.runner()
+        # A different verified-looking index can share config; it is still not this root.
+        alternate = {**self.release.index, "annotations": {"different": "root"}}
+        raw = encoded(alternate)
+        other = descriptor(raw)["digest"]
+        runner.blobs[other] = raw
+        runner.cri["status"]["imageRef"] = identity.IMAGE + "@" + other
+        with self.assertRaisesRegex(ValueError, "selected image graph"):
+            self.verify(runner)
+        runner = self.runner()
+        alternate_manifest = {**self.release.manifest, "annotations": {"different": "manifest"}}
+        raw = encoded(alternate_manifest)
+        other = descriptor(raw)["digest"]
+        runner.blobs[other] = raw
+        runner.pod["status"]["containerStatuses"][0]["imageID"] = identity.IMAGE + "@" + other
+        with self.assertRaisesRegex(ValueError, "selected image graph"):
+            self.verify(runner)
+        runner = self.runner()
+        runner.image["status"]["repoDigests"] = ["other.invalid/plinth@" + self.release.spec.digest]
+        with self.assertRaises(ValueError):
+            self.verify(runner)
+
+    def test_exact_configured_root_and_current_container_are_checked_even_with_cached_content(self):
+        runner, cache = self.runner(), {}
+        self.verify(runner, cache)
+        reads = len(runner.layer_reads)
+        for target in ("pod", "ctr"):
+            with self.subTest(target=target):
+                selected = identity.IMAGE + "@" + self.release.platform.digest
+                original = runner.pod["spec"]["containers"][0]["image"] if target == "pod" else runner.container["Image"]
+                if target == "pod":
+                    runner.pod["spec"]["containers"][0]["image"] = selected
+                else:
+                    runner.container["Image"] = selected
+                with self.assertRaises(ValueError):
+                    self.verify(runner, cache)
+                if target == "pod":
+                    runner.pod["spec"]["containers"][0]["image"] = original
+                else:
+                    runner.container["Image"] = original
+        runner.cri["status"]["image"]["image"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(ValueError, "config identity"):
+            self.verify(runner, cache)
+        self.assertEqual(len(runner.layer_reads), reads)
+
+    def test_wrong_node_cid_and_runtime_profile_fail_explicitly(self):
+        runner = self.runner()
+        for node, cid in (("k3d-foreign-server-0", runner.container_id), ("k3d-owned-server-0", "f" * 64)):
+            with self.subTest(node=node, cid=cid), self.assertRaises(ValueError):
+                identity.verify_runtime(self.release, runner.pod, node, cid, runner, {})
+        self.assertEqual(runner.calls, [])
+        for field, value in (("SnapshotKey", "different"), ("Snapshotter", "unknown")):
+            runner = self.runner()
+            runner.container[field] = value
+            with self.assertRaisesRegex(ValueError, "runtime profile"):
+                self.verify(runner)
+        runner = self.runner()
+        runner.image["status"]["id"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(ValueError, "config identity"):
+            self.verify(runner)
+
+    def test_node_lifetime_and_expected_preflight_revalidate_cached_graph(self):
+        runner, cache = self.runner(), {}
+        self.verify(runner, cache)
+        layer_reads = len(runner.layer_reads)
+        runner.owner["started_at"] = "2026-10-24T06:00:00Z"
+        self.verify(runner, cache)
+        self.assertEqual(len(runner.layer_reads), layer_reads * 2)
+        self.assertEqual(len(cache), 2)
+        wrong = replace(self.release, manifest={**self.release.manifest, "unexpected": True})
+        with self.assertRaisesRegex(ValueError, "published preflight"):
+            self.verify(runner, cache, wrong)
+        wrong = replace(self.release, platform=replace(self.release.platform, size=self.release.platform.size + 1))
+        with self.assertRaisesRegex(ValueError, "published preflight"):
+            self.verify(runner, cache, wrong)
+        key = next(key for key in cache if key[2] == runner.owner["started_at"])
+        cache[key] = replace(cache[key], node="foreign")
+        with self.assertRaisesRegex(ValueError, "cache identity"):
+            self.verify(runner, cache)
+
+    def test_mid_observation_node_lifetime_change_is_rejected(self):
+        runner = self.runner()
+        original = runner.run
+        reads = 0
+        def changing_owner(argv, **kwargs):
+            nonlocal reads
+            if list(argv)[:2] == ["docker", "inspect"]:
+                reads += 1
+                if reads == 3:
+                    runner.owner["started_at"] = "2026-10-24T07:00:00Z"
+            return original(argv, **kwargs)
+        runner.run = changing_owner
+        with self.assertRaisesRegex(ValueError, "lifetime changed during"):
+            self.verify(runner)
+        self.assertEqual(reads, 3)
+
+    def test_corrupt_root_manifest_config_layer_and_unknown_root_kind_fail_closed(self):
+        for digest in (self.release.spec.digest, self.release.platform.digest,
+                       self.release.config.digest, self.release.layers[0].digest):
+            with self.subTest(digest=digest):
+                runner = self.runner()
+                runner.blobs[digest] += b"changed"
+                with self.assertRaises(ValueError):
+                    self.verify(runner)
+        runner = self.runner()
+        raw = encoded({"schemaVersion": 2, "mediaType": "application/unknown"})
+        digest = descriptor(raw)["digest"]
+        runner.blobs[digest] = raw
+        with self.assertRaisesRegex(ValueError, "root object kind"):
+            identity.read_node_graph(identity.IMAGE + "@" + digest, "k3d-owned-server-0", runner, {})
+
+    def test_plinth_actual_config_labels_user_entrypoint_are_required_but_size_stays_opaque(self):
+        for override in ({"User": "101:102"}, {"Entrypoint": ["other"]}, {"Labels": {}}):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory:
+                release, blobs = simulated_release(Path(directory), config_overrides=override)
+                runner = RuntimeRunner(release, blobs, release.spec.reference)
+                with self.assertRaisesRegex(ValueError, "Plinth release contract"):
+                    identity.verify_runtime(release, runner.pod, "k3d-owned-server-0", runner.container_id, runner, {})
+        runner = self.runner()
+        runner.image["status"]["size"] = "opaque-size-no-sum-formula"
+        receipt = self.verify(runner)
+        self.assertEqual(receipt["selected"]["image"]["size"], "opaque-size-no-sum-formula")
+
+    def test_actual_flat_field_fixture_links_and_duplicate_diff_ids_have_only_flat_credit(self):
+        path = Path(__file__).parent / "fixtures/runtime-identity/flat-plinth-amd64.json"
+        fixture = json.loads(path.read_text())
+        selected, content = fixture["receipt"]["selected"], fixture["receipt"]["content"]
+        # Recorded role/field links only; raw actual OCI bytes are not in this fixture.
+        roles = SimpleNamespace(node=selected["pod"]["node"],
+                                reference=selected["pod"]["container"]["image"], root_kind="manifest",
+                                root=identity.blob(content["root"]), manifest=identity.blob(content["manifest"]),
+                                config=identity.blob(content["config"]))
+        result = identity.bind_selected_runtime(roles.reference, selected, roles.node,
+                                                selected["cri"]["id"], roles)
+        self.assertEqual(result["cri.imageRef"], "root_manifest")
+        self.assertIsInstance(selected["image"]["size"], str)
+        self.assertEqual(len(content["rootfs_diff_ids"]), 7)
+        self.assertEqual(content["rootfs_diff_ids"][-2:], [content["rootfs_diff_ids"][-1]] * 2)
+        self.assertIn("no raw OCI bytes", fixture["qualification"])
+
+
+class PublishedPhaseTest(unittest.TestCase):
+    def test_receipt_hit_still_rebinds_current_metadata_and_checks_expected_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release, _ = simulated_release(Path(directory))
+            harness = object.__new__(recovery.PublishedRecoveryHarness)
+            harness.selected, harness.runner, harness.content_cache = release, Mock(), {}
+            harness.namespace = "owned"
+            pod = {"metadata": {"name": "plinth-pod"}}
+            harness.runtime_receipts, harness.runtime_versions, harness.phase = {}, {}, "initial"
+            harness.container_runtime_identity = Mock(return_value=("node", "1" * 64))
+            harness.kubectl = Mock(return_value=SimpleNamespace(stdout="v0.6.8\n"))
+            receipt = {"node_owner": {"id": "2" * 64, "started_at": "time"}, "reference": release.spec.reference}
+            with patch.object(identity, "verify_runtime", return_value=receipt) as bind:
+                harness.verify_pod_image(pod, None, None)
+                harness.verify_pod_image(pod, None, None)
+                self.assertEqual(bind.call_count, 2)
+                self.assertEqual(harness.kubectl.call_count, 1)
+            with patch.object(identity, "verify_runtime", side_effect=ValueError("current root changed")), \
+                    self.assertRaisesRegex(ValueError, "current root"):
+                harness.verify_pod_image(pod, None, None)
+
+    def test_initial_is_bound_before_bootstrap_and_all_eight_stage_inputs_are_explicit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous, _ = simulated_release(Path(directory))
+            current, _ = simulated_release(Path(directory), "0.6.9", "b" * 40)
+            harness = object.__new__(recovery.PublishedRecoveryHarness)
+            harness.pair = identity.VerifiedPair(previous, current, "simulated")
+            harness.select_release(previous.spec.digest, previous.spec.chart)
+            observed = []
+            harness.active_pod = Mock(side_effect=lambda: observed.append((harness.phase, harness.selected.spec.digest, str(harness.chart))))
+            order = []
+            with patch.object(Harness, "install_chart", side_effect=lambda _self: order.append("install")), \
+                    patch.object(Harness, "bootstrap_admin", side_effect=lambda _self: order.append("bootstrap")):
+                harness.install_chart()
+                self.assertEqual([item[0] for item in observed], ["initial"])
+                harness.bootstrap_admin()
+            self.assertEqual(order, ["install", "bootstrap"])
+            with patch.object(Harness, "remove_bootstrap_authority"), patch.object(Harness, "enable_public_route"):
+                harness.remove_bootstrap_authority()
+                harness.enable_public_route()
+            def restored(_self, digest, _nonce, chart):
+                harness.select_release(digest, chart)
+            with patch.object(recovery.RecoveryHarness, "install_restored", side_effect=restored):
+                harness.install_restored(previous.spec.digest, "restored-previous", previous.spec.chart)
+            with patch.object(recovery.RecoveryHarness, "upgrade_current", side_effect=lambda *_: harness.select_release(current.spec.digest, current.spec.chart)):
+                harness.upgrade_current({})
+            with patch.object(recovery.RecoveryHarness, "verify_active_signal"):
+                harness.verify_active_signal("SIGINT")
+                harness.verify_active_signal("SIGTERM")
+            with patch.object(recovery.RecoveryHarness, "install_restored", side_effect=restored):
+                harness.install_restored(previous.spec.digest, "matched-rollback", previous.spec.chart)
+            self.assertEqual([item[0] for item in observed],
+                             ["initial", "bootstrap_removed", "public", "restore", "upgrade", "SIGINT", "SIGTERM", "rollback"])
+            self.assertEqual([item[1] for item in observed], [previous.spec.digest] * 4 + [current.spec.digest] * 3 + [previous.spec.digest])
+    def test_complete_ledger_is_required_before_passed_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous, _ = simulated_release(Path(directory))
+            current, _ = simulated_release(Path(directory), "0.6.9", "b" * 40)
+            harness = object.__new__(recovery.PublishedRecoveryHarness)
+            harness.pair = identity.VerifiedPair(previous, current, "simulated")
+            phases = ("initial", "bootstrap_removed", "public", "restore", "upgrade", "SIGINT", "SIGTERM", "rollback")
+            good = {}
+            for index, phase in enumerate(phases):
+                release = current if phase in ("upgrade", "SIGINT", "SIGTERM") else previous
+                cid = f"{index + 1:064x}"
+                good[phase] = {"phase": phase, "reference": release.spec.reference,
+                               "chart": str(release.spec.chart), "version": "v" + release.spec.version,
+                               "content": {"root_kind": "index", "root": {"digest": release.spec.digest},
+                                           "manifest": {"digest": release.platform.digest, "size": release.platform.size},
+                                           "config": {"digest": release.config.digest, "size": release.config.size}},
+                               "selected": {"cri": {"id": cid}, "pod": {"container": {"image": release.spec.reference,
+                                                                                        "containerID": "containerd://" + cid}}}}
+            harness.runtime_receipts = copy.deepcopy(good)
+            with patch("builtins.print") as summary:
+                harness.print_summary()
+            summary.assert_called_once()
+            missing = copy.deepcopy(good)
+            del missing["bootstrap_removed"]
+            wrong_root = copy.deepcopy(good)
+            wrong_root["restore"]["content"]["root"]["digest"] = current.spec.digest
+            wrong_chart = copy.deepcopy(good)
+            wrong_chart["initial"]["chart"] = str(current.spec.chart)
+            wrong_version = copy.deepcopy(good)
+            wrong_version["SIGTERM"]["version"] = "v0.6.8"
+            duplicate = copy.deepcopy(good)
+            duplicate["rollback"]["selected"] = copy.deepcopy(duplicate["initial"]["selected"])
+            for value in (missing, wrong_root, wrong_chart, wrong_version, duplicate):
+                harness.runtime_receipts = value
+                with self.subTest(value=value), patch("builtins.print") as summary, self.assertRaises(AssertionError):
+                    harness.print_summary()
+                summary.assert_not_called()
+
+    def restarted_harness(self, wrong_new=False):
+        harness = object.__new__(recovery.PublishedRecoveryHarness)
+        harness.namespace, harness.release, harness.cluster = "owned", "owned", "owned"
+        old_id, new_id = "1" * 64, "2" * 64
+        def pod(cid):
+            return {"metadata": {"name": "plinth-pod", "uid": "pod"},
+                    "spec": {"nodeName": "k3d-owned-server-0", "containers": [{"name": "plinth", "image": "exact-root"}]},
+                    "status": {"containerStatuses": [{"name": "plinth", "containerID": "containerd://" + cid}]}}
+        old, new = pod(old_id), pod(new_id)
+        harness.ready_pod_snapshot = Mock(side_effect=[old, new])
+        harness.kubectl = Mock(return_value=SimpleNamespace(returncode=0))
+        def verify(_pod, _container, status):
+            if status["containerID"] == "containerd://" + old_id:
+                raise ValueError("retired old CRI must not be inspected")
+            if wrong_new:
+                raise ValueError("new binding invalid")
+        harness.verify_pod_image = Mock(side_effect=verify)
+        return harness, old_id, new
+
+    def test_old_ready_retired_cri_is_not_bound_and_new_snapshot_is_fully_verified(self):
+        harness, old_id, new = self.restarted_harness()
+        with patch.object(recovery.time, "sleep") as sleep:
+            self.assertEqual(harness._wait_restarted(old_id), new)
+        sleep.assert_called_once_with(0.5)
+        harness.verify_pod_image.assert_called_once()
+        self.assertEqual(harness.verify_pod_image.call_args.args[0], new)
+
+    def test_wrong_new_binding_propagates_without_blanket_retry(self):
+        harness, old_id, _new = self.restarted_harness(wrong_new=True)
+        with patch.object(recovery.time, "sleep"), self.assertRaisesRegex(ValueError, "new binding invalid"):
+            harness._wait_restarted(old_id)
+        self.assertEqual(harness.ready_pod_snapshot.call_count, 2)
+        harness.verify_pod_image.assert_called_once()
+
+
+
+class SupportingObservationTest(unittest.TestCase):
+    def test_default_is_noop_and_preserves_original_ready_and_denial_commands(self):
+        harness = object.__new__(Harness)
+        harness.args, harness.namespace, harness.release = SimpleNamespace(), "owned", "owned"
+        harness.apply_json = Mock()
+        harness.kubectl = Mock(side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(returncode=22)])
+        harness.verify_network_policy_denial()
+        self.assertEqual(harness.kubectl.call_count, 2)
+        self.assertEqual(harness.kubectl.call_args_list[0].args[:3], ("wait", "--for=condition=Ready", "pod/attacker"))
+        self.assertEqual(harness.kubectl.call_args_list[1].args[:5], ("exec", "-n", "owned", "attacker", "--"))
+
+    def test_existing_attacker_index_and_flat_profiles_use_shared_binding_without_plinth_policy(self):
+        import k3d_lifecycle_test as lifecycle
+        for indexed in (True, False):
+            with self.subTest(indexed=indexed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                release, blobs = simulated_release(root, config_overrides={"User": "101:102", "Entrypoint": ["curl"], "Labels": {}})
+                digest = release.spec.digest if indexed else release.platform.digest
+                reference = "docker.io/curlimages/curl:8.16.0@" + digest
+                runner = RuntimeRunner(release, blobs, reference, "attacker")
+                runner.pod["metadata"].update(name="attacker", namespace="owned")
+                harness = object.__new__(Harness)
+                path = root / "identity.json"
+                harness.args = SimpleNamespace(runtime_identity_evidence=path)
+                harness.namespace, harness.release, harness.cluster = "owned", "owned", "owned"
+                harness.apply_json = Mock()
+                harness.kubectl = Mock(side_effect=[SimpleNamespace(returncode=0), SimpleNamespace(stdout=json.dumps(runner.pod)), SimpleNamespace(returncode=22)])
+                with patch.object(lifecycle, "CURL_IMAGE", reference), patch.object(identity, "CommandRunner", return_value=runner), \
+                        patch.object(identity, "validate_release_graph") as plinth_policy, patch("builtins.print") as log:
+                    harness.verify_network_policy_denial()
+                plinth_policy.assert_not_called()
+                self.assertEqual(harness.kubectl.call_count, 3)
+                self.assertEqual(harness.kubectl.call_args_list[2].args[:5], ("exec", "-n", "owned", "attacker", "--"))
+                report = json.loads(path.read_text())
+                self.assertEqual(report["receipt"]["indexed_runtime_proof"], indexed)
+                self.assertEqual(report["receipt"]["selected"]["pod"]["container"]["name"], "attacker")
+                self.assertEqual(report["receipt"]["selected"]["pod"]["container"]["image"], reference)
+                self.assertNotIn("PRIVATE-CANARY", path.read_text())
+                self.assertNotIn("PRIVATE-CANARY", str(log.call_args))
+                self.assertEqual(log.call_count, 1)
+
+    def test_generic_index_can_select_amd64_among_additional_upstream_platforms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release, blobs = simulated_release(Path(directory))
+            index = copy.deepcopy(release.index)
+            index["manifests"].append({"digest": "sha256:" + "9" * 64, "size": 123,
+                                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                                        "platform": {"os": "linux", "architecture": "386"}})
+            raw = encoded(index)
+            digest = descriptor(raw)["digest"]
+            blobs[digest] = raw
+            reference = "docker.io/curlimages/curl:8.16.0@" + digest
+            runner = RuntimeRunner(release, blobs, reference, "attacker")
+            receipt, graph = identity.observe_runtime(reference, runner.pod, "k3d-owned-server-0",
+                                                      runner.container_id, runner, {}, "attacker")
+            self.assertEqual(graph.root_kind, "index")
+            self.assertEqual(receipt["roles"]["cri.imageRef"], "root_index")
+            with self.assertRaises(ValueError):
+                identity.index_platforms(index)
+
+    def test_missing_node_content_fails_explicitly_without_an_index_success_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            release, blobs = simulated_release(Path(directory))
+            runner = RuntimeRunner(release, blobs, release.spec.reference)
+            del runner.blobs[release.spec.digest]
+            with self.assertRaises(KeyError):
+                identity.observe_runtime(release.spec.reference, runner.pod, "k3d-owned-server-0", runner.container_id, runner, {})
 
 
 if __name__ == "__main__":

@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "qualification": "Curated actual selected flat-manifest field fixture only; no raw OCI bytes, indexed runtime, publication or release-pair proof.",
+  "provenance": {
+    "candidate": "65c1e179c43d3a9ae1329b1d7dc068fc09676dce",
+    "actual_source": "54a823dbda8aa228e03d203ab0870b996ca36169",
+    "run": 40064807292,
+    "job": 120785694464,
+    "log_sha256": "57278ed43bab25b314ae4ae2413cef8826888114e2f538af803ec39935bc4aa4",
+    "line": 5894,
+    "timestamp": "2026-10-24T05:48:53.2432440Z",
+    "url": "https://github.com/gobha-me/plinth/actions/runs/40064807292/job/120785694464",
+    "filtered_receipts_sha256": "7d5b89dfc3d686063d2d41fe34d7bfeebc4f3ac50398d9f34c592a20e1928c7c"
+  },
+  "receipt": {
+    "content": {
+      "config": {
+        "digest": "sha256:53b6ffd438a6671f5398ff4de4496fd2ec734db9937adfddb9ee43305cdf4677",
+        "size": 6392
+      },
+      "manifest": {
+        "digest": "sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526",
+        "size": 1778
+      },
+      "platform": "linux/amd64",
+      "root": {
+        "digest": "sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526",
+        "size": 1778
+      },
+      "rootfs_diff_ids": [
+        "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
+        "sha256:19193bc5f65317df670db1b6f5c15e84014d18ed626db77a89d52668ffb7073a",
+        "sha256:da3c263280277904ed2dc91d60b5ca20c05566b7d17a15868fcc1a42b7896631",
+        "sha256:2dd65fdc91183e577b9d32c2c40369ba312b7cae9a2e9cbe6600dc1d3183cc44",
+        "sha256:40677bda75ad0917510e5aa1b4506b5c98cc8f3401a375ccd5e2d8202fc1a523",
+        "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef",
+        "sha256:5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef"
+      ]
+    },
+    "selected": {
+      "containerd": {
+        "ID": "173d93a967196421e5bd5d2c50f5d49ca339908c63e5e492a5771ca134afecd0",
+        "Image": "k3d-plinth-issue38-reg-8f159019:5000/plinth@sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526",
+        "Runtime.Name": "io.containerd.runc.v2",
+        "SnapshotKey": "173d93a967196421e5bd5d2c50f5d49ca339908c63e5e492a5771ca134afecd0",
+        "Snapshotter": "overlayfs"
+      },
+      "cri": {
+        "id": "173d93a967196421e5bd5d2c50f5d49ca339908c63e5e492a5771ca134afecd0",
+        "image": {
+          "image": "sha256:53b6ffd438a6671f5398ff4de4496fd2ec734db9937adfddb9ee43305cdf4677"
+        },
+        "imageRef": "k3d-plinth-issue38-reg-8f159019:5000/plinth@sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526",
+        "name": "plinth"
+      },
+      "image": {
+        "id": "sha256:53b6ffd438a6671f5398ff4de4496fd2ec734db9937adfddb9ee43305cdf4677",
+        "repoDigests": [
+          "k3d-plinth-issue38-reg-8f159019:5000/plinth@sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526"
+        ],
+        "repoTags": [],
+        "size": "37665916"
+      },
+      "pod": {
+        "container": {
+          "containerID": "containerd://173d93a967196421e5bd5d2c50f5d49ca339908c63e5e492a5771ca134afecd0",
+          "image": "k3d-plinth-issue38-reg-8f159019:5000/plinth@sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526",
+          "imageID": "k3d-plinth-issue38-reg-8f159019:5000/plinth@sha256:c93cffee34bf487a07878a25bcf63550afa3311015cec55b5f6f5f4a83a7f526",
+          "name": "plinth"
+        },
+        "node": "k3d-plinth-issue38-8f159019-server-0",
+        "uid": "ac64ae9c-18a3-4ad3-b389-13ce3f54a699"
+      }
+    }
+  }
+}

@@ -166,11 +166,8 @@ class RecoveryHarness(Harness):
             output.write("\n")
         os.replace(temporary, evidence_path)
         # Only whitelisted identity fields, never full Pod/CRI/Spec/environment output.
-        log_receipt = {"selected": receipt["selected"],
-                       "content": {name: receipt["content"][name]
-                                   for name in ("root", "manifest", "config", "platform", "rootfs_diff_ids")}}
         print("source runtime identity verified (selected fields; no published credit): "
-              + json.dumps(log_receipt, sort_keys=True))
+              + json.dumps(published.log_identity(receipt), sort_keys=True))
 
     def image_revision(self, image):
         result = self.run([
@@ -757,13 +754,16 @@ class RecoveryHarness(Harness):
                 self.kubectl("rollout", "status",
                              "statefulset/" + self.workload_name,
                              "-n", self.namespace, "--timeout=10s", timeout=15)
-                pod = self.active_pod()
-                _, container_id = self.container_runtime_identity(pod)
-                if container_id != old_container_id:
-                    return pod
-                last = "old container is still active"
+                pod = self.ready_pod_snapshot()
             except (AssertionError, RuntimeError) as error:
                 last = str(error)
+            else:
+                _, container_id = self.container_runtime_identity(pod)
+                if container_id != old_container_id:
+                    # Strictly verify only the accepted replacement. The old
+                    # Ready snapshot may outlive its retiring CRI record.
+                    return self.verify_pod_snapshot(pod)
+                last = "old container is still active"
             time.sleep(0.5)
         raise AssertionError("Pod supervisor did not restart Plinth: " + last)
 
@@ -1055,6 +1055,8 @@ class PublishedRecoveryHarness(RecoveryHarness):
         self.selected = pair.previous
         self.content_cache = {}
         self.runtime_receipts = {}
+        self.runtime_versions = {}
+        self.phase = "initial"
         self.previous_digest = pair.previous.spec.digest
         self.current_digest = pair.current.spec.digest
         self.previous_revision = pair.previous.spec.revision
@@ -1089,15 +1091,42 @@ class PublishedRecoveryHarness(RecoveryHarness):
 
     def install_chart(self):
         Harness.install_chart(self)
+        # Bind the initial release before the first bootstrap request.
+        self.phase = "initial"
+        self.active_pod()
 
     def bootstrap_admin(self):
         Harness.bootstrap_admin(self)
 
     def remove_bootstrap_authority(self):
+        self.phase = None
         Harness.remove_bootstrap_authority(self)
+        self.phase = "bootstrap_removed"
+        self.active_pod()
 
     def enable_public_route(self):
+        self.phase = None
         Harness.enable_public_route(self)
+        self.phase = "public"
+        self.active_pod()
+
+    def install_restored(self, digest, nonce, chart):
+        self.phase = None
+        RecoveryHarness.install_restored(self, digest, nonce, chart)
+        self.phase = "rollback" if nonce == "matched-rollback" else "restore"
+        self.active_pod()
+
+    def upgrade_current(self, expected):
+        self.phase = None
+        RecoveryHarness.upgrade_current(self, expected)
+        self.phase = "upgrade"
+        self.active_pod()
+
+    def verify_active_signal(self, signame):
+        self.phase = None
+        RecoveryHarness.verify_active_signal(self, signame)
+        self.phase = signame
+        self.active_pod()
 
     def restored_values(self, _chart, nonce):
         return self.values(registration=False, nonce=nonce, traefik_enabled=True)
@@ -1110,22 +1139,50 @@ class PublishedRecoveryHarness(RecoveryHarness):
 
     def verify_pod_image(self, pod, _container, _status):
         node, container_id = self.container_runtime_identity(pod)
-        key = (node, container_id)
-        if key not in self.runtime_receipts:
-            receipt = published.verify_runtime(self.selected, pod, node, container_id,
-                                                self.runner, self.content_cache)
+        # Only content is cached. Rebind current Pod/CRI/ctr and expected release
+        # on every call, even when this exact container already has a receipt.
+        receipt = published.verify_runtime(self.selected, pod, node, container_id,
+                                            self.runner, self.content_cache)
+        owner = receipt["node_owner"]
+        key = (node, owner["id"], owner["started_at"], container_id, self.selected.spec.reference)
+        if key not in self.runtime_versions:
             version = self.kubectl("exec", "-n", self.namespace, pod["metadata"]["name"],
                                    "--", "/usr/local/bin/plinth", "--version").stdout.strip()
             require(version == "v" + self.selected.spec.version,
                     "deployed binary is not the selected release identity")
-            receipt["version"] = version
-            receipt["chart"] = str(self.chart)
-            self.runtime_receipts[key] = receipt
-        else:
-            require(self.runtime_receipts[key]["reference"] == self.selected.spec.reference,
-                    "container was rebound to a different release")
+            self.runtime_versions[key] = version
+        receipt.update(version=self.runtime_versions[key], chart=str(self.chart), phase=self.phase)
+        if self.phase is not None:
+            self.runtime_receipts[(self.phase, *key)] = receipt
+
+    def validate_phase_ledger(self):
+        phases = ("initial", "bootstrap_removed", "public", "restore", "upgrade", "SIGINT", "SIGTERM", "rollback")
+        receipts = list(self.runtime_receipts.values())
+        require(tuple(item.get("phase") for item in receipts) == phases,
+                "published recovery phase ledger is incomplete or out of order")
+        containers = []
+        for phase, receipt in zip(phases, receipts):
+            release = self.pair.current if phase in ("upgrade", "SIGINT", "SIGTERM") else self.pair.previous
+            content = receipt.get("content", {})
+            selected = receipt.get("selected", {})
+            pod = selected.get("pod", {}).get("container", {})
+            cid = selected.get("cri", {}).get("id")
+            require(receipt.get("reference") == release.spec.reference
+                    and receipt.get("chart") == str(release.spec.chart)
+                    and receipt.get("version") == "v" + release.spec.version
+                    and pod.get("image") == release.spec.reference
+                    and isinstance(cid, str) and re.fullmatch(r"[0-9a-f]{64}", cid)
+                    and pod.get("containerID") == "containerd://" + cid
+                    and content.get("root_kind") == "index"
+                    and content.get("root", {}).get("digest") == release.spec.digest
+                    and content.get("manifest") == {"digest": release.platform.digest, "size": release.platform.size}
+                    and content.get("config") == {"digest": release.config.digest, "size": release.config.size},
+                    "published recovery phase identity differs")
+            containers.append(cid)
+        require(len(set(containers)) == len(phases), "published recovery phases did not bind distinct replacements")
 
     def print_summary(self):
+        self.validate_phase_ledger()
         print("k3d recovery: published exact-artifact matched backup/restore, "
               "upgrade/rollback and active SIGINT/SIGTERM passed; "
               f"previous={self.pair.previous.spec.reference} "
@@ -1202,6 +1259,7 @@ def run_published(args):
             preflight_charts(pair, args, runner, Path(temporary))
         harness = PublishedRecoveryHarness(args, pair, runner)
         harness.execute()
+        harness.validate_phase_ledger()
         report["outcome"] = "passed"
     finally:
         primary = sys.exc_info()[0] is not None

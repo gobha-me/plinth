@@ -177,8 +177,8 @@ class CommandRunner:
                             errors.extend(chunk)
                         else:
                             count += len(chunk)
-                            require(count <= maximum, "identity stdout exceeds limit")
                             digest.update(chunk)
+                            require(count <= maximum, "identity stdout exceeds limit")
                             if not streaming:
                                 output.extend(chunk)
                 process.wait(timeout=max(0.001, deadline - time.monotonic()))
@@ -391,17 +391,12 @@ def verify_pair(spec, runner):
     return VerifiedPair(previous, current, spec.compatibility)
 
 
-def verify_runtime(_release, _pod, _node, _container_id, _runner, _cache):
-    """Fail closed until actual pinned CI schema evidence validates the adapter."""
-    raise ValueError("published runtime binding requires reviewed actual CRI/containerd schema fixtures")
-
-
-def selected_runtime_fields(pod, cri, image, container):
+def selected_runtime_fields(pod, cri, image, container, container_name="plinth"):
     """Whitelist only identity fields; never persist runtime Spec/Env/Secrets."""
     status = cri.get("status", {})
     image_status = image.get("status", {})
-    pod_container = next(item for item in pod["spec"]["containers"] if item.get("name") == "plinth")
-    pod_status = next(item for item in pod["status"]["containerStatuses"] if item.get("name") == "plinth")
+    pod_container = next(item for item in pod["spec"]["containers"] if item.get("name") == container_name)
+    pod_status = next(item for item in pod["status"]["containerStatuses"] if item.get("name") == container_name)
     def scalar(value):
         return value if type(value) in (str, int) else None
 
@@ -415,7 +410,7 @@ def selected_runtime_fields(pod, cri, image, container):
         source_image = scalar(source_image)
     return {
         "pod": {"uid": scalar(pod["metadata"]["uid"]), "node": scalar(pod["spec"]["nodeName"]),
-                "container": {"name": "plinth", "image": scalar(pod_container.get("image")),
+                "container": {"name": container_name, "image": scalar(pod_container.get("image")),
                               "containerID": scalar(pod_status.get("containerID")),
                               "imageID": scalar(pod_status.get("imageID"))}},
         "cri": {"id": scalar(status.get("id")), "name": scalar(status.get("metadata", {}).get("name")),
@@ -429,64 +424,267 @@ def selected_runtime_fields(pod, cri, image, container):
 
 
 
-def verify_source_runtime(reference, pod, node, container_id, runner, cache):
-    """Actual source-image graph proof; CRI digest forms remain opaque here.
 
-    This verifies task-node content, not publication, attestations or the held
-    strict published binding adapter. No runtime environment fields are returned.
-    """
-    repository, separator, digest = reference.rpartition("@")
-    require(separator and repository and DIGEST.fullmatch(digest), "source image is not digest pinned")
+@dataclass(frozen=True)
+class ImageReference:
+    repository: str
+    digest: str
+    tag: str | None = None
+
+    @property
+    def canonical(self):
+        return self.repository + "@" + self.digest
+
+
+def image_reference(value):
+    require(isinstance(value, str) and len(value) <= 2048, "image reference unavailable")
+    name, separator, digest = value.rpartition("@")
+    require(separator and DIGEST.fullmatch(digest)
+            and re.fullmatch(r"[a-z0-9][a-z0-9./:_-]*", name), "unsupported digest-pinned image reference")
+    tag = None
+    if name.rfind(":") > name.rfind("/"):
+        name, tag = name.rsplit(":", 1)
+        require(bool(re.fullmatch(r"[a-z0-9_][a-z0-9_.-]{0,127}", tag)), "unsupported image tag")
+    require(name and not name.endswith("/"), "image repository missing")
+    return ImageReference(name, digest, tag)
+
+
+@dataclass(frozen=True)
+class NodeGraph:
+    node: str
+    reference: str
+    root: Blob
+    root_kind: str
+    root_document: dict
+    manifest: Blob
+    manifest_document: dict
+    config: Blob
+    config_document: dict
+    layers: tuple[Blob, ...]
+    diff_ids: tuple[str, ...]
+    owner: tuple[str, str]
+
+    def summary(self):
+        def descriptor(item):
+            return {"digest": item.digest, "size": item.size}
+        return {"root": descriptor(self.root), "root_kind": self.root_kind,
+                "manifest": descriptor(self.manifest), "config": descriptor(self.config),
+                "platform": "linux/amd64", "rootfs_diff_ids": list(self.diff_ids),
+                "layers": [descriptor(item) for item in self.layers]}
+
+
+def node_owner(node, runner):
+    # A fixed safe projection; never capture Docker Env/Config/Spec here.
+    owner = runner.json(["docker", "inspect", "--type", "container", "--format",
+                         '{"id":{{json .Id}},"started_at":{{json .State.StartedAt}}}', node])
+    require(isinstance(owner, dict) and isinstance(owner.get("id"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", owner["id"])
+            and isinstance(owner.get("started_at"), str)
+            and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z", owner["started_at"])
+            and not owner["started_at"].startswith("0001-"), "owned node lifetime unavailable")
+    return owner["id"], owner["started_at"]
+
+
+def selected_amd64(index):
+    entries = index.get("manifests")
+    require(isinstance(entries, list) and 0 < len(entries) <= 128, "invalid node image index")
+    matches = []
+    for entry in entries:
+        descriptor = blob(entry)
+        require(entry.get("mediaType") in MANIFEST_TYPES, "unsupported indexed object kind")
+        platform = entry.get("platform", {})
+        require(isinstance(platform, dict), "invalid node index platform")
+        if platform.get("os") == "linux" and platform.get("architecture") == "amd64":
+            require(not platform.get("variant"), "unsupported amd64 variant")
+            matches.append(descriptor)
+    require(len(matches) == 1, "node index lacks one unique amd64 manifest")
+    return matches[0]
+
+
+def validate_graph_edges(graph):
+    if graph.root_kind == "index":
+        require(graph.root_document.get("mediaType") in INDEX_TYPES
+                and selected_amd64(graph.root_document) == graph.manifest, "cached index edges differ")
+    else:
+        require(graph.root_kind == "manifest" and graph.root == graph.manifest
+                and graph.root_document == graph.manifest_document, "cached root kind differs")
+    require(graph.manifest_document.get("mediaType") in MANIFEST_TYPES
+            and blob(graph.manifest_document.get("config")) == graph.config
+            and tuple(blob(item) for item in graph.manifest_document.get("layers", [])) == graph.layers
+            and tuple(graph.config_document.get("rootfs", {}).get("diff_ids", [])) == graph.diff_ids,
+            "cached manifest or config edges differ")
+
+
+def read_node_graph(reference, node, runner, cache):
+    expected = image_reference(reference)
+    owner = node_owner(node, runner)
+    key = (node, *owner, expected.canonical)
+    if key in cache:
+        graph = cache[key]
+        require(isinstance(graph, NodeGraph) and graph.node == node
+                and graph.reference == expected.canonical and graph.root.digest == expected.digest
+                and graph.owner == owner, "node content cache identity differs")
+        validate_graph_edges(graph)
+        return graph
+    prefix = ["docker", "exec", node, "ctr", "--namespace", "k8s.io", "content", "get"]
+
+    def content(digest, size=None):
+        raw = runner.run(prefix + [digest], maximum=min(METADATA_LIMIT, size or METADATA_LIMIT)).stdout
+        require("sha256:" + hashlib.sha256(raw).hexdigest() == digest
+                and (size is None or len(raw) == size), "node content identity differs")
+        document = parse_json(raw)
+        require(isinstance(document, dict), "node content is not an OCI object")
+        return document, Blob(digest, len(raw))
+
+    root, root_blob = content(expected.digest)
+    require(root.get("schemaVersion") == 2, "unsupported node root schema")
+    if root.get("mediaType") in INDEX_TYPES:
+        manifest_blob = selected_amd64(root)
+        manifest, _ = content(manifest_blob.digest, manifest_blob.size)
+        root_kind = "index"
+    elif root.get("mediaType") in MANIFEST_TYPES:
+        manifest, manifest_blob, root_kind = root, root_blob, "manifest"
+    else:
+        raise ValueError("unsupported node root object kind")
+    require(manifest.get("schemaVersion") == 2 and manifest.get("mediaType") in MANIFEST_TYPES,
+            "selected node object is not an image manifest")
+    config_entry = manifest.get("config")
+    require(isinstance(config_entry, dict) and config_entry.get("mediaType") in CONFIG_TYPES,
+            "unsupported node config kind")
+    config_blob = blob(config_entry)
+    require(config_blob.digest not in (root_blob.digest, manifest_blob.digest), "ambiguous config object role")
+    config, _ = content(config_blob.digest, config_blob.size)
+    require(config.get("architecture") == "amd64" and config.get("os") == "linux", "node config platform differs")
+    layer_entries = manifest.get("layers")
+    require(isinstance(layer_entries, list) and 0 < len(layer_entries) <= 256, "invalid node layer list")
+    require(all(isinstance(item, dict) and item.get("mediaType") in LAYER_TYPES for item in layer_entries),
+            "unsupported node layer kind")
+    layers = tuple(blob(entry) for entry in layer_entries)
+    rootfs = config.get("rootfs")
+    require(isinstance(rootfs, dict), "node rootfs is missing")
+    diffs = rootfs.get("diff_ids")
+    require(sum(item.size for item in layers) <= CONTENT_LIMIT and isinstance(diffs, list)
+            and len(diffs) == len(layers)
+            and all(isinstance(item, str) and DIGEST.fullmatch(item) for item in diffs), "node rootfs descriptors invalid")
+    # Ordering and repeated layers/diff IDs are part of the image identity.
+    for layer in layers:
+        runner.hash_stream(prefix + [layer.digest], layer)
+    graph = NodeGraph(node, expected.canonical, root_blob, root_kind, root, manifest_blob, manifest,
+                      config_blob, config, layers, tuple(diffs), owner)
+    validate_graph_edges(graph)
+    cache[key] = graph
+    return graph
+
+
+def resolve_image_role(value, expected, graph):
+    """Resolve a qualified image reference via verified OCI object kinds/edges."""
+    actual = image_reference(value)
+    require(actual.repository == expected.repository and actual.tag in (None, expected.tag),
+            "runtime image repository or tag differs")
+    if actual.digest == graph.root.digest:
+        require(graph.root_kind in ("index", "manifest"), "unknown root object role")
+        return "root_index" if graph.root_kind == "index" else "root_manifest"
+    if graph.root_kind == "index" and actual.digest == graph.manifest.digest:
+        require(graph.manifest_document.get("mediaType") in MANIFEST_TYPES, "unknown selected manifest role")
+        return "selected_manifest"
+    # A config or a foreign-platform manifest cannot stand in for an image reference.
+    raise ValueError("runtime reference does not resolve to the selected image graph")
+
+
+def bind_selected_runtime(reference, selected, node, container_id, graph, container_name="plinth"):
+    expected = image_reference(reference)
+    require(graph.node == node and graph.reference == expected.canonical and graph.root.digest == expected.digest,
+            "runtime graph owner or root differs")
+    require(isinstance(container_id, str) and re.fullmatch(r"[0-9a-f]{64}", container_id), "unsupported container identity")
+    pod, cri, image, ctr = (selected[name] for name in ("pod", "cri", "image", "containerd"))
+    require(isinstance(pod["uid"], str) and pod["uid"] and pod["node"] == node
+            and pod["container"]["name"] == container_name
+            and pod["container"]["containerID"] == "containerd://" + container_id
+            and pod["container"]["image"] == reference and cri["id"] == container_id
+            and cri["name"] == container_name and ctr["ID"] == container_id
+            and ctr["SnapshotKey"] == container_id
+            and ctr["Runtime.Name"] == "io.containerd.runc.v2" and ctr["Snapshotter"] == "overlayfs",
+            "runtime container or pinned runtime profile differs")
+    configured = image_reference(ctr["Image"])
+    require((ctr["Image"] == reference if expected.tag is None else
+             configured.canonical == expected.canonical and configured.tag in (None, expected.tag)),
+            "containerd container does not retain the configured root reference")
+    require(isinstance(cri["image"], dict) and cri["image"].get("image") == graph.config.digest
+            and image["id"] == graph.config.digest, "CRI config identity differs from verified config")
+    require(isinstance(image["size"], str) and isinstance(image["repoTags"], list),
+            "unsupported CRI image metadata shape")
+    digests = image["repoDigests"]
+    require(isinstance(digests, list) and digests, "CRI repository identities missing")
+    roles = {"pod.imageID": resolve_image_role(pod["container"]["imageID"], expected, graph),
+             "cri.imageRef": resolve_image_role(cri["imageRef"], expected, graph),
+             "image.repoDigests": [resolve_image_role(item, expected, graph) for item in digests]}
+    return roles
+
+
+def observe_runtime(reference, pod, node, container_id, runner, cache, container_name="plinth"):
+    expected = image_reference(reference)
+    require(pod.get("spec", {}).get("nodeName") == node
+            and isinstance(container_id, str) and re.fullmatch(r"[0-9a-f]{64}", container_id),
+            "runtime Pod owner differs")
+    containers = [item for item in pod["spec"].get("containers", []) if item.get("name") == container_name]
+    statuses = [item for item in pod.get("status", {}).get("containerStatuses", [])
+                if item.get("name") == container_name]
+    require(len(containers) == len(statuses) == 1 and containers[0].get("image") == reference
+            and statuses[0].get("containerID") == "containerd://" + container_id,
+            "runtime Pod container differs")
+    owner_before = node_owner(node, runner)
     prefix = ["docker", "exec", node]
     cri = runner.json(prefix + ["crictl", "inspect", container_id])
-    image_ref = cri.get("status", {}).get("imageRef")
-    require(isinstance(image_ref, str) and image_ref and len(image_ref) <= 2048
-            and not image_ref.startswith("-") and "\x00" not in image_ref, "CRI image reference unavailable")
-    image = runner.json(prefix + ["crictl", "inspecti", image_ref])
-    container = runner.json(prefix + ["ctr", "--namespace", "k8s.io", "containers", "info", container_id])
-    selected = selected_runtime_fields(pod, cri, image, container)
-    require(selected["pod"]["node"] == node and selected["cri"]["id"] == container_id
-            and selected["pod"]["container"]["containerID"] == "containerd://" + container_id
-            and selected["pod"]["container"]["image"] == reference
-            and selected["containerd"]["ID"] == container_id
-            and selected["containerd"]["Image"] == reference,
-            "source container does not bind the exact task image reference")
-    key = (node, reference)
-    if key not in cache:
-        def content(expected_digest, expected_size=None):
-            raw = runner.run(prefix + ["ctr", "--namespace", "k8s.io", "content", "get", expected_digest],
-                             maximum=min(METADATA_LIMIT, expected_size or METADATA_LIMIT)).stdout
-            require("sha256:" + hashlib.sha256(raw).hexdigest() == expected_digest
-                    and (expected_size is None or len(raw) == expected_size), "node content identity differs")
-            return parse_json(raw), Blob(expected_digest, len(raw))
-        root, root_blob = content(digest)
-        require(isinstance(root, dict) and root.get("schemaVersion") == 2, "unsupported source root manifest")
-        if root.get("mediaType") in INDEX_TYPES:
-            matches = [entry for entry in root.get("manifests", [])
-                       if entry.get("platform", {}).get("os") == "linux"
-                       and entry.get("platform", {}).get("architecture") == "amd64"]
-            require(len(matches) == 1, "ambiguous source amd64 platform")
-            selected_manifest = blob(matches[0])
-            manifest, _ = content(selected_manifest.digest, selected_manifest.size)
-        else:
-            manifest, selected_manifest = root, root_blob
-        require(manifest.get("mediaType") in MANIFEST_TYPES, "unsupported source image manifest")
-        config_blob = blob(manifest.get("config"))
-        config, _ = content(config_blob.digest, config_blob.size)
-        require(config.get("architecture") == "amd64" and config.get("os") == "linux",
-                "source node config platform differs")
-        layers = tuple(blob(entry) for entry in manifest.get("layers", []))
-        diffs = config.get("rootfs", {}).get("diff_ids", [])
-        require(0 < len(layers) <= 256 and sum(item.size for item in layers) <= CONTENT_LIMIT
-                and len(diffs) == len(layers)
-                and all(isinstance(item, str) and DIGEST.fullmatch(item) for item in diffs),
-                "source rootfs descriptors invalid")
-        for layer in layers:
-            runner.hash_stream(prefix + ["ctr", "--namespace", "k8s.io", "content", "get", layer.digest], layer)
-        cache[key] = {"root": {"digest": root_blob.digest, "size": root_blob.size},
-                      "manifest": {"digest": selected_manifest.digest, "size": selected_manifest.size},
-                      "config": {"digest": config_blob.digest, "size": config_blob.size},
-                      "platform": "linux/amd64", "rootfs_diff_ids": diffs,
-                      "layers": [{"digest": item.digest, "size": item.size} for item in layers]}
-    return {"qualification": "selected actual source identity fields; CRI digests opaque; no published credit",
-            "selected": selected, "content": cache[key]}
+    ctr = runner.json(prefix + ["ctr", "--namespace", "k8s.io", "containers", "info", container_id])
+    graph = read_node_graph(reference, node, runner, cache)
+    actual_ref = cri.get("status", {}).get("imageRef")
+    resolve_image_role(actual_ref, expected, graph)
+    # Query the actual CRI reference, never a guessed root/config alias.
+    image = runner.json(prefix + ["crictl", "inspecti", actual_ref])
+    selected = selected_runtime_fields(pod, cri, image, ctr, container_name)
+    roles = bind_selected_runtime(reference, selected, node, container_id, graph, container_name)
+    require(graph.owner == owner_before == node_owner(node, runner), "node lifetime changed during observation")
+    return {"selected": selected, "content": graph.summary(), "roles": roles,
+            "node_owner": {"id": graph.owner[0], "started_at": graph.owner[1]}}, graph
+
+
+def validate_release_graph(release, graph):
+    require(graph.reference == release.spec.reference and graph.root_kind == "index"
+            and graph.root.digest == release.spec.digest and graph.root_document == release.index
+            and graph.manifest == release.platform and graph.manifest_document == release.manifest
+            and graph.config == release.config and graph.layers == release.layers,
+            "node graph differs from verified published preflight")
+    config = graph.config_document.get("config", {})
+    require(isinstance(config, dict), "actual Plinth config is missing")
+    labels = config.get("Labels", {})
+    require(isinstance(labels, dict), "actual Plinth labels are missing")
+    require(config.get("User") == "10001:10001" and config.get("Entrypoint") == ["/usr/local/bin/plinth"]
+            and labels.get("org.opencontainers.image.version") == release.spec.version
+            and labels.get("org.opencontainers.image.revision") == release.spec.revision,
+            "actual node config differs from the Plinth release contract")
+    require(release.image_config.get("Id") == graph.config.digest,
+            "preflight config identity differs from actual node config")
+    preflight = release.image_config.get("Config", {})
+    require(all(config.get(name) == preflight.get(name) for name in ("User", "Entrypoint", "Labels")),
+            "preflight Plinth config fields differ from actual node config")
+
+
+def verify_runtime(release, pod, node, container_id, runner, cache):
+    receipt, graph = observe_runtime(release.spec.reference, pod, node, container_id, runner, cache)
+    validate_release_graph(release, graph)
+    receipt["reference"] = release.spec.reference
+    receipt["qualification"] = "verified published preflight/node binding; actual pair journey still required"
+    return receipt
+
+
+def verify_source_runtime(reference, pod, node, container_id, runner, cache):
+    receipt, _graph = observe_runtime(reference, pod, node, container_id, runner, cache)
+    receipt["qualification"] = "verified source-image node binding; no published credit"
+    return receipt
+
+
+def log_identity(receipt):
+    names = ("root", "root_kind", "manifest", "config", "platform", "rootfs_diff_ids")
+    return {"selected": receipt["selected"], "content": {name: receipt["content"][name] for name in names},
+            "roles": receipt["roles"], "node_owner": receipt["node_owner"],
+            "qualification": receipt["qualification"]}

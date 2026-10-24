@@ -8,6 +8,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import uuid
@@ -25,6 +26,52 @@ def workflow_job(text: str, name: str) -> str:
         text,
     )
     return match.group(0) if match else ""
+
+
+def check_live_lifecycle_commands(candidate: str) -> list[str]:
+    """Check this finite executed run block, not matching text in dead shell code."""
+    name = "Exercise the Kubernetes and Traefik lifecycle"
+    steps = re.findall(rf"(?ms)^      - name: {re.escape(name)}\s*\n(.*?)(?=^      - |\Z)", candidate)
+    error = "Runtime image CI must execute min/max lifecycle commands with their exact helper evidence paths"
+    if len(steps) != 1:
+        return [error]
+    header, separator, body = steps[0].partition("        run: |\n")
+    # Keep the reviewed executable context: an echo shell, extra condition or
+    # different working directory must not turn matching text into fake credit.
+    expected_header = ["if: ${{ matrix.arch == 'amd64' }}", "env:",
+                       "PLINTH_DEPLOYMENT_TOOLS_DIR: /tmp/plinth-deployment-tools/bin"]
+    if not separator or [line.strip() for line in header.splitlines()
+                         if line.strip() and not line.lstrip().startswith("#")] != expected_header:
+        return [error]
+    lines = body.splitlines()
+    if any(line.strip() and not line.startswith("          ") for line in lines):
+        return [error]
+    script = "\n".join(line[10:] if line else "" for line in lines)
+    script = re.sub(r"\\\n", " ", script)
+    try:
+        commands = [shlex.split(line, comments=False, posix=False) for line in script.splitlines()
+                    if line.strip() and not line.lstrip().startswith("#")]
+    except ValueError:
+        return [error]
+    commands = [command for command in commands if command]
+    expected_lines = [
+        "set -euo pipefail",
+        ".github/scripts/install-deployment-tools.sh all",
+        'export PATH="$PLINTH_DEPLOYMENT_TOOLS_DIR:$PATH"',
+        'image="plinth-runtime:amd64-$GITHUB_RUN_ID"',
+    ]
+    for lane in ("min", "max"):
+        expected_lines.append(
+            'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" '
+            f'--kubernetes {lane} --runtime-identity-evidence '
+            f'"$RUNNER_TEMP/helper-runtime-identity-{lane}-$GITHUB_RUN_ID.json"')
+    # Preserve quote spelling: single-quoted variables and quoted assignments
+    # do not have the expansion/assignment semantics of these actual commands.
+    expected = [shlex.split(line, comments=False, posix=False) for line in expected_lines]
+    # No general shell interpreter: accept the known straight-line commands.
+    # Heredocs, functions, if-false, echo, prefixes and ignored failure suffixes
+    # therefore cannot satisfy this execution contract.
+    return [] if commands == expected else [error]
 
 
 def check_runtime_image_workflow() -> list[str]:
@@ -281,10 +328,6 @@ def check_kubernetes_deployment() -> list[str]:
             )
 
     contract_command = "python3 tests/deployment/helm_contract_test.py"
-    live_commands = (
-        'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes min',
-        'python3 tests/deployment/k3d_lifecycle_test.py --image "$image" --kubernetes max',
-    )
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     runtime_ci = (ROOT / ".github" / "workflows" / "runtime-image.yml").read_text(
         encoding="utf-8"
@@ -295,14 +338,7 @@ def check_kubernetes_deployment() -> list[str]:
         rf"(?m)^\s*{re.escape(contract_command)}\s*$", quality_job
     ) is None:
         errors.append("CI is missing the non-cluster Helm contract test invocation")
-    for live_command in live_commands:
-        if re.search(
-            rf"(?m)^\s*{re.escape(live_command)}\s*$", candidate_job
-        ) is None:
-            errors.append(
-                "Runtime image CI is missing the live k3d lifecycle invocation: "
-                + live_command
-            )
+    errors.extend(check_live_lifecycle_commands(candidate_job))
     if re.search(
         r"(?m)^\s*\.github/scripts/install-deployment-tools\.sh contract\s*$",
         quality_job,
