@@ -18,6 +18,7 @@
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
+#include "static_validation_fixture.hpp"
 #include "typed_surface_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -884,6 +885,75 @@ TEST_CASE("U.07: reconciler recovers UNINSTALLING crashed pre-row-delete",
 }
 
 // ── X.01: upgrade happy path (v1.2.3 → v1.3.0) ──────────────────────
+
+TEST_CASE("static upgrade parity: shared configured limit and preflight",
+          "[lifecycle_transitions][integration][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  const auto predecessor = install_valid_notes(scratch);
+  scratch.ctx.schedule_rbac_tests = false;
+  plinth::packages::static_test::PackageCopy copy{
+      "lifecycle_transitions/upgrade-v2"};
+  const auto scenario =
+      GENERATE("lower-limit", "raised-limit", "rbac", "migration");
+  constexpr std::size_t MIB = std::size_t{1024} * 1024;
+  if (std::string_view{scenario} == "lower-limit") {
+    copy.write("client/assets/padding.bin",
+               std::string(std::size_t{64} * 1024, 'x'));
+    scratch.ctx.max_package_size_bytes = copy.tree_bytes() / 2 + 1;
+  } else if (std::string_view{scenario} == "raised-limit") {
+    copy.write("client/assets/padding.bin", std::string(50 * MIB, 'x'));
+    REQUIRE(copy.tree_bytes() > 50 * MIB);
+    CHECK(plinth::packages::validate(copy.root()).disposition() == 1);
+    scratch.ctx.max_package_size_bytes = 64 * MIB;
+  } else if (std::string_view{scenario} == "rbac") {
+    copy.assertion("notes:99:missing");
+  } else {
+    fs::copy_file(copy.root() / "migrations/001_init.sql",
+                  copy.root() / "migrations/001_duplicate.sql");
+  }
+  plinth::packages::ValidationConfig config;
+  config.max_size_bytes = scratch.ctx.max_package_size_bytes;
+  const auto offline = plinth::packages::validate(copy.root(), config);
+  const auto blob = copy.zip();
+  REQUIRE(blob.size() <= scratch.ctx.max_package_size_bytes);
+  REQUIRE(copy.tree_bytes() <= 2 * scratch.ctx.max_package_size_bytes);
+  const auto upgraded =
+      plinth::packages::upgrade_package(blob, predecessor.id, scratch.ctx);
+  INFO((upgraded ? "upgraded" : upgraded.error().report.dump()));
+  if (std::string_view{scenario} == "raised-limit") {
+    REQUIRE(offline.disposition() == 0);
+    REQUIRE(upgraded.has_value());
+    CHECK(upgraded->new_record.state == plinth::packages::InstallStage::ACTIVE);
+    CHECK(upgraded->new_record.version == "1.3.0");
+  } else {
+    REQUIRE(offline.disposition() == 1);
+    REQUIRE_FALSE(upgraded.has_value());
+    const auto& stored = upgraded.error().report;
+    REQUIRE(stored.at("kind") == "validation-errors");
+    CHECK(stored.at("disposition") == 1);
+    if (std::string_view{scenario} == "lower-limit") {
+      REQUIRE(copy.tree_bytes() > scratch.ctx.max_package_size_bytes);
+      REQUIRE(stored.at("messages").size() == 1);
+      CHECK(stored.at("messages")[0].at("rule") == "size-limit");
+    }
+    const auto cli =
+        plinth::packages::static_test::cli_report(offline, copy.root());
+    CHECK(stored.at("total_bytes") == cli.at("total_bytes"));
+    CHECK(stored.at("files_scanned") == cli.at("files_scanned"));
+    CHECK(
+        plinth::packages::static_test::finding_projection(
+            stored.at("messages")) ==
+        plinth::packages::static_test::finding_projection(cli.at("messages")));
+    CHECK(scratch.scalar("SELECT COUNT(*) FROM plinth.packages "
+                         "WHERE version='1.3.0' AND state='INSTALL_FAILED'") ==
+          "1");
+    CHECK(scratch.scalar("SELECT state FROM plinth.packages WHERE id='" +
+                         predecessor.id + "'") == "ACTIVE");
+  }
+}
 
 TEST_CASE("X.01: upgrade v1.3.0 over ACTIVE v1.2.3 lands ACTIVE + SUPERSEDED",
           "[lifecycle_transitions][integration][X.01]") {

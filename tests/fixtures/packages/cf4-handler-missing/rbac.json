@@ -1,5 +1,5 @@
 {
   "rules": [
-    {"namespace": "notes", "description": "Edit access"}
+    {"rule": "notes.edit", "namespace": "notes", "description": "Edit access"}
   ]
 }

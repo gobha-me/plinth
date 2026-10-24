@@ -4,7 +4,9 @@
 #include "kernel/capabilities/types.hpp"
 #include "kernel/js/runtime_config.hpp"
 #include "kernel/packages/detail/reporter.hpp"
+#include "kernel/packages/migrations_internal.hpp"
 #include "kernel/packages/reserved_names.hpp"
+#include "kernel/rbac/rule_validator.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -513,7 +515,72 @@ auto cfw4_memory_over_max(const ParsedPackage& pkg, Reporter& r) -> void {
          Phase::CROSS_FILE);
 }
 
-// ─── Runtime-state: RT1, RT2, RT3 ────────────────────────────────────
+// Typed RBAC supplements the legacy CF rules without renaming their codes.
+auto run_typed_rbac_validation(const ParsedPackage& pkg, Reporter& r) -> void {
+  if (!pkg.rbac_typed || !pkg.manifest || !pkg.capabilities) {
+    return;
+  }
+  auto findings = rbac::validate_rules_static(
+      *pkg.rbac_typed, *pkg.capabilities, pkg.manifest->name);
+  for (const auto& finding : findings) {
+    r.error(finding.rule, finding.message,
+            "rbac.json" + finding.field_path.value_or(""), finding.remediation,
+            Phase::CROSS_FILE);
+  }
+}
+
+auto migration_discovery_rule(MigrationError kind) -> std::string_view {
+  switch (kind) {
+    case MigrationError::DUPLICATE_SEQUENCE:
+      return "migration-duplicate-sequence";
+    case MigrationError::INVALID_FILENAME: return "migration-invalid-filename";
+    case MigrationError::UNQUALIFIED_DDL: return "migration-unqualified-ddl";
+    case MigrationError::READ_FAILED: return "migration-read-failed";
+    case MigrationError::CHECKSUM_MISMATCH:
+    case MigrationError::SCHEMA_CREATE_FAILED:
+    case MigrationError::MIGRATION_APPLY_FAILED:
+    case MigrationError::DB_CONNECTION_BAD:
+    case MigrationError::ADVISORY_LOCK_FAILED:
+    case MigrationError::DROP_FAILED: return "migration-discovery";
+  }
+  return "migration-discovery";
+}
+
+auto run_migration_validation(const ParsedPackage& pkg,
+                              const fs::path& package_root, Reporter& r)
+    -> void {
+  if (!pkg.manifest) {
+    return;
+  }
+  const auto directory = package_root / "migrations";
+  std::error_code ec;
+  const bool exists = fs::exists(directory, ec);
+  if (ec) {
+    r.error("migration-read-failed", ec.message(), "migrations", std::nullopt,
+            Phase::CROSS_FILE);
+    return;
+  }
+  if (!exists) {
+    return;
+  }
+  const auto discovered =
+      detail::discover_migrations(directory, pkg.manifest->name);
+  if (!discovered) {
+    const auto& failure = discovered.error();
+    r.error(std::string{migration_discovery_rule(failure.kind)},
+            failure.message,
+            failure.migration_file ? "migrations/" + *failure.migration_file
+                                   : "migrations",
+            std::nullopt, Phase::CROSS_FILE);
+    return;
+  }
+  for (const auto& warning : discovered->warnings) {
+    r.warn(warning.kind, warning.detail, "migrations", std::nullopt,
+           Phase::CROSS_FILE);
+  }
+}
+
+// ─── Runtime-state: RT1, RT2, RT3 ──────────────────────────────────────
 //
 // Inline per ICD Open Question #4. 0.4.2 does not yet have a live
 // HTTP path to the kernel's registry (0.4.4 scope); when
@@ -566,6 +633,9 @@ auto run_cross_file_validation(const ParsedPackage& pkg,
   cfw2_shareable_non_empty(pkg, r);
   cfw3_entry_imports_client(pkg, package_root, r);
   cfw4_memory_over_max(pkg, r);
+  // Append static parity passes; preserve every legacy CF/CFW relative order.
+  run_typed_rbac_validation(pkg, r);
+  run_migration_validation(pkg, package_root, r);
 }
 
 auto run_runtime_state_validation(const ParsedPackage& pkg,

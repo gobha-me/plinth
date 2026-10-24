@@ -823,6 +823,7 @@ add_executable(plinth_tests
   tests/kernel/packages/config_manifest_test.cpp
   tests/kernel/packages/cross_file_validator_test.cpp
   tests/kernel/packages/validator_test.cpp
+  tests/kernel/packages/static_validation_test.cpp
   tests/kernel/packages/migrations_parsing_test.cpp
   tests/kernel/packages/migrations_test.cpp
   tests/kernel/packages/install_lifecycle_unit_test.cpp

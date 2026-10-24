@@ -32,6 +32,14 @@ using PGconn = pg_conn;
 
 namespace plinth::rbac {
 
+// Pure A.1-A.4 checks for an already-parsed manifest. The caller must not
+// pass a parser result with structural errors: invalid rules are omitted by
+// the parser, so their source-array indexes would no longer be preserved.
+auto validate_rules_static(const RbacManifest& rbac,
+                           const plinth::packages::CapabilityManifest& caps,
+                           std::string_view package_name)
+    -> std::vector<plinth::packages::ManifestParseError>;
+
 auto validate_rules(const RbacManifest& rbac,
                     const plinth::packages::CapabilityManifest& caps,
                     std::string_view package_name, PGconn& conn)

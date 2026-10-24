@@ -954,6 +954,14 @@ auto classify_uploading_collision(PGconn* conn, std::string_view name,
 
 // ─── Validation + migration + registration + extract + activate ──────
 
+auto static_validation_config(const InstallerContext& ctx,
+                              Provenance provenance) -> ValidationConfig {
+  ValidationConfig cfg;
+  cfg.max_size_bytes = ctx.max_package_size_bytes;
+  cfg.is_bundled = (provenance == Provenance::BUNDLED);
+  return cfg;
+}
+
 auto build_validation_report(const ValidationReport& vr) -> nlohmann::json {
   nlohmann::json out;
   out["files_scanned"] = vr.files_scanned;
@@ -1898,13 +1906,12 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
 
   // ── VALIDATING ───────────────────────────────────────────────────
   set_state("VALIDATING");
-  ValidationConfig vcfg{};
+  auto vcfg = static_validation_config(ctx, provenance);
   vcfg.cross_file = true;
   vcfg.against_running_kernel = false; // RT1 handled inline above;
                                        // RT2 handled by PG UNIQUE index
                                        // at REGISTERING; RT3 enforced
                                        // structurally via manifest parse.
-  vcfg.is_bundled = (provenance == Provenance::BUNDLED);
   auto vr = validate(staging, vcfg);
   nlohmann::json vreport = build_validation_report(vr);
   if (!dry_run) {
@@ -4273,11 +4280,10 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
       !u.has_value()) {
     return std::unexpected(fail_and_mark("db-error", u.error()));
   }
-  ValidationConfig vcfg{};
+  auto vcfg = static_validation_config(ctx, provenance);
   vcfg.cross_file = true;
   vcfg.against_running_kernel = false; // RT1 whitelisted via in-process path
   vcfg.upgrade_from_id = existing.id;
-  vcfg.is_bundled = (provenance == Provenance::BUNDLED);
   auto vr = validate(staging, vcfg);
   if (vr.disposition() == 1) {
     return std::unexpected(fail_and_mark("validation-errors",

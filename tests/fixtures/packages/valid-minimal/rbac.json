@@ -1,5 +1,5 @@
 {
   "rules": [
-    {"namespace": "minimal", "description": "Greet access"}
+    {"rule": "minimal.greet", "namespace": "minimal", "description": "Greet access"}
   ]
 }

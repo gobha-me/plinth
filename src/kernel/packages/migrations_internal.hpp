@@ -1,7 +1,8 @@
 #pragma once
 
 // plinth::packages::detail — migrations internal helpers exposed for
-// unit testing. Not part of the 0.4.3 public library surface. Only
+// shared static package validation and unit testing. Not part of the
+// 0.4.3 public library surface. Only
 // pure-logic helpers live here; PG-touching internals stay in the
 // translation unit's anonymous namespace.
 

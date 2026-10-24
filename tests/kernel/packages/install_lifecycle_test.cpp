@@ -19,8 +19,10 @@
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
+#include "static_validation_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 #include <zip.h>
@@ -217,6 +219,153 @@ auto make_path_traversal_zip() -> std::vector<std::byte> {
 } // namespace
 
 // ── Test cases ────────────────────────────────────────────────────
+
+TEST_CASE("static install parity: configured lower limit reaches R6",
+          "[install_lifecycle][integration][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  plinth::packages::static_test::PackageCopy copy;
+  copy.write("client/assets/padding.bin",
+             std::string(std::size_t{64} * 1024, 'x'));
+  const auto tree_bytes = copy.tree_bytes();
+  const auto limit = tree_bytes / 2 + 1;
+  const auto blob = copy.zip();
+  REQUIRE(blob.size() <= limit);
+  REQUIRE(tree_bytes > limit);
+  REQUIRE(tree_bytes <= 2 * limit);
+  scratch.ctx.max_package_size_bytes = limit;
+  plinth::packages::ValidationConfig config;
+  config.max_size_bytes = limit;
+  const auto offline = plinth::packages::validate(copy.root(), config);
+  REQUIRE(offline.disposition() == 1);
+  const auto installed = plinth::packages::install_package(
+      blob, plinth::packages::Provenance::USER, scratch.ctx);
+  REQUIRE_FALSE(installed.has_value());
+  CHECK(installed.error().failed_at ==
+        plinth::packages::InstallStage::VALIDATING);
+  CHECK(installed.error().kind == "validation-errors");
+  const auto cli =
+      plinth::packages::static_test::cli_report(offline, copy.root());
+  const auto& stored = installed.error().report;
+  REQUIRE(stored.at("disposition") == 1);
+  CHECK(stored.at("total_bytes") == tree_bytes);
+  CHECK(stored.at("files_scanned") == cli.at("files_scanned"));
+  CHECK(plinth::packages::static_test::finding_projection(
+            stored.at("messages")) ==
+        plinth::packages::static_test::finding_projection(cli.at("messages")));
+  REQUIRE(stored.at("messages").size() == 1);
+  CHECK(stored.at("messages")[0].at("rule") == "size-limit");
+}
+
+TEST_CASE("static install parity: raised limit replaces the old static default",
+          "[install_lifecycle][integration][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  scratch.ctx.schedule_rbac_tests = false;
+  plinth::packages::static_test::PackageCopy copy;
+  constexpr std::size_t MIB = std::size_t{1024} * 1024;
+  copy.write("client/assets/padding.bin", std::string(50 * MIB, 'x'));
+  REQUIRE(copy.tree_bytes() > 50 * MIB);
+  CHECK(plinth::packages::validate(copy.root()).disposition() == 1);
+  scratch.ctx.max_package_size_bytes = 64 * MIB;
+  plinth::packages::ValidationConfig config;
+  config.max_size_bytes = scratch.ctx.max_package_size_bytes;
+  REQUIRE(plinth::packages::validate(copy.root(), config).disposition() == 0);
+  const auto blob = copy.zip();
+  REQUIRE(blob.size() <= scratch.ctx.max_package_size_bytes);
+  const auto installed = plinth::packages::install_package(
+      blob, plinth::packages::Provenance::USER, scratch.ctx);
+  INFO((installed ? "installed" : installed.error().message));
+  REQUIRE(installed.has_value());
+  CHECK(installed->state == plinth::packages::InstallStage::ACTIVE);
+}
+
+TEST_CASE("static install parity: shared RBAC and migration diagnostics",
+          "[install_lifecycle][integration][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  plinth::packages::static_test::PackageCopy copy;
+  const auto scenario = GENERATE("rbac", "migration", "migration-ddl");
+  if (std::string_view{scenario} == "rbac") {
+    copy.assertion("notes:99:missing");
+  } else if (std::string_view{scenario} == "migration-ddl") {
+    // Same ordinary SQL-policy input as the existing discovery regression.
+    copy.write("migrations/001_init.sql", "CREATE TABLE notes (id INT);");
+  } else {
+    fs::copy_file(copy.root() / "migrations/001_init.sql",
+                  copy.root() / "migrations/001_duplicate.sql");
+  }
+  const auto offline = plinth::packages::validate(copy.root());
+  REQUIRE(offline.disposition() == 1);
+  const auto cli =
+      plinth::packages::static_test::cli_report(offline, copy.root());
+  const auto installed = plinth::packages::install_package(
+      copy.zip(), plinth::packages::Provenance::USER, scratch.ctx);
+  REQUIRE_FALSE(installed.has_value());
+  CHECK(installed.error().failed_at ==
+        plinth::packages::InstallStage::VALIDATING);
+  CHECK(installed.error().kind == "validation-errors");
+  const auto& stored = installed.error().report;
+  CHECK(stored.at("disposition") == cli.at("exit_code"));
+  CHECK(stored.at("total_bytes") == cli.at("total_bytes"));
+  CHECK(stored.at("files_scanned") == cli.at("files_scanned"));
+  CHECK(plinth::packages::static_test::finding_projection(
+            stored.at("messages")) ==
+        plinth::packages::static_test::finding_projection(cli.at("messages")));
+  CHECK_FALSE(stored.contains("exit_code"));
+  CHECK_FALSE(stored.at("messages")[0].contains("phase"));
+
+  std::unique_ptr<PGconn, decltype(&PQfinish)> conn{
+      PQconnectdb(conninfo_of(scratch.db).c_str()), PQfinish};
+  REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+  std::unique_ptr<PGresult, decltype(&PQclear)> schemas{
+      PQexec(conn.get(), "SELECT COUNT(*) FROM information_schema.schemata "
+                         "WHERE schema_name = 'ext_notes'"),
+      PQclear};
+  REQUIRE(PQresultStatus(schemas.get()) == PGRES_TUPLES_OK);
+  CHECK(std::string{PQgetvalue(schemas.get(), 0, 0)} == "0");
+}
+
+TEST_CASE("static install parity: migration gap remains a warning",
+          "[install_lifecycle][integration][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  scratch.ctx.schedule_rbac_tests = false;
+  plinth::packages::static_test::PackageCopy copy;
+  fs::copy_file(copy.root() / "migrations/001_init.sql",
+                copy.root() / "migrations/004_next.sql");
+  const auto offline = plinth::packages::validate(copy.root());
+  REQUIRE(offline.disposition() == 2);
+  const auto installed = plinth::packages::install_package(
+      copy.zip(), plinth::packages::Provenance::USER, scratch.ctx);
+  INFO((installed ? "installed" : installed.error().message));
+  REQUIRE(installed.has_value());
+  CHECK(installed->state == plinth::packages::InstallStage::ACTIVE);
+  std::unique_ptr<PGconn, decltype(&PQfinish)> conn{
+      PQconnectdb(conninfo_of(scratch.db).c_str()), PQfinish};
+  REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+  std::unique_ptr<PGresult, decltype(&PQclear)> report{
+      PQexec(conn.get(), "SELECT last_install_report FROM plinth.packages "
+                         "WHERE name = 'notes' AND state = 'ACTIVE'"),
+      PQclear};
+  REQUIRE(PQresultStatus(report.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(report.get()) == 1);
+  const auto stored = nlohmann::json::parse(PQgetvalue(report.get(), 0, 0));
+  CHECK(stored.at("disposition") == 2);
+  const auto cli =
+      plinth::packages::static_test::cli_report(offline, copy.root());
+  CHECK(plinth::packages::static_test::finding_projection(
+            stored.at("messages")) ==
+        plinth::packages::static_test::finding_projection(cli.at("messages")));
+}
 
 TEST_CASE("I.01: valid install -> ACTIVE with DB + disk artefacts",
           "[install_lifecycle][integration][I.01]") {
