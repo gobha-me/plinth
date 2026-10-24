@@ -1773,3 +1773,580 @@ TEST_CASE(
   CHECK(counts.final == 5);
   CHECK(Clock::now() < deadline);
 }
+
+namespace {
+
+constexpr std::size_t COLUMN_FAMILIES = 3;
+constexpr std::size_t COLUMN_NAMES = 9;
+constexpr std::size_t COLUMN_EPOCHS = 2;
+
+// SQL input names/values are written independently of the literal oracle below.
+constexpr std::array<std::string_view, COLUMN_FAMILIES> COLUMN_SQL{
+    R"SQL(SELECT true::boolean AS "alpha", false::boolean AS "Alpha",
+true::boolean AS "two words", false::boolean AS "dash-name",
+true::boolean AS "dot.name", false::boolean AS "café",
+true::boolean AS "café", false::boolean AS "Ωmega",
+true::boolean AS "orbit🪐")SQL",
+    R"SQL(SELECT 10::int4 AS "alpha", 11::int4 AS "Alpha",
+12::int4 AS "two words", 13::int4 AS "dash-name",
+14::int4 AS "dot.name", 15::int4 AS "café",
+16::int4 AS "café", 17::int4 AS "Ωmega",
+18::int4 AS "orbit🪐")SQL",
+    R"SQL(SELECT 'plain-0'::text AS "alpha", 'plain-1'::text AS "Alpha",
+'plain-2'::text AS "two words", 'plain-3'::text AS "dash-name",
+'plain-4'::text AS "dot.name", 'plain-5'::text AS "café",
+'plain-6'::text AS "café", 'plain-7'::text AS "Ωmega",
+'plain-8'::text AS "orbit🪐")SQL"};
+
+constexpr std::string_view COLUMN_OBSERVER = R"JS(
+function object(v) {
+  return v!==null&&typeof v==='object'&&!Array.isArray(v);
+}
+const own=(o,k)=>Object.prototype.hasOwnProperty.call(o,k);
+function members(o,bound) {
+  if(!object(o))throw Error('column object shape');
+  const keys=Reflect.ownKeys(o);
+  if(keys.length>bound||keys.some(k=>typeof k!=='string'||k.length>32))
+    throw Error('column member bound');
+  return keys;
+}
+function shape(r) {
+  const keys=members(r,4);
+  if(!Array.isArray(r.rows)||r.rows.length!==1)
+    throw Error('column row bound');
+  return {object:object(r),keys,owns:{rows:own(r,'rows'),row_count:own(r,'row_count')},
+    count:r.row_count,rowsLength:r.rows.length};
+}
+function row(r) {
+  const keys=members(r,16),properties=[];
+  for(const name of keys) {
+    const units=[];
+    for(let i=0;i<name.length;++i)units.push(name.charCodeAt(i));
+    properties.push({name,units,own:own(r,name),kind:typeof r[name],value:r[name]});
+  }
+  return {object:object(r),count:keys.length,properties};
+}
+(async()=>{
+  const operations=[];
+  const first=await db.query(sql);
+  operations.push({role:'primary',route:'query',settled:'fulfilled'});
+  const held=first.rows[0],before={shape:shape(first),row:row(held)};
+  const second=await db.query('SELECT 42::int4 AS followup');
+  operations.push({role:'retained-followup',route:'query',settled:'fulfilled'});
+  return {before,retained:row(held),firstAfter:shape(first),
+    sameRow:held===first.rows[0],follow:{shape:shape(second),row:row(second.rows[0])},
+    queries:operations.length,execs:0,operations};
+})()
+)JS";
+
+auto column_source(std::size_t family) -> std::string {
+  demand(family < COLUMN_FAMILIES && COLUMN_SQL[family].size() <= 2048,
+         "native PG column SQL bound");
+  Json::StreamWriterBuilder writer;
+  writer["indentation"] = "";
+  return "const sql=" +
+         Json::writeString(writer, std::string{COLUMN_SQL[family]}) + ";" +
+         std::string{COLUMN_OBSERVER};
+}
+
+auto column_key(std::size_t column) -> const char* {
+  constexpr std::array<const char*, COLUMN_NAMES> literals{
+      "alpha",        "Alpha",        "two words",
+      "dash-name",    "dot.name",     "caf\xc3\xa9",
+      "cafe\xcc\x81", "\xce\xa9mega", "orbit\xf0\x9f\xaa\x90"};
+  return literals.at(column);
+}
+
+auto column_units(std::size_t column) -> Json::Value {
+  // UTF-16 code units are literal expectations, not decoded input/observations.
+  switch (column) {
+    case 0: return list({97, 108, 112, 104, 97});
+    case 1: return list({65, 108, 112, 104, 97});
+    case 2: return list({116, 119, 111, 32, 119, 111, 114, 100, 115});
+    case 3: return list({100, 97, 115, 104, 45, 110, 97, 109, 101});
+    case 4: return list({100, 111, 116, 46, 110, 97, 109, 101});
+    case 5: return list({99, 97, 102, 233});
+    case 6: return list({99, 97, 102, 101, 769});
+    case 7: return list({937, 109, 101, 103, 97});
+    default: return list({111, 114, 98, 105, 116, 55358, 56976});
+  }
+}
+
+auto column_value(std::size_t family, std::size_t column) -> Json::Value {
+  constexpr std::array<bool, COLUMN_NAMES> booleans{
+      true, false, true, false, true, false, true, false, true};
+  constexpr std::array<int, COLUMN_NAMES> integers{10, 11, 12, 13, 14,
+                                                   15, 16, 17, 18};
+  constexpr std::array<const char*, COLUMN_NAMES> strings{
+      "plain-0", "plain-1", "plain-2", "plain-3", "plain-4",
+      "plain-5", "plain-6", "plain-7", "plain-8"};
+  if (family == 0) return Json::Value{booleans.at(column)};
+  if (family == 1) return Json::Value{integers.at(column)};
+  return Json::Value{strings.at(column)};
+}
+
+auto column_entry(std::size_t family, std::size_t column) -> Json::Value {
+  Json::Value result{Json::objectValue};
+  result["name"] = column_key(column);
+  result["units"] = column_units(column);
+  result["own"] = true;
+  result["kind"] = family == 0 ? "boolean" : family == 1 ? "number" : "string";
+  result["value"] = column_value(family, column);
+  return result;
+}
+
+auto column_followup() -> Json::Value {
+  Json::Value result{Json::objectValue};
+  result["name"] = "followup";
+  result["units"] = list({102, 111, 108, 108, 111, 119, 117, 112});
+  result["own"] = true;
+  result["kind"] = "number";
+  result["value"] = 42;
+  return result;
+}
+
+auto column_envelope_valid(const Json::Value& actual) -> bool {
+  if (!actual.isObject() ||
+      actual.getMemberNames() != std::vector<std::string>{"count", "keys",
+                                                          "object", "owns",
+                                                          "rowsLength"} ||
+      !equal(actual["object"], true) || !equal(actual["count"], 1) ||
+      !equal(actual["rowsLength"], 1) || !actual["keys"].isArray() ||
+      actual["keys"].size() != 2)
+    return false;
+  bool rows = false;
+  bool count = false;
+  for (const auto& key : actual["keys"]) {
+    if (!key.isString()) return false;
+    if (key == "rows" && !rows)
+      rows = true;
+    else if (key == "row_count" && !count)
+      count = true;
+    else
+      return false;
+  }
+  Json::Value owns{Json::objectValue};
+  owns["row_count"] = true;
+  owns["rows"] = true;
+  return rows && count && equal(actual["owns"], owns);
+}
+
+auto column_row_valid(const Json::Value& actual, std::size_t family,
+                      bool followup = false) -> bool {
+  if (family >= COLUMN_FAMILIES || !actual.isObject() ||
+      actual.getMemberNames() !=
+          std::vector<std::string>{"count", "object", "properties"} ||
+      !equal(actual["object"], true) || !actual["properties"].isArray())
+    return false;
+  const auto count = followup ? 1U : static_cast<unsigned>(COLUMN_NAMES);
+  if (!equal(actual["count"], count) || actual["properties"].size() != count)
+    return false;
+  if (followup) return equal(actual["properties"][0], column_followup());
+  std::array<unsigned, COLUMN_NAMES> seen{};
+  for (const auto& entry : actual["properties"]) {
+    if (!entry.isObject() || !entry["name"].isString()) return false;
+    std::size_t column = COLUMN_NAMES;
+    for (std::size_t candidate = 0; candidate < COLUMN_NAMES; ++candidate) {
+      if (entry["name"] == column_key(candidate)) {
+        column = candidate;
+        break;
+      }
+    }
+    if (column == COLUMN_NAMES || ++seen[column] != 1 ||
+        !equal(entry, column_entry(family, column)))
+      return false;
+  }
+  return true;
+}
+
+auto column_snapshot_valid(const Json::Value& actual, std::size_t family,
+                           bool followup = false) -> bool {
+  return actual.isObject() &&
+         actual.getMemberNames() == std::vector<std::string>{"row", "shape"} &&
+         column_envelope_valid(actual["shape"]) &&
+         column_row_valid(actual["row"], family, followup);
+}
+
+auto column_observation_valid(const Json::Value& actual, std::size_t family)
+    -> bool {
+  return family < COLUMN_FAMILIES && actual.isObject() &&
+         actual.getMemberNames() ==
+             std::vector<std::string>{"before",   "execs",      "firstAfter",
+                                      "follow",   "operations", "queries",
+                                      "retained", "sameRow"} &&
+         equal(actual["queries"], 2) && equal(actual["execs"], 0) &&
+         equal(actual["sameRow"], true) &&
+         equal(actual["operations"], text_operations()) &&
+         column_snapshot_valid(actual["before"], family) &&
+         column_envelope_valid(actual["firstAfter"]) &&
+         column_row_valid(actual["retained"], family) &&
+         column_snapshot_valid(actual["follow"], family, true);
+}
+
+struct ColumnIdentity {
+  std::size_t family;
+  std::size_t epoch;
+};
+using ColumnLedger =
+    std::array<std::array<unsigned, COLUMN_EPOCHS>, COLUMN_FAMILIES>;
+
+auto column_identity_valid(const ColumnIdentity& id) -> bool {
+  return id.family < COLUMN_FAMILIES && id.epoch < COLUMN_EPOCHS;
+}
+
+auto column_identities_complete(const std::vector<ColumnIdentity>& records)
+    -> bool {
+  ColumnLedger counts{};
+  for (const auto& id : records) {
+    if (!column_identity_valid(id)) return false;
+    ++counts[id.family][id.epoch];
+  }
+  for (const auto& family : counts)
+    for (const auto count : family)
+      if (count != 1) return false;
+  return true;
+}
+
+struct ColumnOperation {
+  ColumnIdentity id;
+  std::string role;
+  std::string route;
+  std::string settled;
+};
+
+auto column_operations_complete(const std::vector<ColumnOperation>& records)
+    -> bool {
+  std::array<ColumnLedger, 2> counts{};
+  for (const auto& record : records) {
+    if (!column_identity_valid(record.id) || record.route != "query" ||
+        record.settled != "fulfilled")
+      return false;
+    std::size_t role = 2;
+    if (record.role == "primary") role = 0;
+    if (record.role == "retained-followup") role = 1;
+    if (role == 2) return false;
+    ++counts[role][record.id.family][record.id.epoch];
+  }
+  for (const auto& role : counts)
+    for (const auto& family : role)
+      for (const auto count : family)
+        if (count != 1) return false;
+  return true;
+}
+
+struct ColumnOwnerRecord {
+  std::size_t epoch;
+  Shutdown state;
+};
+
+auto column_owners_complete(const std::vector<ColumnOwnerRecord>& records)
+    -> bool {
+  std::array<unsigned, COLUMN_EPOCHS> counts{};
+  for (const auto& record : records) {
+    if (record.epoch >= COLUMN_EPOCHS || !stopped(record.state)) return false;
+    ++counts[record.epoch];
+  }
+  for (const auto count : counts)
+    if (count != 1) return false;
+  return true;
+}
+
+struct ColumnCell {
+  ColumnIdentity id;
+  Execution execution;
+};
+
+struct ColumnControlCounts {
+  unsigned common = 0;
+  unsigned envelopes = 0;
+  unsigned rows = 0;
+  unsigned properties = 0;
+  unsigned permutations = 0;
+  unsigned associations = 0;
+  unsigned cleanup = 0;
+  unsigned identities = 0;
+  unsigned operations = 0;
+  unsigned owners = 0;
+  unsigned shutdown = 0;
+  unsigned final = 0;
+};
+
+auto corrupt_column_entry(Json::Value& entry, unsigned field) -> void {
+  switch (field) {
+    case 0: entry["name"] = "changed-name"; break;
+    case 1: entry["units"][0] = entry["units"][0].asInt() ^ 1; break;
+    case 2: entry["own"] = false; break;
+    case 3: entry["kind"] = "undefined"; break;
+    default:
+      if (entry["value"].isBool())
+        entry["value"] = !entry["value"].asBool();
+      else if (entry["value"].isString())
+        entry["value"] = "changed";
+      else
+        entry["value"] = entry["value"].asInt() + 1;
+      break;
+  }
+}
+
+auto column_observation_controls(const std::vector<ColumnCell>& cells,
+                                 ColumnControlCounts& counts) -> void {
+  for (const auto& cell : cells) {
+    const auto& actual = *cell.execution.result.value;
+    for (unsigned field = 0; field < 7; ++field) {
+      auto corrupt = actual;
+      switch (field) {
+        case 0: corrupt["queries"] = 3; break;
+        case 1: corrupt["execs"] = 1; break;
+        case 2: corrupt["sameRow"] = false; break;
+        case 3: corrupt["operations"][0]["route"] = "exec"; break;
+        case 4: corrupt["operations"][1]["settled"] = "rejected"; break;
+        case 5: corrupt["operations"].resize(1); break;
+        default: corrupt["extra"] = true; break;
+      }
+      REQUIRE_FALSE(column_observation_valid(corrupt, cell.id.family));
+      ++counts.common;
+    }
+    for (const auto* part : {"before", "firstAfter", "follow"}) {
+      for (unsigned field = 0; field < 9; ++field) {
+        auto corrupt = actual;
+        auto& shape = std::string_view{part} == "firstAfter"
+                          ? corrupt[part]
+                          : corrupt[part]["shape"];
+        switch (field) {
+          case 0: shape["object"] = false; break;
+          case 1: shape["count"] = 2; break;
+          case 2: shape["rowsLength"] = 2; break;
+          case 3: shape["keys"][0] = "extra"; break;
+          case 4: shape["keys"].append("extra"); break;
+          case 5: shape["keys"][1] = shape["keys"][0]; break;
+          case 6: shape["owns"]["rows"] = false; break;
+          case 7: shape["owns"]["row_count"] = false; break;
+          default: shape["extra"] = true; break;
+        }
+        REQUIRE_FALSE(column_observation_valid(corrupt, cell.id.family));
+        ++counts.envelopes;
+      }
+    }
+    for (const auto* part : {"before", "retained", "follow"}) {
+      const bool retained = std::string_view{part} == "retained";
+      const bool followup = std::string_view{part} == "follow";
+      const auto& row = retained ? actual[part] : actual[part]["row"];
+      for (unsigned field = 0; field < 6; ++field) {
+        auto corrupt = actual;
+        auto& changed = retained ? corrupt[part] : corrupt[part]["row"];
+        switch (field) {
+          case 0: changed["object"] = false; break;
+          case 1: changed["count"] = 10; break;
+          case 2: changed["properties"] = Json::Value{Json::objectValue}; break;
+          case 3:
+            changed["properties"].resize(changed["properties"].size() - 1);
+            break;
+          case 4: changed["properties"].append(row["properties"][0]); break;
+          default: changed["extra"] = true; break;
+        }
+        REQUIRE_FALSE(column_observation_valid(corrupt, cell.id.family));
+        ++counts.rows;
+      }
+      for (Json::ArrayIndex property = 0; property < row["properties"].size();
+           ++property) {
+        for (unsigned field = 0; field < 5; ++field) {
+          auto corrupt = actual;
+          auto& changed = retained ? corrupt[part] : corrupt[part]["row"];
+          corrupt_column_entry(changed["properties"][property], field);
+          REQUIRE_FALSE(column_observation_valid(corrupt, cell.id.family));
+          ++counts.properties;
+        }
+      }
+      if (!followup) {
+        auto duplicate = actual;
+        auto& changed = retained ? duplicate[part] : duplicate[part]["row"];
+        changed["properties"][1] = changed["properties"][0];
+        REQUIRE_FALSE(column_observation_valid(duplicate, cell.id.family));
+        ++counts.rows;
+
+        // Only whole-tuple order changes: no column enumeration policy.
+        auto permuted = actual;
+        auto& reordered = retained ? permuted[part] : permuted[part]["row"];
+        Json::Value reverse{Json::arrayValue};
+        for (auto index = row["properties"].size(); index != 0; --index)
+          reverse.append(row["properties"][index - 1]);
+        reordered["properties"] = std::move(reverse);
+        REQUIRE(column_observation_valid(permuted, cell.id.family));
+        ++counts.permutations;
+
+        if (cell.id.family != 0) {
+          // Membership is unchanged; the key-to-value association must fail.
+          auto swapped = actual;
+          auto& association = retained ? swapped[part] : swapped[part]["row"];
+          const auto first = association["properties"][0]["value"];
+          association["properties"][0]["value"] =
+              association["properties"][1]["value"];
+          association["properties"][1]["value"] = first;
+          REQUIRE_FALSE(column_observation_valid(swapped, cell.id.family));
+          ++counts.associations;
+        }
+      }
+    }
+    for (unsigned field = 0; field < 17; ++field) {
+      auto corrupt = cell.execution.cleanup;
+      corrupt_cleanup(corrupt, field);
+      REQUIRE_FALSE(clean(corrupt));
+      ++counts.cleanup;
+    }
+  }
+}
+
+auto column_ledger_controls(const std::vector<ColumnIdentity>& identities,
+                            const std::vector<ColumnOperation>& operations,
+                            const std::vector<ColumnOwnerRecord>& owners,
+                            const TextFinal& final, ColumnControlCounts& counts)
+    -> void {
+  for (std::size_t index = 0; index < identities.size(); ++index) {
+    auto dropped = identities;
+    dropped.erase(dropped.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(column_identities_complete(dropped));
+    auto duplicate = identities;
+    duplicate.push_back(identities[index]);
+    REQUIRE_FALSE(column_identities_complete(duplicate));
+    counts.identities += 2;
+  }
+  for (unsigned field = 0; field < 2; ++field) {
+    auto corrupt = identities;
+    if (field == 0)
+      corrupt[0].family = COLUMN_FAMILIES;
+    else
+      corrupt[0].epoch = COLUMN_EPOCHS;
+    REQUIRE_FALSE(column_identities_complete(corrupt));
+    ++counts.identities;
+  }
+  for (std::size_t index = 0; index < operations.size(); ++index) {
+    auto dropped = operations;
+    dropped.erase(dropped.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(column_operations_complete(dropped));
+    auto duplicate = operations;
+    duplicate.push_back(operations[index]);
+    REQUIRE_FALSE(column_operations_complete(duplicate));
+    counts.operations += 2;
+  }
+  for (unsigned field = 0; field < 5; ++field) {
+    auto corrupt = operations;
+    switch (field) {
+      case 0: corrupt[0].id.family = COLUMN_FAMILIES; break;
+      case 1: corrupt[0].id.epoch = COLUMN_EPOCHS; break;
+      case 2: corrupt[0].role = "unexpected"; break;
+      case 3: corrupt[0].route = "exec"; break;
+      default: corrupt[0].settled = "rejected"; break;
+    }
+    REQUIRE_FALSE(column_operations_complete(corrupt));
+    ++counts.operations;
+  }
+  for (std::size_t index = 0; index < owners.size(); ++index) {
+    auto dropped = owners;
+    dropped.erase(dropped.begin() + static_cast<std::ptrdiff_t>(index));
+    REQUIRE_FALSE(column_owners_complete(dropped));
+    auto duplicate = owners;
+    duplicate.push_back(owners[index]);
+    REQUIRE_FALSE(column_owners_complete(duplicate));
+    counts.owners += 2;
+    for (unsigned field = 0; field < 4; ++field) {
+      auto corrupt = owners;
+      switch (field) {
+        case 0: corrupt[index].state.stopped = false; break;
+        case 1: corrupt[index].state.idempotent = false; break;
+        case 2: corrupt[index].state.active = 1; break;
+        default: corrupt[index].state.free = 1; break;
+      }
+      REQUIRE_FALSE(column_owners_complete(corrupt));
+      ++counts.shutdown;
+    }
+  }
+  auto bad_owner = owners;
+  bad_owner[0].epoch = COLUMN_EPOCHS;
+  REQUIRE_FALSE(column_owners_complete(bad_owner));
+  ++counts.owners;
+  for (unsigned field = 0; field < 5; ++field) {
+    auto corrupt = final;
+    switch (field) {
+      case 0: corrupt.drained = false; break;
+      case 1: corrupt.audits = false; break;
+      case 2: corrupt.active = 1; break;
+      case 3: corrupt.mapping_before = false; break;
+      default: corrupt.mapping_after = false; break;
+    }
+    REQUIRE_FALSE(text_final_valid(corrupt));
+    ++counts.final;
+  }
+}
+
+} // namespace
+
+TEST_CASE("QuickJS native PostgreSQL queries preserve benign column names",
+          "[js][async][db][corpus][native-pg-column-names]") {
+  const auto deadline = Clock::now() + 55s;
+  REQUIRE(plinth::async_bridge_test::pg_available());
+  plinth::async_bridge_test::ensure_drogon_with_db_running();
+  const bool mapping_before = plinth::js::db::oid_mapping_enabled();
+  REQUIRE(mapping_before);
+  std::vector<ColumnCell> observations;
+  std::vector<ColumnOwnerRecord> owners;
+  observations.reserve(6);
+  owners.reserve(2);
+  for (std::size_t epoch = 0; epoch < COLUMN_EPOCHS; ++epoch) {
+    TextOwner owner{deadline};
+    for (std::size_t family = 0; family < COLUMN_FAMILIES; ++family) {
+      observations.push_back(
+          {{family, epoch},
+           drive_text(owner.pool, column_source(family), deadline)});
+    }
+    owners.push_back({epoch, owner.finish()});
+  }
+  const TextFinal final{
+      plinth::lifecycle::async_tasks().drain(text_remaining(deadline)),
+      plinth::log::wait_for_audits(text_remaining(deadline)),
+      plinth::lifecycle::async_tasks().active_for_test(), mapping_before,
+      plinth::js::db::oid_mapping_enabled()};
+  // Actual native/context/owner cleanup precedes every copied-oracle control.
+  // Retention above witnesses a second native query, not driver-result freeing.
+  REQUIRE(text_final_valid(final));
+  REQUIRE(observations.size() == 6);
+  REQUIRE(owners.size() == 2);
+  REQUIRE(column_owners_complete(owners));
+  std::vector<ColumnIdentity> identities;
+  std::vector<ColumnOperation> operations;
+  identities.reserve(6);
+  operations.reserve(12);
+  for (const auto& cell : observations) {
+    INFO("native PG columns family=" << cell.id.family
+                                     << " epoch=" << cell.id.epoch);
+    REQUIRE(clean(cell.execution.cleanup));
+    REQUIRE(cell.execution.result.value.has_value());
+    const auto& actual = *cell.execution.result.value;
+    INFO("native PG column actual=" << actual.toStyledString());
+    REQUIRE(column_observation_valid(actual, cell.id.family));
+    identities.push_back(cell.id);
+    for (const auto& operation : actual["operations"]) {
+      operations.push_back({cell.id, operation["role"].asString(),
+                            operation["route"].asString(),
+                            operation["settled"].asString()});
+    }
+  }
+  REQUIRE(column_identities_complete(identities));
+  REQUIRE(column_operations_complete(operations));
+  REQUIRE(operations.size() == 12);
+  ColumnControlCounts counts;
+  column_observation_controls(observations, counts);
+  column_ledger_controls(identities, operations, owners, final, counts);
+  CHECK(counts.common == 42);
+  CHECK(counts.envelopes == 162);
+  CHECK(counts.rows == 120);
+  CHECK(counts.properties == 570);
+  CHECK(counts.permutations == 12);
+  CHECK(counts.associations == 8);
+  CHECK(counts.cleanup == 102);
+  CHECK(counts.identities == 14);
+  CHECK(counts.operations == 29);
+  CHECK(counts.owners == 5);
+  CHECK(counts.shutdown == 8);
+  CHECK(counts.final == 5);
+  CHECK(Clock::now() < deadline);
+}
