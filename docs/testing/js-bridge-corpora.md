@@ -5,6 +5,10 @@ An ordinary integration test or a successful aggregate test run is not evidence
 that every requested malformed-input and ownership target was exercised.
 Missing, unbuildable, skipped or incomplete targets must remain explicit.
 
+The [coverage ledger](js-bridge-coverage.md) maps the 21 native entries to the
+six requested dimensions with direct, native, simulated and unestablished
+source evidence kept separate.
+
 ## Existing slices and remaining scope
 
 | Slice | Named target | Boundary covered by that slice |
