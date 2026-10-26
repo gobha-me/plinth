@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail closed if the pinned scanner's fake cursor allowlist becomes broad."""
+"""Fail closed if the pinned scanner's exact fixture allowlists become broad."""
 
 import argparse
 import json
@@ -18,6 +18,14 @@ FIXTURES = (
     ("admin_defaults_", Path("tests/kernel/frontend/admin_defaults_contract_test.cpp")),
 )
 OTHER_PATH = Path("tests/kernel/frontend/not_allowed_test.cpp")
+MODULE_FIXTURE = Path("tests/browser/groups-admin-production.mjs")
+MODULE_OTHER_PATH = Path("tests/browser/not_allowed_test.mjs")
+CONTROL_NAMES = (
+    "exact_fixture_allowed", "same_value_other_path", "other_value_same_path",
+    "admin_defaults_exact_fixture_allowed", "admin_defaults_same_value_other_path",
+    "admin_defaults_other_value_same_path", "admin_module_exact_fixture_allowed",
+    "admin_module_same_value_other_path", "admin_module_other_value_same_path",
+)
 REPORT_MAX_BYTES = 1024 * 1024
 
 
@@ -45,6 +53,24 @@ def fixture_inputs(fixture):
     # high-entropy literal. Never emit either fingerprint in diagnostics.
     changed = ("t" if credential[0] != "t" else "u") + credential[1:]
     return source, source.replace(credential, changed, 1)
+
+
+def module_fixture_inputs():
+    source = (ROOT / MODULE_FIXTURE).read_text(encoding="utf-8")
+    blocks = re.findall(
+        r"\bconst\s+OLD_MODULES\s*=\s*Object\.freeze\(\{(.*?)\}\);",
+        source, re.DOTALL,
+    )
+    if len(blocks) != 1:
+        raise RegressionFailure("known module provenance fixture is missing or ambiguous")
+    values = re.findall(r"^\s*api:\s*'([0-9a-f]{64})',?\s*$", blocks[0], re.MULTILINE)
+    if len(values) != 1 or source.count(values[0]) != 1:
+        raise RegressionFailure("known module provenance fixture changed shape")
+    fingerprint = values[0]
+    # Keep the real baseline module hash intact and derive one different,
+    # equally shaped negative value without embedding another hash literal.
+    changed = ("0" if fingerprint[0] != "0" else "1") + fingerprint[1:]
+    return source, source.replace(fingerprint, changed, 1)
 
 
 def check_control(scanner, root, name, path, content, expected_count):
@@ -105,9 +131,18 @@ def main():
                     check_control(scanner, root, prefix + "same_value_other_path", OTHER_PATH, original, 1),
                     check_control(scanner, root, prefix + "other_value_same_path", fixture, changed, 1),
                 ])
-        if len(controls) != 6:
-            raise RegressionFailure("unexpected cursor fixture control inventory")
-        print(json.dumps({"gitleaksAllowlistControls": 6, "passed": 6, "controls": controls}, sort_keys=True))
+            original, changed = module_fixture_inputs()
+            controls.extend([
+                check_control(scanner, root, "admin_module_exact_fixture_allowed",
+                              MODULE_FIXTURE, original, 0),
+                check_control(scanner, root, "admin_module_same_value_other_path",
+                              MODULE_OTHER_PATH, original, 1),
+                check_control(scanner, root, "admin_module_other_value_same_path",
+                              MODULE_FIXTURE, changed, 1),
+            ])
+        if tuple(control["control"] for control in controls) != CONTROL_NAMES:
+            raise RegressionFailure("unexpected exact fixture control inventory")
+        print(json.dumps({"gitleaksAllowlistControls": 9, "passed": 9, "controls": controls}, sort_keys=True))
     except (OSError, UnicodeError, RegressionFailure) as error:
         # No scanner stdout/stderr, match text or fingerprint is printed.
         print("gitleaks allowlist regression failed: " + str(error), file=sys.stderr)

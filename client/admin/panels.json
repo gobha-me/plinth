@@ -6,6 +6,13 @@
       "rbac_rule": "plinth.admin.packages",
       "client_path": "packages.js",
       "order": 0
+    },
+    {
+      "id": "groups",
+      "title": "Groups",
+      "rbac_rule": "plinth.admin.groups",
+      "client_path": "groups.js",
+      "order": 1
     }
   ]
 }

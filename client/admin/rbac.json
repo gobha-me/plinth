@@ -4,6 +4,11 @@
       "rule": "plinth.admin.packages",
       "namespace": "plinth",
       "description": "Discover Administration packages panel; package API permissions are independent."
+    },
+    {
+      "rule": "plinth.admin.groups",
+      "namespace": "plinth",
+      "description": "Discover Administration groups panel; group APIs independently require kernel.admin."
     }
   ]
 }

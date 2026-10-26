@@ -53,3 +53,11 @@ condition = "AND"
 paths = ['''^tests/kernel/frontend/admin_defaults_contract_test\.cpp$''']
 regexTarget = "secret"
 regexes = ['''^aU8t7ANB_fIOdAVVM2G5uF5eF9LqZryfCh0aw265nnc$''']
+
+[[allowlists]]
+description = "Public module SHA256 provenance fixture, not a credential"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''^tests/browser/groups-admin-production\.mjs$''']
+regexTarget = "secret"
+regexes = ['''^809e189dcc1df92b8ea873db241be51d55db92de5e5a0cfc7843770936ab9242$''']

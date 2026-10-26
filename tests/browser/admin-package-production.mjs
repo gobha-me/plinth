@@ -7,14 +7,17 @@ import { createHash, randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { chromium } from 'playwright';
+import { runGroupsAdminJourney } from './groups-admin-production.mjs';
 
 const baseURL = process.env.PLINTH_BASE_URL;
 const buildDir = process.env.PLINTH_TEST_BUILD_DIR;
 const bootstrapToken = process.env.PLINTH_TEST_BOOTSTRAP_TOKEN;
-assert(baseURL && buildDir && bootstrapToken,
+const baselineArchive = process.env.PLINTH_ADMIN_BASELINE_ARCHIVE;
+const identityPath = process.env.PLINTH_ADMIN_ARTIFACT_IDENTITIES;
+assert(baseURL && buildDir && bootstrapToken && baselineArchive && identityPath,
     'run through run-admin-package.py with an owned kernel and fake bootstrap token');
 const origin = new URL(baseURL).origin;
-const archive = join(buildDir, 'packages/admin-0.1.0.zip');
+const archive = join(buildDir, 'packages/admin-0.1.1.zip');
 const fixture = name => join(buildDir, `fixtures/${name}.zip`);
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const literal = value => "'" + String(value).replaceAll("'", "''") + "'";
@@ -54,6 +57,7 @@ async function browserRequest(page, path, method = 'GET', payload = null) {
             body.append('package', new Blob([bytes], { type: 'application/zip' }), payload.name);
         } else if (payload !== null) body = JSON.stringify(payload);
         const prepared = withCsrf(path, { method, credentials: 'same-origin',
+            signal: AbortSignal.timeout(15000),
             ...(body === undefined ? {} : { body }),
             ...(body && !(body instanceof FormData) ?
                 { headers: { 'Content-Type': 'application/json' } } : {}) });
@@ -87,6 +91,7 @@ let archiveHash;
 let moduleHash;
 const moduleHashes = {};
 let kernelAuthority;
+let groupsProof;
 
 function packageRow(name, states = ['ACTIVE', 'ACTIVE_FLAGGED', 'DISABLED']) {
     const stateList = states.map(literal).join(',');
@@ -129,10 +134,12 @@ async function login(principal) {
     await page.getByRole('heading', { name: 'Sign in to Plinth', exact: true }).waitFor();
     await page.locator('input[name=username]').fill(principal.username);
     await page.locator('input[name=password]').fill(principal.password);
-    const loginResponse = page.waitForResponse(response =>
-        new URL(response.url()).pathname === '/api/auth/login');
-    await page.getByRole('button', { name: 'Sign In', exact: true }).click();
-    assert.equal((await loginResponse).status(), 200, `real ${principal.role} login`);
+    const loginResults = await Promise.allSettled([
+        page.waitForResponse(response => new URL(response.url()).pathname === '/api/auth/login'),
+        page.getByRole('button', { name: 'Sign In', exact: true }).click(),
+    ]);
+    for (const result of loginResults) if (result.status === 'rejected') throw result.reason;
+    assert.equal(loginResults[0].value.status(), 200, `real ${principal.role} login`);
     await page.getByRole('heading', { name: 'Home', exact: true }).waitFor();
     const session = await browserRequest(page, '/api/auth/session');
     assert.equal(session.status, 200);
@@ -156,9 +163,11 @@ async function chooseZip(page, zipPath) {
     await page.locator('#admin-package-file').setInputFiles(zipPath);
 }
 async function clickAndResponse(page, button, predicate, expected) {
-    const response = page.waitForResponse(predicate);
-    await page.locator(button).click();
-    const observed = await response;
+    const results = await Promise.allSettled([
+        page.waitForResponse(predicate), page.locator(button).click(),
+    ]);
+    for (const result of results) if (result.status === 'rejected') throw result.reason;
+    const observed = results[0].value;
     assert.equal(observed.status(), expected, `${button} authoritative HTTP status`);
     return observed;
 }
@@ -235,6 +244,7 @@ async function installWriterFetchProxy(page) {
 }
 
 try {
+    const identities = JSON.parse(await readFile(identityPath, 'utf8'));
     const zip = await readFile(archive);
     archiveHash = sha256(zip);
     assert(zip.length > 0 && /^[0-9a-f]{64}$/.test(archiveHash));
@@ -293,7 +303,7 @@ try {
     assert.equal(dryAdmin.status, 200);
     assert.equal(dryAdmin.body.state, 'VALIDATING');
     assert.equal(dryAdmin.body.name, 'admin');
-    assert.equal(dryAdmin.body.version, '0.1.0');
+    assert.equal(dryAdmin.body.version, '0.1.1');
     assert.equal(sql("SELECT count(*) FROM plinth.packages WHERE name='admin'"), '0');
     assert.equal(audit('packages.installed', 'admin').length, 0);
     const installedAdmin = await browserUpload(maintainerPage, archive);
@@ -304,7 +314,7 @@ try {
     assert.match(adminId, uuid);
     const admin = packageRow('admin');
     assert.equal(admin.id, adminId);
-    assert.equal(admin.version, '0.1.0');
+    assert.equal(admin.version, '0.1.1');
     assert.equal(admin.provenance, 'user');
     assert.equal(admin.installed_by_user_id, maintainer.id);
     assert.equal(admin.frontend_mount, null);
@@ -313,15 +323,20 @@ try {
     assert.equal(sql("SELECT count(*) FROM plinth.capabilities WHERE extension_name='admin'"), '0');
     assert.equal(sql(`SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
         WHERE n.nspname='ext_admin' AND c.relkind='r'`), '0', 'admin declares no tables');
-    const ownerRows = jsonSql(`SELECT coalesce(json_agg(r),'[]'::json)::text FROM
+    const ownerRows = jsonSql(`SELECT coalesce(json_agg(r ORDER BY rule),'[]'::json)::text FROM
         (SELECT rule,namespace,extension_name FROM plinth.rbac_rules
          WHERE extension_name='admin' AND orphaned_at IS NULL) r`);
-    assert.deepEqual(ownerRows, [{ rule: 'plinth.admin.packages', namespace: 'plinth', extension_name: 'admin' }]);
+    assert.deepEqual(ownerRows, ['plinth.admin.groups', 'plinth.admin.packages'].map(rule =>
+        ({ rule, namespace: 'plinth', extension_name: 'admin' })));
     assert.equal(sql(`SELECT count(*) FROM plinth.group_rules gr JOIN plinth.rbac_rules r
-        ON r.id=gr.rule_id WHERE r.rule='plinth.admin.packages'`), '0');
+        ON r.id=gr.rule_id WHERE r.extension_name='admin'`), '0');
     assert.equal(sql(`SELECT count(*) FROM plinth.panels WHERE package_id=${literal(adminId)}
         AND panel_id='packages' AND panel_type='primary'
         AND declaration->>'rbac_rule'='plinth.admin.packages'`), '1');
+    assert.equal(sql(`SELECT count(*) FROM plinth.panels WHERE package_id=${literal(adminId)}`), '2');
+    assert.equal(sql(`SELECT count(*) FROM plinth.panels WHERE package_id=${literal(adminId)}
+        AND panel_id='groups' AND panel_type='primary'
+        AND declaration->>'rbac_rule'='plinth.admin.groups'`), '1');
     assert.deepEqual(jsonSql(`SELECT coalesce(json_agg(k ORDER BY rule),'[]'::json)::text FROM
         (SELECT r.rule,r.id,r.extension_name,
             (SELECT coalesce(array_agg(g.name ORDER BY g.name),ARRAY[]::text[])
@@ -335,8 +350,10 @@ try {
     const discovered = await browserRequest(maintainerPage, '/api/frontend/applications');
     assert.equal(discovered.status, 200);
     const application = discovered.body.applications.find(item => item.id === 'admin');
-    assert(application && application.panels.length === 1);
-    assert.equal(application.version, '0.1.0');
+    assert(application);
+    assert.deepEqual(application.panels.map(panel => panel.id), ['packages', 'groups'],
+        'kernel.admin supplies universal panel visibility for the bootstrapped maintainer');
+    assert.equal(application.version, '0.1.1');
     assert.equal(application.title, 'Administration',
         'launcher title comes from manifest display_name, not panel title');
     assert.equal(application.panels[0].id, 'packages');
@@ -356,14 +373,23 @@ try {
     }
     completed.push('N03 real authenticated dry run/install, provenance, ownership and audit');
 
-    // The ordinary package grants its visibility rule to nobody by default.
-    // Even this bootstrapped maintainer needs an explicit, task-owned panel
-    // grant; kernel.admin already supplies the separate package API authority.
+    // Neither package-owned visibility rule is granted by installation.
+    // kernel.admin already gives the maintainer universal visibility and API
+    // authority; retain its task-owned grant for state/upgrade witnesses.
+    // Non-admins need their own visibility rule and independent API grants.
     grant('maintainer', ['plinth.admin.packages']);
     grant('reader', ['plinth.admin.packages', 'packages.read']);
     grant('writer', ['plinth.admin.packages', 'packages.read', 'packages.install']);
     grant('visible', ['plinth.admin.packages']);
     for (const role of ['reader', 'writer', 'visible', 'denied']) await login(principals[role]);
+    for (const role of ['reader', 'writer', 'visible']) {
+        const discovery = await browserRequest(principals[role].page, '/api/frontend/applications');
+        assert.equal(discovery.status, 200);
+        const app = discovery.body.applications.find(item => item.id === 'admin');
+        assert(app);
+        assert.deepEqual(app.panels.map(panel => panel.id), ['packages'],
+            `${role} has package-only visibility without kernel.admin or the groups rule`);
+    }
     const writerPage = principals.writer.page;
     await installWriterFetchProxy(writerPage);
     await openAdmin(maintainerPage, maintainer);
@@ -722,14 +748,38 @@ try {
     // Admin cannot uninstall itself while its panel remains current; navigate
     // Home first, then use the same real maintainer browser session/API.
     await maintainerPage.getByRole('button', { name: 'Home', exact: true }).click();
+    const legacyAdminId = adminId;
     const removedAdmin = await browserRequest(maintainerPage,
         `/api/packages/${adminId}?confirm=true`, 'DELETE');
     assert.equal(removedAdmin.status, 204);
-    adminId = null;
     assert.equal(packageRow('admin'), null);
     assert.deepEqual(audit('packages.uninstalled', 'admin').map(row =>
         row.detail.uninstalled_by_user_id), [maintainer.id]);
     completed.push('N12 admin normal uninstall and actor');
+    const session = await browserRequest(maintainerPage, '/api/auth/session');
+    assert.equal(session.status, 200);
+    assert.equal(session.body.user.id, maintainer.id);
+    const actorRow = jsonSql(`SELECT row_to_json(s)::text FROM (SELECT user_id,
+        host(ip_address) AS ip FROM plinth.sessions WHERE id=${literal(session.body.session.id)}) s`);
+    assert.equal(actorRow.user_id, maintainer.id);
+    const uninstallRows = jsonSql(`SELECT coalesce(json_agg(a),'[]'::json)::text FROM
+        (SELECT id,action,detail,detail_encoding FROM plinth.audit_log
+        WHERE action='packages.uninstalled' AND detail->>'id'=${literal(legacyAdminId)}) a`);
+    assert.equal(uninstallRows.length, 1);
+    assert.equal(uninstallRows[0].detail_encoding, 0);
+    const legacyProof = { cases: [...completed], count: completed.length,
+        version: '0.1.1', archiveSha256: archiveHash, moduleHashes: { ...moduleHashes },
+        finalState: 'uninstalled_at_N12', packageId: legacyAdminId,
+        actor: { userId: maintainer.id, username: session.body.user.username,
+            sessionId: session.body.session.id, ipAddress: actorRow.ip },
+        uninstallAudit: { id: uninstallRows[0].id, action: uninstallRows[0].action,
+            packageId: uninstallRows[0].detail.id,
+            uninstalledByUserId: uninstallRows[0].detail.uninstalled_by_user_id } };
+    adminId = null;
+    groupsProof = await runGroupsAdminJourney({ baseURL, browser, principals,
+        sql, jsonSql, request: browserRequest, upload: browserUpload, login, bounded,
+        baselineArchive, baselineIdentity: identities.baseline,
+        currentArchive: archive, currentIdentity: identities.current, legacyProof });
 } catch (error) { failure = error; }
 
 // Cleanup is independent: one rejected context close cannot skip the others,
@@ -792,8 +842,9 @@ try {
 if (failure || cleanupErrors.length) throw new AggregateError(
     [...(failure ? [failure] : []), ...cleanupErrors], 'native admin package journey failed');
 assert.equal(completed.length, 12);
+assert(groupsProof && groupsProof.groupsAdminNativeCases === 8);
 console.log(JSON.stringify({ adminPackageNativeCases: completed.length, expectedCases: 12,
     actualAuth: true, actualRbacCsrf: true, packageProvenance: 'user',
     archiveSha256: archiveHash, installedModuleSha256: moduleHash,
-    installedModulesSha256: moduleHashes,
+    installedModulesSha256: moduleHashes, groupsProof,
     cleanup: 'PASS', scope: 'actual kernel/ZIP/installed panel/browser/SQL' }));

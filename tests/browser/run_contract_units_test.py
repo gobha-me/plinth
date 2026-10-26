@@ -142,7 +142,7 @@ class ContractUnitDiscoveryTest(unittest.TestCase):
                          ("float-resolver.test.mjs", 4), ("float-production-owner.test.mjs", 11),
                          ("float-persistence-adapter.test.mjs", 8), ("float-transport.test.mjs", 8),
                          ("platform-storage.test.mjs", 8)),
-            "admin": (("admin-package.test.mjs", 20),),
+            "admin": (("admin-package.test.mjs", 20), ("groups-admin.test.mjs", 25)),
         })
 
     def test_each_float_file_rejects_missing_or_partial_discovery(self):
