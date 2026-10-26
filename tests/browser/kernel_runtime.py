@@ -245,7 +245,7 @@ class ContainerRuntime:
                 for path in sorted(source.rglob("*")):
                     if path.is_file():
                         package.write(path, path.relative_to(source))
-        admin_archive = fixture_root.parent / "packages/admin-0.1.0.zip"
+        admin_archive = fixture_root.parent / "packages/admin-0.1.1.zip"
         subprocess.run(
             [sys.executable, str(repo / "tools/pack_admin.py"),
              "--source", str(repo / "client/admin"), "--output", str(admin_archive)],

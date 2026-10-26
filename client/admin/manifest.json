@@ -1,8 +1,8 @@
 {
   "name": "admin",
   "display_name": "Administration",
-  "version": "0.1.0",
-  "description": "Administration — separately installed package-management panel.",
+  "version": "0.1.1",
+  "description": "Administration — separately installed package and groups management panels.",
   "author": "plinth",
   "license": "MIT",
   "entry_point": "server/main.js"

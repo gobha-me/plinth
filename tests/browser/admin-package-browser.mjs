@@ -76,8 +76,8 @@ function summary() {
 }
 window.__admin = {
   async prepare(generation = 'admin-A', context = {}) {
-    instance = await manager.prepare({ applicationId: 'admin', generation, version: '0.1.0',
-      panel: { id: 'packages', module_url: '/ext/admin/0.1.0/panels/packages.js' },
+    instance = await manager.prepare({ applicationId: 'admin', generation, version: '0.1.1',
+      panel: { id: 'packages', module_url: '/ext/admin/0.1.1/panels/packages.js' },
       tabId: 'admin-tab', paneId: 'admin-pane' }, { context });
     return { ...summary(), context: instance.api.getContext(), status: instance.status,
       hidden: instance.container.hidden };
@@ -143,7 +143,7 @@ async function scenario(name, check) {
                 if (path === '/') return response.writeHead(200, { 'Content-Type': 'text/html' }).end(html);
                 if (path === '/harness.js') return response.writeHead(200,
                     { 'Content-Type': 'application/javascript' }).end(harness);
-                const adminPrefix = '/ext/admin/0.1.0/';
+                const adminPrefix = '/ext/admin/0.1.1/';
                 const root = path.startsWith(adminPrefix) ? admin : shell;
                 const relative = path.startsWith(adminPrefix) ? path.slice(adminPrefix.length) : path.slice(1);
                 const file = resolve(root, relative); assert(file.startsWith(root + sep));

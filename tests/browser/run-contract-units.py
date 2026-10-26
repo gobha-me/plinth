@@ -16,7 +16,7 @@ GROUPS = {
                  ("float-resolver.test.mjs", 4), ("float-production-owner.test.mjs", 11),
                  ("float-persistence-adapter.test.mjs", 8), ("float-transport.test.mjs", 8),
                  ("platform-storage.test.mjs", 8)),
-    "admin": (("admin-package.test.mjs", 20),),
+    "admin": (("admin-package.test.mjs", 20), ("groups-admin.test.mjs", 25)),
 }
 COUNTERS = ("tests", "suites", "pass", "fail", "cancelled", "skipped", "todo")
 
