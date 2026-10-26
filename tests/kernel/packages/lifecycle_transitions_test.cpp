@@ -25,6 +25,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -34,7 +35,9 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -241,6 +244,23 @@ auto typed_command(Scratch& s, const std::string& sql) -> void {
       PQexec(s.conn, sql.c_str()), PQclear);
   INFO(PQresultErrorMessage(result.get()));
   REQUIRE(PQresultStatus(result.get()) == PGRES_COMMAND_OK);
+}
+
+// Existing API shape: disposition corresponds to CLI exit_code; phase is
+// CLI-only and absent optionals are omitted by the API. Preserve every other
+// ordered message field/value, rather than comparing only rule identifiers.
+auto http_api_report_from_cli(const nlohmann::json& cli) -> nlohmann::json {
+  auto messages = cli.at("messages");
+  for (auto& message : messages) {
+    message.erase("phase");
+    for (const auto* field : {"path", "remediation"}) {
+      if (message.at(field).is_null()) message.erase(field);
+    }
+  }
+  return {{"disposition", cli.at("exit_code")},
+          {"files_scanned", cli.at("files_scanned")},
+          {"total_bytes", cli.at("total_bytes")},
+          {"messages", std::move(messages)}};
 }
 
 } // namespace
@@ -1356,4 +1376,95 @@ TEST_CASE("G.02: GC deletes eligible SUPERSEDED row + tree + NULLs FK",
   REQUIRE(s.scalar("SELECT COUNT(*) FROM plinth.packages "
                    "WHERE id='" +
                    v2->id + "' AND supersedes_id IS NULL") == "1");
+}
+
+TEST_CASE(
+    "HTTP upgrade submission: raw preflight preserves predecessor and report "
+    "parity",
+    "[lifecycle_transitions][integration][http-submission][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  scratch.ctx.schedule_rbac_tests = false;
+  const auto installed = plinth::packages::install_package(
+      read_fixture_zip("valid-install"), plinth::packages::Provenance::USER,
+      scratch.ctx);
+  REQUIRE(installed.has_value());
+  const auto predecessor = *installed;
+  REQUIRE(predecessor.state == plinth::packages::InstallStage::ACTIVE);
+  plinth::packages::static_test::PackageCopy copy{
+      "lifecycle_transitions/upgrade-v2"};
+  const auto scenario = GENERATE("future-overflow", "http-overflow",
+                                 "duplicate", "invalid-declaration");
+  std::string raw = copy.json("manifest.json").dump();
+  raw.pop_back();
+  if (std::string_view{scenario} == "future-overflow") {
+    raw += R"(,"future":1e400})";
+  } else if (std::string_view{scenario} == "http-overflow") {
+    raw += R"(,"http_prefixes":1e400})";
+  } else if (std::string_view{scenario} == "duplicate") {
+    raw += R"(,"http_prefixes":[],"http_\u0070refixes":[]})";
+  } else {
+    raw += R"(,"http_prefixes":["/dav/*"],"handler_mode":"not-a-mode"})";
+  }
+  copy.write("manifest.json", raw);
+  const auto offline = plinth::packages::validate(copy.root());
+  REQUIRE(offline.disposition() == 1);
+  const auto cli =
+      plinth::packages::static_test::cli_report(offline, copy.root());
+  const auto package_count =
+      scratch.scalar("SELECT COUNT(*) FROM plinth.packages");
+  const auto capability_count =
+      scratch.scalar("SELECT COUNT(*) FROM plinth.capabilities");
+  const auto active = scratch.ctx.data_dir / "extensions" / "notes" / "active";
+  const auto active_target = fs::read_symlink(active);
+  REQUIRE(plinth::packages::asset_server::has_registered_route(
+      predecessor.name, predecessor.version));
+
+  const auto upgraded = plinth::packages::upgrade_package(
+      copy.zip(), predecessor.id, scratch.ctx);
+  REQUIRE_FALSE(upgraded.has_value());
+  REQUIRE(upgraded.error().kind == plinth::packages::TransitionKind::UPGRADE);
+  REQUIRE(upgraded.error().package_id == predecessor.id);
+  const auto& report = upgraded.error().report;
+  REQUIRE(report.at("kind") == "validation-errors");
+  REQUIRE(report.at("message") == "upgrade validation failed");
+  REQUIRE(upgraded.error().message == "upgrade validation failed");
+  auto expected = http_api_report_from_cli(cli);
+  expected["kind"] = "validation-errors";
+  expected["message"] = "upgrade validation failed";
+  CHECK(report == expected);
+  CHECK(report.at("disposition") == offline.disposition());
+  CHECK(cli.at("exit_code") == offline.disposition());
+  const auto severity_count = [&](std::string_view severity) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(report.at("messages"), [&](const auto& finding) {
+          return finding.at("severity") == severity;
+        }));
+  };
+  CHECK(severity_count("error") == offline.error_count());
+  CHECK(severity_count("warning") == offline.warning_count());
+  const auto expected_rule = std::string_view{scenario} == "invalid-declaration"
+                                 ? "http-handler-mode-unavailable"
+                                 : "http-prefix-invalid";
+  REQUIRE(std::ranges::any_of(report.at("messages"), [&](const auto& finding) {
+    return finding.at("rule") == expected_rule;
+  }));
+  CHECK(scratch.scalar("SELECT COUNT(*) FROM plinth.packages") ==
+        package_count);
+  CHECK(scratch.scalar("SELECT COUNT(*) FROM plinth.capabilities") ==
+        capability_count);
+  CHECK(scratch.scalar("SELECT state FROM plinth.packages WHERE id='" +
+                       predecessor.id + "'") == "ACTIVE");
+  CHECK(scratch.scalar("SELECT COUNT(*) FROM plinth.packages "
+                       "WHERE name='notes' AND version='1.3.0'") == "0");
+  CHECK(fs::read_symlink(active) == active_target);
+  CHECK_FALSE(
+      fs::exists(scratch.ctx.data_dir / "extensions" / "notes" / "1.3.0"));
+  CHECK(plinth::packages::asset_server::has_registered_route(
+      predecessor.name, predecessor.version));
+  CHECK_FALSE(
+      plinth::packages::asset_server::has_registered_route("notes", "1.3.0"));
+  CHECK(fs::is_empty(scratch.ctx.staging_dir));
 }

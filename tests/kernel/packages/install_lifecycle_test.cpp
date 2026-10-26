@@ -27,6 +27,7 @@
 #include <nlohmann/json.hpp>
 #include <zip.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +38,8 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -214,6 +217,23 @@ auto make_path_traversal_zip() -> std::vector<std::byte> {
   zip_source_close(src);
   zip_source_free(src);
   return out;
+}
+
+// Existing API shape: disposition corresponds to CLI exit_code; phase is
+// CLI-only and absent optionals are omitted by the API. Preserve every other
+// ordered message field/value, rather than comparing only rule identifiers.
+auto http_api_report_from_cli(const nlohmann::json& cli) -> nlohmann::json {
+  auto messages = cli.at("messages");
+  for (auto& message : messages) {
+    message.erase("phase");
+    for (const auto* field : {"path", "remediation"}) {
+      if (message.at(field).is_null()) message.erase(field);
+    }
+  }
+  return {{"disposition", cli.at("exit_code")},
+          {"files_scanned", cli.at("files_scanned")},
+          {"total_bytes", cli.at("total_bytes")},
+          {"messages", std::move(messages)}};
 }
 
 } // namespace
@@ -596,4 +616,80 @@ TEST_CASE("I.10: migration syntax error -> INSTALL_FAILED at MIGRATING, schema "
   REQUIRE(PQntuples(pr) == 0);
   PQclear(pr);
   PQfinish(conn);
+}
+
+TEST_CASE("HTTP install submission: raw preflight preserves collected parity "
+          "without a row",
+          "[install_lifecycle][integration][http-submission][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  scratch.ctx.schedule_rbac_tests = false;
+  plinth::packages::static_test::PackageCopy copy;
+  const auto scenario = GENERATE("future-overflow", "http-overflow",
+                                 "duplicate", "invalid-declaration");
+  std::string raw = copy.json("manifest.json").dump();
+  raw.pop_back();
+  if (std::string_view{scenario} == "future-overflow") {
+    raw += R"(,"future":1e400})";
+  } else if (std::string_view{scenario} == "http-overflow") {
+    raw += R"(,"http_prefixes":1e400})";
+  } else if (std::string_view{scenario} == "duplicate") {
+    raw += R"(,"http_prefixes":[],"http_\u0070refixes":[]})";
+  } else {
+    raw += R"(,"http_prefixes":["/dav/*"],"handler_mode":"not-a-mode"})";
+  }
+  copy.write("manifest.json", raw);
+  const auto offline = plinth::packages::validate(copy.root());
+  REQUIRE(offline.disposition() == 1);
+  const auto cli =
+      plinth::packages::static_test::cli_report(offline, copy.root());
+
+  std::unique_ptr<PGconn, decltype(&PQfinish)> connection(
+      PQconnectdb(conninfo_of(scratch.db).c_str()), PQfinish);
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  const auto scalar = [&](std::string_view sql) -> std::string {
+    std::unique_ptr<PGresult, decltype(&PQclear)> result(
+        PQexec(connection.get(), std::string{sql}.c_str()), PQclear);
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(result.get()) == 1);
+    return PQgetvalue(result.get(), 0, 0);
+  };
+  const auto package_count = scalar("SELECT COUNT(*) FROM plinth.packages");
+  const auto capability_count =
+      scalar("SELECT COUNT(*) FROM plinth.capabilities");
+  const auto blob = copy.zip();
+  const auto installed = plinth::packages::install_package(
+      blob, plinth::packages::Provenance::USER, scratch.ctx);
+  REQUIRE_FALSE(installed.has_value());
+  REQUIRE(installed.error().failed_at ==
+          plinth::packages::InstallStage::VALIDATING);
+  REQUIRE(installed.error().kind == "validation-errors");
+  REQUIRE(installed.error().package_id.empty());
+  const auto& report = installed.error().report;
+  const auto expected = http_api_report_from_cli(cli);
+  CHECK(report == expected);
+  CHECK(report.at("disposition") == offline.disposition());
+  CHECK(cli.at("exit_code") == offline.disposition());
+  const auto severity_count = [&](std::string_view severity) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(report.at("messages"), [&](const auto& finding) {
+          return finding.at("severity") == severity;
+        }));
+  };
+  CHECK(severity_count("error") == offline.error_count());
+  CHECK(severity_count("warning") == offline.warning_count());
+  const auto expected_rule = std::string_view{scenario} == "invalid-declaration"
+                                 ? "http-handler-mode-unavailable"
+                                 : "http-prefix-invalid";
+  REQUIRE(std::ranges::any_of(report.at("messages"), [&](const auto& finding) {
+    return finding.at("rule") == expected_rule;
+  }));
+  CHECK(scalar("SELECT COUNT(*) FROM plinth.packages") == package_count);
+  CHECK(scalar("SELECT COUNT(*) FROM plinth.capabilities") == capability_count);
+  CHECK(scalar("SELECT COUNT(*) FROM pg_namespace WHERE nspname='ext_notes'") ==
+        "0");
+  CHECK_FALSE(fs::exists(scratch.ctx.data_dir / "extensions" / "notes"));
+  CHECK(fs::is_empty(scratch.ctx.staging_dir));
 }

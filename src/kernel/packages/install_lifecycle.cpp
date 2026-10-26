@@ -12,6 +12,7 @@
 #include "kernel/logging.hpp"
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/capabilities_manifest.hpp"
+#include "kernel/packages/http_declarations.hpp"
 #include "kernel/packages/installed_generation_registry.hpp"
 #include "kernel/packages/manifest.hpp"
 #include "kernel/packages/migrations.hpp"
@@ -985,6 +986,33 @@ auto build_validation_report(const ValidationReport& vr) -> nlohmann::json {
   return out;
 }
 
+// Only explicit install/upgrade submissions call this before their neutral
+// name/version probe. Legacy enable/recovery/captured-manifest reads do not.
+// A pure parse is not authority; rejected bytes receive the SAME collected
+// static report as CLI validation before a candidate row or cutover exists.
+auto preflight_http_submission(const fs::path& staging,
+                               const InstallerContext& ctx,
+                               Provenance provenance)
+    -> std::optional<InstallFailure> {
+  std::ifstream input(staging / "manifest.json", std::ios::binary);
+  if (!input) return std::nullopt; // retain the existing missing-file outcome
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  if (input.bad()) return std::nullopt;
+  const auto bytes = buffer.str();
+  if (HttpDeclaration::parse(bytes, "manifest.json").value) return std::nullopt;
+
+  auto config = static_validation_config(ctx, provenance);
+  config.cross_file = true;
+  config.against_running_kernel = false;
+  const auto report = validate(staging, config);
+  return InstallFailure{.failed_at = InstallStage::VALIDATING,
+                        .package_id = "",
+                        .kind = "validation-errors",
+                        .message = "validation failed",
+                        .report = build_validation_report(report)};
+}
+
 auto build_migration_report(const MigrationReport& mr) -> nlohmann::json {
   nlohmann::json out;
   out["applied"] = mr.applied;
@@ -1722,6 +1750,12 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
   auto ex = extract_zip_to(zip_blob, staging, ctx.max_package_size_bytes);
   if (!ex.has_value()) {
     return std::unexpected(ex.error());
+  }
+
+  // Reject malformed NEW declarations/raw JSON before neutral probing can
+  // overwrite duplicate keys or throw on an unrepresentable numeric value.
+  if (auto failure = preflight_http_submission(staging, ctx, provenance)) {
+    return std::unexpected(std::move(*failure));
   }
 
   // ── Minimal manifest parse ───────────────────────────────────────
@@ -4169,6 +4203,12 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
       !ex.has_value()) {
     return std::unexpected(upgrade_failure(existing_package_id, ex.error().kind,
                                            ex.error().message));
+  }
+  if (auto failure = preflight_http_submission(staging, ctx, provenance)) {
+    auto rejected = upgrade_failure(existing_package_id, "validation-errors",
+                                    "upgrade validation failed");
+    rejected.report.update(failure->report);
+    return std::unexpected(std::move(rejected));
   }
   // Only the kernel's explicit bundled-shell operation supplies BUNDLED.
   // HTTP callers retain USER and cannot upgrade a reserved bundled package.

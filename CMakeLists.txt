@@ -601,6 +601,9 @@ add_executable(plinth
   src/kernel/js/stdlib/audit_bindings.cpp
   src/kernel/js/stdlib/cap_bindings.cpp
   src/kernel/js/stdlib/pubsub_bindings.cpp
+  src/kernel/extension_http/codec.cpp
+  src/kernel/extension_http/ownership.cpp
+  src/kernel/packages/http_declarations.cpp
   src/kernel/packages/manifest.cpp
   src/kernel/packages/capabilities_manifest.cpp
   src/kernel/packages/panels_manifest.cpp
@@ -807,6 +810,9 @@ add_executable(plinth_tests
   tests/kernel/js/owned_database_completion_test.cpp
   tests/kernel/js/native_setup_failure_test.cpp
   tests/kernel/js/eval_guard_test.cpp
+  tests/kernel/extension_http/codec_test.cpp
+  tests/kernel/extension_http/ownership_test.cpp
+  tests/kernel/packages/http_declarations_test.cpp
   tests/kernel/packages/manifest_test.cpp
   tests/kernel/packages/capabilities_manifest_test.cpp
   tests/kernel/packages/panels_manifest_test.cpp
@@ -932,6 +938,9 @@ add_executable(plinth_tests
   src/kernel/js/stdlib/audit_bindings.cpp
   src/kernel/js/stdlib/cap_bindings.cpp
   src/kernel/js/stdlib/pubsub_bindings.cpp
+  src/kernel/extension_http/codec.cpp
+  src/kernel/extension_http/ownership.cpp
+  src/kernel/packages/http_declarations.cpp
   src/kernel/packages/manifest.cpp
   src/kernel/packages/capabilities_manifest.cpp
   src/kernel/packages/panels_manifest.cpp
