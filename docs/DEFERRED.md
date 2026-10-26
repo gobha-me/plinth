@@ -256,63 +256,44 @@ on advisory-lock interference), and verification posture.
 
 ---
 
-### 2026-04-29 — Extension HTTP surface §6.10 sub-questions — multi-tenant host scoping, per-prefix handler_mode overrides, final performance threshold, drain-timeout default and bounds [deferred from 0.6.0.N architecture session 2026-04-29]
+### 2026-04-29 — Extension HTTP surface §6.10 questions — scoped disposition
 
-**Tracking:** specification is [GitHub issue #47](https://github.com/gobha-me/plinth/issues/47), followed by implementation in [#48](https://github.com/gobha-me/plinth/issues/48).
+**Tracking:** [#47 specification](https://github.com/gobha-me/plinth/issues/47),
+then [#48 implementation](https://github.com/gobha-me/plinth/issues/48).
+**Delivery contract:** [Extension HTTP implementation contract](icd/ICD-extension-http-surfaces.md),
+with maintainer-selected parameters and required delivery review/CI. General
+HTTP claims and their actual measurements remain unimplemented.
 
-**Milestone:** the 2026-04-29 paper architecture session ratifying the
-extension HTTP surface primitive (now normative at
-[`architecture/05-extensions.md §6`](architecture/05-extensions.md))
-deliberately did not pin four sub-questions. Each is a single-question
-follow-up that does not block ICD-0.6.7 authoring or the 0.6.7
-implementation milestone but should be answered before the relevant
-shape ships.
+The 2026-04-29 architecture ratified the primitive while leaving four bounded
+questions open. Authoring can proceed after completed #29/#33 without pretending
+#29 was a completed post-Dogfood review or closing/weakening #38/#39. The
+original four #47 acceptance criteria remain. Specification merge alone does
+not complete the measured-contract outcome; #47 stays OPEN through actual
+mode-qualified #48 measurements and the recorded final threshold decision.
 
-The four sub-questions:
+| Question | Scoped disposition |
+|---|---|
+| Multi-tenant per-host claims | Deferred. The contract retains single-tenant/all-host exclusive ownership; a real multi-tenant use case needs a separate architecture decision. |
+| Per-prefix handler_mode | Deferred. One mode per extension; no new override feature or implicit mode fallback. |
+| Drain default/bounds | Specified future HTTP default5000ms/configured range1000..5000ms, capped by remaining package/coordinator time even below1000ms. Existing package config stays unchanged. Timeout fails before destructive removal and retains actual owners. |
+| Final performance threshold | OPEN.100µs PER REQUEST remains the starting figure, not an adopted p95/mean rule. Actual primitive/mode-qualified #48 measurements and a recorded final decision are required; an unmeasured draft does not satisfy #47. |
 
-- **Multi-tenant per-host scoping** for prefix claims. The 2026-04-29
-  session pinned single-tenant exclusive ownership only ("no host
-  scoping in single-tenant"). If multi-tenant deployments materialize
-  (separate `*.plinth.example.com` per tenant, or a shared instance
-  with per-host extension installations), prefix-claim resolution
-  needs a host dimension. Future architecture session.
-- **Per-prefix `handler_mode` overrides.** The session pinned one
-  mode per extension via the manifest field. A real use case where
-  one extension wants `bundled_native` for `/dav/*` (high-throughput)
-  and `quickjs` for `/admin/*` (low-throughput admin UI) on the same
-  manifest would re-open this. Punted to ICD-0.6.7 if a need surfaces.
-- **Final performance threshold.** Starting figure ≤ 100 μs catch-all
-  overhead vs fixed-prefix; the actual ICD-0.6.7 number is set after
-  a measurement pass on the implemented primitive. Could be tighter
-  (≤ 50 μs) or looser (≤ 200 μs) depending on what Drogon's path
-  matching adds.
-- **Drain timeout default and configurable bounds.** §6.5 pins the
-  drain semantics ("complete in-flight, 503 new, remove on count=0
-  or timeout") but punts the specific timeout value (and its lower
-  / upper bounds) to ICD-0.6.7. Likely range: 5–60 s.
+The earlier speculative5–60s drain range is history, not implemented HTTP
+behavior or the selected bounds above. The old “remove at zero OR timeout”
+phrase is explicitly reconciled in architecture§6.5: a timer never authorizes
+freeing live work. The old per-dispatch/60s-dedup tension is reconciled as a
+acknowledged HTTP obligation with same-ID dedup only, not suppression of
+distinct dispatches; current void audit callers remain unchanged.
 
-**Why deferred:** Each is independently scoped — none of them
-foreclose the others. Pinning them in the architecture session would
-have over-determined the ICD; pinning them in the ICD without
-measurement (performance threshold) or without a real use case
-(multi-tenant, per-prefix mode) would have been speculative.
+The contract keeps all THREE real adapter interfaces/proofs. Unavailable-mode
+negative tests cannot complete the primitive; binary buffered limits do not
+claim whole-application WebDAV/large-upload/streaming/cookie compatibility.
+No new route, grant, package, parser activation or performance result is
+introduced by these documentation dispositions.
 
-**Future approach:** Multi-tenant scoping likely lands at whatever
-arch session opens multi-tenant deployments (post-1.0). Per-prefix
-mode resolves at ICD-0.6.7 authoring if a candidate use case is
-already on the table; otherwise Closes-by-foreclosure (the manifest
-field stays per-extension). Performance threshold pinned at
-ICD-0.6.7 authoring with explicit "subject to measurement" hedge —
-final number lands in the 0.6.7 ship PR's §17 amendment block per
-ICD-0.5.5 / ICD-0.6.0 OQ Resolutions precedent. Drain timeout
-defaults pinned at ICD-0.6.7 authoring; can be re-tuned post-ship
-if a real workload demands.
-
-**Pointers:**
-- [`docs/architecture/05-extensions.md §6.10`](architecture/05-extensions.md)
-  enumerates these in-place.
-- [`docs/discussion/DISCUSSION-extension-http-surface.md`](discussion/DISCUSSION-extension-http-surface.md)
-  Risks-and-Unknowns section frames the original questions.
+**Pointers:** [architecture§6](architecture/05-extensions.md#6-extension-http-surface),
+[the implementation ICD](icd/ICD-extension-http-surfaces.md), and
+[original design discussion](discussion/DISCUSSION-extension-http-surface.md).
 
 ### 2026-04-26 — ICD-0.5.4 I.02 / I.03 + ICD-0.5.5 S.06 / S.07 / L.03 / L.04 / L.05 / W.06 / I.01 / I.02 / I.03 / I.04 — realtime test coverage + W.06 design defer [deferred from v0.5.4 / v0.5.5 ship; ICD-0.5.4 I.02 closed in 0.6.0.N session 3; ICD-0.5.4 I.03 discharged via L.03 in session 6; ICD-0.5.5 L.03 / L.04 / L.05 closed in 0.6.0.N session 6; ICD-0.5.5 S.06 closed in 0.6.0.N session 8; S.07 resolved by #34]
 

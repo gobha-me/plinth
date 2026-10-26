@@ -654,8 +654,12 @@ nine commitments below.
 [#47](https://github.com/gobha-me/plinth/issues/47) owns the final
 specification and [#48](https://github.com/gobha-me/plinth/issues/48) owns
 implementation. Historical `0.6.6.N`/`0.6.7` names are traceability aliases,
-not release promises. No schema, code, or test behavior is implied by this
-section alone.
+not release promises. No current schema, code or test behavior is implied.
+The [implementation contract](../icd/ICD-extension-http-surfaces.md)
+records the maintainer-selected interfaces, budgets and scoped reconciliations
+below. Delivery requires independent review and green candidate/exact-merge CI;
+the primitive is unimplemented. The binary buffered/cookie-free profile is
+not whole-application WebDAV, large-upload/streaming or cookie compatibility.
 
 ### 6.1 Principle
 
@@ -691,10 +695,12 @@ Mechanically:
 2. Each extension's manifest declares `http_prefixes` it claims (e.g.
    `["/dav/*", "/ocs/*", "/remote.php/*", "/status.php"]`).
 3. At install time, the kernel validates `http_prefixes` against (a)
-   every reserved prefix in §2 (including `reserved (planned)` rows
-   like `/docs/*` and `/api/docs/*`), and (b) every already-installed
+   every currently ratified reserved prefix in §2 and active/installed
+   frontend ownership, and (b) every already-installed
    extension's `http_prefixes`. Conflicts fail the install with a
-   clear error code (final code-shape pinned in ICD).
+   clear validation/conflict result. This supersedes the stale `/docs/*`
+   planned-reservation example: §2 explicitly does not reserve it;
+   `/api/docs/*` is already protected by `/api/*`.
 4. The kernel maintains a runtime route table keyed by prefix →
    `{extension_id, handler_reference, handler_mode}`. Thread-safety
    uses the same `shared_mutex` pattern as the
@@ -706,14 +712,19 @@ Mechanically:
    forwards to the extension's declared handler.
 6. The handler reference is execution-mode-agnostic: `quickjs` (in
    the extension's runtime pool), `sidecar` (over UDS), or
-   `bundled_native` (Shell, Admin, etc.). The kernel doesn't pick;
-   the manifest declares the mode.
+   `bundled_native` (an eligible kernel-compiled adapter bound to actual trusted
+   bundled provenance). The manifest selects the mode but cannot create its
+   eligibility. Shell is the only current bundled companion; ordinary
+   API-installed Admin is not a native/bundled exception. All three real
+   adapter contracts/positive lifetime tests remain required; unavailable-mode
+   refusals alone cannot complete #48.
 
 ### 6.3 Manifest schema additions
 
-Three new fields land in the package manifest (exact location +
-validation pinned in ICD-0.6.7; reserved in the parsers when the ICD
-authoring slot opens):
+The implementation contract places three future fields at the manifest top level.
+They are not current parser/runtime support: existing unknown fields stay
+inert until an explicit validated install/upgrade records kernel-owned
+provenance. The contract pins shared validation and recovery semantics:
 
 - **`http_prefixes: string[]`** — the prefixes this extension claims.
 - **`unauthenticated_prefixes: string[]`** — subset of `http_prefixes`
@@ -721,11 +732,11 @@ authoring slot opens):
   `/status.php` for Nextcloud-compat clients that probe before
   authenticating). Privileged: see §6.6.
 - **`handler_mode: "quickjs" | "sidecar" | "bundled_native"`** —
-  execution-mode tag. Per-prefix overrides reserved for ICD-0.6.7.
+  execution-mode tag. Per-prefix overrides remain deferred; one mode per extension.
 
 Validation against the §2 reserved-prefix table runs at install time;
-overlapping any kernel-owned prefix (including `reserved (planned)`
-rows) fails installation. Validation against already-installed
+overlapping any actually reserved kernel/active-frontend ownership fails
+installation; the contract does not create additional reservations. Validation against already-installed
 extensions runs in the same install-time pass.
 
 ### 6.4 Prefix-claim semantics (simplest-rule first)
@@ -740,8 +751,8 @@ extensions runs in the same install-time pass.
   is a separate question deferred to a future architecture session
   (see `DEFERRED.md`).
 - **Wildcard depth.** A prefix matches any path depth below it
-  (`/dav/*` matches `/dav/files/foo/bar`); the literal grammar pinned
-  in ICD-0.6.7 (likely Drogon-compatible globbing).
+  (`/dav/*` matches `/dav/files/foo/bar`); the contract pins exact literal/terminal-subtree grammar and component matching,
+  not arbitrary Drogon glob registration.
 
 Simplest-rule first is reversible: a future session can introduce
 method or host scoping if a real use case demands it. Starting
@@ -749,30 +760,37 @@ permissive and narrowing later breaks installed extensions.
 
 ### 6.5 Uninstall while requests in flight
 
-On extension uninstall:
+The route entry closes admission before a transition; new requests receive503.
+Already admitted work retains actual request/code/adapter owners. The specified
+HTTP-specific `extension_http.drain_timeout_ms` defaults to5000ms and permits
+configured integers1000..5000ms. The effective deadline is capped by the remaining
+enclosing package/coordinator deadline, even if only700ms,100ms or0 remains;
+the configured lower bound never rounds remaining time up. Existing package
+configuration is not rewritten and sequential owners do not each start a new5s
+wait.
 
-1. The runtime route table entry is marked `draining`.
-2. In-flight requests dispatched against the entry complete to
-   natural termination.
-3. New requests for the prefix → `503 Service Unavailable`.
-4. The entry is removed from the table once the in-flight count
-   reaches zero OR a configurable timeout fires (default and bounds
-   pinned in ICD-0.6.7).
-
-This matches the upgrade-drain semantics already implemented for
-extension dispatch in
-[`install_lifecycle.cpp`](../../src/kernel/packages/install_lifecycle.cpp)
-(see ICD-0.4.5 §X.07–X.09); the HTTP-surface uninstall path reuses
-the same `DrainState` machinery where the shapes align.
+**Scoped replacement of the old “zero OR timeout removes entry” wording:** only
+actual settled zero permits destructive removal/replacement. Expiry fails the
+transition before destructive commit and retains live owners/code/data with
+the proper original/recovery fence. A timer, response or disconnect is not
+physical settlement. This follows the current owned-lifecycle constraint and
+pre-destructive drain failure in
+[`install_lifecycle.cpp`](../../src/kernel/packages/install_lifecycle.cpp).
+The linked contract specifies the captured-generation and response/audit owners;
+none is claimed implemented here.
 
 ### 6.6 Privilege model
 
 Declaring `http_prefixes` is gated by an RBAC rule at install time.
-A new rule (working name `packages.install.with_http_prefixes`; final
-name pinned in ICD-0.6.7) gates whether an install request carrying a
+The future rule `packages.install.with_http_prefixes`, detailed in the
+linked contract, gates whether an install request carrying a
 non-empty `http_prefixes` array succeeds.
 
-- **Default grant:** `admins` group only.
+- **Administrative authority:** the actual built-in group is `admin`;
+  its existing universal `kernel.admin` semantics remain authoritative.
+  The contract specifies declaration-specific rule names without adding grants
+  or making installation itself confer access. This corrects the old plural
+  `admins` wording; no rule/default-grant change is performed here.
 - **Bundled-extension exception:** the bundled-package first-boot
   install lifecycle (ICD-0.6.1 §3) bypasses the install-request RBAC
   check by design — the kernel installs bundled packages directly. A
@@ -783,8 +801,9 @@ non-empty `http_prefixes` array succeeds.
 - **`unauthenticated_prefixes`:** declaring a non-empty
   `unauthenticated_prefixes` is gated by a separate, more privileged
   rule (working name `packages.install.with_unauthenticated_prefixes`;
-  pinned in ICD-0.6.7). Default grant: `admins` only, with explicit
-  install-time confirmation. Arbitrary third-party extensions cannot
+  detailed in the implementation contract). Administrative-only intention and explicit
+  artifact-bound install confirmation are retained; no automatic grants are
+  introduced. Arbitrary third-party extensions cannot
   drop authentication without an admin grant + explicit confirmation.
 
 The privilege model is RBAC-on-install — *not* RBAC-on-runtime-route.
@@ -792,37 +811,49 @@ Once an extension is installed, its prefix dispatches without further
 runtime RBAC check (auth still happens; the privileged check is on
 the act of *claiming* the prefix in the first place).
 
-### 6.7 Audit log entry per dispatch
+### 6.7 Authoritative audit per dispatch
 
-The kernel emits one non-skippable audit entry per catch-all-routed
-request:
+The kernel owns one logical `extension.http.dispatched` event per actual
+kernel dispatch handoff. It captures the selected PAT/user or anonymous marker,
+validated matched prefix, immutable extension generation and method. Physical
+handler entry and wire observations remain separate facts; an authorized
+handoff is not proof an external instruction ran or a client received a reply.
 
-- `event`: `extension.http.dispatched` (final name pinned in
-  ICD-0.6.7).
-- `pat_identity`: PAT identity if authenticated; `unauthenticated`
-  marker for `unauthenticated_prefixes` dispatches.
-- `prefix_matched`: the manifest prefix that resolved.
-- `extension`: extension name + version.
-- `http_method`, `http_status`.
-- `latency_ms`: optional, reserved for ICD-0.6.7.
-- Rate-limited / dedup'd via the existing `audit::claim_*` pattern
-  (reference ICD-0.5.5 OQ7's 60-second TTL precedent).
+**Scoped reconciliation selected on 2026-10-26:** accept a
+durable HTTP-specific obligation before dispatch, then use one local response
+arbiter to freeze one status choice and require its durable acknowledgement or
+same-choice readback before wire status. A timed-out/uncertain wire closes with
+UNKNOWN delivery rather than letting a late200 audit contradict an emitted504.
+The response decision and actual wire-status observation are separate. Current
+void audit APIs do not provide this acknowledgement and remain unchanged for
+old callers; #48 must implement/prove the acknowledged HTTP contract.
 
-Extensions may emit additional audit entries via the
-`kernel:1:audit.write` capability; the kernel-issued
-`extension.http.dispatched` entry is non-skippable and authoritative
-for "request reached an extension surface."
+Deduplication is only for repeated records/completion of the SAME dispatch ID.
+Different dispatched requests cannot be suppressed under action/prefix/60s
+rate-limiting. Rate-limited diagnostic chatter is separate from authoritative
+dispatch obligations. The contract defines privacy-safe fields, epoch/crash
+recovery, physical-entry uncertainty and bounded retained owners; no
+best-effort durability downgrade or fabricated final record is implied.
+
+Extensions may emit additional audit events through their existing authority,
+but cannot opt out of or forge this kernel-owned event. The prospective
+semantics are fixed in the implementation contract; #48 owns its storage and
+lifecycle implementation. The current writer does not already supply durable
+per-request acknowledgement.
 
 ### 6.8 Performance contract
 
 The catch-all + lookup + auth path must add **≤ 100 μs of overhead**
 per request versus an equivalent fixed-prefix kernel-owned route
-(starting figure; final threshold pinned in ICD-0.6.7).
+(starting figure retained; actual mode-qualified measurements and a recorded
+final threshold decision are required under #47/#48).
 
 Validation: a one-off micro-bench OR an LH-tier exercise of the
 catch-all under sustained load (LH slot pinned at implementation
 time). Performance below threshold gates the implementation
-milestone.
+milestone. A percentile such as p95 does not silently replace “per request.”
+No measurements are supplied by a specification draft. #47 stays OPEN after
+specification merge until actual #48 evidence and its other acceptance are met.
 
 Rationale: high-throughput surfaces (WebDAV under sync clients,
 S3-compat object stores) have native-perf expectations; the catch-
@@ -835,8 +866,11 @@ does not become the bottleneck.
 
 #47 specifies the catch-all, manifest prefixes, route table, authority,
 lifecycle, and measurable performance contract. #48 implements that accepted
-specification. Their explicit dependencies and labels, not legacy release
-numbers, determine scheduling.
+specification. Specification authoring follows completed #29/#33 without
+claiming #29 was a post-Dogfood review or closing/weakening #38/#39. The original
+four #47 criteria remain; actual mode-qualified #48 measurement and recorded
+final threshold decision are required before #47 closure. Their explicit
+issue dependencies, not historical release numbers, determine scheduling.
 
 The Files-Nextcloud-compat arc (post-1.0 candidate) depends on this
 primitive having landed; CalDAV / CardDAV / S3-compat / ActivityPub
@@ -844,21 +878,20 @@ extensions inherit it without further architecture work. The share
 primitive (§5.1) and any future site-host shape (§5.2) become
 extension-design questions instead of kernel-architecture questions.
 
-### 6.10 What §6 does not decide
+### 6.10 Deferred scope and selected delivery bounds
 
-The session of 2026-04-29 deliberately did not pin:
+- **Host scoping:** deferred; single-tenant exclusive ownership remains.
+- **Per-prefix mode:** deferred; one handler_mode per extension remains.
+- **Drain:** the specified HTTP-specific default5000/range1000..5000ms is capped
+  by actual remaining transition time, never deleting a live owner on timeout.
+  This is future delivery configuration, not current HTTP support.
+- **Performance:**100µs per request remains the starting target. Actual #48
+  measurements/recorded interpretation and final decision remain OPEN; no
+  percentile, missing mode or specification-only completion shortcut.
 
-- **Multi-tenant per-host scoping** for prefix claims. Single-tenant
-  exclusive ownership only; multi-tenant is a future arch-session
-  question.
-- **Per-prefix `handler_mode` overrides.** The 2026-04-29 session
-  pins one mode per extension via the manifest field; per-prefix
-  overrides reserved for ICD-0.6.7 if a real use case surfaces.
-- **Final performance threshold.** Starting figure ≤ 100 μs; ICD
-  pins the final number after a measurement pass.
-- **Drain timeout bounds and default.** ICD-0.6.7 pins the default
-  and the configurable bounds.
-
-These appear in `DEFERRED.md` to keep the active-question list
-visible; each is a single-question follow-up that does not block
-the implementation milestone or the ICD authoring.
+The [implementation ICD](../icd/ICD-extension-http-surfaces.md) provides literal binary
+interfaces, all three real-mode acceptance, admission/4500ms execution cutoff
+versus5000ms wire expiry, and the acknowledged audit protocol. Its bounded
+buffered/cookie-free profile and explicit adoption decisions are not existing
+API support or permission to narrow the ratified primitive to QuickJS-only.
+[DEFERRED](../DEFERRED.md) records the scoped dispositions and history.
