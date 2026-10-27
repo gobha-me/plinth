@@ -1,6 +1,8 @@
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/db/connection_info.hpp"
 #include "kernel/db/operations.hpp"
+#include "kernel/extension_http/dispatch_store.hpp"
+#include "kernel/packages/http_claims.hpp"
 
 #include <fstream>
 #include <libpq-fe.h>
@@ -503,6 +505,18 @@ auto bootstrap_schema(const Config::Database& db_cfg,
 
   ensure_typed_panel_schema(pg);
   ensure_artifact_receipts_schema(pg);
+
+  // Retained legacy manifests stay inert: create/check only empty kernel
+  // metadata tables, never reconstruct HTTP authority from package JSON.
+  // The store checks independent schema templates on this same transaction.
+  pg.exec("BEGIN");
+  if (!packages::http_claims::ensure_schema(*pg.conn)) {
+    throw std::runtime_error("incompatible HTTP claims schema");
+  }
+  if (!extension_http::ensure_schema(*pg.conn)) {
+    throw std::runtime_error("incompatible HTTP dispatch schema");
+  }
+  pg.exec("COMMIT");
 
   // Kernel-owned, idempotent upgrade for #37 invite registration. Existing
   // retained installations skip schema.sql, so create the digest-only invite

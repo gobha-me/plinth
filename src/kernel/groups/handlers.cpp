@@ -945,6 +945,16 @@ auto bootstrap_groups(const Config::Database& db_cfg) -> void {
                 "metadata', 'kernel') "
                 "ON CONFLICT (rule) DO NOTHING");
 
+  // HTTP declaration permissions are definitions only. Existing kernel.admin
+  // remains universal; installation never creates grants for these rules.
+  pg_exec(conn, "INSERT INTO plinth.rbac_rules (rule, namespace, description, "
+                "extension_name) VALUES "
+                "('packages.install.with_http_prefixes', 'kernel', "
+                "'Install extension HTTP claims', 'kernel'), "
+                "('packages.install.with_unauthenticated_prefixes', 'kernel', "
+                "'Install public extension HTTP claims', 'kernel') "
+                "ON CONFLICT (rule) DO NOTHING");
+
   pg_exec(conn, "INSERT INTO plinth.group_rules (group_id, rule_id) "
                 "SELECT g.id, r.id "
                 "FROM plinth.groups g, plinth.rbac_rules r "
@@ -953,6 +963,8 @@ auto bootstrap_groups(const Config::Database& db_cfg) -> void {
                 "ON CONFLICT DO NOTHING");
 
   for (const auto* rule : {"packages.install", "packages.read",
+                           "packages.install.with_http_prefixes",
+                           "packages.install.with_unauthenticated_prefixes",
                            "kernel.realtime.subscribe.applications.changed"}) {
     std::string sql = std::string("SELECT 1 FROM plinth.audit_log "
                                   "WHERE action = 'rbac.rule_registered' "

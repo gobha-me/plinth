@@ -10,8 +10,8 @@
 
 namespace plinth::extension_http {
 
-inline constexpr std::size_t MAX_BODY_BYTES = 8 * 1024 * 1024;
-inline constexpr std::size_t MAX_WIRE_BYTES = 12 * 1024 * 1024;
+inline constexpr std::size_t MAX_BODY_BYTES = std::size_t{8} * 1024 * 1024;
+inline constexpr std::size_t MAX_WIRE_BYTES = std::size_t{12} * 1024 * 1024;
 inline constexpr std::size_t MAX_METADATA_BYTES = 65536;
 inline constexpr std::size_t MAX_ENCODED_METADATA_BYTES = 524288;
 inline constexpr std::size_t MAX_TARGET_BYTES = 8192;

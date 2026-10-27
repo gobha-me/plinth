@@ -100,7 +100,7 @@ TEST_CASE(
     "[extension_http][codec]") {
   REQUIRE(valid_utf8("café 🪐"));
   REQUIRE(valid_utf8(std::string_view{"a\0b", 3}));
-  for (const std::string bad :
+  for (const std::string& bad :
        {std::string{"\xc0\xaf"}, std::string{"\xed\xa0\x80"},
         std::string{"\xf4\x90\x80\x80"}, std::string{"\xe2\x82"},
         std::string{"\x80"}}) {
@@ -200,7 +200,7 @@ TEST_CASE("HTTP codec filters only validated request header tuples",
     REQUIRE_FALSE(filter_request_headers({{"connection", value}}));
   for (auto name : {"Content-Type", "x space", "x:bad", "", "é"})
     REQUIRE_FALSE(validate_headers({{name, "ok"}}));
-  for (const auto value :
+  for (const auto& value :
        {std::string{"a\rb"}, std::string{"a\nb"}, std::string{"a\0b", 3},
         std::string{"\x7f"}, std::string{"\xff"}})
     REQUIRE_FALSE(validate_headers({{"x-note", value}}));

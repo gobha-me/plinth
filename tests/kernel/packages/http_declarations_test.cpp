@@ -47,6 +47,7 @@ auto reject(const Json& document, std::string_view rule) -> void {
 
 auto numbered_claims(std::size_t count) -> std::vector<std::string> {
   std::vector<std::string> claims;
+  claims.reserve(count);
   for (std::size_t index = 0; index < count; ++index) {
     claims.push_back("/p" + std::to_string(index));
   }

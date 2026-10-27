@@ -24,6 +24,14 @@ TEST_CASE("generation receipts schema: validated retained bootstrap",
   SECTION("fresh and retained schema are identical and missing table is "
           "recreated empty") {
     REQUIRE_NOTHROW(retained());
+    // Model an installation predating HTTP metadata. The new restrictive
+    // receipt FK correctly prevents dropping its artifact parent on its own.
+    // Remove only these empty fixture tables in dependency order first.
+    command("DROP TABLE plinth.extension_http_dispatch_obligations");
+    command("DROP TABLE plinth.extension_http_pending_gate");
+    command("DROP TABLE plinth.package_http_adapter_bindings");
+    command("DROP TABLE plinth.package_http_claim_reservations");
+    command("DROP TABLE plinth.package_http_claim_receipts");
     command("DROP TABLE plinth.package_artifact_receipts");
     REQUIRE_NOTHROW(retained());
     const auto result =

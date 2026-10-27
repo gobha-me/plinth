@@ -1,11 +1,14 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <libpq-fe.h>
+#include <memory>
 
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
+#include "kernel/db/connection_info.hpp"
 
 // ── Unit tests (no PG required) ─────────────────────────────
 
@@ -127,6 +130,24 @@ auto drop_plinth_schema(const plinth::Config::Database& db) -> void {
     PQclear(PQexec(conn, "DROP SCHEMA IF EXISTS plinth CASCADE"));
   }
   PQfinish(conn);
+}
+
+struct OwnedBootstrapSchema {
+  plinth::Config::Database db = pg_config();
+  OwnedBootstrapSchema() { drop_plinth_schema(db); }
+  ~OwnedBootstrapSchema() { drop_plinth_schema(db); }
+  OwnedBootstrapSchema(const OwnedBootstrapSchema&) = delete;
+  auto operator=(const OwnedBootstrapSchema&) -> OwnedBootstrapSchema& = delete;
+};
+
+using BootstrapResult = std::unique_ptr<PGresult, decltype(&PQclear)>;
+auto http_schema_query(PGconn& connection, const std::string& sql)
+    -> BootstrapResult {
+  BootstrapResult result{PQexec(&connection, sql.c_str()), PQclear};
+  REQUIRE(result != nullptr);
+  REQUIRE((PQresultStatus(result.get()) == PGRES_COMMAND_OK ||
+           PQresultStatus(result.get()) == PGRES_TUPLES_OK));
+  return result;
 }
 
 } // namespace
@@ -288,4 +309,84 @@ TEST_CASE("bootstrap_schema upgrades an existing install with invite storage",
   REQUIRE_NOTHROW(plinth::db::bootstrap_schema(db, migrations_dir, false));
 
   drop_plinth_schema(db);
+}
+
+TEST_CASE("HTTP claims bootstrap creates checked empty storage without legacy "
+          "backfill",
+          "[bootstrap][integration][http-claims-bootstrap]") {
+  if (!pg_available()) SKIP("PG not available");
+  OwnedBootstrapSchema fixture;
+  const auto migrations = std::string{CMAKE_SOURCE_DIR} + "/migrations";
+  REQUIRE_NOTHROW(plinth::db::bootstrap_schema(fixture.db, migrations, false));
+  auto connection = std::unique_ptr<PGconn, decltype(&PQfinish)>(
+      PQconnectdb(plinth::db::connection_info(fixture.db).c_str()), PQfinish);
+  REQUIRE(connection);
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  for (const auto* name :
+       {"package_http_claim_receipts", "package_http_claim_reservations",
+        "package_http_adapter_bindings"})
+    REQUIRE(table_exists(fixture.db, name));
+  http_schema_query(*connection, R"sql(
+INSERT INTO plinth.packages(name,version,state,provenance,manifest_json,
+entry_point,manifest_checksum) VALUES('legacy-http','1.0.0','ACTIVE','user',
+'{"http_prefixes":["/legacy/**"],"handler_mode":"historical-unknown"}',
+'server/main.js','unchanged');
+DROP TABLE plinth.extension_http_dispatch_obligations;
+DROP TABLE plinth.extension_http_pending_gate;
+DROP TABLE plinth.package_http_adapter_bindings;
+DROP TABLE plinth.package_http_claim_reservations;
+DROP TABLE plinth.package_http_claim_receipts;
+)sql");
+  REQUIRE_NOTHROW(plinth::db::bootstrap_schema(fixture.db, migrations, false));
+  REQUIRE_NOTHROW(plinth::db::bootstrap_schema(fixture.db, migrations, false));
+  const auto rows = http_schema_query(*connection, R"sql(
+SELECT state,manifest_checksum,manifest_json->>'handler_mode',
+(SELECT count(*) FROM plinth.package_http_claim_receipts),
+(SELECT count(*) FROM plinth.package_http_claim_reservations),
+(SELECT count(*) FROM plinth.package_http_adapter_bindings),
+(SELECT count(*) FROM plinth.package_artifact_receipts)
+FROM plinth.packages WHERE name='legacy-http'
+)sql");
+  REQUIRE(PQntuples(rows.get()) == 1);
+  REQUIRE(std::string{PQgetvalue(rows.get(), 0, 0)} == "ACTIVE");
+  REQUIRE(std::string{PQgetvalue(rows.get(), 0, 1)} == "unchanged");
+  REQUIRE(std::string{PQgetvalue(rows.get(), 0, 2)} == "historical-unknown");
+  for (int column = 3; column < 7; ++column)
+    REQUIRE(std::string{PQgetvalue(rows.get(), 0, column)} == "0");
+}
+
+TEST_CASE(
+    "HTTP claims bootstrap refuses incompatible retained authority tables",
+    "[bootstrap][integration][http-claims-bootstrap]") {
+  if (!pg_available()) SKIP("PG not available");
+  OwnedBootstrapSchema fixture;
+  const auto migrations = std::string{CMAKE_SOURCE_DIR} + "/migrations";
+  REQUIRE_NOTHROW(plinth::db::bootstrap_schema(fixture.db, migrations, false));
+  auto connection = std::unique_ptr<PGconn, decltype(&PQfinish)>(
+      PQconnectdb(plinth::db::connection_info(fixture.db).c_str()), PQfinish);
+  REQUIRE(connection);
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  SECTION("receipt column") {
+    http_schema_query(*connection,
+                      "ALTER TABLE plinth.package_http_claim_receipts "
+                      "ALTER COLUMN http_prefixes DROP NOT NULL");
+  }
+  SECTION("reservation column") {
+    http_schema_query(*connection,
+                      "ALTER TABLE plinth.package_http_claim_reservations "
+                      "ALTER COLUMN phase DROP NOT NULL");
+  }
+  SECTION("binding column") {
+    http_schema_query(*connection,
+                      "ALTER TABLE plinth.package_http_adapter_bindings "
+                      "ALTER COLUMN owner_epoch DROP NOT NULL");
+  }
+  SECTION("nonkernel grants") {
+    http_schema_query(
+        *connection,
+        "GRANT SELECT ON plinth.package_http_claim_receipts TO PUBLIC");
+  }
+  REQUIRE_THROWS_WITH(
+      plinth::db::bootstrap_schema(fixture.db, migrations, false),
+      "incompatible HTTP claims schema");
 }

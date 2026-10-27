@@ -494,6 +494,8 @@ endif()
 # on fresh population and skip it on reconfigure when already present.
 set(PLINTH_QUICKJS_CSTRING_PATCH
     ${CMAKE_SOURCE_DIR}/third_party/quickjs-patches/cstring-conversion-failure-leak.patch)
+set(PLINTH_QUICKJS_HTTP_MODULE_PATCH
+    ${CMAKE_SOURCE_DIR}/third_party/quickjs-patches/http-module-name-validation.patch)
 FetchContent_Declare(
   quickjs
   GIT_REPOSITORY https://github.com/quickjs-ng/quickjs.git
@@ -501,6 +503,9 @@ FetchContent_Declare(
   PATCH_COMMAND sh -c
     "git apply --reverse --check '${PLINTH_QUICKJS_CSTRING_PATCH}' 2>/dev/null \
      || git apply --whitespace=nowarn '${PLINTH_QUICKJS_CSTRING_PATCH}'"
+    COMMAND sh -c
+    "git apply --reverse --check '${PLINTH_QUICKJS_HTTP_MODULE_PATCH}' 2>/dev/null \
+     || git apply --whitespace=nowarn '${PLINTH_QUICKJS_HTTP_MODULE_PATCH}'"
 )
 FetchContent_GetProperties(quickjs)
 if(NOT quickjs_POPULATED)
@@ -602,7 +607,15 @@ add_executable(plinth
   src/kernel/js/stdlib/cap_bindings.cpp
   src/kernel/js/stdlib/pubsub_bindings.cpp
   src/kernel/extension_http/codec.cpp
+  src/kernel/extension_http/authentication.cpp
+  src/kernel/extension_http/dispatch_store.cpp
+  src/kernel/extension_http/frames.cpp
+  src/kernel/extension_http/quickjs_codec.cpp
   src/kernel/extension_http/ownership.cpp
+  src/kernel/packages/http_claims.cpp
+  src/kernel/packages/http_generation.cpp
+  src/kernel/packages/http_generation_stage.cpp
+  src/kernel/packages/http_install_authorization.cpp
   src/kernel/packages/http_declarations.cpp
   src/kernel/packages/manifest.cpp
   src/kernel/packages/capabilities_manifest.cpp
@@ -811,7 +824,15 @@ add_executable(plinth_tests
   tests/kernel/js/native_setup_failure_test.cpp
   tests/kernel/js/eval_guard_test.cpp
   tests/kernel/extension_http/codec_test.cpp
+  tests/kernel/extension_http/authentication_test.cpp
+  tests/kernel/extension_http/dispatch_store_test.cpp
+  tests/kernel/extension_http/frames_test.cpp
+  tests/kernel/extension_http/quickjs_codec_test.cpp
+  tests/kernel/extension_http/quickjs_module_boundary_test.cpp
   tests/kernel/extension_http/ownership_test.cpp
+  tests/kernel/packages/http_claims_test.cpp
+  tests/kernel/packages/http_generation_test.cpp
+  tests/kernel/packages/http_install_authorization_test.cpp
   tests/kernel/packages/http_declarations_test.cpp
   tests/kernel/packages/manifest_test.cpp
   tests/kernel/packages/capabilities_manifest_test.cpp
@@ -939,7 +960,15 @@ add_executable(plinth_tests
   src/kernel/js/stdlib/cap_bindings.cpp
   src/kernel/js/stdlib/pubsub_bindings.cpp
   src/kernel/extension_http/codec.cpp
+  src/kernel/extension_http/authentication.cpp
+  src/kernel/extension_http/dispatch_store.cpp
+  src/kernel/extension_http/frames.cpp
+  src/kernel/extension_http/quickjs_codec.cpp
   src/kernel/extension_http/ownership.cpp
+  src/kernel/packages/http_claims.cpp
+  src/kernel/packages/http_generation.cpp
+  src/kernel/packages/http_generation_stage.cpp
+  src/kernel/packages/http_install_authorization.cpp
   src/kernel/packages/http_declarations.cpp
   src/kernel/packages/manifest.cpp
   src/kernel/packages/capabilities_manifest.cpp
@@ -1804,13 +1833,151 @@ add_plinth_native_setup_case(commit_bookkeeping
 add_plinth_native_setup_case(domain_retry
   "private database domain failed close is retained until actual retry")
 
+# Exact positive/no-skip checks for the new HTTP metadata/capture facility.
+# Grouped PG success alone must not hide an unavailable fixture or renamed case.
+foreach(HTTP_CASE IN ITEMS
+    "01|HTTP claims bootstrap creates checked empty storage without legacy backfill"
+    "02|HTTP claims bootstrap refuses incompatible retained authority tables"
+    "03|HTTP claim schema checks independent definitions and creates no authority"
+    "04|HTTP claims require the actual name transaction isolation and xact lock"
+    "05|HTTP provisional claims remain caller transaction owned and never backfill ACTIVE"
+    "06|HTTP receipts bind artifacts and exact retry retains the first UUID"
+    "07|HTTP binding tuples are immutable values and cannot resurrect retired epochs"
+    "08|HTTP two-session xact contention and fresh snapshot prevent conflicting commits"
+    "09|HTTP disjoint near-miss claims commit and conflict scan crosses page boundary"
+    "10|HTTP frontend conflict scan retains exact states and fails unknown ownership closed"
+    "11|HTTP held records prevent ordinary cascade deletion without a retirement proof"
+    "12|HTTP upgrade exemption is only the exact authorized predecessor and never a fixed root"
+    "13|HTTP attached receipt UUID cannot cross package ownership even through a direct FK write"
+    "14|HTTP committed reader requires fresh IDLE ACTIVE same-name metadata"
+    "15|HTTP committed reader distinguishes inert legacy from partial reservations"
+    "16|HTTP committed reader rejects committed identity attachment and state mismatches"
+    "17|HTTP install auth PG: rule definitions grant nothing and real API dry-run checks them"
+    "18|HTTP install auth PG: direct caller identity cannot mutate HTTP but legacy stays ordinary"
+    "19|HTTP capture binds exact authorized manifest without publishing or evaluating"
+    "20|HTTP capture refuses changed authorized source entry or control budget"
+    "21|HTTP install submission: authorized unintegrated modes refuse mutation and dry-run"
+    "22|HTTP upgrade submission: authorized unintegrated modes preserve the installed predecessor"
+    )
+  string(REPLACE "|" ";" HTTP_CASE_PARTS "${HTTP_CASE}")
+  list(GET HTTP_CASE_PARTS 0 HTTP_CASE_NAME)
+  list(GET HTTP_CASE_PARTS 1 HTTP_CASE_TITLE)
+  add_test(NAME plinth_tests_http_metadata_${HTTP_CASE_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${HTTP_CASE_TITLE}" --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_http_metadata_${HTTP_CASE_NAME} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg;extension_http" TIMEOUT 75)
+endforeach()
+
+# The new store and actual authentication-filter checks need positive PG
+# execution as well as grouped coverage. The auth fixture also owns WS ports.
+foreach(HTTP_OWNED_CASE IN ITEMS
+    "store_01|HTTP obligation PG acknowledges real prepare and ARM commits without execution projection"
+    "store_02|HTTP obligation PG durable root retains dropped callers before first acquisition"
+    "store_03|HTTP obligation PG pending capacity survives completed physical domains"
+    "store_04|HTTP obligation PG stale fence refuses ARM and does not fabricate handoff"
+    "store_05|HTTP obligation PG schema check refuses altered constraints"
+    "store_06|HTTP obligation PG pending live pin restricts receipt deletion"
+    "store_07|HTTP obligation PG missing and mismatched receipt cannot prepare"
+    "store_08|HTTP obligation PG shortened deadline never resets or admits expired prepare"
+    "auth_01|HTTP authentication actual PG filter validates PAT state and refuses sessions"
+    "auth_02|HTTP authentication actual PAT bookkeeping retains ownership after success"
+    )
+  string(REPLACE "|" ";" HTTP_OWNED_PARTS "${HTTP_OWNED_CASE}")
+  list(GET HTTP_OWNED_PARTS 0 HTTP_OWNED_NAME)
+  list(GET HTTP_OWNED_PARTS 1 HTTP_OWNED_TITLE)
+  add_test(NAME plinth_tests_http_owned_${HTTP_OWNED_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${HTTP_OWNED_TITLE}" --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_http_owned_${HTTP_OWNED_NAME} PROPERTIES
+    RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg;extension_http" TIMEOUT 75)
+  if(HTTP_OWNED_NAME MATCHES "^auth_")
+    set_tests_properties(plinth_tests_http_owned_${HTTP_OWNED_NAME} PROPERTIES
+      RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099")
+  endif()
+endforeach()
+
+# Length-complete import policy requires actual engine execution, including
+# static imports, dynamic jobs and loaded-module cache hits.
+foreach(HTTP_MODULE_CASE IN ITEMS
+    "01|HTTP QuickJS hook preserves complete static escaped NUL before normalization"
+    "02|HTTP QuickJS hook preserves computed dynamic NUL in the actual import job"
+    "03|HTTP QuickJS hook allows owned relative static dynamic and Unicode module bytes"
+    "04|HTTP QuickJS hook rejects nonrelative oversized and nonscalar decoded names"
+    "05|HTTP QuickJS hook validates static and dynamic imports before cache hits"
+    "06|HTTP QuickJS hook exception rejection and clearing have owned cleanup"
+    "07|HTTP QuickJS hook runtime owns queued import through context destruction"
+    )
+  string(REPLACE "|" ";" HTTP_MODULE_PARTS "${HTTP_MODULE_CASE}")
+  list(GET HTTP_MODULE_PARTS 0 HTTP_MODULE_NAME)
+  list(GET HTTP_MODULE_PARTS 1 HTTP_MODULE_TITLE)
+  add_test(NAME plinth_tests_http_module_${HTTP_MODULE_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${HTTP_MODULE_TITLE}" --timeout 30
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_http_module_${HTTP_MODULE_NAME} PROPERTIES
+    LABELS "extension_http" TIMEOUT 40)
+endforeach()
+
+# Frame1 wire data and native QuickJS value conversion need positive actual
+# case execution. These are bounded codec checks, not live adapter coverage.
+foreach(HTTP_CODEC_CASE IN ITEMS
+    "frame_01|HTTP Frame1 all eight variants roundtrip with canonical definition order"
+    "frame_02|HTTP Frame1 closed outcomes cancellation and settlement enums remain exact"
+    "frame_03|HTTP Frame1 raw decoded duplicate and unknown keys reject at every record role"
+    "frame_04|HTTP Frame1 rejects wrong primitive types missing data and malformed scalars"
+    "frame_05|HTTP Frame1 call identity prefix and path equality are data checks only"
+    "frame_06|HTTP Frame1 UTF8 body token encoding and illegal shape fail before DOM use"
+    "frame_07|HTTP Frame1 encoded metadata uses a total payload whitespace ceiling"
+    "frame_08|HTTP Frame1 maximal legal call metadata is counted across all nested values"
+    "frame_09|HTTP Frame1 eight MiB binary and escaped body key roundtrip without quota reset"
+    "frame_10|HTTP Frame1 body plus one and malformed canonical base64 reject"
+    "frame_11|HTTP Frame1 BE lengths are checked before allocation and complete buffers are exact"
+    "frame_12|HTTP Frame1 admission and partial reservation failure restore exact credits"
+    "frame_13|HTTP Frame1 returned buffers and DTOs retain process credits through destruction"
+    "value_01|HTTP QuickJS codec encodes exact frozen metadata and mutable local binary"
+    "value_02|HTTP QuickJS codec encodes binary empties and refuses invalid captured data"
+    "value_03|HTTP QuickJS codec accepts semantic record order and literal repeated headers"
+    "value_04|HTTP QuickJS codec rejects proxies accessors symbols and nonenumerable extras without traps"
+    "value_05|HTTP QuickJS codec rejects exotic and missing own fields without thenable coercion"
+    "value_06|HTTP QuickJS codec enforces dense exact header tuples and byte bounds"
+    "value_07|HTTP QuickJS codec requires exact numeric and header scalar policy"
+    "value_08|HTTP QuickJS codec snapshots exact binary slices independently of later mutation"
+    "value_09|HTTP QuickJS codec distinguishes empty detached shared and exact binary brands"
+    "value_10|HTTP QuickJS codec inspects only native promise slots without pumping or rejection coercion"
+    "value_11|HTTP QuickJS codec keeps copied response credits through actual engine destruction"
+    "value_12|HTTP QuickJS codec refuses wrong budgets exhausted memory retired turns and thrown consumers"
+    )
+  string(REPLACE "|" ";" HTTP_CODEC_PARTS "${HTTP_CODEC_CASE}")
+  list(GET HTTP_CODEC_PARTS 0 HTTP_CODEC_NAME)
+  list(GET HTTP_CODEC_PARTS 1 HTTP_CODEC_TITLE)
+  add_test(NAME plinth_tests_http_codec_${HTTP_CODEC_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${HTTP_CODEC_TITLE}" --timeout 30
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_http_codec_${HTTP_CODEC_NAME} PROPERTIES
+    LABELS "extension_http" TIMEOUT 40)
+endforeach()
+
 # Keep every integration section in the same process, including repeated schema
-# bootstrap. Sanitizer instrumentation needs a larger aggregate runner budget;
+# bootstrap and the new HTTP metadata cases. The prior Debug group took 294.9s
+# before those additions against its 300s cap. Sanitizer instrumentation needs
+# a larger aggregate runner budget;
 # individual database, worker and lifecycle deadlines remain unchanged.
-set(PLINTH_PG_AGGREGATE_TIMEOUT 300)
+set(PLINTH_PG_AGGREGATE_TIMEOUT 450)
 set(PLINTH_PG_REPORT_ARGS)
 if(PLINTH_SANITIZERS)
-  set(PLINTH_PG_AGGREGATE_TIMEOUT 450)
+  set(PLINTH_PG_AGGREGATE_TIMEOUT 600)
   set(PLINTH_PG_REPORT_ARGS --durations yes)
 endif()
 add_test(NAME plinth_tests_pg

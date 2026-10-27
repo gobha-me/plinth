@@ -246,8 +246,14 @@ auto validate_pat_token(const std::string& raw_token,
           db->execSqlAsync(
               "UPDATE plinth.pats SET last_used_at = NOW() "
               "WHERE id = $1::uuid",
-              [](const drogon::orm::Result&) {},
-              [pat_id](const drogon::orm::DrogonDbException& e) {
+              [shared_cb](const drogon::orm::Result&) {
+                static_cast<void>(
+                    shared_cb); // Retain the caller's owned callback lineage
+                                // through this command.
+              },
+              [pat_id, shared_cb](const drogon::orm::DrogonDbException& e) {
+                static_cast<void>(shared_cb); // Error settlement retains the
+                                              // same caller ownership.
                 spdlog::warn("PAT last_used_at update failed for {}: {}",
                              pat_id, e.base().what());
               },

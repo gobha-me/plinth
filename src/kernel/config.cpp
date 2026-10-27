@@ -195,6 +195,31 @@ auto apply_ws(Config& cfg, const nlohmann::json& j) -> void {
   }
 }
 
+auto apply_extension_http(Config& cfg, const nlohmann::json& section) -> void {
+  if (!section.is_object()) {
+    throw std::runtime_error("config.extension_http_not_object");
+  }
+  for (auto it = section.begin(); it != section.end(); ++it) {
+    if (it.key() != "drain_timeout_ms") {
+      throw std::runtime_error("config.extension_http.unknown_key");
+    }
+  }
+  if (!section.contains("drain_timeout_ms")) return;
+  const auto& value = section["drain_timeout_ms"];
+  constexpr auto INVALID =
+      "config.extension_http.drain_timeout_ms_out_of_range";
+  if (!value.is_number_integer()) throw std::runtime_error(INVALID);
+  if (value.is_number_unsigned()) {
+    const auto parsed = value.get<std::uint64_t>();
+    if (parsed < 1000 || parsed > 5000) throw std::runtime_error(INVALID);
+    cfg.extension_http_drain_timeout_ms = static_cast<std::uint32_t>(parsed);
+  } else {
+    const auto parsed = value.get<std::int64_t>();
+    if (parsed < 1000 || parsed > 5000) throw std::runtime_error(INVALID);
+    cfg.extension_http_drain_timeout_ms = static_cast<std::uint32_t>(parsed);
+  }
+}
+
 auto apply_packages(Config& cfg, const nlohmann::json& p) -> void {
   if (p.contains("restore_policy_file")) {
     if (!p["restore_policy_file"].is_string())
@@ -626,6 +651,9 @@ auto apply_json(Config& cfg, const nlohmann::json& j) -> void {
   }
   if (j.contains("packages") && j["packages"].is_object()) {
     apply_packages(cfg, j["packages"]);
+  }
+  if (j.contains("extension_http")) {
+    apply_extension_http(cfg, j["extension_http"]);
   }
   if (j.contains("realtime") && j["realtime"].is_object()) {
     apply_realtime(cfg, j["realtime"]);

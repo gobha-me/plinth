@@ -1,18 +1,27 @@
 #include "../ws/ws_test_fixture.hpp"
+#include "kernel/auth/middleware.hpp"
 #include "kernel/db/connection_info.hpp"
+#include "kernel/packages/http_generation_stage.hpp"
+#include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/installed_generation_registry.hpp"
 #include "kernel/packages/migrations_internal.hpp"
+#include "kernel/rbac/enforcement.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace {
 namespace generation = plinth::packages::generation;
@@ -60,7 +69,7 @@ struct Fixture {
                                 .version = "1.0.0",
                                 .profile = 1};
   fs::path version_root{tree.root / "extensions" / key.name / key.version};
-  Fixture() {
+  explicit Fixture(std::string raw_manifest = MANIFEST) {
     plinth::ws_test::reset_schema(config.db);
     connection = std::shared_ptr<PGconn>{
         PQconnectdb(plinth::db::connection_info(config.db).c_str()), PQfinish};
@@ -68,13 +77,14 @@ struct Fixture {
     REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
     fs::create_directories(version_root / "server");
     fs::create_directories(version_root / "client");
-    write("manifest.json", MANIFEST);
+    write("manifest.json", raw_manifest);
     write("panels.json", "{\"panels\":[]}");
     write("capabilities.json", "{\"provides\":[],\"requires\":[]}");
     write("server/main.js", "export default {};\n");
     write("client/value.txt", "original\n");
-    const auto checksum = plinth::packages::detail::sha256_hex(MANIFEST);
-    const std::array<const char*, 2> parameters{MANIFEST, checksum.c_str()};
+    const auto checksum = plinth::packages::detail::sha256_hex(raw_manifest);
+    const std::array<const char*, 2> parameters{raw_manifest.c_str(),
+                                                checksum.c_str()};
     const std::unique_ptr<PGresult, decltype(&PQclear)> result{
         PQexecParams(
             connection.get(),
@@ -114,6 +124,44 @@ struct Fixture {
             "WHERE name='registryfixture'");
   }
 };
+
+constexpr auto HTTP_MANIFEST = R"({"name":"registryfixture","version":"1.0.0",
+"description":"owned registry fixture","author":"plinth","license":"MIT",
+"entry_point":"server/main.js","http_prefixes":["/capture/*"],"handler_mode":"quickjs"})";
+
+auto authorize_http(std::string_view raw)
+    -> plinth::packages::AuthorizedHttpSubmission {
+  // Trusted request-attribute fixture through the production proof factory.
+  // No actual ZIP install or authentication filter-chain claim is made here.
+  const std::array zip{std::byte{'P'}, std::byte{'K'}, std::byte{3},
+                       std::byte{4}};
+  auto request = drogon::HttpRequest::newHttpRequest();
+  request->attributes()->insert(
+      plinth::auth::ATTR_USER_ID,
+      std::string{"11111111-1111-1111-1111-111111111111"});
+  request->attributes()->insert(plinth::auth::ATTR_AUTH_TYPE,
+                                std::string{"session"});
+  request->attributes()->insert(plinth::auth::ATTR_CREDENTIAL_SOURCE,
+                                std::string{"cookie"});
+  request->attributes()->insert(plinth::rbac::ATTR_EFFECTIVE_RULES,
+                                std::vector<std::string>{"kernel.admin"});
+  request->attributes()->insert(plinth::rbac::ATTR_PERMISSION_GRANTED, true);
+  auto declaration = plinth::packages::HttpDeclaration::parse(raw);
+  REQUIRE(declaration.value);
+  const plinth::packages::HttpInstallAuthorizationRequest input{
+      zip,
+      raw,
+      *declaration.value,
+      "registryfixture",
+      "1.0.0",
+      plinth::packages::HttpInstallOperation::INSTALL,
+      {},
+      plinth::packages::Provenance::USER};
+  auto result =
+      plinth::packages::make_http_install_authorizer(request, zip)(input);
+  REQUIRE(result);
+  return std::move(*result);
+}
 } // namespace
 
 TEST_CASE("installed generation registry: receipt commit and immutable cache "
@@ -262,4 +310,107 @@ TEST_CASE("installed generation registry: receipt commit and immutable cache "
         registry.current_locked(operation, fixture.key, fixture.deadline()),
         Error::RECEIPT_REQUIRED);
   }
+}
+
+TEST_CASE("HTTP capture binds exact authorized manifest without publishing or "
+          "evaluating",
+          "[packages][http-generation-stage][integration]") {
+  if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
+  namespace http = plinth::packages::http_generation;
+  Fixture fixture{HTTP_MANIFEST};
+  const std::string binary_source{"throw 1;\0tail", 13};
+  fixture.write("server/http.js", binary_source);
+  generation::InstalledGenerationRegistry registry{fixture.tree.root};
+  auto budget = registry.source_budget();
+  auto operation = fixture.lock();
+  fixture.command("BEGIN");
+  auto staged =
+      registry.stage_locked(operation, fixture.key, fixture.deadline());
+  REQUIRE(staged);
+  const auto captured_digest = staged->artifact()->digest();
+  auto authorized = authorize_http(HTTP_MANIFEST);
+  const auto approved_manifest = authorized.raw_manifest_sha256();
+  auto bound = http::prepare_http_capture(std::move(*staged),
+                                          std::move(authorized), budget);
+  REQUIRE(bound);
+  REQUIRE(bound->authorization().raw_manifest_sha256() == approved_manifest);
+  REQUIRE(bound->prepared_generation().artifact()->digest() == captured_digest);
+  REQUIRE(bound->modules());
+  REQUIRE(bound->modules()->entry().bytes() == std::string_view{binary_source});
+  fixture.write("server/http.js", "different on disk");
+  REQUIRE(bound->modules()->entry().bytes() == std::string_view{binary_source});
+  require_error(registry.publish_committed_locked(operation,
+                                                  bound->prepared_generation(),
+                                                  fixture.deadline()),
+                Error::TRANSACTION_REQUIRED);
+  plinth::ws_test::TestPg observer{fixture.config.db};
+  auto count = observer.exec(
+      "SELECT (SELECT count(*) FROM plinth.package_http_claim_receipts),"
+      "(SELECT count(*) FROM plinth.package_http_claim_reservations),"
+      "(SELECT count(*) FROM plinth.package_artifact_receipts)");
+  REQUIRE(PQresultStatus(count.get()) == PGRES_TUPLES_OK);
+  REQUIRE(PQntuples(count.get()) == 1);
+  for (int column = 0; column < 3; ++column)
+    REQUIRE(std::string_view{PQgetvalue(count.get(), 0, column)} == "0");
+  fixture.command("ROLLBACK");
+  fixture.activate();
+  require_error(registry.publish_committed_locked(operation,
+                                                  bound->prepared_generation(),
+                                                  fixture.deadline()),
+                Error::RECEIPT_REQUIRED);
+  REQUIRE(bound->modules()->entry().bytes() == std::string_view{binary_source});
+}
+
+TEST_CASE(
+    "HTTP capture refuses changed authorized source entry or control budget",
+    "[packages][http-generation-stage][integration]") {
+  if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
+  namespace http = plinth::packages::http_generation;
+  Fixture fixture{HTTP_MANIFEST};
+  generation::InstalledGenerationRegistry registry{fixture.tree.root};
+  auto budget = registry.source_budget();
+  auto operation = fixture.lock();
+  auto raw = std::string{HTTP_MANIFEST};
+  bool write_entry = true;
+  auto expected = http::PreparationError::SOURCE_MISMATCH;
+  bool foreign = false;
+  bool pressure = false;
+  SECTION("different exact manifest bytes") {
+    raw.insert(raw.size() - 1, " ");
+  }
+  SECTION("different declaration") {
+    raw.replace(raw.find("/capture/*"), std::string_view{"/capture/*"}.size(),
+                "/different/*");
+  }
+  SECTION("missing fixed entry") {
+    write_entry = false;
+    expected = http::PreparationError::ENTRY_REQUIRED;
+  }
+  SECTION("another budget cannot inherit source ownership") {
+    foreign = true;
+    expected = http::PreparationError::INVALID;
+  }
+  SECTION("control allocation refused before digest copies") {
+    pressure = true;
+    expected = http::PreparationError::BUDGET_UNAVAILABLE;
+  }
+  if (write_entry)
+    fixture.write("server/http.js", "export default () => ({});");
+  fixture.command("BEGIN");
+  auto staged =
+      registry.stage_locked(operation, fixture.key, fixture.deadline());
+  REQUIRE(staged);
+  generation::Budget unrelated;
+  std::optional<generation::BudgetTicket> hold;
+  if (pressure) {
+    hold = budget.try_reserve(budget.capacity() - budget.used() -
+                              (std::size_t{128} * 1024 - 1));
+    REQUIRE(hold);
+  }
+  auto bound = http::prepare_http_capture(
+      std::move(*staged), authorize_http(raw), foreign ? unrelated : budget);
+  REQUIRE_FALSE(bound);
+  REQUIRE(bound.error() == expected);
+  REQUIRE(PQtransactionStatus(fixture.connection.get()) == PQTRANS_INTRANS);
+  fixture.command("ROLLBACK");
 }

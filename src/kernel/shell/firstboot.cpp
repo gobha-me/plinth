@@ -449,8 +449,14 @@ auto ensure_bundled_shell_installed(
                              .message = "available shell is older than "
                                         "installed shell; downgrade refused"});
       }
+      auto authorized_ctx = bootstrap_ctx;
+      authorized_ctx.http_authorizer =
+          packages::make_bundled_http_install_authorizer(
+              packages::KernelBundledHttpInstallToken{
+                  bundle->bytes, packages::HttpInstallOperation::UPGRADE,
+                  detect->id});
       auto upgraded =
-          packages::upgrade_package(bundle->bytes, detect->id, bootstrap_ctx,
+          packages::upgrade_package(bundle->bytes, detect->id, authorized_ctx,
                                     packages::Provenance::BUNDLED);
       if (!upgraded) {
         return std::unexpected(FirstBootFailure{
@@ -501,9 +507,14 @@ auto ensure_bundled_shell_installed(
   }
 
   auto t0 = std::chrono::steady_clock::now();
+  auto authorized_ctx = bootstrap_ctx;
+  authorized_ctx.http_authorizer =
+      packages::make_bundled_http_install_authorizer(
+          packages::KernelBundledHttpInstallToken{
+              *bytes, packages::HttpInstallOperation::INSTALL, {}});
   auto result = packages::install_package(
       std::span<const std::byte>{bytes->data(), bytes->size()},
-      packages::Provenance::BUNDLED, bootstrap_ctx);
+      packages::Provenance::BUNDLED, authorized_ctx);
   auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::steady_clock::now() - t0)
                      .count();
