@@ -1961,8 +1961,8 @@ foreach(HTTP_CODEC_CASE IN ITEMS
   list(GET HTTP_CODEC_PARTS 1 HTTP_CODEC_TITLE)
   set(HTTP_CODEC_INNER_TIMEOUT 30)
   set(HTTP_CODEC_OUTER_TIMEOUT 40)
-  if(PLINTH_TSAN AND HTTP_CODEC_NAME STREQUAL "frame_09")
-    # This full 8 MiB case hit its 30s TSan harness limit. Preserve every
+  if((PLINTH_TSAN OR PLINTH_SANITIZERS) AND HTTP_CODEC_NAME STREQUAL "frame_09")
+    # This full 8 MiB case hit its 30s sanitizer harness limit. Preserve every
     # byte/overflow check with one bounded instrumented-test allowance.
     set(HTTP_CODEC_INNER_TIMEOUT 90)
     set(HTTP_CODEC_OUTER_TIMEOUT 105)
