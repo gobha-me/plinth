@@ -1959,14 +1959,22 @@ foreach(HTTP_CODEC_CASE IN ITEMS
   string(REPLACE "|" ";" HTTP_CODEC_PARTS "${HTTP_CODEC_CASE}")
   list(GET HTTP_CODEC_PARTS 0 HTTP_CODEC_NAME)
   list(GET HTTP_CODEC_PARTS 1 HTTP_CODEC_TITLE)
+  set(HTTP_CODEC_INNER_TIMEOUT 30)
+  set(HTTP_CODEC_OUTER_TIMEOUT 40)
+  if(PLINTH_TSAN AND HTTP_CODEC_NAME STREQUAL "frame_09")
+    # This full 8 MiB case hit its 30s TSan harness limit. Preserve every
+    # byte/overflow check with one bounded instrumented-test allowance.
+    set(HTTP_CODEC_INNER_TIMEOUT 90)
+    set(HTTP_CODEC_OUTER_TIMEOUT 105)
+  endif()
   add_test(NAME plinth_tests_http_codec_${HTTP_CODEC_NAME}
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
       --binary $<TARGET_FILE:plinth_tests>
-      --case "${HTTP_CODEC_TITLE}" --timeout 30
+      --case "${HTTP_CODEC_TITLE}" --timeout ${HTTP_CODEC_INNER_TIMEOUT}
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
   set_tests_properties(plinth_tests_http_codec_${HTTP_CODEC_NAME} PROPERTIES
-    LABELS "extension_http" TIMEOUT 40)
+    LABELS "extension_http" TIMEOUT ${HTTP_CODEC_OUTER_TIMEOUT})
 endforeach()
 
 # Keep every integration section in the same process, including repeated schema
