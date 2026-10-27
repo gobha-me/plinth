@@ -133,7 +133,7 @@ class KernelBundledHttpInstallToken {
 
  private:
   friend auto plinth::shell::ensure_bundled_shell_installed(
-      const Config&, const InstallerContext&, bool)
+      const plinth::Config&, const plinth::packages::InstallerContext&, bool)
       -> std::expected<void, plinth::shell::FirstBootFailure>;
   friend auto make_bundled_http_install_authorizer(
       KernelBundledHttpInstallToken token) -> HttpInstallAuthorizer;
