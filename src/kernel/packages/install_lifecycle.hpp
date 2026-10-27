@@ -15,6 +15,7 @@
 // and `last_install_report`. See ICD OQ #5.
 
 #include "kernel/config.hpp"
+#include "kernel/packages/http_install_authorization.hpp"
 #include "kernel/packages/manifest_error.hpp"
 
 #include <nlohmann/json.hpp>
@@ -141,6 +142,9 @@ struct InstallerContext {
   // Optional process-owned facility. Null preserves ordinary legacy/test
   // behavior; this is neither an eager capture switch nor a permission grant.
   std::shared_ptr<generation::InstalledGenerationRegistry> generation_registry;
+  // Request-owned kernel producer. Missing preserves ordinary non-HTTP paths,
+  // but cannot authorize a new nonempty HTTP declaration.
+  HttpInstallAuthorizer http_authorizer;
 };
 
 // Primary entry point. Drives UPLOADING through ACTIVE or

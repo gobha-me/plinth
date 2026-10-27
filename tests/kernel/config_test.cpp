@@ -797,3 +797,105 @@ TEST_CASE("Restore policy configuration is explicit absolute and optional",
   REQUIRE_THROWS_WITH(plinth::load_config(),
                       "config.packages.restore_policy_file_invalid");
 }
+
+TEST_CASE("HTTP drain configuration defaults and inclusive integer bounds",
+          "[config][unit][extension_http]") {
+  EnvGuard guard;
+  REQUIRE(plinth::load_config().extension_http_drain_timeout_ms == 5000);
+  for (const auto& document :
+       {nlohmann::json::object(),
+        nlohmann::json{{"extension_http", nlohmann::json::object()}}}) {
+    const auto path = write_temp_config(document);
+    const auto cfg = plinth::load_config(path);
+    remove_file(path);
+    REQUIRE(cfg.extension_http_drain_timeout_ms == 5000);
+  }
+  for (std::uint32_t value : {1000U, 1234U, 5000U}) {
+    const auto path =
+        write_temp_config({{"extension_http", {{"drain_timeout_ms", value}}}});
+    const auto cfg = plinth::load_config(path);
+    remove_file(path);
+    REQUIRE(cfg.extension_http_drain_timeout_ms == value);
+    REQUIRE(cfg.packages_upgrade_drain_timeout_ms == 5000);
+  }
+}
+
+TEST_CASE("HTTP drain configuration rejects out of range numeric values "
+          "without coercion",
+          "[config][unit][extension_http]") {
+  EnvGuard guard;
+  const std::vector<nlohmann::json> values{
+      -1,
+      0,
+      999,
+      5001,
+      std::numeric_limits<std::int64_t>::min(),
+      std::numeric_limits<std::int64_t>::max(),
+      std::numeric_limits<std::uint64_t>::max(),
+      nlohmann::json::parse("18446744073709551616"),
+      nlohmann::json::parse("-9223372036854775809"),
+      1000.0,
+      1000.5,
+      5000.0,
+      1.0e100};
+  for (const auto& value : values) {
+    const auto path =
+        write_temp_config({{"extension_http", {{"drain_timeout_ms", value}}}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.extension_http.drain_timeout_ms_out_of_range");
+    remove_file(path);
+  }
+}
+
+TEST_CASE("HTTP drain configuration rejects wrong value types",
+          "[config][unit][extension_http]") {
+  EnvGuard guard;
+  for (const auto& value : std::vector<nlohmann::json>{
+           nullptr, true, false, "1000", "", nlohmann::json::array({1000}),
+           nlohmann::json::object()}) {
+    const auto path =
+        write_temp_config({{"extension_http", {{"drain_timeout_ms", value}}}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.extension_http.drain_timeout_ms_out_of_range");
+    remove_file(path);
+  }
+}
+
+TEST_CASE(
+    "HTTP drain configuration rejects non object sections and unknown fields",
+    "[config][unit][extension_http]") {
+  EnvGuard guard;
+  for (const auto& section : std::vector<nlohmann::json>{
+           nullptr, true, false, 1000, 1000.0, "", "5000",
+           nlohmann::json::array(), nlohmann::json::array({1000})}) {
+    const auto path = write_temp_config({{"extension_http", section}});
+    REQUIRE_THROWS_WITH(plinth::load_config(path),
+                        "config.extension_http_not_object");
+    remove_file(path);
+  }
+  const auto path = write_temp_config(
+      {{"extension_http", {{"drain_timeout_ms", 1000}, {"other", 5000}}}});
+  REQUIRE_THROWS_WITH(plinth::load_config(path),
+                      "config.extension_http.unknown_key");
+  remove_file(path);
+}
+
+TEST_CASE("HTTP and package configured drain budgets remain independent",
+          "[config][unit][extension_http]") {
+  EnvGuard guard;
+  for (std::uint32_t http : {1000U, 5000U}) {
+    const auto path =
+        write_temp_config({{"packages", {{"upgrade_drain_timeout_ms", 12345}}},
+                           {"extension_http", {{"drain_timeout_ms", http}}}});
+    const auto cfg = plinth::load_config(path);
+    remove_file(path);
+    REQUIRE(cfg.extension_http_drain_timeout_ms == http);
+    REQUIRE(cfg.packages_upgrade_drain_timeout_ms == 12345);
+  }
+  const auto path =
+      write_temp_config({{"packages", {{"upgrade_drain_timeout_ms", 12345}}}});
+  const auto cfg = plinth::load_config(path);
+  remove_file(path);
+  REQUIRE(cfg.extension_http_drain_timeout_ms == 5000);
+  REQUIRE(cfg.packages_upgrade_drain_timeout_ms == 12345);
+}

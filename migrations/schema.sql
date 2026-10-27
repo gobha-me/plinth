@@ -228,6 +228,85 @@ CREATE TABLE plinth.package_artifact_receipts (
     PRIMARY KEY (package_id, profile)
 );
 
+-- HTTP exposure requires explicit validated install provenance. These empty
+-- tables grant no claims to historical manifests. Restrictive foreign keys
+-- preserve retained generation ownership until acknowledged retirement.
+CREATE TABLE plinth.package_http_claim_receipts (
+    generation_receipt_id UUID PRIMARY KEY,
+    package_id UUID NOT NULL UNIQUE,
+    capture_profile INTEGER NOT NULL CHECK (capture_profile = 1),
+    name TEXT NOT NULL CHECK (name COLLATE "C" ~ '^[a-z][a-z0-9-]{1,63}$'),
+    version TEXT NOT NULL CHECK (octet_length(version) BETWEEN 1 AND 256 AND version COLLATE "C" ~ '^[0-9A-Za-z.+-]+$'),
+    provenance TEXT NOT NULL CHECK (provenance IN ('user','bundled')),
+    schema SMALLINT NOT NULL CHECK (schema = 1),
+    artifact_digest TEXT NOT NULL CHECK (artifact_digest COLLATE "C" ~ '^[0-9a-f]{64}$'),
+    registered_declarations_digest TEXT NOT NULL CHECK (registered_declarations_digest COLLATE "C" ~ '^[0-9a-f]{64}$'),
+    http_declarations_digest TEXT NOT NULL CHECK (http_declarations_digest COLLATE "C" ~ '^[0-9a-f]{64}$'),
+    adapter_descriptor_digest TEXT NOT NULL CHECK (adapter_descriptor_digest COLLATE "C" ~ '^[0-9a-f]{64}$'),
+    handler_mode TEXT NOT NULL CHECK (handler_mode IN ('quickjs','sidecar','bundled_native')),
+    http_prefixes TEXT[] NOT NULL CHECK (array_ndims(http_prefixes) = 1 AND array_lower(http_prefixes,1) = 1 AND cardinality(http_prefixes) BETWEEN 1 AND 64 AND array_position(http_prefixes,NULL) IS NULL AND octet_length(array_to_string(http_prefixes,E'\n')) <= 16447),
+    unauthenticated_prefixes TEXT[] NOT NULL CHECK ((cardinality(unauthenticated_prefixes) = 0 OR (array_ndims(unauthenticated_prefixes) = 1 AND array_lower(unauthenticated_prefixes,1) = 1)) AND cardinality(unauthenticated_prefixes) BETWEEN 0 AND 64 AND array_position(unauthenticated_prefixes,NULL) IS NULL AND octet_length(array_to_string(unauthenticated_prefixes,E'\n')) <= 16447 AND unauthenticated_prefixes <@ http_prefixes),
+    adapter_binding_key TEXT NOT NULL CHECK (octet_length(adapter_binding_key) BETWEEN 1 AND 256),
+    module_entry TEXT CHECK ((handler_mode = 'quickjs' AND module_entry IS NOT NULL AND module_entry = 'server/http.js') OR (handler_mode <> 'quickjs' AND module_entry IS NULL)),
+    UNIQUE (package_id,generation_receipt_id),
+    FOREIGN KEY (package_id,capture_profile) REFERENCES plinth.package_artifact_receipts(package_id,profile) ON DELETE RESTRICT
+);
+
+CREATE TABLE plinth.package_http_claim_reservations (
+    package_id UUID PRIMARY KEY,
+    http_prefixes TEXT[] NOT NULL CHECK (array_ndims(http_prefixes) = 1 AND array_lower(http_prefixes,1) = 1 AND cardinality(http_prefixes) BETWEEN 1 AND 64 AND array_position(http_prefixes,NULL) IS NULL AND octet_length(array_to_string(http_prefixes,E'\n')) <= 16447),
+    http_declarations_digest TEXT NOT NULL CHECK (http_declarations_digest COLLATE "C" ~ '^[0-9a-f]{64}$'),
+    generation_receipt_id UUID,
+    phase TEXT NOT NULL CHECK (phase IN ('HELD','RETIRING')),
+    FOREIGN KEY (package_id) REFERENCES plinth.packages(id) ON DELETE RESTRICT,
+    FOREIGN KEY (package_id,generation_receipt_id) REFERENCES plinth.package_http_claim_receipts(package_id,generation_receipt_id) ON DELETE RESTRICT
+);
+
+CREATE TABLE plinth.package_http_adapter_bindings (
+    adapter_epoch UUID PRIMARY KEY,
+    generation_receipt_id UUID NOT NULL,
+    owner_epoch UUID NOT NULL,
+    clock_domain_id UUID NOT NULL,
+    adapter_descriptor_digest TEXT NOT NULL CHECK (adapter_descriptor_digest COLLATE "C" ~ '^[0-9a-f]{64}$'),
+    retired_at TIMESTAMPTZ,
+    FOREIGN KEY (generation_receipt_id) REFERENCES plinth.package_http_claim_receipts(generation_receipt_id) ON DELETE RESTRICT
+);
+
+-- A pending HTTP dispatch pins its exact receipt until owned terminal
+-- settlement. The singleton gate serializes the bounded pending count.
+CREATE TABLE plinth.extension_http_pending_gate (
+    singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK(singleton)
+);
+INSERT INTO plinth.extension_http_pending_gate VALUES(true);
+
+CREATE TABLE plinth.extension_http_dispatch_obligations (
+    dispatch_id UUID PRIMARY KEY,
+    binding JSONB NOT NULL CHECK(jsonb_typeof(binding)='object' AND octet_length(binding::text)<=8192),
+    owner_epoch UUID NOT NULL,
+    fence_version BIGINT NOT NULL CHECK(fence_version>0),
+    revision BIGINT NOT NULL DEFAULT 1 CHECK(revision>0),
+    authorization_state TEXT NOT NULL DEFAULT 'prepared' CHECK(authorization_state IN ('prepared','armed','dispatched','unknown','aborted')),
+    choice JSONB CHECK(choice IS NULL OR (jsonb_typeof(choice)='object' AND octet_length(choice::text)<=1024)),
+    wire TEXT NOT NULL DEFAULT 'not_attempted' CHECK(wire IN ('not_attempted','attempt_started','write_completed','write_failed','unknown')),
+    physical_entry TEXT NOT NULL DEFAULT 'unknown' CHECK(physical_entry IN ('known_entered','known_not_entered','unknown')),
+    entered_at_ns NUMERIC(20,0) CHECK(entered_at_ns IS NULL OR entered_at_ns BETWEEN 0 AND 18446744073709551615),
+    live_generation_receipt_id UUID REFERENCES plinth.package_http_claim_receipts(generation_receipt_id) ON DELETE RESTRICT,
+    projection_confirmed BOOLEAN NOT NULL DEFAULT false,
+    pending BOOLEAN NOT NULL DEFAULT true,
+    retained BOOLEAN NOT NULL DEFAULT false,
+    settlement_resolved BOOLEAN NOT NULL DEFAULT false,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK((physical_entry='known_entered')=(entered_at_ns IS NOT NULL)),
+    CHECK(NOT projection_confirmed OR authorization_state='dispatched'),
+    CHECK(live_generation_receipt_id IS NULL OR (live_generation_receipt_id::text IS NOT DISTINCT FROM (binding#>>'{context,extension,generation_receipt_id}'))),
+    CHECK(NOT pending OR live_generation_receipt_id IS NOT NULL),
+    CHECK(live_generation_receipt_id IS NOT NULL OR (NOT pending AND retained AND settlement_resolved)),
+    CHECK(pending OR (retained AND settlement_resolved))
+);
+CREATE INDEX extension_http_pending_package ON
+    plinth.extension_http_dispatch_obligations((binding->>'package_name'))
+    WHERE pending;
+
 CREATE TABLE plinth.panels (
     package_id    UUID        NOT NULL REFERENCES plinth.packages(id) ON DELETE CASCADE,
     panel_id      TEXT        NOT NULL,

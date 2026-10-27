@@ -87,6 +87,10 @@ struct Config {
   // (not poll-with-budget).
   std::size_t packages_upgrade_drain_timeout_ms = 5000;
 
+  // HTTP-only configured budget. Enclosing remaining deadlines may shorten
+  // it below 1000ms; the owner must never clamp remaining time upward.
+  std::uint32_t extension_http_drain_timeout_ms = 5000;
+
   // Optional protected, root-owned deployment file, captured once before
   // ingress. Empty means no approved restore projections (live-only).
   // Configuration alone does not establish filesystem trust or reviewer RBAC.

@@ -12,6 +12,7 @@
 #include "kernel/logging.hpp"
 #include "kernel/packages/asset_server.hpp"
 #include "kernel/packages/capabilities_manifest.hpp"
+#include "kernel/packages/http_declarations.hpp"
 #include "kernel/packages/installed_generation_registry.hpp"
 #include "kernel/packages/manifest.hpp"
 #include "kernel/packages/migrations.hpp"
@@ -985,6 +986,131 @@ auto build_validation_report(const ValidationReport& vr) -> nlohmann::json {
   return out;
 }
 
+// Only explicit install/upgrade submissions call this before their neutral
+// name/version probe. Legacy enable/recovery/captured-manifest reads do not.
+// A pure parse is not authority; rejected bytes receive the SAME collected
+// static report as CLI validation before a candidate row or cutover exists.
+struct HttpSubmissionManifest {
+  std::string raw;
+  HttpDeclaration declaration;
+};
+
+auto preflight_http_submission(const fs::path& staging,
+                               const InstallerContext& ctx,
+                               Provenance provenance,
+                               HttpSubmissionManifest& submission)
+    -> std::optional<InstallFailure> {
+  std::ifstream input(staging / "manifest.json", std::ios::binary);
+  if (!input) return std::nullopt; // retain the existing missing-file outcome
+  std::stringstream buffer;
+  buffer << input.rdbuf();
+  if (input.bad()) return std::nullopt;
+  auto bytes = buffer.str();
+  auto declaration = HttpDeclaration::parse(bytes, "manifest.json");
+  if (declaration.value) {
+    submission.raw = std::move(bytes);
+    submission.declaration = std::move(*declaration.value);
+    return std::nullopt;
+  }
+
+  auto config = static_validation_config(ctx, provenance);
+  config.cross_file = true;
+  config.against_running_kernel = false;
+  const auto report = validate(staging, config);
+  return InstallFailure{.failed_at = InstallStage::VALIDATING,
+                        .package_id = "",
+                        .kind = "validation-errors",
+                        .message = "validation failed",
+                        .report = build_validation_report(report)};
+}
+
+auto authorize_http_submission(
+    std::span<const std::byte> zip_blob,
+    const HttpSubmissionManifest& submission, const MinimalManifest& minimal,
+    const InstallerContext& ctx, Provenance provenance,
+    HttpInstallOperation operation, std::string_view predecessor,
+    std::optional<AuthorizedHttpSubmission>& authorization)
+    -> std::optional<InstallFailure> {
+  if (!ctx.http_authorizer && submission.declaration.http_prefixes.empty())
+    return std::nullopt;
+  if (!ctx.http_authorizer) {
+    return InstallFailure{
+        .failed_at = InstallStage::UPLOADING,
+        .kind = "permission-denied",
+        .message = "HTTP declarations require kernel installer authorization"};
+  }
+  const HttpInstallAuthorizationRequest request{
+      .zip_blob = zip_blob,
+      .raw_manifest = submission.raw,
+      .declaration = submission.declaration,
+      .package_name = minimal.name,
+      .package_version = minimal.version,
+      .operation = operation,
+      .predecessor_id = predecessor,
+      .provenance = provenance};
+  auto result = ctx.http_authorizer(request);
+  if (!result) {
+    // Ordinary claim-free callers retain their existing trusted library path.
+    // A later HTTP-to-empty replacement still needs an actual proof at its
+    // receipt/publication hook; absence here never certifies that removal.
+    if (submission.declaration.http_prefixes.empty()) return std::nullopt;
+    const auto kind =
+        result.error().code ==
+                HttpInstallAuthorizationCode::CONFIRMATION_REQUIRED
+            ? "confirmation-required"
+        : result.error().code ==
+                HttpInstallAuthorizationCode::INVALID_SUBMISSION
+            ? "invalid-http-authorization"
+            : "permission-denied";
+    return InstallFailure{.failed_at = InstallStage::UPLOADING,
+                          .kind = kind,
+                          .message = result.error().message};
+  }
+  const bool actor_matches =
+      provenance == Provenance::USER
+          ? !result->kernel_selected_bundle() &&
+                result->actor_user_id() == ctx.caller_user_id
+          : result->kernel_selected_bundle() &&
+                result->actor_user_id().empty() && ctx.caller_user_id.empty();
+  if (!actor_matches || !result->matches(request)) {
+    if (submission.declaration.http_prefixes.empty()) return std::nullopt;
+    return InstallFailure{
+        .failed_at = InstallStage::UPLOADING,
+        .kind = "permission-denied",
+        .message = "HTTP authorization does not match this owned operation"};
+  }
+  authorization.emplace(std::move(*result));
+  return std::nullopt;
+}
+
+// Partial HTTP foundations do not supply a selected-mode receipt/readiness
+// gate yet. Authorization and valid declarations cannot make that surface
+// available, including in an install dry-run. Legacy claim-free paths stay
+// unchanged; a future actual readiness integration must replace this refusal.
+auto reject_unintegrated_http_submission(
+    const fs::path& staging, const InstallerContext& ctx, Provenance provenance,
+    const HttpSubmissionManifest& submission, std::string_view predecessor = {})
+    -> std::optional<InstallFailure> {
+  if (submission.declaration.http_prefixes.empty()) return std::nullopt;
+  auto config = static_validation_config(ctx, provenance);
+  config.cross_file = true;
+  config.against_running_kernel = false;
+  if (!predecessor.empty()) config.upgrade_from_id = std::string{predecessor};
+  auto report = validate(staging, config);
+  report.messages.push_back(ValidationMessage{
+      .severity = Severity::ERROR,
+      .phase = Phase::RUNTIME_STATE,
+      .rule = "http-handler-mode-unavailable",
+      .path = "manifest.json/handler_mode",
+      .message = "HTTP handler mode is unavailable in this kernel build",
+  });
+  return InstallFailure{.failed_at = InstallStage::VALIDATING,
+                        .package_id = "",
+                        .kind = "validation-errors",
+                        .message = "validation failed",
+                        .report = build_validation_report(report)};
+}
+
 auto build_migration_report(const MigrationReport& mr) -> nlohmann::json {
   nlohmann::json out;
   out["applied"] = mr.applied;
@@ -1724,12 +1850,30 @@ auto install_package(std::span<const std::byte> zip_blob, Provenance provenance,
     return std::unexpected(ex.error());
   }
 
+  // Reject malformed NEW declarations/raw JSON before neutral probing can
+  // overwrite duplicate keys or throw on an unrepresentable numeric value.
+  HttpSubmissionManifest http_submission;
+  if (auto failure = preflight_http_submission(staging, ctx, provenance,
+                                               http_submission)) {
+    return std::unexpected(std::move(*failure));
+  }
+
   // ── Minimal manifest parse ───────────────────────────────────────
   auto mmr = read_minimal_manifest(staging, provenance);
   if (!mmr.has_value()) {
     return std::unexpected(mmr.error());
   }
   MinimalManifest minimal = *mmr;
+  std::optional<AuthorizedHttpSubmission> http_authorization;
+  if (auto failure = authorize_http_submission(
+          zip_blob, http_submission, minimal, ctx, provenance,
+          HttpInstallOperation::INSTALL, {}, http_authorization)) {
+    return std::unexpected(std::move(*failure));
+  }
+  if (auto failure = reject_unintegrated_http_submission(
+          staging, ctx, provenance, http_submission)) {
+    return std::unexpected(std::move(*failure));
+  }
 
   // ── Admin PG connection ──────────────────────────────────────────
   PgGuard pg(ctx.db);
@@ -4170,6 +4314,14 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     return std::unexpected(upgrade_failure(existing_package_id, ex.error().kind,
                                            ex.error().message));
   }
+  HttpSubmissionManifest http_submission;
+  if (auto failure = preflight_http_submission(staging, ctx, provenance,
+                                               http_submission)) {
+    auto rejected = upgrade_failure(existing_package_id, "validation-errors",
+                                    "upgrade validation failed");
+    rejected.report.update(failure->report);
+    return std::unexpected(std::move(rejected));
+  }
   // Only the kernel's explicit bundled-shell operation supplies BUNDLED.
   // HTTP callers retain USER and cannot upgrade a reserved bundled package.
   auto minimal_r = read_minimal_manifest(staging, provenance);
@@ -4190,6 +4342,21 @@ auto upgrade_package(std::span<const std::byte> zip_blob,
     return std::unexpected(upgrade_failure(
         existing_package_id, "upgrade-version-not-newer",
         "incoming " + minimal.version + " not > existing " + existing.version));
+  }
+
+  std::optional<AuthorizedHttpSubmission> http_authorization;
+  if (auto failure = authorize_http_submission(
+          zip_blob, http_submission, minimal, ctx, provenance,
+          HttpInstallOperation::UPGRADE, existing.id, http_authorization)) {
+    return std::unexpected(
+        upgrade_failure(existing_package_id, failure->kind, failure->message));
+  }
+  if (auto failure = reject_unintegrated_http_submission(
+          staging, ctx, provenance, http_submission, existing.id)) {
+    auto rejected = upgrade_failure(existing_package_id, "validation-errors",
+                                    "upgrade validation failed");
+    rejected.report.update(failure->report);
+    return std::unexpected(std::move(rejected));
   }
 
   // 5. INSERT new row with state=UPLOADING, supersedes_id=existing.

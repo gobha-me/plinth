@@ -11,14 +11,17 @@
 // surface, not the library entry point).
 
 #include "../ws/ws_test_fixture.hpp"
+#include "kernel/auth/middleware.hpp"
 #include "kernel/capabilities/resolution.hpp"
 #include "kernel/config.hpp"
 #include "kernel/db/bootstrap.hpp"
 #include "kernel/extensions/runtime_registry.hpp"
 #include "kernel/groups/handlers.hpp"
 #include "kernel/packages/asset_server.hpp"
+#include "kernel/packages/http_install_authorization.hpp"
 #include "kernel/packages/install_lifecycle.hpp"
 #include "kernel/packages/rbac_test_runner.hpp"
+#include "kernel/rbac/enforcement.hpp"
 #include "static_validation_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -27,6 +30,7 @@
 #include <nlohmann/json.hpp>
 #include <zip.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -37,6 +41,8 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -214,6 +220,23 @@ auto make_path_traversal_zip() -> std::vector<std::byte> {
   zip_source_close(src);
   zip_source_free(src);
   return out;
+}
+
+// Existing API shape: disposition corresponds to CLI exit_code; phase is
+// CLI-only and absent optionals are omitted by the API. Preserve every other
+// ordered message field/value, rather than comparing only rule identifiers.
+auto http_api_report_from_cli(const nlohmann::json& cli) -> nlohmann::json {
+  auto messages = cli.at("messages");
+  for (auto& message : messages) {
+    message.erase("phase");
+    for (const auto* field : {"path", "remediation"}) {
+      if (message.at(field).is_null()) message.erase(field);
+    }
+  }
+  return {{"disposition", cli.at("exit_code")},
+          {"files_scanned", cli.at("files_scanned")},
+          {"total_bytes", cli.at("total_bytes")},
+          {"messages", std::move(messages)}};
 }
 
 } // namespace
@@ -596,4 +619,223 @@ TEST_CASE("I.10: migration syntax error -> INSTALL_FAILED at MIGRATING, schema "
   REQUIRE(PQntuples(pr) == 0);
   PQclear(pr);
   PQfinish(conn);
+}
+
+TEST_CASE("HTTP install submission: raw preflight preserves collected parity "
+          "without a row",
+          "[install_lifecycle][integration][http-submission][static-parity]") {
+  if (!pg_available()) {
+    SKIP("PG not available");
+  }
+  Scratch scratch;
+  scratch.ctx.schedule_rbac_tests = false;
+  plinth::packages::static_test::PackageCopy copy;
+  const auto scenario = GENERATE("future-overflow", "http-overflow",
+                                 "duplicate", "invalid-declaration");
+  std::string raw = copy.json("manifest.json").dump();
+  raw.pop_back();
+  if (std::string_view{scenario} == "future-overflow") {
+    raw += R"(,"future":1e400})";
+  } else if (std::string_view{scenario} == "http-overflow") {
+    raw += R"(,"http_prefixes":1e400})";
+  } else if (std::string_view{scenario} == "duplicate") {
+    raw += R"(,"http_prefixes":[],"http_\u0070refixes":[]})";
+  } else {
+    raw += R"(,"http_prefixes":["/dav/*"],"handler_mode":"not-a-mode"})";
+  }
+  copy.write("manifest.json", raw);
+  const auto offline = plinth::packages::validate(copy.root());
+  REQUIRE(offline.disposition() == 1);
+  const auto cli =
+      plinth::packages::static_test::cli_report(offline, copy.root());
+
+  std::unique_ptr<PGconn, decltype(&PQfinish)> connection(
+      PQconnectdb(conninfo_of(scratch.db).c_str()), PQfinish);
+  REQUIRE(PQstatus(connection.get()) == CONNECTION_OK);
+  const auto scalar = [&](std::string_view sql) -> std::string {
+    std::unique_ptr<PGresult, decltype(&PQclear)> result(
+        PQexec(connection.get(), std::string{sql}.c_str()), PQclear);
+    REQUIRE(PQresultStatus(result.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(result.get()) == 1);
+    return PQgetvalue(result.get(), 0, 0);
+  };
+  const auto package_count = scalar("SELECT COUNT(*) FROM plinth.packages");
+  const auto capability_count =
+      scalar("SELECT COUNT(*) FROM plinth.capabilities");
+  const auto blob = copy.zip();
+  const auto installed = plinth::packages::install_package(
+      blob, plinth::packages::Provenance::USER, scratch.ctx);
+  REQUIRE_FALSE(installed.has_value());
+  REQUIRE(installed.error().failed_at ==
+          plinth::packages::InstallStage::VALIDATING);
+  REQUIRE(installed.error().kind == "validation-errors");
+  REQUIRE(installed.error().package_id.empty());
+  const auto& report = installed.error().report;
+  const auto expected = http_api_report_from_cli(cli);
+  CHECK(report == expected);
+  CHECK(report.at("disposition") == offline.disposition());
+  CHECK(cli.at("exit_code") == offline.disposition());
+  const auto severity_count = [&](std::string_view severity) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(report.at("messages"), [&](const auto& finding) {
+          return finding.at("severity") == severity;
+        }));
+  };
+  CHECK(severity_count("error") == offline.error_count());
+  CHECK(severity_count("warning") == offline.warning_count());
+  const auto expected_rule = std::string_view{scenario} == "invalid-declaration"
+                                 ? "http-handler-mode-unavailable"
+                                 : "http-prefix-invalid";
+  REQUIRE(std::ranges::any_of(report.at("messages"), [&](const auto& finding) {
+    return finding.at("rule") == expected_rule;
+  }));
+  CHECK(scalar("SELECT COUNT(*) FROM plinth.packages") == package_count);
+  CHECK(scalar("SELECT COUNT(*) FROM plinth.capabilities") == capability_count);
+  CHECK(scalar("SELECT COUNT(*) FROM pg_namespace WHERE nspname='ext_notes'") ==
+        "0");
+  CHECK_FALSE(fs::exists(scratch.ctx.data_dir / "extensions" / "notes"));
+  CHECK(fs::is_empty(scratch.ctx.staging_dir));
+}
+
+TEST_CASE(
+    "HTTP install submission: authorized unintegrated modes refuse "
+    "mutation and dry-run",
+    "[install_lifecycle][integration][http-submission][http-unavailable]") {
+  if (!pg_available()) SKIP("PG not available");
+  Scratch scratch;
+  scratch.ctx.schedule_rbac_tests = false;
+
+  plinth::ws_test::TestPg observer{scratch.db};
+  const auto actor = plinth::ws_test::insert_user(
+      observer, "http-unavailable-installer", "fake-http-install-password");
+  scratch.ctx.caller_user_id = actor;
+  const auto scalar = [&](const std::string& sql) -> std::string {
+    auto rows = observer.exec(sql);
+    REQUIRE(rows);
+    REQUIRE(PQresultStatus(rows.get()) == PGRES_TUPLES_OK);
+    REQUIRE(PQntuples(rows.get()) == 1);
+    return PQgetvalue(rows.get(), 0, 0);
+  };
+  const auto snapshot = [&] {
+    auto result = nlohmann::json::object();
+    for (const auto* table :
+         {"packages", "capabilities", "panels", "rbac_rules", "group_rules",
+          "migrations", "package_artifact_receipts",
+          "package_http_claim_receipts", "package_http_claim_reservations",
+          "package_http_adapter_bindings",
+          "extension_http_dispatch_obligations", "audit_log"}) {
+      result[table] = nlohmann::json::parse(scalar(
+          "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),"
+          "'[]'::jsonb)::text FROM plinth." +
+          std::string{table} + " t"));
+    }
+    result["extension_columns"] = nlohmann::json::parse(scalar(
+        "SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY table_name,"
+        "ordinal_position),'[]'::jsonb)::text FROM information_schema.columns "
+        "c WHERE table_schema='ext_notes'"));
+    return result;
+  };
+  const auto authorize = [&](const std::vector<std::byte>& zip,
+                             plinth::packages::HttpInstallOperation operation,
+                             std::string predecessor) {
+    // Owned trusted attributes exercise the production proof factory with
+    // actual archive bytes, not a fake proof or an HTTP auth-filter claim.
+    auto request = drogon::HttpRequest::newHttpRequest();
+    request->attributes()->insert(plinth::auth::ATTR_USER_ID, actor);
+    request->attributes()->insert(plinth::auth::ATTR_AUTH_TYPE,
+                                  std::string{"session"});
+    request->attributes()->insert(plinth::auth::ATTR_CREDENTIAL_SOURCE,
+                                  std::string{"cookie"});
+    request->attributes()->insert(plinth::rbac::ATTR_EFFECTIVE_RULES,
+                                  std::vector<std::string>{"kernel.admin"});
+    request->attributes()->insert(plinth::rbac::ATTR_PERMISSION_GRANTED, true);
+    auto producer =
+        plinth::packages::make_http_install_authorizer(request, zip);
+    auto proofs = std::make_shared<unsigned>(0);
+    scratch.ctx.http_authorizer =
+        [producer = std::move(producer), proofs, actor, operation,
+         predecessor = std::move(predecessor)](
+            const plinth::packages::HttpInstallAuthorizationRequest& input)
+        -> plinth::packages::HttpInstallAuthorizationResult {
+      auto proof = producer(input);
+      REQUIRE(proof);
+      CHECK(proof->actor_user_id() == actor);
+      CHECK(proof->operation() == operation);
+      CHECK(proof->predecessor_id() == predecessor);
+      CHECK(proof->matches(input));
+      ++*proofs;
+      return proof;
+    };
+    return proofs;
+  };
+  const auto expected_report = [&](const auto& package) {
+    const auto offline = plinth::packages::validate(package.root());
+    REQUIRE(offline.error_count() == 0);
+    auto report = http_api_report_from_cli(
+        plinth::packages::static_test::cli_report(offline, package.root()));
+    report["disposition"] = 1;
+    report["messages"].push_back(
+        {{"severity", "error"},
+         {"rule", "http-handler-mode-unavailable"},
+         {"path", "manifest.json/handler_mode"},
+         {"message", "HTTP handler mode is unavailable in this kernel build"}});
+    return report;
+  };
+
+  const auto original = snapshot();
+  plinth::packages::static_test::PackageCopy package;
+  auto manifest = package.json("manifest.json");
+  manifest["http_prefixes"] = {"/unavailable/*"};
+  for (const auto* mode : {"quickjs", "sidecar", "bundled_native"}) {
+    manifest["handler_mode"] = mode;
+    package.write("manifest.json", manifest.dump());
+    const auto source = read_file_bytes(package.root() / "manifest.json");
+    const auto zip = package.zip();
+    const auto zip_hash = plinth::packages::http_install_zip_sha256(zip);
+    const auto expected = expected_report(package);
+    for (const bool dry_run : {false, true}) {
+      CAPTURE(mode, dry_run);
+      REQUIRE(snapshot() == original);
+      const auto proofs =
+          authorize(zip, plinth::packages::HttpInstallOperation::INSTALL, {});
+      nlohmann::json dry_report;
+      const auto installed = plinth::packages::install_package(
+          zip, plinth::packages::Provenance::USER, scratch.ctx, dry_run,
+          &dry_report);
+      REQUIRE(*proofs == 1);
+      REQUIRE_FALSE(installed);
+      CHECK(installed.error().failed_at ==
+            plinth::packages::InstallStage::VALIDATING);
+      CHECK(installed.error().package_id.empty());
+      CHECK(installed.error().kind == "validation-errors");
+      CHECK(installed.error().message == "validation failed");
+      CHECK(installed.error().report == expected);
+      CHECK(dry_report.is_null());
+      CHECK(snapshot() == original);
+      CHECK(scalar("SELECT count(*) FROM pg_namespace WHERE "
+                   "nspname='ext_notes'") == "0");
+      CHECK_FALSE(fs::exists(scratch.ctx.data_dir / "extensions" / "notes"));
+      CHECK_FALSE(plinth::extensions::has_pool("notes"));
+      CHECK_FALSE(plinth::packages::asset_server::has_registered_route(
+          "notes", "1.2.3"));
+      CHECK(fs::is_empty(scratch.ctx.staging_dir));
+      CHECK(read_file_bytes(package.root() / "manifest.json") == source);
+      CHECK(plinth::packages::http_install_zip_sha256(zip) == zip_hash);
+
+      // Readiness refusal must not replace the earlier authority denial.
+      scratch.ctx.http_authorizer = {};
+      const auto denied = plinth::packages::install_package(
+          zip, plinth::packages::Provenance::USER, scratch.ctx, dry_run);
+      REQUIRE_FALSE(denied);
+      CHECK(denied.error().kind == "permission-denied");
+      CHECK(denied.error().failed_at ==
+            plinth::packages::InstallStage::UPLOADING);
+      CHECK(denied.error().package_id.empty());
+      CHECK(snapshot() == original);
+      CHECK_FALSE(plinth::extensions::has_pool("notes"));
+      CHECK_FALSE(plinth::packages::asset_server::has_registered_route(
+          "notes", "1.2.3"));
+      CHECK(fs::is_empty(scratch.ctx.staging_dir));
+    }
+  }
 }

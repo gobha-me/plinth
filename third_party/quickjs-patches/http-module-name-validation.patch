@@ -1,0 +1,170 @@
+Add an opt-in per-runtime decoded module-name validation hook before
+C-string normalization and loaded-module lookup. Static and dynamic imports
+preserve actual base/specifier lengths. Existing runtimes without the hook
+retain existing loader behavior. The C-string JS_LoadModule ABI is unchanged.
+
+Against quickjs-ng 3c051980ab7e783dfbfb1c70c014ce5e05ecf24c, after the
+existing Plinth cstring-conversion-failure-leak.patch.
+
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1193,6 +1193,22 @@
+ JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
+                                           JSModuleNormalizeFunc2 *module_normalize);
+ 
++/* Optional per-runtime validation before normalization and loaded-module lookup.
++   base/specifier contain decoded UTF-8 bytes and may include embedded NUL or
++   non-scalar sequences. The lengths are authoritative; bytes are borrowed only
++   during the callback. Return 0 to continue or -1 with a pending exception.
++   Any pending exception rejects, even if the callback returns 0. Never unwind
++   a foreign-language exception through this C API. The runtime borrows opaque;
++   its owner must outlive all contexts/jobs and runtime destruction. NULL turns
++   validation off without changing existing loader/normalizer callbacks. */
++typedef int JSModuleNameValidationFunc(JSContext *ctx,
++                                      const char *base, size_t base_len,
++                                      const char *specifier, size_t specifier_len,
++                                      void *opaque);
++JS_EXTERN void JS_SetModuleNameValidationFunc(JSRuntime *rt,
++                                              JSModuleNameValidationFunc *validate,
++                                              void *opaque);
++
+ /* return the import.meta object of a module */
+ JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -334,6 +334,8 @@
+     } u;
+     JSModuleCheckSupportedImportAttributes *module_check_attrs;
+     void *module_loader_opaque;
++    JSModuleNameValidationFunc *module_name_validation_func;
++    void *module_name_validation_opaque;
+     /* timestamp for internal use in module evaluation */
+     int64_t module_async_evaluation_next_timestamp;
+ 
+@@ -29225,6 +29227,14 @@
+     rt->normalize_u.module_normalize_func2 = module_normalize;
+ }
+ 
++void JS_SetModuleNameValidationFunc(JSRuntime *rt,
++                                    JSModuleNameValidationFunc *validate,
++                                    void *opaque)
++{
++    rt->module_name_validation_func = validate;
++    rt->module_name_validation_opaque = opaque;
++}
++
+ int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val)
+ {
+     set_value(ctx, &m->private_value, val);
+@@ -29314,13 +29324,28 @@
+ /* `base_cname` and `cname1` may be pure ASCII or UTF-8 encoded */
+ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
+                                                     const char *base_cname,
++                                                    size_t base_len,
+                                                     const char *cname1,
++                                                    size_t cname1_len,
+                                                     JSValueConst attributes)
+ {
+     JSRuntime *rt = ctx->rt;
+     JSModuleDef *m;
+     char *cname;
+     JSAtom module_name;
++
++    /* Length-complete validation must precede BOTH C-string normalization and
++       the loaded-module cache, including when the target is already loaded. */
++    if (rt->module_name_validation_func) {
++        int result = rt->module_name_validation_func(ctx, base_cname, base_len,
++                                                      cname1, cname1_len,
++                                                      rt->module_name_validation_opaque);
++        if (result != 0 || JS_HasException(ctx)) {
++            if (!JS_HasException(ctx))
++                JS_ThrowTypeError(ctx, "module name validation rejected import");
++            return NULL;
++        }
++    }
+ 
+     if (!rt->normalize_u.module_normalize_func && !rt->normalize_u.module_normalize_func2) {
+         cname = js_default_module_normalize_name(ctx, base_cname, cname1);
+@@ -29376,17 +29401,18 @@
+                                                          JSValueConst attributes)
+ {
+     const char *base_cname, *cname;
++    size_t base_len, cname_len;
+     JSModuleDef *m;
+ 
+-    base_cname = JS_AtomToCString(ctx, base_module_name);
++    base_cname = JS_AtomToCStringLen(ctx, &base_len, base_module_name);
+     if (!base_cname)
+         return NULL;
+-    cname = JS_AtomToCString(ctx, module_name1);
++    cname = JS_AtomToCStringLen(ctx, &cname_len, module_name1);
+     if (!cname) {
+         JS_FreeCString(ctx, base_cname);
+         return NULL;
+     }
+-    m = js_host_resolve_imported_module(ctx, base_cname, cname, attributes);
++    m = js_host_resolve_imported_module(ctx, base_cname, base_len, cname, cname_len, attributes);
+     JS_FreeCString(ctx, base_cname);
+     JS_FreeCString(ctx, cname);
+     return m;
+@@ -30311,7 +30337,8 @@
+ }
+ 
+ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
+-                                  const char *filename,
++                                  size_t basename_len, const char *filename,
++                                  size_t filename_len,
+                                   JSValueConst *resolving_funcs,
+                                   JSValueConst attributes)
+ {
+@@ -30320,7 +30347,7 @@
+     JSValue ret, err, func_obj, evaluate_resolving_funcs[2];
+     JSValueConst func_data[3];
+ 
+-    m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
++    m = js_host_resolve_imported_module(ctx, basename, basename_len, filename, filename_len, attributes);
+     if (!m)
+         goto fail;
+ 
+@@ -30365,7 +30392,9 @@
+     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
+     if (JS_IsException(promise))
+         return JS_EXCEPTION;
+-    JS_LoadModuleInternal(ctx, basename, filename, vc(resolving_funcs), JS_UNDEFINED);
++    JS_LoadModuleInternal(ctx, basename, basename ? strlen(basename) : 0,
++                          filename, filename ? strlen(filename) : 0,
++                          vc(resolving_funcs), JS_UNDEFINED);
+     JS_FreeValue(ctx, resolving_funcs[0]);
+     JS_FreeValue(ctx, resolving_funcs[1]);
+     return promise;
+@@ -30378,22 +30407,23 @@
+     JSValueConst basename_val = argv[2];
+     JSValueConst specifier = argv[3];
+     JSValueConst attributes = argv[4];
+-    const char *basename = NULL, *filename;
++    const char *basename = NULL, *filename = NULL;
++    size_t basename_len, filename_len;
+     JSValue ret, err;
+ 
+     if (!JS_IsString(basename_val)) {
+         JS_ThrowTypeError(ctx, "no function filename for import()");
+         goto exception;
+     }
+-    basename = JS_ToCString(ctx, basename_val);
++    basename = JS_ToCStringLen(ctx, &basename_len, basename_val);
+     if (!basename)
+         goto exception;
+ 
+-    filename = JS_ToCString(ctx, specifier);
++    filename = JS_ToCStringLen(ctx, &filename_len, specifier);
+     if (!filename)
+         goto exception;
+ 
+-    JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs, attributes);
++    JS_LoadModuleInternal(ctx, basename, basename_len, filename, filename_len, resolving_funcs, attributes);
+     JS_FreeCString(ctx, filename);
+     JS_FreeCString(ctx, basename);
+     return JS_UNDEFINED;

@@ -5,6 +5,7 @@
 #include "kernel/packages/config_manifest.hpp"
 #include "kernel/packages/cross_file_validator.hpp"
 #include "kernel/packages/detail/reporter.hpp"
+#include "kernel/packages/http_declarations.hpp"
 #include "kernel/packages/manifest.hpp"
 #include "kernel/packages/manifest_error.hpp"
 #include "kernel/packages/panels_manifest.hpp"
@@ -337,9 +338,26 @@ auto parse_required_manifest(const fs::path& root, bool is_bundled,
             relative_string(root, mpath));
     return;
   }
-  auto res = PackageManifest::parse(*bytes, "manifest.json", is_bundled);
+  // Submission-only raw validation runs before any neutral DOM can overwrite
+  // duplicate keys. Neutral enable/capture reads remain unchanged and inert.
+  auto http = HttpDeclaration::parse(*bytes, "manifest.json");
+  PackageManifestParseResult res;
+  try {
+    res = PackageManifest::parse(*bytes, "manifest.json", is_bundled);
+  } catch (const nlohmann::json::out_of_range&) {
+    // Numeric JSON overflow was already rejected by the raw submission parser.
+    // Honor that failure without changing neutral installed-manifest semantics
+    // or swallowing an exception for a document the raw parser accepted.
+    if (http.value) throw;
+    forward_manifest_messages(http.messages, root, mpath, r);
+    return;
+  }
   forward_manifest_messages(res.messages, root, mpath, r);
   if (res.value) {
+    // Also applies to --structure-only. Existing neutral syntax/schema errors
+    // already reject; do not duplicate their findings with a second parser's
+    // syntax error. Successful HTTP parsing grants no publication authority.
+    forward_manifest_messages(http.messages, root, mpath, r);
     parsed.manifest = std::move(*res.value);
   }
 }

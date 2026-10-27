@@ -83,6 +83,8 @@ auto error_body(std::string_view code, std::string_view message)
 
 auto failure_to_status(InstallStage stage, std::string_view kind)
     -> drogon::HttpStatusCode {
+  if (kind == "permission-denied") return drogon::k403Forbidden;
+  if (kind == "confirmation-required") return drogon::k409Conflict;
   if (stage == InstallStage::UPLOADING) {
     if (kind == "upload-too-large") {
       return drogon::k413RequestEntityTooLarge;
@@ -113,6 +115,8 @@ auto transition_failure_to_status(const TransitionFailure& f)
       f.report["kind"].is_string()) {
     kind = f.report["kind"].get<std::string>();
   }
+  if (kind == "permission-denied") return drogon::k403Forbidden;
+  if (kind == "invalid-http-authorization") return drogon::k400BadRequest;
   if (kind == "not-found") {
     return drogon::k404NotFound;
   }
@@ -209,6 +213,8 @@ auto handle_post_packages(
   std::span<const std::byte> blob{
       // body is raw bytes; std::span<const std::byte> is the installer API.
       reinterpret_cast<const std::byte*>(content.data()), content.size()};
+
+  ctx.http_authorizer = make_http_install_authorizer(req, blob);
 
   // ICD-0.4.4 §HTTP Surface — `?dry_run=1` runs UPLOADING + VALIDATING
   // and returns the ValidationReport without persisting any row or

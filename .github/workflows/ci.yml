@@ -877,6 +877,21 @@ jobs:
           ctest --test-dir build -N -R '^plinth_tsan_' | grep -Ex 'Total Tests: 16'
           ctest --test-dir build --output-on-failure --parallel 1 -R '^plinth_tsan_'
 
+      - name: Focused extension HTTP component TSan checks
+        env:
+          PLINTH_PG_HOST: 127.0.0.1
+          PLINTH_PG_PORT: "5432"
+          PLINTH_PG_USER: plinth
+          PLINTH_PG_PASSWORD: plinth
+          PLINTH_PG_DATABASE: plinth_test
+          TSAN_OPTIONS: halt_on_error=1:exitcode=66
+        run: |
+          set -euo pipefail
+          ctest --test-dir build -N -L extension_http |
+            grep -Ex 'Total Tests: 64'
+          ctest --test-dir build --verbose --output-on-failure --parallel 1 \
+            -L extension_http
+
       - name: Focused QuickJS db.batch ownership TSan corpus
         env:
           TSAN_OPTIONS: halt_on_error=1:exitcode=66
