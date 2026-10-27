@@ -47,3 +47,38 @@ jobs:
 
       - name: Analyze
         uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+
+  prune-trap-caches:
+    name: CodeQL / prune TRAP caches
+    needs: analyze
+    if: >-
+      needs.analyze.result == 'success' &&
+      github.ref == 'refs/heads/main' &&
+      contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the newest two main TRAP caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Fetch beyond gh's default limit, then defensively filter by prefix/ref.
+          if ! cache_ids=$(gh cache list --repo "$GH_REPO" \
+            --ref refs/heads/main --key codeql-trap- --limit 2147483647 \
+            --sort created_at --order desc --json id,key,ref,createdAt \
+            --jq 'map(select(.ref == "refs/heads/main" and (.key | startswith("codeql-trap-")))) |
+              sort_by(.createdAt) | reverse | .[2:] | .[].id'); then
+            echo "::warning::Unable to list CodeQL TRAP caches; skipping pruning."
+            exit 0
+          fi
+          while IFS= read -r cache_id; do
+            [[ -n "$cache_id" ]] || continue
+            echo "Deleting CodeQL TRAP cache $cache_id"
+            if ! gh cache delete "$cache_id" --repo "$GH_REPO"; then
+              echo "::warning::Unable to delete CodeQL TRAP cache $cache_id; continuing."
+            fi
+          done <<< "$cache_ids"
