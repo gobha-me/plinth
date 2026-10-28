@@ -2,7 +2,6 @@ name: Runtime image
 
 on:
   push:
-    branches: [main]
     tags:
       - "v*.*.*"
   pull_request:
@@ -726,3 +725,51 @@ jobs:
             echo
             echo "Preferred immutable reference: \`$digest_ref\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  nightly_failure_tracking:
+    name: Runtime image / nightly failure tracking
+    needs: [changes, candidate, release_preflight, publish]
+    if: ${{ always() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    # Serialize both workflows' updates so overlapping failures share one issue.
+    concurrency:
+      group: nightly-ci-failure-issue
+      cancel-in-progress: false
+    steps:
+      - name: Track failed or cancelled nightly jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_SHA: ${{ github.sha }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          ISSUE_TITLE: Nightly CI failure
+          ISSUE_SEARCH: 'in:title "Nightly CI failure"'
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed_jobs=$(jq -r 'to_entries[] |
+            select(.value.result == "failure" or .value.result == "cancelled") |
+            "- \(.key): \(.value.result)"' <<<"$NEEDS_JSON")
+          if [[ -z "$failed_jobs" ]]; then
+            exit 0
+          fi
+
+          body_file=$(mktemp)
+          trap 'rm -f -- "$body_file"' EXIT
+          printf '[Engine Lead]\nWorkflow: %s\nRun: %s\nSHA: %s\n\nFailed jobs:\n%s\n' \
+            "$WORKFLOW_NAME" "$RUN_URL" "$RUN_SHA" "$failed_jobs" > "$body_file"
+          issue_number=$(gh issue list --search "$ISSUE_SEARCH" --state open --limit 100 \
+            --json number,title | jq -r --arg title "$ISSUE_TITLE" '
+              [.[] | select(.title == $title)] | sort_by(.number) |
+              first | .number // empty')
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" --body-file "$body_file"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file "$body_file"
+          fi
