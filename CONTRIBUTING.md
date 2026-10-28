@@ -43,6 +43,9 @@ inside the image on toolchain or dependency changes. It never publishes an
 image. The regular CI also retains Clang 20 tests and ASan/UBSan alongside
 Clang 21 during the transition.
 
+Runtime image and CI image skip `main` pushes and run nightly or on dispatch
+(Runtime image also on `v*.*.*` tags); nightly failures go to the "Nightly CI failure" issue.
+
 Clang-21 ASan+UBSan, TSan (realtime and lifecycle), and PostgreSQL standard
 diagnostics no longer run on pull requests; they run on `main` pushes
 and manual runs. Authors of lifecycle, realtime, or
@@ -58,8 +61,9 @@ analysis.
 
 `docker/Dockerfile` is the distinct production runtime contract. The
 **Runtime image** workflow builds its `server-tests` and `runtime` stages for
-both supported architectures on pull requests and `main`, runs the complete
-server surface, inspects the non-root runtime, and exercises the production
+amd64 on runtime-affecting pull requests and both supported architectures on
+nightly and manual runs; it runs the complete server surface, inspects the
+non-root runtime, and exercises the production
 browser and retained-upgrade journeys without logging in to a registry or
 pushing an image. Keep build-only dependencies in the builder or test stage;
 the final runtime must remain UID/GID 10001 and contain only installed runtime

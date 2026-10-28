@@ -1,19 +1,6 @@
 name: CI image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - docker/ci.Dockerfile
-      - .github/workflows/ci-image.yml
-      - .github/scripts/install-llvm.sh
-      - .github/scripts/check-ci-image.sh
-      - CMakeLists.txt
-      - cmake/**
-      - third_party/**
-      - tools/**
-      - .clang-format
-      - .clang-tidy
   pull_request:
     paths:
       - docker/ci.Dockerfile
@@ -27,12 +14,14 @@ on:
       - .clang-format
       - .clang-tidy
   workflow_dispatch:
+  schedule:
+    - cron: "41 7 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -73,8 +62,8 @@ jobs:
           pull: true
           load: true
           cache-from: type=gha,scope=ci-image
-          # Share one main cache; PRs and dispatches on other refs only read it.
-          cache-to: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && 'type=gha,mode=max,scope=ci-image' || '' }}
+          # Nightly and manual runs on main refresh the cache; all others only read it.
+          cache-to: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name) && 'type=gha,mode=max,scope=ci-image' || '' }}
 
       - name: Build, test, format, and lint inside the image
         env:
@@ -91,3 +80,51 @@ jobs:
             --env PLINTH_PG_USER --env PLINTH_PG_PASSWORD --env PLINTH_PG_DATABASE \
             plinth-ci-check:local bash -euc \
             'git config --global --add safe.directory /work; exec bash .github/scripts/check-ci-image.sh'
+
+  nightly_failure_tracking:
+    name: CI image / nightly failure tracking
+    needs: [validate]
+    if: ${{ always() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    # Serialize both workflows' updates so overlapping failures share one issue.
+    concurrency:
+      group: nightly-ci-failure-issue
+      cancel-in-progress: false
+    steps:
+      - name: Track failed or cancelled nightly jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_SHA: ${{ github.sha }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          ISSUE_TITLE: Nightly CI failure
+          ISSUE_SEARCH: 'in:title "Nightly CI failure"'
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed_jobs=$(jq -r 'to_entries[] |
+            select(.value.result == "failure" or .value.result == "cancelled") |
+            "- \(.key): \(.value.result)"' <<<"$NEEDS_JSON")
+          if [[ -z "$failed_jobs" ]]; then
+            exit 0
+          fi
+
+          body_file=$(mktemp)
+          trap 'rm -f -- "$body_file"' EXIT
+          printf '[Engine Lead]\nWorkflow: %s\nRun: %s\nSHA: %s\n\nFailed jobs:\n%s\n' \
+            "$WORKFLOW_NAME" "$RUN_URL" "$RUN_SHA" "$failed_jobs" > "$body_file"
+          issue_number=$(gh issue list --search "$ISSUE_SEARCH" --state open --limit 100 \
+            --json number,title | jq -r --arg title "$ISSUE_TITLE" '
+              [.[] | select(.title == $title)] | sort_by(.number) |
+              first | .number // empty')
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" --body-file "$body_file"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file "$body_file"
+          fi
