@@ -235,6 +235,7 @@ jobs:
 
   postgres-standard:
     name: clang-21 / PostgreSQL standard diagnostics
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -339,8 +340,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Clang 20 remains a protected compatibility lane during adoption.
-        llvm_version: ["20", "21"]
+        # Clang 20 remains protected on every PR; Clang 21 also runs after merge.
+        llvm_version: ${{ fromJSON(github.event_name == 'pull_request' && '["20"]' || '["20", "21"]') }}
     runs-on: ubuntu-24.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -918,6 +919,7 @@ jobs:
 
   tsan:
     name: clang-21 / TSan realtime and lifecycle
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
