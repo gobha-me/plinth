@@ -1,27 +1,10 @@
 name: CI image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - docker/ci.Dockerfile
-      - .github/workflows/ci-image.yml
-      - .github/workflows/ci.yml
-      - .github/scripts/install-llvm.sh
-      - .github/scripts/check-ci-image.sh
-      - CMakeLists.txt
-      - cmake/**
-      - third_party/**
-      - tools/**
-      - .clang-format
-      - .clang-tidy
-      - AGENTS.md
-      - CONTRIBUTING.md
   pull_request:
     paths:
       - docker/ci.Dockerfile
       - .github/workflows/ci-image.yml
-      - .github/workflows/ci.yml
       - .github/scripts/install-llvm.sh
       - .github/scripts/check-ci-image.sh
       - CMakeLists.txt
@@ -30,15 +13,15 @@ on:
       - tools/**
       - .clang-format
       - .clang-tidy
-      - AGENTS.md
-      - CONTRIBUTING.md
   workflow_dispatch:
+  schedule:
+    - cron: "41 7 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -63,8 +46,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+
       - name: Build the CI image locally
-        run: docker build --file docker/ci.Dockerfile --tag plinth-ci-check:local docker
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+        with:
+          context: docker
+          file: docker/ci.Dockerfile
+          tags: plinth-ci-check:local
+          pull: true
+          load: true
+          cache-from: type=gha,scope=ci-image
+          # Nightly and manual runs on main refresh the cache; all others only read it.
+          cache-to: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name) && 'type=gha,mode=max,scope=ci-image' || '' }}
 
       - name: Build, test, format, and lint inside the image
         env:
@@ -81,3 +80,51 @@ jobs:
             --env PLINTH_PG_USER --env PLINTH_PG_PASSWORD --env PLINTH_PG_DATABASE \
             plinth-ci-check:local bash -euc \
             'git config --global --add safe.directory /work; exec bash .github/scripts/check-ci-image.sh'
+
+  nightly_failure_tracking:
+    name: CI image / nightly failure tracking
+    needs: [validate]
+    if: ${{ always() && github.event_name == 'schedule' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    # Serialize both workflows' updates so overlapping failures share one issue.
+    concurrency:
+      group: nightly-ci-failure-issue
+      cancel-in-progress: false
+    steps:
+      - name: Track failed or cancelled nightly jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_SHA: ${{ github.sha }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          ISSUE_TITLE: Nightly CI failure
+          ISSUE_SEARCH: 'in:title "Nightly CI failure"'
+        shell: bash
+        run: |
+          set -euo pipefail
+          failed_jobs=$(jq -r 'to_entries[] |
+            select(.value.result == "failure" or .value.result == "cancelled") |
+            "- \(.key): \(.value.result)"' <<<"$NEEDS_JSON")
+          if [[ -z "$failed_jobs" ]]; then
+            exit 0
+          fi
+
+          body_file=$(mktemp)
+          trap 'rm -f -- "$body_file"' EXIT
+          printf '[Engine Lead]\nWorkflow: %s\nRun: %s\nSHA: %s\n\nFailed jobs:\n%s\n' \
+            "$WORKFLOW_NAME" "$RUN_URL" "$RUN_SHA" "$failed_jobs" > "$body_file"
+          issue_number=$(gh issue list --search "$ISSUE_SEARCH" --state open --limit 100 \
+            --json number,title | jq -r --arg title "$ISSUE_TITLE" '
+              [.[] | select(.title == $title)] | sort_by(.number) |
+              first | .number // empty')
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" --body-file "$body_file"
+          else
+            gh issue create --title "$ISSUE_TITLE" --body-file "$body_file"
+          fi
