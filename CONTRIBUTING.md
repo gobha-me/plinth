@@ -44,8 +44,8 @@ image. The regular CI also retains Clang 20 tests and ASan/UBSan alongside
 Clang 21 during the transition.
 
 Clang-21 ASan+UBSan, TSan (realtime and lifecycle), and PostgreSQL standard
-diagnostics no longer run on pull requests; they run on `main` pushes,
-nightly/scheduled runs, and manual runs. Authors of lifecycle, realtime, or
+diagnostics no longer run on pull requests; they run on `main` pushes
+and manual runs. Authors of lifecycle, realtime, or
 PostgreSQL changes should start a `workflow_dispatch` CI run on their branch
 before requesting review, including the TSan lifecycle coverage expected by
 `AGENTS.md`.
