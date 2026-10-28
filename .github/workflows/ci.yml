@@ -1324,9 +1324,8 @@ jobs:
   main_red_lane_alert:
     name: main red diagnostics lane alert
     needs: [postgres-standard, asan-ubsan, tsan]
-    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'gobha-me/plinth' }}
     permissions:
-      contents: read
       issues: write
     timeout-minutes: 10
     runs-on: ubuntu-24.04
@@ -1344,19 +1343,38 @@ jobs:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
           set -euo pipefail
-          # Superseded main runs are cancelled; cancellation is not a red lane.
-          failed_lanes=$(jq -r 'to_entries | map(select(.value.result == "failure") | "- \(.key)") | join("\n")' <<< "$NEEDS_JSON")
-          [[ -n "$failed_lanes" ]] || exit 0
+          # Failure, cancellation (including run cancellation), and explicit timeout are red.
+          # Needs normally reports timeouts as cancelled or failure; handle timed_out explicitly too.
+          red_lanes=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled" or .value.result == "timed_out") | [.key, .value.result] | @tsv' <<< "$NEEDS_JSON")
+          [[ -n "$red_lanes" ]] || exit 0
 
           body_file=$(mktemp)
           trap 'rm -f "$body_file"' EXIT
-          printf '[Engine Lead]\n\nWorkflow run: %s\nSHA: %s\n\nFailed lanes:\n%s\n' \
-            "$RUN_URL" "$RUN_SHA" "$failed_lanes" > "$body_file"
 
-          gh label create ci-main-red --color B60205 --description "A non-required diagnostics lane failed on main" 2>/dev/null || true
-          issue_number=$(gh issue list --label ci-main-red --state open --limit 100 --json number | jq -r 'sort_by(.number) | first | .number // empty')
-          if [[ -n "$issue_number" ]]; then
-            gh issue comment "$issue_number" --body-file "$body_file"
-          else
-            gh issue create --title "Main CI diagnostics lane red" --label ci-main-red --body-file "$body_file"
-          fi
+          gh label create ci-main-red --color B60205 --description "A non-required diagnostics lane is red on main" --force
+
+          while IFS=$'\t' read -r lane result; do
+            case "$lane" in
+              postgres-standard) lane_label=ci-main-red:postgres; lane_description="PostgreSQL diagnostics lane is red on main" ;;
+              asan-ubsan) lane_label=ci-main-red:asan-ubsan; lane_description="ASan/UBSan diagnostics lane is red on main" ;;
+              tsan) lane_label=ci-main-red:tsan; lane_description="TSan diagnostics lane is red on main" ;;
+              *) echo "::error::Unknown diagnostics lane: $lane" >&2; exit 1 ;;
+            esac
+            gh label create "$lane_label" --color B60205 --description "$lane_description" --force
+            printf '[Engine Lead]\n\nWorkflow run: %s\nSHA: %s\nLane: %s\nResult: %s\n' \
+              "$RUN_URL" "$RUN_SHA" "$lane" "$result" > "$body_file"
+
+            issue_number=$(gh issue list --state open --label ci-main-red --label "$lane_label" --limit 100 --json number | jq -r 'sort_by(.number) | first | .number // empty')
+            if [[ -n "$issue_number" ]]; then
+              gh issue comment "$issue_number" --body-file "$body_file"
+            else
+              gh issue create --title "Main CI diagnostics lane red: $lane" --label ci-main-red --label "$lane_label" --body-file "$body_file"
+              issue_numbers=$(gh issue list --state open --label ci-main-red --label "$lane_label" --limit 100 --json number | jq -r 'sort_by(.number) | .[].number')
+              canonical_issue=${issue_numbers%%$'\n'*}
+              while read -r duplicate_issue; do
+                if [[ -n "$duplicate_issue" && "$duplicate_issue" != "$canonical_issue" ]]; then
+                  gh issue close "$duplicate_issue" --comment "[Engine Lead] This issue duplicates #$canonical_issue."
+                fi
+              done <<< "$issue_numbers"
+            fi
+          done <<< "$red_lanes"
