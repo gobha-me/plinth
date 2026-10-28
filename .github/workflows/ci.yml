@@ -88,6 +88,11 @@ jobs:
   build-and-test:
     name: ${{ matrix.name }}
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
+      CCACHE_COMPRESS: "1"
+      CCACHE_BASEDIR: ${{ github.workspace }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -139,15 +144,32 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake pkg-config git ca-certificates \
+            build-essential cmake pkg-config git ca-certificates ccache \
             libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
             libargon2-dev nodejs
+
+      - name: Identify compiler version for ccache
+        id: compiler
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: echo "version=$("$CXX" -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-build-and-test-${{ matrix.cxx }}-${{ steps.compiler.outputs.version }}-debug-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-build-and-test-${{ matrix.cxx }}-${{ steps.compiler.outputs.version }}-debug-
 
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build build --parallel 2
@@ -196,9 +218,30 @@ jobs:
           python3 tests/browser/fixed_browser_harness_test.py
           python3 .github/scripts/run-installed-floats-fixed-browser.py --binary build/plinth --bundle-dir build/share/plinth/bundled
 
+      - name: Save ccache on main
+        if: >-
+          always() && github.ref == 'refs/heads/main' &&
+          contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name)
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Report ccache statistics
+        if: always()
+        continue-on-error: true
+        run: ccache -s
+
   postgres-standard:
     name: clang-21 / PostgreSQL standard diagnostics
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
+      CCACHE_COMPRESS: "1"
+      CCACHE_BASEDIR: ${{ github.workspace }}
     timeout-minutes: 35
     services:
       postgres:
@@ -230,9 +273,24 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential cmake pkg-config git ca-certificates \
+            build-essential cmake pkg-config git ca-certificates ccache \
             libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
             libargon2-dev nodejs
+
+      - name: Identify compiler version for ccache
+        id: compiler
+        env:
+          CXX: clang++-21
+        run: echo "version=$("$CXX" -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-postgres-standard-clang-21-${{ steps.compiler.outputs.version }}-debug-libpq-batch-off-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-postgres-standard-clang-21-${{ steps.compiler.outputs.version }}-debug-libpq-batch-off-
 
       - name: Verify separately compiled standard PostgreSQL diagnostics
         env:
@@ -245,7 +303,8 @@ jobs:
           PLINTH_PG_DATABASE: plinth_test
         run: |
           set -euo pipefail
-          cmake -S . -B build-pg-standard -DCMAKE_BUILD_TYPE=Debug -DLIBPQ_BATCH_MODE=OFF
+          cmake -S . -B build-pg-standard -DCMAKE_BUILD_TYPE=Debug -DLIBPQ_BATCH_MODE=OFF \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_C_COMPILER_LAUNCHER=ccache
           cmake --build build-pg-standard --target plinth_tests --parallel 2
           config=build-pg-standard/_deps/drogon-build/drogon/config.h
           test -f "$config"
@@ -261,14 +320,34 @@ jobs:
           ctest --test-dir build-pg-standard --verbose --output-on-failure --parallel 1 -R \
             '^plinth_tests_sqlstate_(native|projection)$'
 
+      - name: Save ccache on main
+        if: >-
+          always() && github.ref == 'refs/heads/main' &&
+          contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name)
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Report ccache statistics
+        if: always()
+        continue-on-error: true
+        run: ccache -s
+
   asan-ubsan:
     name: clang-${{ matrix.llvm_version }} / ASan+UBSan
     strategy:
       fail-fast: false
       matrix:
-        # Clang 20 remains a protected compatibility lane during adoption.
-        llvm_version: ["20", "21"]
+        # Clang 20 remains protected on every PR; Clang 21 also runs after merge.
+        llvm_version: ${{ fromJSON(github.event_name == 'pull_request' && '["20"]' || '["20", "21"]') }}
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
+      CCACHE_COMPRESS: "1"
+      CCACHE_BASEDIR: ${{ github.workspace }}
     timeout-minutes: 60
     services:
       postgres:
@@ -296,9 +375,24 @@ jobs:
           set -euo pipefail
           .github/scripts/install-llvm.sh "$CLANG_VERSION"
           sudo apt-get install -y \
-            build-essential cmake pkg-config git ca-certificates \
+            build-essential cmake pkg-config git ca-certificates ccache \
             libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
             libargon2-dev nodejs "libclang-rt-${CLANG_VERSION}-dev"
+
+      - name: Identify compiler version for ccache
+        id: compiler
+        env:
+          CXX: clang++-${{ matrix.llvm_version }}
+        run: echo "version=$("$CXX" -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-asan-ubsan-clang-${{ matrix.llvm_version }}-${{ steps.compiler.outputs.version }}-debug-fsanitize-address-undefined-fno-omit-frame-pointer-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-asan-ubsan-clang-${{ matrix.llvm_version }}-${{ steps.compiler.outputs.version }}-debug-fsanitize-address-undefined-fno-omit-frame-pointer-
 
       - name: Configure
         env:
@@ -307,6 +401,8 @@ jobs:
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DPLINTH_SANITIZERS=ON
 
       - name: Build
@@ -806,9 +902,30 @@ jobs:
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: ctest --test-dir build --output-on-failure --parallel 1
 
+      - name: Save ccache on main
+        if: >-
+          always() && github.ref == 'refs/heads/main' &&
+          contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name)
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Report ccache statistics
+        if: always()
+        continue-on-error: true
+        run: ccache -s
+
   tsan:
     name: clang-21 / TSan realtime and lifecycle
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 300M
+      CCACHE_COMPRESS: "1"
+      CCACHE_BASEDIR: ${{ github.workspace }}
     timeout-minutes: 45
     services:
       postgres:
@@ -834,7 +951,7 @@ jobs:
           set -euo pipefail
           .github/scripts/install-llvm.sh 21
           sudo apt-get install -y \
-            build-essential cmake pkg-config git ca-certificates \
+            build-essential cmake pkg-config git ca-certificates ccache \
             libpq-dev libjsoncpp-dev libssl-dev zlib1g-dev uuid-dev \
             libargon2-dev nodejs postgresql-client libclang-rt-21-dev
 
@@ -849,6 +966,21 @@ jobs:
           set -euo pipefail
           psql -v ON_ERROR_STOP=1 -tAc 'SELECT 1' | grep -qx '1'
 
+      - name: Identify compiler version for ccache
+        id: compiler
+        env:
+          CXX: clang++-21
+        run: echo "version=$("$CXX" -dumpversion)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-${{ runner.os }}-tsan-clang-21-${{ steps.compiler.outputs.version }}-debug-fsanitize-thread-fno-omit-frame-pointer-${{ hashFiles('CMakeLists.txt', 'cmake/**') }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-tsan-clang-21-${{ steps.compiler.outputs.version }}-debug-fsanitize-thread-fno-omit-frame-pointer-
+
       - name: Configure TSan
         env:
           CC: clang-21
@@ -856,6 +988,8 @@ jobs:
         run: >-
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          -DCMAKE_C_COMPILER_LAUNCHER=ccache
           -DPLINTH_TSAN=ON
 
       - name: Build
@@ -1136,3 +1270,111 @@ jobs:
             grep -Ex 'Total Tests: 43'
           ctest --test-dir build --output-on-failure --parallel 1 -R \
             '^plinth_tests_(generation_|installed_float_|admin_defaults_)'
+
+      - name: Save ccache on main
+        if: >-
+          always() && github.ref == 'refs/heads/main' &&
+          contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name)
+        continue-on-error: true
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Report ccache statistics
+        if: always()
+        continue-on-error: true
+        run: ccache -s
+
+  prune-compiler-caches:
+    name: CI / prune compiler caches
+    needs: [build-and-test, postgres-standard, asan-ubsan, tsan]
+    if: >-
+      always() && github.ref == 'refs/heads/main' &&
+      contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      actions: write
+    steps:
+      - name: Keep the newest main compiler cache per lane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          # Fetch beyond gh's default limit, then defensively filter by prefix/ref.
+          if ! cache_ids=$(gh cache list --repo "$GH_REPO" \
+            --ref refs/heads/main --key ccache- --limit 2147483647 \
+            --sort created_at --order desc --json id,key,ref,createdAt \
+            --jq 'map(select(.ref == "refs/heads/main" and (.key | startswith("ccache-")))) |
+              group_by(.key | sub("(-[0-9a-f]{64})?-[0-9a-f]{40}$"; "")) | .[] |
+              sort_by(.createdAt) | reverse | .[1:] | .[].id'); then
+            echo "::warning::Unable to list compiler caches; skipping pruning."
+            exit 0
+          fi
+          while IFS= read -r cache_id; do
+            [[ -n "$cache_id" ]] || continue
+            echo "Deleting compiler cache $cache_id"
+            if ! gh cache delete "$cache_id" --repo "$GH_REPO"; then
+              echo "::warning::Unable to delete compiler cache $cache_id; continuing."
+            fi
+          done <<< "$cache_ids"
+
+  main_red_lane_alert:
+    name: main red diagnostics lane alert
+    needs: [postgres-standard, asan-ubsan, tsan]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'gobha-me/plinth' }}
+    permissions:
+      issues: write
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-main-red-issue
+      cancel-in-progress: false
+    steps:
+      - name: Open or update the main diagnostics issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_SHA: ${{ github.sha }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # Failure, cancellation (including run cancellation), and explicit timeout are red.
+          # Needs normally reports timeouts as cancelled or failure; handle timed_out explicitly too.
+          red_lanes=$(jq -r 'to_entries[] | select(.value.result == "failure" or .value.result == "cancelled" or .value.result == "timed_out") | [.key, .value.result] | @tsv' <<< "$NEEDS_JSON")
+          [[ -n "$red_lanes" ]] || exit 0
+
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+
+          gh label create ci-main-red --color B60205 --description "A non-required diagnostics lane is red on main" --force
+
+          while IFS=$'\t' read -r lane result; do
+            case "$lane" in
+              postgres-standard) lane_label=ci-main-red:postgres; lane_description="PostgreSQL diagnostics lane is red on main" ;;
+              asan-ubsan) lane_label=ci-main-red:asan-ubsan; lane_description="ASan/UBSan diagnostics lane is red on main" ;;
+              tsan) lane_label=ci-main-red:tsan; lane_description="TSan diagnostics lane is red on main" ;;
+              *) echo "::error::Unknown diagnostics lane: $lane" >&2; exit 1 ;;
+            esac
+            gh label create "$lane_label" --color B60205 --description "$lane_description" --force
+            printf '[Engine Lead]\n\nWorkflow run: %s\nSHA: %s\nLane: %s\nResult: %s\n' \
+              "$RUN_URL" "$RUN_SHA" "$lane" "$result" > "$body_file"
+
+            issue_number=$(gh issue list --state open --label ci-main-red --label "$lane_label" --limit 100 --json number | jq -r 'sort_by(.number) | first | .number // empty')
+            if [[ -n "$issue_number" ]]; then
+              gh issue comment "$issue_number" --body-file "$body_file"
+            else
+              gh issue create --title "Main CI diagnostics lane red: $lane" --label ci-main-red --label "$lane_label" --body-file "$body_file"
+              issue_numbers=$(gh issue list --state open --label ci-main-red --label "$lane_label" --limit 100 --json number | jq -r 'sort_by(.number) | .[].number')
+              canonical_issue=${issue_numbers%%$'\n'*}
+              while read -r duplicate_issue; do
+                if [[ -n "$duplicate_issue" && "$duplicate_issue" != "$canonical_issue" ]]; then
+                  gh issue close "$duplicate_issue" --comment "[Engine Lead] This issue duplicates #$canonical_issue."
+                fi
+              done <<< "$issue_numbers"
+            fi
+          done <<< "$red_lanes"

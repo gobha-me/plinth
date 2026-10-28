@@ -43,6 +43,19 @@ inside the image on toolchain or dependency changes. It never publishes an
 image. The regular CI also retains Clang 20 tests and ASan/UBSan alongside
 Clang 21 during the transition.
 
+Clang-21 ASan+UBSan, TSan (realtime and lifecycle), and PostgreSQL standard
+diagnostics no longer run on pull requests; they run on `main` pushes
+and manual runs. Authors of lifecycle, realtime, or
+PostgreSQL changes should start a `workflow_dispatch` CI run on their branch
+before requesting review, including the TSan lifecycle coverage expected by
+`AGENTS.md`.
+
+Plinth is public today. The required `CodeQL / C++` check runs only with
+`if: github.event.repository.visibility == 'public'`; otherwise it is skipped,
+which branch protection treats as passing. Before making Plinth private,
+replace that required gate with a paid code-scanning plan or another required
+analysis.
+
 `docker/Dockerfile` is the distinct production runtime contract. The
 **Runtime image** workflow builds its `server-tests` and `runtime` stages for
 both supported architectures on pull requests and `main`, runs the complete
