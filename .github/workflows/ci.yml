@@ -1320,3 +1320,43 @@ jobs:
               echo "::warning::Unable to delete compiler cache $cache_id; continuing."
             fi
           done <<< "$cache_ids"
+
+  main_red_lane_alert:
+    name: main red diagnostics lane alert
+    needs: [postgres-standard, asan-ubsan, tsan]
+    if: ${{ always() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    permissions:
+      contents: read
+      issues: write
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: ci-main-red-issue
+      cancel-in-progress: false
+    steps:
+      - name: Open or update the main diagnostics issue
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_SHA: ${{ github.sha }}
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          # Superseded main runs are cancelled; cancellation is not a red lane.
+          failed_lanes=$(jq -r 'to_entries | map(select(.value.result == "failure") | "- \(.key)") | join("\n")' <<< "$NEEDS_JSON")
+          [[ -n "$failed_lanes" ]] || exit 0
+
+          body_file=$(mktemp)
+          trap 'rm -f "$body_file"' EXIT
+          printf '[Engine Lead]\n\nWorkflow run: %s\nSHA: %s\n\nFailed lanes:\n%s\n' \
+            "$RUN_URL" "$RUN_SHA" "$failed_lanes" > "$body_file"
+
+          gh label create ci-main-red --color B60205 --description "A non-required diagnostics lane failed on main" 2>/dev/null || true
+          issue_number=$(gh issue list --label ci-main-red --state open --limit 100 --json number | jq -r 'sort_by(.number) | first | .number // empty')
+          if [[ -n "$issue_number" ]]; then
+            gh issue comment "$issue_number" --body-file "$body_file"
+          else
+            gh issue create --title "Main CI diagnostics lane red" --label ci-main-red --body-file "$body_file"
+          fi
