@@ -483,6 +483,14 @@ TEST_CASE("PostgreSQL cancellation survives worker allocation failure after "
   REQUIRE(outcome.fatal_result);
   REQUIRE(outcome.denial_at_return);
   REQUIRE(outcome.returned_at < stopped_at + 3500ms);
+  // cancel_query's catch converts a heap-allocating setup into an unconfirmed
+  // cancellation, which then still aborts the socket. Only these two facts
+  // distinguish fixed-storage cancellation from that fallback.
+  REQUIRE(outcome.rejected_at_return == 0);
+  REQUIRE_FALSE(outcome.cancel_failed);
+  // Confirmed or not, an interrupted owner aborts its native socket on return
+  // while the waiting worker STILL owns the PGconn.
+  REQUIRE(outcome.disconnected);
   CHECK(outcome.checkpoint_rejected);
   CHECK(outcome.rejected_after_checkpoint > outcome.rejected_at_return);
   // The original blocker must still own the exact lock: cancellation cannot
@@ -493,24 +501,18 @@ TEST_CASE("PostgreSQL cancellation survives worker allocation failure after "
                  "AND classid=208 AND objid=$1::oid AND objsubid=2 "
                  "AND granted)",
                  key));
-  if (outcome.cancel_failed) {
-    // A refused/unconfirmed cancellation must already have aborted the native
-    // socket, while its PGconn is STILL owned by the waiting worker.
-    REQUIRE(outcome.disconnected);
-  } else {
-    bool quiescent = false;
-    while (!quiescent && Clock::now() < stopped_at + 4500ms) {
-      quiescent =
-          scalar(observer.get(),
-                 "SELECT NOT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity "
-                 "WHERE pid=$1::integer AND state='active') "
-                 "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_locks "
-                 "WHERE pid=$1::integer AND NOT granted)",
-                 worker_pid.c_str());
-    }
-    REQUIRE(quiescent);
-    CHECK_FALSE(scalar(observer.get(), BLOCKED, worker_pid.c_str(), key));
+  bool quiescent = false;
+  while (!quiescent && Clock::now() < stopped_at + 4500ms) {
+    quiescent =
+        scalar(observer.get(),
+               "SELECT NOT EXISTS(SELECT 1 FROM pg_catalog.pg_stat_activity "
+               "WHERE pid=$1::integer AND state='active') "
+               "AND NOT EXISTS(SELECT 1 FROM pg_catalog.pg_locks "
+               "WHERE pid=$1::integer AND NOT granted)",
+               worker_pid.c_str());
   }
+  REQUIRE(quiescent);
+  CHECK_FALSE(scalar(observer.get(), BLOCKED, worker_pid.c_str(), key));
   release_worker.release();
   {
     std::unique_lock lock(completion.mutex);
