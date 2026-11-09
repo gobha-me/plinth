@@ -6,7 +6,6 @@ on:
     paths:
       - docker/ci.Dockerfile
       - .github/workflows/ci-image.yml
-      - .github/workflows/ci.yml
       - .github/scripts/install-llvm.sh
       - .github/scripts/check-ci-image.sh
       - CMakeLists.txt
@@ -15,13 +14,10 @@ on:
       - tools/**
       - .clang-format
       - .clang-tidy
-      - AGENTS.md
-      - CONTRIBUTING.md
   pull_request:
     paths:
       - docker/ci.Dockerfile
       - .github/workflows/ci-image.yml
-      - .github/workflows/ci.yml
       - .github/scripts/install-llvm.sh
       - .github/scripts/check-ci-image.sh
       - CMakeLists.txt
@@ -30,8 +26,6 @@ on:
       - tools/**
       - .clang-format
       - .clang-tidy
-      - AGENTS.md
-      - CONTRIBUTING.md
   workflow_dispatch:
 
 permissions:
@@ -63,8 +57,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          version: v0.37.1
+          driver-opts: image=moby/buildkit:v0.33.0@sha256:6c2fa84a6b61ccd72899dde4239f8d5717f05f9a8ca6f3cad185fb1a95a94de3
+
       - name: Build the CI image locally
-        run: docker build --file docker/ci.Dockerfile --tag plinth-ci-check:local docker
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: 'false'
+        with:
+          context: docker
+          file: docker/ci.Dockerfile
+          tags: plinth-ci-check:local
+          pull: true
+          load: true
+          cache-from: type=gha,scope=ci-image
+          # Share one main cache; PRs and dispatches on other refs only read it.
+          cache-to: ${{ github.ref == 'refs/heads/main' && contains(fromJSON('["push", "workflow_dispatch"]'), github.event_name) && 'type=gha,mode=max,scope=ci-image' || '' }}
 
       - name: Build, test, format, and lint inside the image
         env:

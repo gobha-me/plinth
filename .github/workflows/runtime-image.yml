@@ -7,12 +7,14 @@ on:
       - "v*.*.*"
   pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "23 7 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   # A release must reach a terminal result. Superseded branch and PR builds may
   # be cancelled, but a tag publication must never be interrupted halfway.
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
@@ -21,22 +23,94 @@ env:
   REGISTRY_IMAGE: ghcr.io/gobha-me/plinth
 
 jobs:
+  changes:
+    name: Runtime image / changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      runtime: ${{ steps.select.outputs.runtime }}
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 0
+
+      - name: Select runtime inputs and architectures
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          # Docker copies the .dockerignore allowlist; candidate verification
+          # also consumes deployment assets, browser manifests and scripts.
+          runtime_files = {
+              ".dockerignore", "CMakeLists.txt", "VERSION", "LICENSE",
+              "THIRD_PARTY_NOTICES.md", "sbom.cdx.json",
+              ".github/workflows/runtime-image.yml",
+          }
+          runtime_dirs = (
+              "docker/", "src/", "include/", "cmake/", "third_party/",
+              "client/", "tests/", "migrations/", "deploy/", "tools/",
+              ".github/scripts/",
+          )
+          documentation_files = {
+              "AGENTS.md", "CONTRIBUTING.md", "README.md",
+              "CODE_OF_CONDUCT.md", "SECURITY.md", "SUPPORT.md",
+          }
+
+          def needs_runtime(path):
+              if path in runtime_files or path.startswith(runtime_dirs):
+                  return True
+              if path in documentation_files or path.startswith("docs/"):
+                  return False
+              # New or unclassified inputs must receive runtime coverage.
+              return True
+
+          event = os.environ["EVENT_NAME"]
+          runtime = True
+          if event == "pull_request":
+              try:
+                  result = subprocess.run(
+                      ["git", "diff", "--name-only", "--no-renames", "-z",
+                       f'{os.environ["PR_BASE_SHA"]}...{os.environ["PR_HEAD_SHA"]}',
+                       "--"],
+                      check=True, stdout=subprocess.PIPE,
+                  )
+                  paths = [path.decode("utf-8") for path in result.stdout.split(b"\0") if path]
+                  runtime = not paths or any(needs_runtime(path) for path in paths)
+              except (OSError, subprocess.CalledProcessError, UnicodeError):
+                  print("::warning::Unable to classify PR changes; running runtime coverage.")
+
+          candidates = [{"arch": "amd64", "platform": "linux/amd64",
+                         "runner": "ubuntu-24.04", "browser": True}]
+          if event in ("workflow_dispatch", "schedule") or (
+              event == "push" and os.environ["EVENT_REF"].startswith("refs/tags/v")
+          ):
+              candidates.append({"arch": "arm64", "platform": "linux/arm64",
+                                 "runner": "ubuntu-24.04-arm", "browser": False})
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"runtime={str(runtime).lower()}", file=output)
+              print("matrix=" + json.dumps({"include": candidates}), file=output)
+          PY
+
   candidate:
     name: ${{ matrix.arch }} / build and test without publication
+    needs: changes
+    if: needs.changes.outputs.runtime == 'true'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - arch: amd64
-            platform: linux/amd64
-            runner: ubuntu-24.04
-            browser: true
-          - arch: arm64
-            platform: linux/arm64
-            runner: ubuntu-24.04-arm
-            browser: false
+      matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     services:
       postgres:
         image: pgvector/pgvector:pg16@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
