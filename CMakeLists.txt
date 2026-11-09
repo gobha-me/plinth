@@ -608,6 +608,7 @@ add_executable(plinth
   src/kernel/js/stdlib/pubsub_bindings.cpp
   src/kernel/extension_http/codec.cpp
   src/kernel/extension_http/authentication.cpp
+  src/kernel/extension_http/caller_resolution.cpp
   src/kernel/extension_http/dispatch_store.cpp
   src/kernel/extension_http/frames.cpp
   src/kernel/extension_http/quickjs_codec.cpp
@@ -961,6 +962,7 @@ add_executable(plinth_tests
   src/kernel/js/stdlib/pubsub_bindings.cpp
   src/kernel/extension_http/codec.cpp
   src/kernel/extension_http/authentication.cpp
+  src/kernel/extension_http/caller_resolution.cpp
   src/kernel/extension_http/dispatch_store.cpp
   src/kernel/extension_http/frames.cpp
   src/kernel/extension_http/quickjs_codec.cpp
