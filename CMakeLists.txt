@@ -1076,6 +1076,38 @@ add_dependencies(plinth_tests plinth_shell_bundle_staged plinth_install_fixture_
 
 include(Catch)
 
+# Keep replaceable C++ allocation functions out of the shared test process.
+# This executable exercises the real inline PostgreSQL operation helpers.
+find_package(Threads REQUIRED)
+add_executable(plinth_db_cancellation_allocation_tests
+  tests/kernel/db/cancellation_allocation_test.cpp)
+target_include_directories(plinth_db_cancellation_allocation_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(plinth_db_cancellation_allocation_tests PRIVATE
+  Catch2::Catch2WithMain PostgreSQL::PostgreSQL Threads::Threads)
+# Server-test images build plinth_tests explicitly before running all CTests.
+add_dependencies(plinth_tests plinth_db_cancellation_allocation_tests)
+
+add_test(NAME plinth_tests_db_cancellation_allocator
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_db_cancellation_allocation_tests>
+    --case "PostgreSQL cancellation allocator pairs every family and isolates its worker"
+    --timeout 20
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_db_cancellation_allocator PROPERTIES
+  TIMEOUT 30)
+
+add_test(NAME plinth_tests_db_cancellation_allocation
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_db_cancellation_allocation_tests>
+    --case "PostgreSQL cancellation survives worker allocation failure after native blocking"
+    --timeout 40
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_db_cancellation_allocation PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg;native_ownership" TIMEOUT 50)
+
 # 0.4.5.1 — grouped Catch2 entries, single Drogon lifecycle per group.
 # Replaces catch_discover_tests(plinth_tests) which spawned one
 # subprocess per TEST_CASE (~494) and reliably fired the teardown flake
