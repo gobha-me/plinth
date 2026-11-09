@@ -52,6 +52,18 @@ The internal building blocks comprise:
 - An HTTP authentication wrapper using the existing kernel filters, preserving
   selected-cookie precedence while requiring a selected PAT for protected
   claims. It is exercised at the filter seam, not through a new HTTP route.
+- A synchronous worker-side caller lookup accepting only the sealed
+  authentication output. One PostgreSQL statement rechecks the PAT's user,
+  revocation, expiry and disabled-user state and loads the additive group and
+  `everyone` rule union, excluding orphaned rules. Public identities load only
+  `everyone` rules. The native result is bounded to 1024 rules and 256 UTF-8
+  bytes per username/rule; overflow fails closed, without partial grants.
+  The lookup inherits the original execution deadline and stop token through
+  bounded libpq operations and retains the accepted process/admission lease
+  through physical cleanup and the sealed caller output. Each output snapshot
+  rechecks cancellation. The connection must be exclusively owned, idle and
+  outside a transaction; an enclosing worker must join the call before closing
+  it. This component is not wired to a new worker queue or HTTP route.
 
 The configuration parser accepts `extension_http.drain_timeout_ms` as an integer
 from 1000 through 5000, defaulting to 5000. The deadline helper caps it by the
@@ -72,7 +84,7 @@ component inputs, not installed provenance or full authentication journeys.
 | M01–M06 | Original-byte declarations, grammar, duplicates, scalar limits and public subset | Actual selected-mode install/readiness |
 | C01–C06 | Caller-owned transactions, serialization, reservations, frontend conflicts and fresh receipt reads | Atomic lifecycle publication, replacement, removal and restart recovery |
 | P01–P04 | Original/decoded-path agreement and opaque raw-query validation | Real parser and catch-all transport mapping |
-| A01–A06 | Authentication decision controls and actual PostgreSQL filter cases | New route, backend failure and full mixed-fault journeys |
+| A01–A06 | Authentication controls, PostgreSQL filter cases and bounded worker-side caller lookup | Owned queue integration, new route, backend failure and full mixed-fault journeys |
 | I01–I04 | Bound authorization and public confirmation; rule definitions without grants | Complete authenticated install/upgrade-to-live journey |
 | Q01–Q04 | Captured module index, actual import hook and native value/binary/Promise codec | Real owned QuickJS driver, cancellation and child settlement |
 | S01–S04 | Exact closed Frame1 variants, aggregate bounds and charged buffers | Real UDS peer, verified identity/clock, sequence and physical settlement |
