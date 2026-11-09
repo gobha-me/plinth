@@ -280,7 +280,7 @@ TEST_CASE("HTTP caller decoder preserves PAT and anonymous rule data without "
   NativeTable table;
   table.rows = {{{"fixture-\xC3\xA9", "caller.group", "t"}},
                 {{"fixture-\xC3\xA9", "caller.public", "t"}}};
-  const auto native = table.build();
+  auto native = table.build();
   const auto user = detail::decode_http_caller(*native, pat_data());
   REQUIRE(user);
   require_context(*user, USER, "fixture-\xC3\xA9", "pat",
@@ -295,6 +295,8 @@ TEST_CASE("HTTP caller decoder preserves PAT and anonymous rule data without "
                   {"caller.group", "caller.public"});
   // Later mutation/free of the native fixture cannot mutate the decoded DATA.
   REQUIRE(PQsetvalue(native.get(), 0, 1, nullptr, 0) == 1);
+  native.reset();
+  CHECK(user->username == "fixture-\xC3\xA9");
   CHECK(user->effective_rules ==
         std::vector<std::string>{"caller.group", "caller.public"});
 }
@@ -593,14 +595,15 @@ TEST_CASE("HTTP caller preflight uses real public authentication and "
   SECTION("existing PAT validator seam is decision proof only") {
     decision_only = true;
   }
-  auto principal =
-      decision_only ? decision_pat_principal(live) : public_principal(live);
-  REQUIRE(principal.snapshot());
+  // Held in an optional because its moved-from state is asserted below.
+  std::optional<AuthenticatedHttpPrincipal> principal{
+      decision_only ? decision_pat_principal(live) : public_principal(live)};
+  REQUIRE(principal->snapshot());
   REQUIRE(live.lease->extra_used() == before_owner + PRINCIPAL_CHARGE);
   const std::string native_error{PQerrorMessage(connection.get())};
-  const auto resolved = resolve_http_caller(std::move(principal), *connection);
+  const auto resolved = resolve_http_caller(std::move(*principal), *connection);
   require_resolution_failure(resolved, CallerResolutionFailure::UNAVAILABLE);
-  CHECK_FALSE(principal.snapshot());
+  CHECK_FALSE(principal->snapshot());
   CHECK(live.lease->extra_used() == before_owner);
   CHECK(live.pool.snapshot() == counters);
   CHECK(live.process.active_for_test() == 1);
@@ -616,7 +619,8 @@ TEST_CASE("HTTP caller preflight retires sealed inputs before any native query",
   LiveOwner live;
   auto connection = unconnected();
   const auto before_owner = live.lease->extra_used();
-  auto principal = public_principal(live);
+  // Held in an optional because one section passes it moved-from on purpose.
+  std::optional<AuthenticatedHttpPrincipal> principal{public_principal(live)};
   std::optional<AuthenticatedHttpPrincipal> retained;
   SECTION("client cancellation") {
     live.owner->cancel(CancelReason::CLIENT_GONE);
@@ -643,10 +647,10 @@ TEST_CASE("HTTP caller preflight retires sealed inputs before any native query",
     live.throwing_clock->store(true);
   }
   SECTION("moved-from input") {
-    retained.emplace(std::move(principal));
+    retained.emplace(std::move(*principal));
   }
   const std::string native_error{PQerrorMessage(connection.get())};
-  const auto resolved = resolve_http_caller(std::move(principal), *connection);
+  const auto resolved = resolve_http_caller(std::move(*principal), *connection);
   require_resolution_failure(resolved, CallerResolutionFailure::RETIRED);
   CHECK(std::string{PQerrorMessage(connection.get())} == native_error);
   CHECK(PQisnonblocking(connection.get()) == 0);
@@ -842,6 +846,11 @@ TEST_CASE("HTTP caller PG public resolution uses only everyone despite ambient "
           "[extension-http][http_caller_pg][ws][integration]") {
   if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
   PgCaller fixture;
+  {
+    // Before any grant the public query's sentinel row is an empty caller.
+    const auto empty = fixture.resolve(true);
+    require_context(snapshot(empty).user, "", "", "anonymous", {});
+  }
   fixture.group("caller-members");
   fixture.member("caller-members");
   fixture.member("admin");
@@ -877,6 +886,11 @@ TEST_CASE("HTTP caller PG PAT rechecks ownership and current identity state",
   SECTION("active PAT without rules is a valid caller") {
     accepted = true;
   }
+  SECTION("PAT with a future expiry remains valid") {
+    fixture.command("UPDATE plinth.pats SET "
+                    "expires_at=statement_timestamp()+interval '1 hour'");
+    accepted = true;
+  }
   SECTION("PAT belongs to another user after authentication") {
     const auto other = plinth::ws_test::insert_user(
         *fixture.seed, "other-caller", "fake-other-password");
@@ -910,6 +924,9 @@ TEST_CASE("HTTP caller PG PAT rechecks ownership and current identity state",
   } else {
     require_resolution_failure(resolved, CallerResolutionFailure::REJECTED);
   }
+  // Acceptance and rejection both leave the worker's connection reusable.
+  CHECK(PQstatus(fixture.worker->conn) == CONNECTION_OK);
+  CHECK(PQtransactionStatus(fixture.worker->conn) == PQTRANS_IDLE);
 }
 
 TEST_CASE("HTTP caller PG PAT rules are a deduplicated fresh union without "
@@ -988,7 +1005,8 @@ TEST_CASE("HTTP caller PG retired and busy principals never send a query",
           "[extension-http][http_caller_pg][ws][integration]") {
   if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
   PgCaller fixture;
-  auto principal = fixture.authenticate();
+  // Held in an optional because one section passes it moved-from on purpose.
+  std::optional<AuthenticatedHttpPrincipal> principal{fixture.authenticate()};
   const auto marker = fixture.mark_worker();
   std::optional<ExtraMemoryCharge> held;
   std::optional<AuthenticatedHttpPrincipal> retained;
@@ -1009,7 +1027,7 @@ TEST_CASE("HTTP caller PG retired and busy principals never send a query",
     fixture.live.now->store(4600 * MS - 1);
   }
   SECTION("moved-from") {
-    retained.emplace(std::move(principal));
+    retained.emplace(std::move(*principal));
   }
   SECTION("no caller payload credit") {
     held = fixture.live.lease->reserve_extra(EXTRA_BYTES_PER_LEASE -
@@ -1019,7 +1037,7 @@ TEST_CASE("HTTP caller PG retired and busy principals never send a query",
     expected = CallerResolutionFailure::BUSY;
   }
   auto result =
-      resolve_http_caller(std::move(principal), *fixture.worker->conn);
+      resolve_http_caller(std::move(*principal), *fixture.worker->conn);
   require_resolution_failure(result, expected);
   CHECK(fixture.worker_query() == marker);
   CHECK(PQtransactionStatus(fixture.worker->conn) == PQTRANS_IDLE);
@@ -1041,13 +1059,16 @@ TEST_CASE("HTTP caller PG sealed snapshots gate retirement moves and retain "
   }
   REQUIRE(caller->snapshot());
   CHECK(fixture.live.lease->extra_used() == owner_bytes + CALLER_CHARGE);
+  bool still_live = false;
   SECTION("live output and moved-from snapshot") {
-    ResolvedHttpCaller moved{std::move(*caller)};
+    // Held in an optional because its moved-from state is asserted below.
+    std::optional<ResolvedHttpCaller> moved{std::move(*caller)};
     CHECK_FALSE(caller->snapshot());
-    CHECK(moved.snapshot());
-    *caller = std::move(moved);
-    CHECK_FALSE(moved.snapshot());
+    CHECK(moved->snapshot());
+    *caller = std::move(*moved);
+    CHECK_FALSE(moved->snapshot());
     CHECK(caller->snapshot());
+    still_live = true;
   }
   SECTION("cancellation") {
     fixture.live.owner->cancel(CancelReason::CLIENT_GONE);
@@ -1062,6 +1083,9 @@ TEST_CASE("HTTP caller PG sealed snapshots gate retirement moves and retain "
     CHECK_FALSE(caller->snapshot());
   }
   fixture.live.release();
+  // The output's own owner reference keeps it live past the fixture's release;
+  // only the gate retired above may close it.
+  CHECK(caller->snapshot().has_value() == still_live);
   CHECK(fixture.live.pool.snapshot() ==
         CreditSnapshot{1, 23, EXTRA_BYTES_PER_LEASE});
   CHECK(fixture.live.process.active_for_test() == 1);
@@ -1143,21 +1167,45 @@ TEST_CASE(
     "[extension-http][http_caller_pg][ws][integration]") {
   if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
   PgCaller fixture;
-  SECTION("public rule width is bounded before native copying") {
+  SECTION("public and PAT rule widths are bounded before native copying") {
+    // Each caller kind has its own SQL text and so its own width guard.
     fixture.grant(std::string(256, 'r'), "everyone");
-    const auto legal = fixture.resolve(true);
-    CHECK(snapshot(legal).user.effective_rules ==
-          std::vector<std::string>{std::string(256, 'r')});
+    for (const bool anonymous : {true, false}) {
+      CAPTURE(anonymous);
+      const auto legal = fixture.resolve(anonymous);
+      CHECK(snapshot(legal).user.effective_rules ==
+            std::vector<std::string>{std::string(256, 'r')});
+    }
+    fixture.grant(std::string(257, 'r'), "everyone");
+    for (const bool anonymous : {true, false}) {
+      CAPTURE(anonymous);
+      require_resolution_failure(fixture.resolve(anonymous),
+                                 CallerResolutionFailure::UNAVAILABLE);
+    }
+  }
+  SECTION("public overflow releases every temporary charge") {
+    // Anonymous only: PAT bookkeeping callbacks release on their own schedule.
+    const auto baseline = fixture.live.lease->extra_used();
     fixture.grant(std::string(257, 'r'), "everyone");
     require_resolution_failure(fixture.resolve(true),
                                CallerResolutionFailure::UNAVAILABLE);
+    CHECK(fixture.live.lease->extra_used() == baseline);
   }
   SECTION("PAT username width is rechecked after authentication") {
-    auto principal = fixture.authenticate();
+    auto legal_principal = fixture.authenticate();
+    auto overflow_principal = fixture.authenticate();
+    fixture.command("UPDATE plinth.users SET username=$1",
+                    {std::string(256, 'u')});
+    {
+      const auto legal = resolve_http_caller(std::move(legal_principal),
+                                             *fixture.worker->conn);
+      CHECK(snapshot(legal).user.username == std::string(256, 'u'));
+    }
     fixture.command("UPDATE plinth.users SET username=$1",
                     {std::string(257, 'u')});
     require_resolution_failure(
-        resolve_http_caller(std::move(principal), *fixture.worker->conn),
+        resolve_http_caller(std::move(overflow_principal),
+                            *fixture.worker->conn),
         CallerResolutionFailure::UNAVAILABLE);
   }
   SECTION("public and PAT row limits reject the overflow witness") {
@@ -1193,16 +1241,25 @@ TEST_CASE("HTTP caller PG bounded database waits honor deadline and stop with "
           "[extension-http][http_caller_pg][ws][integration]") {
   if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
   PgCaller fixture;
-  auto bounds = *DeadlineBounds::make(100 * MS, 2100 * MS);
-  fixture.live.reset_owner(bounds);
-  auto principal = fixture.authenticate(true);
-  const auto baseline = fixture.live.lease->extra_used() - PRINCIPAL_CHARGE;
-  bool stop_query = false;
+  enum class Interrupt { DEADLINE, ENCLOSING_DEADLINE, STOP, OWNER_CANCEL };
+  auto interrupt = Interrupt::DEADLINE;
   SECTION("absolute database deadline") {
   }
-  SECTION("authentication stop token") {
-    stop_query = true;
+  SECTION("enclosing operation shortens the inherited deadline") {
+    interrupt = Interrupt::ENCLOSING_DEADLINE;
   }
+  SECTION("authentication stop token") {
+    interrupt = Interrupt::STOP;
+  }
+  SECTION("explicit cancellation leaves the in-flight query owned") {
+    interrupt = Interrupt::OWNER_CANCEL;
+  }
+  // The frozen fixture clock makes this exactly 2s of real query budget. Other
+  // sections keep the full 4.5s so a missed relay overruns their 4s window.
+  if (interrupt == Interrupt::DEADLINE)
+    fixture.live.reset_owner(*DeadlineBounds::make(100 * MS, 2100 * MS));
+  auto principal = fixture.authenticate(true);
+  const auto baseline = fixture.live.lease->extra_used() - PRINCIPAL_CHARGE;
   auto locker = std::make_shared<plinth::ws_test::TestPg>(fixture.config.db);
   PgTransaction transaction{locker};
   auto locked =
@@ -1214,17 +1271,29 @@ TEST_CASE("HTTP caller PG bounded database waits honor deadline and stop with "
     std::mutex mutex;
     std::condition_variable changed;
     std::optional<CallerResolutionResult> result;
+    std::chrono::steady_clock::time_point finished_at{};
   };
   auto completion = std::make_shared<Completion>();
   const auto started = std::chrono::steady_clock::now();
+  const auto earliest_expiry = started + 2s;
+  const auto missed_relay_cutoff = started + 4s;
+  std::optional<std::chrono::steady_clock::time_point> enclosing_deadline;
+  if (interrupt == Interrupt::ENCLOSING_DEADLINE)
+    enclosing_deadline = earliest_expiry;
   // The thread owns both the sealed principal and the PGconn's shared owner.
-  // jthread joins even on assertion unwind; the query has its own 2s deadline
+  // jthread joins even on assertion unwind; the query has its own deadline
   // and bounded native cancellation cleanup while the table lock stays held.
   std::jthread worker{[connection = fixture.worker, completion,
-                       principal = std::move(principal)]() mutable {
+                       principal = std::move(principal),
+                       enclosing_deadline]() mutable {
+    std::optional<plinth::db::OperationScope> operation;
+    if (enclosing_deadline)
+      operation.emplace(std::stop_token{}, *enclosing_deadline);
     auto result = resolve_http_caller(std::move(principal), *connection->conn);
+    const auto finished_at = std::chrono::steady_clock::now();
     {
       const std::lock_guard lock(completion->mutex);
+      completion->finished_at = finished_at;
       completion->result.emplace(std::move(result));
     }
     completion->changed.notify_all();
@@ -1241,21 +1310,48 @@ TEST_CASE("HTTP caller PG bounded database waits honor deadline and stop with "
   CHECK(fixture.live.process.active_for_test() == 1);
   CHECK(fixture.live.lease->extra_used() ==
         baseline + PRINCIPAL_CHARGE + CALLER_CHARGE);
-  if (stop_query) REQUIRE(fixture.live.stop.request_stop());
+  if (interrupt == Interrupt::STOP) REQUIRE(fixture.live.stop.request_stop());
+  if (interrupt == Interrupt::OWNER_CANCEL) {
+    fixture.live.owner->cancel(CancelReason::CLIENT_GONE);
+    // Cancellation retires only the output; the native query stays owned and
+    // charged until the lock it is waiting on is released.
+    CHECK(fixture.blocked_by(worker_pid, locker_pid));
+    CHECK(fixture.live.lease->extra_used() ==
+          baseline + PRINCIPAL_CHARGE + CALLER_CHARGE);
+    {
+      const std::lock_guard lock(completion->mutex);
+      CHECK_FALSE(completion->result.has_value());
+    }
+    transaction.release();
+  }
+  const bool retired =
+      interrupt == Interrupt::STOP || interrupt == Interrupt::OWNER_CANCEL;
+  std::chrono::steady_clock::time_point finished_at{};
   {
     std::unique_lock lock(completion->mutex);
     REQUIRE(completion->changed.wait_until(lock, started + 5s, [&completion] {
       return completion->result.has_value();
     }));
-    require_resolution_failure(
-        *completion->result, stop_query ? CallerResolutionFailure::RETIRED
-                                        : CallerResolutionFailure::UNAVAILABLE);
+    require_resolution_failure(*completion->result,
+                               retired ? CallerResolutionFailure::RETIRED
+                                       : CallerResolutionFailure::UNAVAILABLE);
+    finished_at = completion->finished_at;
   }
   worker.join();
   CHECK(std::chrono::steady_clock::now() < started + 5s);
+  if (interrupt == Interrupt::DEADLINE ||
+      interrupt == Interrupt::ENCLOSING_DEADLINE)
+    CHECK(finished_at >= earliest_expiry);
+  if (interrupt == Interrupt::ENCLOSING_DEADLINE ||
+      interrupt == Interrupt::STOP)
+    CHECK(finished_at < missed_relay_cutoff);
+  if (interrupt == Interrupt::OWNER_CANCEL) {
+    CHECK(PQstatus(fixture.worker->conn) == CONNECTION_OK);
+    CHECK(PQtransactionStatus(fixture.worker->conn) == PQTRANS_IDLE);
+  }
   CHECK(fixture.live.lease->extra_used() == baseline);
   CHECK_FALSE(fixture.blocked_by(worker_pid, locker_pid));
-  transaction.release();
+  if (transaction.held) transaction.release();
   fixture.live.release();
   fixture.live.require_drained();
 }
