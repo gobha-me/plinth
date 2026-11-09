@@ -49,10 +49,11 @@ using CallerResolutionResult =
     std::expected<ResolvedHttpCaller, CallerResolutionFailure>;
 
 // Synchronous worker-side component; NEVER call on a Drogon/event loop. The
-// enclosing worker exclusively owns an idle connection outside a transaction
-// and joins this call before closing it. Uses bounded libpq operations with the
-// authentication stop token and one inherited absolute deadline, including
-// physical cancellation cleanup. Explicit owner cancellation retires output; an
+// enclosing worker exclusively owns an idle, authoritative kernel connection
+// outside a transaction and joins this call before closing it. Uses bounded
+// libpq operations with the authentication and enclosing worker stop tokens and
+// one inherited absolute deadline, including physical cancellation cleanup.
+// Explicit owner cancellation retires output; an
 // in-flight query remains owned until its bounded native
 // completion/cancellation. No new thread, timer or database client is created,
 // and no transaction settings are changed. Public identities resolve only

@@ -148,9 +148,20 @@ struct CallerResolutionRun {
         PQtransactionStatus(&connection) != PQTRANS_IDLE)
       return std::unexpected(CallerResolutionFailure::UNAVAILABLE);
 
+    db::OperationScope::checkpoint_current();
+    std::stop_source operation_stop;
+    const auto relay_stop = [operation_stop]() mutable noexcept {
+      static_cast<void>(operation_stop.request_stop());
+    };
+    // A nested scope inherits the outer deadline, but its token must also
+    // observe the enclosing worker's stop, including during native SQL waits.
+    const std::stop_callback authentication_stop{
+        principal.owner->operation_stop_token(), relay_stop};
+    const std::stop_callback enclosing_stop{
+        db::OperationScope::current_stop_token(), relay_stop};
     const auto budget = std::chrono::milliseconds{*remaining};
-    db::OperationScope scope{principal.owner->operation_stop_token(),
-                             started + budget, budget};
+    db::OperationScope scope{operation_stop.get_token(), started + budget,
+                             budget};
     scope.checkpoint();
     const bool anonymous = identity->kind == Principal::Kind::ANONYMOUS;
     const std::array parameters = {identity->user_id.c_str(),
@@ -168,6 +179,7 @@ struct CallerResolutionRun {
     if (!result) return std::unexpected(CallerResolutionFailure::UNAVAILABLE);
     auto user = detail::decode_http_caller(*result, *identity);
     if (!user) return std::unexpected(user.error());
+    scope.checkpoint();
     if (!principal.owner->current())
       return std::unexpected(CallerResolutionFailure::RETIRED);
     return ResolvedHttpCaller{
