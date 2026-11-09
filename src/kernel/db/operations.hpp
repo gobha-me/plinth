@@ -4,6 +4,7 @@
 #include <libpq-fe.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -257,7 +258,7 @@ inline auto receive_result(PGconn* connection, const Operation& operation,
 // can cancel its own role's backend using the normal nonblocking protocol.
 // One two-second deadline covers connect, cancel dispatch, and confirmation on
 // the original connection. Never recursively cancel the control connection.
-inline auto cancel_query(PGconn* connection) -> bool {
+inline auto cancel_query(PGconn* connection) -> bool try {
   OperationScope cleanup_scope{OperationScope::CancellationCleanupTag{}};
   Operation cleanup;
   using Options = std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)>;
@@ -265,30 +266,32 @@ inline auto cancel_query(PGconn* connection) -> bool {
   if (!options || PQbackendPID(connection) <= 0) {
     return false;
   }
-  std::vector<const char*> keywords;
-  std::vector<const char*> values;
+  // Cancellation must still work when ordinary C++ allocation is exhausted.
+  // Leave one null terminator slot; an unfamiliar future libpq option count
+  // fails closed through receive_result's existing socket-abort path.
+  std::array<const char*, 128> keywords{};
+  std::array<const char*, 128> values{};
+  std::size_t count = 0;
+  const auto append = [&](const char* keyword, const char* value) {
+    if (count == keywords.size() - 1) return false;
+    keywords[count] = keyword;
+    values[count] = value;
+    ++count;
+    return true;
+  };
   for (auto* option = options.get(); option->keyword != nullptr; ++option) {
-    if (option->val != nullptr) {
-      keywords.push_back(option->keyword);
-      values.push_back(option->val);
-    }
+    if (option->val != nullptr && !append(option->keyword, option->val))
+      return false;
   }
-  keywords.push_back("host");
-  values.push_back(PQhost(connection));
-  keywords.push_back("port");
-  values.push_back(PQport(connection));
-  keywords.push_back("password");
-  values.push_back(PQpass(connection));
-  keywords.push_back("options");
-  values.push_back("-c statement_timeout=2000");
+  if (!append("host", PQhost(connection)) ||
+      !append("port", PQport(connection)) ||
+      !append("password", PQpass(connection)) ||
+      !append("options", "-c statement_timeout=2000"))
+    return false;
   // Reuse the resolved numeric address so cancellation does not resolve DNS.
   const char* address = PQhostaddr(connection);
-  if (address != nullptr && *address != '\0') {
-    keywords.push_back("hostaddr");
-    values.push_back(address);
-  }
-  keywords.push_back(nullptr);
-  values.push_back(nullptr);
+  if (address != nullptr && *address != '\0' && !append("hostaddr", address))
+    return false;
   using Connection = std::unique_ptr<PGconn, decltype(&PQfinish)>;
   Connection control{PQconnectStartParams(keywords.data(), values.data(), 0),
                      PQfinish};
@@ -296,8 +299,12 @@ inline auto cancel_query(PGconn* connection) -> bool {
       PQsetnonblocking(control.get(), 1) != 0) {
     return false;
   }
-  auto backend = std::to_string(PQbackendPID(connection));
-  const char* parameter = backend.c_str();
+  std::array<char, 12> backend{};
+  const auto converted =
+      std::to_chars(backend.data(), backend.data() + backend.size() - 1,
+                    PQbackendPID(connection));
+  if (converted.ec != std::errc{}) return false;
+  const char* parameter = backend.data();
   if (PQsendQueryParams(control.get(),
                         "SELECT pg_catalog.pg_cancel_backend($1::int)", 1,
                         nullptr, &parameter, nullptr, nullptr, 0) == 0) {
@@ -312,6 +319,11 @@ inline auto cancel_query(PGconn* connection) -> bool {
   }
   Result completed{receive_result(connection, cleanup, false), PQclear};
   return !cleanup.interrupted() && PQstatus(connection) == CONNECTION_OK;
+} catch (...) {
+  // The operation owner must take the same native abort path for exceptional
+  // cleanup as for a refused/unconfirmed cancellation, retaining its lease
+  // until that path completes. Never let cancellation setup bypass it.
+  return false;
 }
 
 } // namespace detail

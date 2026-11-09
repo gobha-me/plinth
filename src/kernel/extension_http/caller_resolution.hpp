@@ -52,7 +52,8 @@ using CallerResolutionResult =
 // enclosing worker exclusively owns an idle, authoritative kernel connection
 // outside a transaction and joins this call before closing it. Uses bounded
 // libpq operations with the authentication and enclosing worker stop tokens and
-// one inherited absolute deadline, including physical cancellation cleanup.
+// one inherited absolute query deadline. Interrupted queries have the existing
+// separate, bounded two-second native cancellation-cleanup allowance.
 // Explicit owner cancellation retires output; an
 // in-flight query remains owned until its bounded native
 // completion/cancellation. No new thread, timer or database client is created,

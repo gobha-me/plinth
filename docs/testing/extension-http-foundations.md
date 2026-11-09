@@ -59,7 +59,10 @@ The internal building blocks comprise:
   `everyone` rules. The native result is bounded to 1024 rules and 256 UTF-8
   bytes per username/rule; overflow fails closed, without partial grants.
   The lookup inherits the original execution deadline and stop token through
-  bounded libpq operations and retains the accepted process/admission lease
+  bounded libpq operations; interrupted queries have the existing separate
+  two-second native cancellation-cleanup allowance. Cancellation setup uses
+  fixed storage and retains the native abort path on exceptional failure.
+  The lookup retains the accepted process/admission lease
   through physical cleanup and the sealed caller output. Each output snapshot
   rechecks cancellation. The connection must be exclusively owned, idle and
   outside a transaction; an enclosing worker must join the call before closing
