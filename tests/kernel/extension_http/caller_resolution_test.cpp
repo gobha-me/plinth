@@ -1062,7 +1062,8 @@ TEST_CASE("HTTP caller PG sealed snapshots gate retirement moves and retain "
   bool still_live = false;
   SECTION("live output and moved-from snapshot") {
     // Held in an optional because its moved-from state is asserted below.
-    std::optional<ResolvedHttpCaller> moved{std::move(*caller)};
+    std::optional<ResolvedHttpCaller> moved;
+    moved.emplace(std::move(*caller));
     CHECK_FALSE(caller->snapshot());
     CHECK(moved->snapshot());
     *caller = std::move(*moved);
