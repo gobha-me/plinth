@@ -104,7 +104,6 @@ jobs:
           RUN_SHA: ${{ github.sha }}
           NEEDS_JSON: ${{ toJSON(needs) }}
           ISSUE_TITLE: Nightly CI failure
-          ISSUE_SEARCH: 'in:title "Nightly CI failure"'
         shell: bash
         run: |
           set -euo pipefail
@@ -119,12 +118,24 @@ jobs:
           trap 'rm -f -- "$body_file"' EXIT
           printf '[Engine Lead]\nWorkflow: %s\nRun: %s\nSHA: %s\n\nFailed jobs:\n%s\n' \
             "$WORKFLOW_NAME" "$RUN_URL" "$RUN_SHA" "$failed_jobs" > "$body_file"
-          issue_number=$(gh issue list --search "$ISSUE_SEARCH" --state open --limit 100 \
-            --json number,title | jq -r --arg title "$ISSUE_TITLE" '
-              [.[] | select(.title == $title)] | sort_by(.number) |
-              first | .number // empty')
+
+          # Label lookup (not title search) to avoid search-lag duplicates; same
+          # close-newer-duplicates backstop as the ci-main-red alert on main.
+          gh label create ci-nightly-red --color B60205 \
+            --description "A scheduled nightly CI image or Runtime image run is red" --force
+
+          issue_number=$(gh issue list --state open --label ci-nightly-red --limit 100 \
+            --json number | jq -r 'sort_by(.number) | first | .number // empty')
           if [[ -n "$issue_number" ]]; then
             gh issue comment "$issue_number" --body-file "$body_file"
           else
-            gh issue create --title "$ISSUE_TITLE" --body-file "$body_file"
+            gh issue create --title "$ISSUE_TITLE" --label ci-nightly-red --body-file "$body_file"
+            issue_numbers=$(gh issue list --state open --label ci-nightly-red --limit 100 \
+              --json number | jq -r 'sort_by(.number) | .[].number')
+            canonical_issue=${issue_numbers%%$'\n'*}
+            while read -r duplicate_issue; do
+              if [[ -n "$duplicate_issue" && "$duplicate_issue" != "$canonical_issue" ]]; then
+                gh issue close "$duplicate_issue" --comment "[Engine Lead] This issue duplicates #$canonical_issue."
+              fi
+            done <<< "$issue_numbers"
           fi
