@@ -1259,3 +1259,115 @@ TEST_CASE("HTTP caller PG bounded database waits honor deadline and stop with "
   fixture.live.release();
   fixture.live.require_drained();
 }
+
+TEST_CASE("HTTP caller PG enclosing stop cancels blocked lookup while "
+          "authentication stays live",
+          "[extension-http][http_caller_pg][ws][integration]") {
+  if (!plinth::ws_test::pg_available()) SKIP("PG unavailable");
+  PgCaller fixture;
+  fixture.grant("caller.public", "everyone");
+  const auto baseline = fixture.live.lease->extra_used();
+  auto principal = fixture.authenticate(true);
+  REQUIRE(fixture.live.owner->current());
+  REQUIRE_FALSE(fixture.live.stop.stop_requested());
+  REQUIRE(fixture.live.lease->extra_used() == baseline + PRINCIPAL_CHARGE);
+
+  auto locker = std::make_shared<plinth::ws_test::TestPg>(fixture.config.db);
+  PgTransaction transaction{locker};
+  auto locked =
+      locker->exec("LOCK TABLE plinth.group_rules IN ACCESS EXCLUSIVE MODE");
+  REQUIRE(PQresultStatus(locked.get()) == PGRES_COMMAND_OK);
+  const auto worker_pid = PQbackendPID(fixture.worker->conn);
+  const auto locker_pid = PQbackendPID(locker->conn);
+  std::stop_source enclosing;
+  struct Completion {
+    std::mutex mutex;
+    std::optional<CallerResolutionResult> result;
+    std::chrono::steady_clock::time_point finished_at{};
+  };
+  auto completion = std::make_shared<Completion>();
+  const auto started = std::chrono::steady_clock::now();
+  const auto execution_deadline = started + 4500ms;
+  const auto completion_deadline = started + 4s;
+  // This deadline precedes both the inherited/authentication query deadline
+  // and PG timeouts. Missing the enclosing-token relay must fail, even if the
+  // query eventually times out. The jthread owns and joins all native work.
+  std::jthread worker{[connection = fixture.worker, completion,
+                       principal = std::move(principal),
+                       stop = enclosing.get_token(),
+                       execution_deadline]() mutable {
+    plinth::db::OperationScope operation{stop, execution_deadline};
+    auto result = resolve_http_caller(std::move(principal), *connection->conn);
+    const auto finished_at = std::chrono::steady_clock::now();
+    const std::lock_guard lock(completion->mutex);
+    completion->finished_at = finished_at;
+    completion->result.emplace(std::move(result));
+  }};
+  bool blocked = false;
+  while (!blocked && std::chrono::steady_clock::now() < started + 2s) {
+    blocked = fixture.blocked_by(worker_pid, locker_pid);
+    if (!blocked) {
+      const std::lock_guard lock(completion->mutex);
+      if (completion->result) break;
+    }
+  }
+  REQUIRE(blocked);
+  REQUIRE(fixture.scalar("SELECT wait_event_type FROM pg_stat_activity WHERE "
+                         "pid=$1::integer",
+                         {std::to_string(worker_pid)}) == "Lock");
+  REQUIRE(fixture.live.lease->extra_used() ==
+          baseline + PRINCIPAL_CHARGE + CALLER_CHARGE);
+  CHECK(fixture.live.pool.snapshot() ==
+        CreditSnapshot{1, 23, EXTRA_BYTES_PER_LEASE});
+  CHECK(fixture.live.process.active_for_test() == 1);
+  {
+    const std::lock_guard lock(completion->mutex);
+    REQUIRE_FALSE(completion->result.has_value());
+  }
+  REQUIRE(enclosing.request_stop());
+  CHECK(fixture.live.owner->current());
+  CHECK_FALSE(fixture.live.stop.stop_requested());
+
+  bool completed = false;
+  while (!completed && std::chrono::steady_clock::now() < completion_deadline) {
+    // Sample charges BEFORE observing PG. If this same lookup is still
+    // physically blocked afterwards, neither temporary charge may be gone.
+    const auto charged = fixture.live.lease->extra_used();
+    if (fixture.blocked_by(worker_pid, locker_pid)) {
+      CHECK(charged == baseline + PRINCIPAL_CHARGE + CALLER_CHARGE);
+    }
+    const std::lock_guard lock(completion->mutex);
+    completed = completion->result.has_value();
+  }
+  {
+    const std::lock_guard lock(completion->mutex);
+    REQUIRE(completion->result.has_value());
+    require_resolution_failure(*completion->result,
+                               CallerResolutionFailure::UNAVAILABLE);
+    CHECK(completion->finished_at < completion_deadline);
+  }
+  worker.join();
+  CHECK(fixture.live.owner->current());
+  CHECK_FALSE(fixture.live.stop.stop_requested());
+  CHECK(fixture.live.lease->extra_used() == baseline);
+  // Cleanup is confirmed while the original exclusive lock remains held.
+  CHECK(fixture.scalar(
+            "SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1::integer "
+            "AND relation='plinth.group_rules'::regclass "
+            "AND mode='AccessExclusiveLock' AND granted)::text",
+            {std::to_string(locker_pid)}) == "true");
+  CHECK_FALSE(fixture.blocked_by(worker_pid, locker_pid));
+  CHECK(fixture.scalar("SELECT count(*)::text FROM pg_stat_activity WHERE "
+                       "pid=$1::integer AND state='active'",
+                       {std::to_string(worker_pid)}) == "0");
+  CHECK(fixture.scalar("SELECT count(*)::text FROM pg_locks WHERE "
+                       "pid=$1::integer AND NOT granted",
+                       {std::to_string(worker_pid)}) == "0");
+  CHECK(fixture.live.pool.snapshot() ==
+        CreditSnapshot{1, 23, EXTRA_BYTES_PER_LEASE});
+  CHECK(fixture.live.process.active_for_test() == 1);
+  CHECK_FALSE(fixture.live.pool.drain(std::chrono::steady_clock::now()));
+  transaction.release();
+  fixture.live.release();
+  fixture.live.require_drained();
+}

@@ -1948,6 +1948,7 @@ foreach(HTTP_CALLER_PG_CASE IN ITEMS
     "08|HTTP caller PG inherits enclosing operation expiry and stop"
     "09|HTTP caller PG rejects rule and username overflow without partial grants"
     "10|HTTP caller PG bounded database waits honor deadline and stop with owned cleanup"
+    "11|HTTP caller PG enclosing stop cancels blocked lookup while authentication stays live"
     )
   string(REPLACE "|" ";" HTTP_CALLER_PG_PARTS "${HTTP_CALLER_PG_CASE}")
   list(GET HTTP_CALLER_PG_PARTS 0 HTTP_CALLER_PG_NAME)
