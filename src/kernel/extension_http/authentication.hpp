@@ -15,6 +15,7 @@
 namespace plinth::extension_http {
 
 struct AuthenticationRun;
+struct CallerResolutionRun;
 
 // Selected by the kernel from the captured committed claim, NEVER request,
 // extension or client flags. This wrapper does not perform that lookup.
@@ -42,15 +43,21 @@ class AuthenticationOwner {
   AuthenticationOwner(const AuthenticationOwner&) = delete;
   auto operator=(const AuthenticationOwner&) -> AuthenticationOwner& = delete;
   [[nodiscard]] auto current() const noexcept -> bool;
+  // Positive, floored budget from the original execution cutoff. A remaining
+  // sub-millisecond interval cannot become an unlimited database timeout.
+  [[nodiscard]] auto remaining_execution_ms() const noexcept
+      -> std::optional<std::uint32_t>;
   auto cancel(CancelReason reason) noexcept -> void;
   auto expire() noexcept -> void;
 
  private:
   friend struct AuthenticationRun;
+  friend struct CallerResolutionRun;
   struct State;
   explicit AuthenticationOwner(std::unique_ptr<State> state);
   [[nodiscard]] auto reserve(std::size_t bytes)
       -> std::optional<ExtraMemoryCharge>;
+  [[nodiscard]] auto operation_stop_token() const noexcept -> std::stop_token;
   std::unique_ptr<State> state;
 };
 
@@ -74,6 +81,7 @@ class AuthenticatedHttpPrincipal {
 
  private:
   friend struct AuthenticationRun;
+  friend struct CallerResolutionRun;
   AuthenticatedHttpPrincipal(Principal principal,
                              std::shared_ptr<AuthenticationOwner> owner,
                              ExtraMemoryCharge allocation);

@@ -608,6 +608,7 @@ add_executable(plinth
   src/kernel/js/stdlib/pubsub_bindings.cpp
   src/kernel/extension_http/codec.cpp
   src/kernel/extension_http/authentication.cpp
+  src/kernel/extension_http/caller_resolution.cpp
   src/kernel/extension_http/dispatch_store.cpp
   src/kernel/extension_http/frames.cpp
   src/kernel/extension_http/quickjs_codec.cpp
@@ -825,6 +826,7 @@ add_executable(plinth_tests
   tests/kernel/js/eval_guard_test.cpp
   tests/kernel/extension_http/codec_test.cpp
   tests/kernel/extension_http/authentication_test.cpp
+  tests/kernel/extension_http/caller_resolution_test.cpp
   tests/kernel/extension_http/dispatch_store_test.cpp
   tests/kernel/extension_http/frames_test.cpp
   tests/kernel/extension_http/quickjs_codec_test.cpp
@@ -961,6 +963,7 @@ add_executable(plinth_tests
   src/kernel/js/stdlib/pubsub_bindings.cpp
   src/kernel/extension_http/codec.cpp
   src/kernel/extension_http/authentication.cpp
+  src/kernel/extension_http/caller_resolution.cpp
   src/kernel/extension_http/dispatch_store.cpp
   src/kernel/extension_http/frames.cpp
   src/kernel/extension_http/quickjs_codec.cpp
@@ -1072,6 +1075,38 @@ add_dependencies(plinth_tests plinth_shell_bundle_staged plinth_install_fixture_
                  plinth_test_extension_zips plinth_admin_zip)
 
 include(Catch)
+
+# Keep replaceable C++ allocation functions out of the shared test process.
+# This executable exercises the real inline PostgreSQL operation helpers.
+find_package(Threads REQUIRED)
+add_executable(plinth_db_cancellation_allocation_tests
+  tests/kernel/db/cancellation_allocation_test.cpp)
+target_include_directories(plinth_db_cancellation_allocation_tests PRIVATE
+  ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(plinth_db_cancellation_allocation_tests PRIVATE
+  Catch2::Catch2WithMain PostgreSQL::PostgreSQL Threads::Threads)
+# Server-test images build plinth_tests explicitly before running all CTests.
+add_dependencies(plinth_tests plinth_db_cancellation_allocation_tests)
+
+add_test(NAME plinth_tests_db_cancellation_allocator
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_db_cancellation_allocation_tests>
+    --case "PostgreSQL cancellation allocator pairs every family and isolates its worker"
+    --timeout 20
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_db_cancellation_allocator PROPERTIES
+  TIMEOUT 30)
+
+add_test(NAME plinth_tests_db_cancellation_allocation
+  COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+    --binary $<TARGET_FILE:plinth_db_cancellation_allocation_tests>
+    --case "PostgreSQL cancellation survives worker allocation failure after native blocking"
+    --timeout 40
+  WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+set_tests_properties(plinth_tests_db_cancellation_allocation PROPERTIES
+  RESOURCE_LOCK plinth_pg_schema LABELS "needs_pg;native_ownership" TIMEOUT 50)
 
 # 0.4.5.1 — grouped Catch2 entries, single Drogon lifecycle per group.
 # Replaces catch_discover_tests(plinth_tests) which spawned one
@@ -1901,6 +1936,64 @@ foreach(HTTP_OWNED_CASE IN ITEMS
     set_tests_properties(plinth_tests_http_owned_${HTTP_OWNED_NAME} PROPERTIES
       RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099")
   endif()
+endforeach()
+
+# Caller resolution has separate native-data, sealed-preflight, and real-PG
+# receipts. Each strict gate must execute exactly its named case without skips.
+foreach(HTTP_CALLER_CASE IN ITEMS
+    "decoder_01|HTTP caller decoder preserves PAT and anonymous rule data without authority"
+    "decoder_02|HTTP caller decoder accepts exactly one null no-rule row"
+    "decoder_03|HTTP caller decoder enforces native row and UTF8 byte limits"
+    "decoder_04|HTTP caller decoder rejects invalid and unknown principal data"
+    "decoder_05|HTTP caller decoder rejects native result status columns and binary formats"
+    "decoder_06|HTTP caller decoder rejects malformed text at every native field"
+    "decoder_07|HTTP caller decoder rejects inconsistent rule flags and mixed identities"
+    "budget_01|HTTP authentication remaining budget preserves the cutoff and floors milliseconds"
+    "budget_02|HTTP authentication remaining budget honors shortened and submillisecond bounds"
+    "budget_03|HTTP authentication remaining budget retires cancellation stop regression and throwing clocks"
+    "budget_04|HTTP authentication remaining budget rechecks changing clocks without renewal"
+    "preflight_01|HTTP caller preflight uses real public authentication and decision-only PAT sealing"
+    "preflight_02|HTTP caller preflight retires sealed inputs before any native query"
+    "preflight_03|HTTP caller preflight refuses exhausted credit and releases every temporary charge"
+    )
+  string(REPLACE "|" ";" HTTP_CALLER_PARTS "${HTTP_CALLER_CASE}")
+  list(GET HTTP_CALLER_PARTS 0 HTTP_CALLER_NAME)
+  list(GET HTTP_CALLER_PARTS 1 HTTP_CALLER_TITLE)
+  add_test(NAME plinth_tests_http_caller_${HTTP_CALLER_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${HTTP_CALLER_TITLE}" --timeout 30
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_http_caller_${HTTP_CALLER_NAME} PROPERTIES
+    LABELS "extension_http" TIMEOUT 40)
+endforeach()
+
+foreach(HTTP_CALLER_PG_CASE IN ITEMS
+    "01|HTTP caller PG public resolution uses only everyone despite ambient credentials"
+    "02|HTTP caller PG PAT rechecks ownership and current identity state"
+    "03|HTTP caller PG PAT rules are a deduplicated fresh union without implicit admin"
+    "04|HTTP caller PG rejects existing transaction snapshots without issuing lookup"
+    "05|HTTP caller PG retired and busy principals never send a query"
+    "06|HTTP caller PG sealed snapshots gate retirement moves and retain exact leases"
+    "07|HTTP caller PG retained auth bookkeeping outlives resolved caller destruction"
+    "08|HTTP caller PG inherits enclosing operation expiry and stop"
+    "09|HTTP caller PG rejects rule and username overflow without partial grants"
+    "10|HTTP caller PG bounded database waits honor deadline and stop with owned cleanup"
+    "11|HTTP caller PG enclosing stop cancels blocked lookup while authentication stays live"
+    )
+  string(REPLACE "|" ";" HTTP_CALLER_PG_PARTS "${HTTP_CALLER_PG_CASE}")
+  list(GET HTTP_CALLER_PG_PARTS 0 HTTP_CALLER_PG_NAME)
+  list(GET HTTP_CALLER_PG_PARTS 1 HTTP_CALLER_PG_TITLE)
+  add_test(NAME plinth_tests_http_caller_pg_${HTTP_CALLER_PG_NAME}
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_SOURCE_DIR}/tests/tools/verify_catch_case.py
+      --binary $<TARGET_FILE:plinth_tests>
+      --case "${HTTP_CALLER_PG_TITLE}" --timeout 60
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+  set_tests_properties(plinth_tests_http_caller_pg_${HTTP_CALLER_PG_NAME} PROPERTIES
+    RESOURCE_LOCK "plinth_pg_schema;plinth_ws_port_28099"
+    LABELS "needs_pg;extension_http" TIMEOUT 75)
 endforeach()
 
 # Length-complete import policy requires actual engine execution, including

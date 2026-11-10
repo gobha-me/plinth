@@ -107,6 +107,31 @@ auto AuthenticationOwner::cancel(CancelReason reason) noexcept -> void try {
 auto AuthenticationOwner::expire() noexcept -> void {
   static_cast<void>(current());
 }
+auto AuthenticationOwner::remaining_execution_ms() const noexcept
+    -> std::optional<std::uint32_t> try {
+  if (!current()) return std::nullopt;
+  const std::lock_guard lock(state->mutex);
+  if (state->cancelled || state->stop.stop_requested()) return std::nullopt;
+  const auto now = state->clock();
+  if (now < state->bounds.admitted_at_ns) {
+    state->cancelled = CancelReason::GENERATION_RETIRED;
+    return std::nullopt;
+  }
+  if (now >= state->bounds.execution_cutoff_ns) {
+    state->cancelled = CancelReason::DEADLINE;
+    return std::nullopt;
+  }
+  const auto remaining = (state->bounds.execution_cutoff_ns - now) / 1000000;
+  if (remaining == 0) return std::nullopt;
+  return static_cast<std::uint32_t>(remaining);
+} catch (...) {
+  state->broken.store(true);
+  return std::nullopt;
+}
+auto AuthenticationOwner::operation_stop_token() const noexcept
+    -> std::stop_token {
+  return state->stop;
+}
 auto AuthenticationOwner::reserve(std::size_t bytes)
     -> std::optional<ExtraMemoryCharge> {
   return state->admission->reserve_extra(bytes);
