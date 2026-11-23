@@ -1121,7 +1121,9 @@ set_tests_properties(plinth_tests_db_cancellation_allocation PROPERTIES
 add_test(NAME plinth_tests_pure
   COMMAND plinth_tests "~[integration] ~[ws] ~[js]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
+# PG-tagged cases without [integration] still use the shared schema.
+set_tests_properties(plinth_tests_pure PROPERTIES
+  TIMEOUT 180 RESOURCE_LOCK plinth_pg_schema)
 
 # Exact positive/no-skip receipts for the typed-install foundation. Keep these
 # independent of the grouped PG/WS entries: a missing database, renamed case or
