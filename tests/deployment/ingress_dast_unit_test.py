@@ -1759,15 +1759,22 @@ class PinnedPassiveRulesDownloadTest(unittest.TestCase):
             self.assertIsInstance(hop.call_args.args[1], float)
 
     def test_verified_nonsecret_archive_is_readable_under_private_umask(self):
-        with tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
-            previous = os.umask(0o077)
-            try:
-                path, _hop = self.download(Path(temporary), [self.response()])
-            finally:
-                os.umask(previous)
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o444)
-            self.assertEqual(path.read_bytes(), self.artifact)
-            self.assertEqual(stat.S_IMODE(Path(temporary).stat().st_mode), 0o700)
+        # A shared scratch parent can lend setgid to new directories. Exercise
+        # both private modes explicitly; the downloader must preserve either.
+        for directory_mode in (0o700, 0o2700):
+            with self.subTest(directory_mode=oct(directory_mode)), \
+                    tempfile.TemporaryDirectory(prefix="plinth-dast-unit-") as temporary:
+                directory = Path(temporary)
+                directory.chmod(directory_mode)
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), directory_mode)
+                previous = os.umask(0o077)
+                try:
+                    path, _hop = self.download(directory, [self.response()])
+                finally:
+                    os.umask(previous)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o444)
+                self.assertEqual(path.read_bytes(), self.artifact)
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), directory_mode)
 
     def test_official_https_release_asset_redirect_retains_one_deadline(self):
         destination = "https://release-assets.githubusercontent.com/github-production-release-asset/123/fake?sig=fake"
