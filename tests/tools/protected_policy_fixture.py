@@ -2,17 +2,48 @@
 """Exercise the real root/service policy boundary; no same-owner substitute."""
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import struct
 import subprocess
 import tempfile
 
 
+@contextmanager
+def executable_fixture(binary: Path):
+    # Policy data needs protected ancestors; executable scratch does not. In
+    # particular, /run may permit policy reads while denying executable launch.
+    # TMPDIR lets the caller select a writable, executable filesystem without
+    # changing the protected-policy path or relaxing the source/build tree.
+    with tempfile.TemporaryDirectory(prefix="plinth-policy-exec-") as temporary:
+        root = Path(temporary)
+        executable = root / "policy-tests"
+        shutil.copyfile(binary, executable)
+        executable.chmod(0o755)
+        verifier = root / "verify.py"
+        shutil.copyfile(Path(__file__).resolve().with_name("verify_catch_case.py"),
+                        verifier)
+        verifier.chmod(0o644)
+        if not os.access(executable, os.X_OK):
+            raise PermissionError(
+                f"Cannot execute {executable}; set TMPDIR to an executable filesystem")
+        # A root provisioner drops to the service identity below. Only its
+        # owned scratch directory needs traversal by that identity.
+        root.chmod(0o755 if os.geteuid() == 0 else 0o700)
+        yield root
+
+
 def run(binary: Path) -> None:
+    with executable_fixture(binary) as execution_root:
+        run_policy_fixture(execution_root)
+
+
+def run_policy_fixture(execution_root: Path) -> None:
     # Root commands are individual argv-only filesystem operations against this
     # unique test directory. Never sudo the caller's test executable or shell.
     privileged = [] if os.geteuid() == 0 else ["sudo", "-n"]
@@ -31,18 +62,8 @@ def run(binary: Path) -> None:
 
     try:
         directory(root)
-        # The build tree may be a private mktemp directory owned by root. Copy
-        # only this gate's executable/verifier into the readable fixture root;
-        # never relax the source/build tree or execute either as root.
-        executable = root / "policy-tests"
-        command("install", "-o", "0", "-g", "0", "-m", "0755",
-                "--", str(binary), str(executable))
-        files.append(executable)
-        verifier_source = Path(__file__).resolve().with_name("verify_catch_case.py")
-        verifier = root / "verify.py"
-        command("install", "-o", "0", "-g", "0", "-m", "0644",
-                "--", str(verifier_source), str(verifier))
-        files.append(verifier)
+        executable = execution_root / "policy-tests"
+        verifier = execution_root / "verify.py"
         with tempfile.TemporaryDirectory(prefix="plinth-policy-input-") as staging:
             source = Path(staging) / "policy.json"
             valid = json.dumps({
@@ -117,7 +138,7 @@ def run(binary: Path) -> None:
             case = "protected restore policy: real protected deployment boundary"
             subprocess.run([*drop, "python3", str(verifier), "--binary", str(executable),
                             "--case", case, "--timeout", "45"],
-                           env=environment, cwd=root, check=True, timeout=55)
+                           env=environment, cwd=execution_root, check=True, timeout=55)
     finally:
         # Only known exact files; no recursive removal, wildcard or broad target.
         for path in reversed(files):

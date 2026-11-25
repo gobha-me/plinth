@@ -311,15 +311,25 @@ def main():
         created_database = True
         command('mkdir', '-m', '0755', '--', str(protected))
         protected_created = True
-        executable = protected / 'plinth'
-        command('install', '-o', '0', '-g', '0', '-m', '0755', '--', str(binary), str(executable))
-        protected_files.append(executable)
         with tempfile.TemporaryDirectory(prefix='plinth-installed-floats-') as temporary:
             root = Path(temporary)
             root.chmod(0o755)
             children = []
             browser = None
             try:
+                # Protected policy files need root-owned ancestry. The kernel
+                # needs an executable filesystem, which /run may not provide.
+                root_info = root.stat()
+                if root_info.st_uid != os.geteuid() or stat.S_IMODE(root_info.st_mode) != 0o755:
+                    raise RuntimeError('installed float staging directory has unexpected ownership or mode')
+                executable = root / 'plinth'
+                command('install', '-o', '0', '-g', '0', '-m', '0755', '--', str(binary), str(executable))
+                executable_info = executable.lstat()
+                if (not stat.S_ISREG(executable_info.st_mode) or executable_info.st_uid != 0 or
+                        executable_info.st_gid != 0 or stat.S_IMODE(executable_info.st_mode) != 0o755):
+                    raise RuntimeError('staged float kernel has unexpected type, ownership or mode')
+                if not os.access(executable, os.X_OK):
+                    raise PermissionError('cannot execute staged float kernel; set TMPDIR to an executable filesystem')
                 data = root / 'data'
                 data.mkdir(mode=0o700)
                 command('chown', f'{service_uid}:{service_gid}', '--', str(data))
