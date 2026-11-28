@@ -1,4 +1,20 @@
 // SPDX-License-Identifier: MIT
+
+#if defined(__SANITIZE_THREAD__)
+#define PLINTH_CANCELLATION_ALLOCATION_TSAN 1
+#else
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define PLINTH_CANCELLATION_ALLOCATION_TSAN 1
+#endif
+#endif
+#endif
+
+// The TSan runtime provides these replacement operators, so defining them here
+// breaks the link. Both cases depend on the replacements to force allocation
+// failure and are exercised in builds without TSan.
+#if !defined(PLINTH_CANCELLATION_ALLOCATION_TSAN)
+
 #include "kernel/db/operations.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -540,3 +556,5 @@ TEST_CASE("PostgreSQL cancellation survives worker allocation failure after "
   }
   CHECK(backend_gone);
 }
+
+#endif
