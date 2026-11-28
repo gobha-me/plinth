@@ -180,6 +180,8 @@ class KernelRuntimeTest(unittest.TestCase):
         runtime = object.__new__(ContainerRuntime)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            # Keep the exact private-mode contract independent of parent SGID.
+            root.chmod(0o700)
             runtime.prepare_root(root)
             (root / "data").chmod(0o750)
             source = root / "data/source"

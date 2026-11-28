@@ -4,6 +4,7 @@ import importlib.util
 from contextlib import nullcontext
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 from types import SimpleNamespace
@@ -382,11 +383,20 @@ console.log(JSON.stringify(ADMIN_DEFAULT_CASES));
                 harness.admin_defaults_source_hashes(root)
 
     def test_fixed_upgrade_variants_preserve_contracts_and_source_without_new_grants(self):
-        source = repo / 'tests/extensions/float-provider'
-        original = {path.relative_to(source).as_posix(): path.read_bytes()
-                    for path in source.rglob('*') if path.is_file()}
+        fixture = repo / 'tests/extensions/float-provider'
+        original = {path.relative_to(fixture).as_posix(): path.read_bytes()
+                    for path in fixture.rglob('*') if path.is_file()}
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            source = root / 'fixture'
+            shutil.copytree(fixture, source)
+            # Git records ordinary directory entries without permission bits;
+            # shared scratch checkouts can inherit SGID from their parent.
+            # Supply a normalized ordinary fixture to the strict artifact gate.
+            source.chmod(0o755)
+            for path in source.rglob('*'):
+                if path.is_dir():
+                    path.chmod(0o755)
             staging, destination = root / 'source', root / 'zips'
             staging.mkdir()
             destination.mkdir()

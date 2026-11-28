@@ -1124,7 +1124,9 @@ endif()
 add_test(NAME plinth_tests_pure
   COMMAND plinth_tests "~[integration] ~[ws] ~[js]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-set_tests_properties(plinth_tests_pure PROPERTIES TIMEOUT 180)
+# PG-tagged cases without [integration] still use the shared schema.
+set_tests_properties(plinth_tests_pure PROPERTIES
+  TIMEOUT 180 RESOURCE_LOCK plinth_pg_schema)
 
 # Exact positive/no-skip receipts for the typed-install foundation. Keep these
 # independent of the grouped PG/WS entries: a missing database, renamed case or
@@ -1385,7 +1387,9 @@ set_tests_properties(plinth_tests_json_nul_regression PROPERTIES TIMEOUT 30)
 add_test(NAME plinth_tests_conversion_corpus
   COMMAND plinth_tests "[js][conversion][corpus] ~[isolated-sync-conversion]"
   WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
-set_tests_properties(plinth_tests_conversion_corpus PROPERTIES TIMEOUT 90)
+# With PostgreSQL configured, the async corpus initializes the shared schema.
+set_tests_properties(plinth_tests_conversion_corpus PROPERTIES
+  TIMEOUT 90 RESOURCE_LOCK plinth_pg_schema)
 
 # The one-shot and pooled synchronous helpers have distinct private conversion
 # paths. Exercise both in one DB-free process with exact fresh-XML verification.
