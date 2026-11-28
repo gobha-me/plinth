@@ -1022,7 +1022,7 @@ jobs:
         run: |
           set -euo pipefail
           ctest --test-dir build -N -L extension_http |
-            grep -Ex 'Total Tests: 64'
+            grep -Ex 'Total Tests: 89'
           ctest --test-dir build --verbose --output-on-failure --parallel 1 \
             -L extension_http
 
